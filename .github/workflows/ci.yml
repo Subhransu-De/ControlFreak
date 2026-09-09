@@ -1,0 +1,160 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Formatting, Clippy, and docs
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check documentation
+        run: |
+          $env:RUSTDOCFLAGS = "-D warnings"
+          cargo doc --workspace --no-deps --locked
+
+  tests:
+    name: Tests
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  windows-build:
+    name: Release build
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Build optimized server
+        run: cargo build -p controlfreak-server --release --locked
+
+  dependencies:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check advisories, licenses, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check advisories bans licenses sources
+
+  workflow-policy:
+    name: GitHub Actions policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      - name: Validate workflows
+        run: '"${HOME}/go/bin/actionlint"'
+
+  hawk:
+    name: Hawk unsafe-code audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1 --profile minimal
+          --component llvm-tools-preview --target x86_64-pc-windows-msvc
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Install cargo-xwin
+        run: cargo install cargo-xwin --version 0.23.0 --locked
+
+      - name: Install Hawk
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/astral-sh/hawk/releases/download/0.1.12/cargo-hawk-installer.sh \
+            --output /tmp/cargo-hawk-installer.sh
+          echo "583c610c6f5433543b8bc6901cb2d5300b3f6f2f0d34a868bd3d189158f2857a  /tmp/cargo-hawk-installer.sh" \
+            | sha256sum --check
+          sh /tmp/cargo-hawk-installer.sh
+
+      - name: Run Hawk against the Windows target
+        shell: bash
+        run: |
+          target=x86_64-pc-windows-msvc
+          eval "$(cargo xwin env --quiet --target "$target" --manifest-path Cargo.toml)"
+          cargo +1.97.1 hawk check \
+            --manifest-path Cargo.toml \
+            --target "$target" \
+            -D warnings

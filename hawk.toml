@@ -1,0 +1,12 @@
+[[production]]
+package = "controlfreak-server"
+bin = "controlfreak"
+reason = "shipped Windows MCP server"
+
+[[override]]
+lint = "hawk::dead_public"
+crate = "controlfreak_mcp"
+item = "serve_stdio_with_indicator"
+kind = "function"
+level = "expect"
+reason = "retained for compatibility with embedders that use the pre-arbitration indicator API"

@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build Windows release
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Install release tools
+        run: |
+          cargo install cargo-auditable --version 0.7.5 --locked
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Test release configuration
+        run: cargo test --workspace --release --locked
+
+      - name: Build auditable server
+        run: cargo auditable build -p controlfreak-server --release --locked
+
+      - name: Generate CycloneDX SBOMs
+        run: cargo cyclonedx --format json --target x86_64-pc-windows-msvc --override-filename controlfreak.cdx.json
+
+      - name: Package release
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME
+          $packageName = "controlfreak-$version-x86_64-pc-windows-msvc"
+          $packageDir = Join-Path dist $packageName
+          New-Item -ItemType Directory -Path (Join-Path $packageDir "sbom") -Force | Out-Null
+
+          Copy-Item target/release/controlfreak.exe $packageDir
+          Copy-Item README.md, CHANGELOG.md, SECURITY.md, LICENSE, Cargo.lock $packageDir
+
+          if (Test-Path controlfreak.cdx.json) {
+            Copy-Item controlfreak.cdx.json (Join-Path $packageDir "sbom/workspace.cdx.json")
+          }
+
+          Get-ChildItem crates -Recurse -Filter controlfreak.cdx.json | ForEach-Object {
+            $crateName = Split-Path $_.DirectoryName -Leaf
+            Copy-Item $_.FullName (Join-Path $packageDir "sbom/$crateName.cdx.json")
+          }
+
+          $archive = Join-Path dist "$packageName.zip"
+          Compress-Archive -Path "$packageDir/*" -DestinationPath $archive
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          "$hash  $packageName.zip" | Set-Content "$archive.sha256"
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = Get-ChildItem dist -File | Where-Object { $_.Extension -in ".zip", ".sha256" }
+          $versions = @(
+            (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages.version |
+              Sort-Object -Unique
+          )
+          if ($versions.Count -ne 1) {
+            throw "Workspace packages must share one version before a release can be published."
+          }
+
+          $workspaceVersion = $versions[0]
+          if ($env:GITHUB_REF_NAME -ne "v$workspaceVersion") {
+            throw "Tag $env:GITHUB_REF_NAME does not match workspace version $workspaceVersion."
+          }
+
+          $releaseKind = @()
+          if ($workspaceVersion -match "-") {
+            $releaseKind = @("--prerelease")
+          }
+
+          gh release create $env:GITHUB_REF_NAME @($assets.FullName) @releaseKind --verify-tag --generate-notes --title $env:GITHUB_REF_NAME

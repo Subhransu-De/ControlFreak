@@ -1,0 +1,25 @@
+[package]
+name = "controlfreak-server"
+description = "Native Windows computer-use MCP server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "controlfreak"
+path = "src/main.rs"
+
+[dependencies]
+controlfreak-core.workspace = true
+controlfreak-mcp.workspace = true
+controlfreak-platform.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+
+[lints]
+workspace = true
