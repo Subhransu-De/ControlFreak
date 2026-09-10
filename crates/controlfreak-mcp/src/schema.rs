@@ -49,7 +49,7 @@ fn begin_control_session_tool() -> Tool {
     );
     Tool::new(
         BEGIN_CONTROL_SESSION,
-        "Reserve desktop control before a multi-step task and show the ARMED safety glow. The call fails retryably when another ControlFreak server owns the desktop.",
+        "Reserve desktop control. Returns a retryable failure if another ControlFreak server owns it.",
         object_schema(properties, &[]),
     )
     .with_annotations(
@@ -64,7 +64,7 @@ fn begin_control_session_tool() -> Tool {
 fn end_control_session_tool() -> Tool {
     Tool::new(
         END_CONTROL_SESSION,
-        "Close mutation admission after the last desktop step. The glow fades and arbitration is released after any in-flight mutation finishes.",
+        "Stop accepting new input actions and release desktop control after pending actions finish.",
         object_schema(JsonObject::new(), &[]),
     )
     .with_annotations(
@@ -79,7 +79,7 @@ fn end_control_session_tool() -> Tool {
 fn get_server_status_tool() -> Tool {
     Tool::new(
         GET_SERVER_STATUS,
-        "Return this MCP process instance ID, version, uptime, backend identity, Windows integrity level, elevation/opt-in state, and bounded operation counters. Use it to confirm that the same server instance and privilege context are still active after a suspected transport or tool failure.",
+        "Return server identity, version, uptime, privileges, and operation diagnostics. Use after suspected server or transport failures.",
         object_schema(JsonObject::new(), &[]),
     )
     .with_annotations(
@@ -94,7 +94,7 @@ fn get_server_status_tool() -> Tool {
 fn list_displays_tool() -> Tool {
     Tool::new(
         LIST_DISPLAYS,
-        "List active displays and return their count, stable Windows device IDs, primary flag, and physical-pixel virtual-desktop bounds.",
+        "List active displays with IDs, primary status, and bounds in physical pixels.",
         object_schema(JsonObject::new(), &[]),
     )
     .with_raw_output_schema(Arc::new(json_object(json!({
@@ -131,7 +131,7 @@ fn capture_display_tool() -> Tool {
     add_capture_options(&mut properties);
     Tool::new(
         CAPTURE_DISPLAY,
-        "Capture one active Windows display and return PNG image content. Use max_width to avoid unnecessary full-resolution images; input tools already return post-action evidence. Protected or HDR content may not reproduce exactly with GDI.",
+        "Capture a display as PNG. Protected or HDR content may render incorrectly.",
         object_schema(properties, &["display_id"]),
     )
     .with_annotations(
@@ -148,7 +148,7 @@ fn capture_region_tool() -> Tool {
     add_capture_options(&mut properties);
     Tool::new(
         CAPTURE_REGION,
-        "Capture a display-local rectangular region. Returns native resolution by default, explicit virtual-desktop source bounds, and an optional cursor marker; use this to inspect small controls or text without recapturing an entire display.",
+        "Capture a rectangular display region as PNG, at native resolution unless max_width is supplied.",
         object_schema(
             properties,
             &["display_id", "x", "y", "width", "height"],
@@ -188,7 +188,7 @@ fn wait_for_visual_change_tool() -> Tool {
     );
     Tool::new(
         WAIT_FOR_VISUAL_CHANGE,
-        "Wait for a display region to change and settle, then return the final screenshot. This replaces guessed sleeps and repeated capture polling; timed_out indicates no settled change before the deadline.",
+        "Wait for a region to change from its appearance at call time and settle. Return the final screenshot; timeout is a normal result.",
         object_schema(
             properties,
             &["display_id", "x", "y", "width", "height"],
@@ -206,7 +206,7 @@ fn wait_for_visual_change_tool() -> Tool {
 fn capture_visual_baseline_tool() -> Tool {
     Tool::new(
         CAPTURE_VISUAL_BASELINE,
-        "Capture and retain a lightweight visual fingerprint for a display region without returning an image. Use its baseline_id before an action, then call wait_for_change_since so fast changes that occur during the action are not missed.",
+        "Save a region's visual baseline without returning an image. Capture before an action, then use wait_for_change_since afterward to wait for its effects.",
         object_schema(region_properties(), &["display_id", "x", "y", "width", "height"]),
     )
     .with_annotations(
@@ -229,7 +229,7 @@ fn wait_for_change_since_tool() -> Tool {
     );
     Tool::new(
         WAIT_FOR_CHANGE_SINCE,
-        "Compare an earlier retained baseline with its region until it has changed and settled, then return one final screenshot. Baselines expire after five minutes and can be reused while valid.",
+        "Wait for a region to differ from its saved baseline and settle, then return a screenshot. Timeout is normal. Baselines remain reusable for five minutes.",
         object_schema(properties, &["baseline_id"]),
     )
     .with_annotations(
@@ -246,7 +246,7 @@ fn read_text_in_region_tool() -> Tool {
     add_ocr_language(&mut properties);
     Tool::new(
         READ_TEXT_IN_REGION,
-        "Read visible text locally with the installed Windows OCR engine. Returns lines and words with display-local physical-pixel bounds and no image data. Windows OCR does not expose confidence scores.",
+        "Read text in a region using OCR. Return lines and words with bounds in display-local physical pixels. No image or confidence scores.",
         object_schema(properties, &["display_id", "x", "y", "width", "height"]),
     )
     .with_annotations(
@@ -272,7 +272,7 @@ fn find_text_on_screen_tool() -> Tool {
     );
     Tool::new(
         FIND_TEXT_ON_SCREEN,
-        "Find visible text locally in a display region and return matching OCR lines with display-local bounds suitable for mouse actions. No screenshot or cloud service is used.",
+        "Find OCR lines matching query within a region. Return matching text and bounds in display-local physical pixels.",
         object_schema(properties, &["display_id", "x", "y", "width", "height", "query"]),
     )
     .with_annotations(
@@ -321,7 +321,7 @@ fn click_text_tool() -> Tool {
     add_observation(&mut properties);
     Tool::new(
         CLICK_TEXT,
-        "Find one unique OCR text line inside a bounded region, click its center, and return post-action evidence. Zero or ambiguous matches fail without injecting input, making this safer than reusing stale coordinates.",
+        "Click the center of a unique matching OCR line in a region. No input occurs if there are zero or multiple matches.",
         object_schema(
             properties,
             &["display_id", "x", "y", "width", "height", "query"],
@@ -340,7 +340,7 @@ fn click_text_tool() -> Tool {
 fn list_virtual_desktops_tool() -> Tool {
     Tool::new(
         LIST_VIRTUAL_DESKTOPS,
-        "Group discoverable titled application windows by their stable Windows virtual-desktop GUID and mark the current group. The supported Windows API cannot reveal empty desktops, desktop names, or desktop order; the result states these limitations explicitly.",
+        "Group discoverable titled windows by desktop ID and identify the current group. Empty desktops, names, and desktop order are unavailable.",
         object_schema(JsonObject::new(), &[]),
     )
     .with_raw_output_schema(Arc::new(json_object(json!({
@@ -396,7 +396,7 @@ fn switch_virtual_desktop_tool() -> Tool {
     );
     Tool::new(
         SWITCH_VIRTUAL_DESKTOP,
-        "Switch left or right across existing Windows virtual desktops using the stable native shortcut, then return the resulting foreground screenshot. changed=false means the requested direction was already at an edge or Windows did not switch.",
+        "Switch left or right across existing virtual desktops. changed=false means no switch was detected.",
         object_schema(properties, &["direction"]),
     )
     .with_raw_output_schema(action_output_schema(false))
@@ -412,7 +412,7 @@ fn switch_virtual_desktop_tool() -> Tool {
 fn list_windows_tool() -> Tool {
     Tool::new(
         LIST_WINDOWS,
-        "List visible titled top-level Windows windows. IDs are ephemeral: refresh this list before focusing after windows open, close, or change ownership.",
+        "List visible titled top-level windows. Refresh IDs after windows open, close, or change ownership.",
         object_schema(JsonObject::new(), &[]),
     )
     .with_raw_output_schema(Arc::new(json_object(json!({
@@ -446,7 +446,7 @@ fn focus_window_tool() -> Tool {
     add_observation(&mut properties);
     Tool::new(
         FOCUS_WINDOW,
-        "Restore and focus one existing visible window without launching applications, verify that it became foreground, then return a bounded screenshot of its display.",
+        "Restore and focus an existing window, then verify it became foreground.",
         object_schema(properties, &["window_id"]),
     )
     .with_raw_output_schema(action_output_schema(false))
@@ -465,7 +465,7 @@ fn capture_window_tool() -> Tool {
     add_capture_options(&mut properties);
     Tool::new(
         CAPTURE_WINDOW,
-        "Capture the current visible frame bounds of one existing window without focusing it or launching anything. Refresh list_windows first; minimized windows must be restored before capture.",
+        "Capture a window's visible frame without focusing it. Use a fresh window ID and restore minimized windows first.",
         object_schema(properties, &["window_id"]),
     )
     .with_annotations(
@@ -493,7 +493,7 @@ fn wait_for_window_tool() -> Tool {
     );
     Tool::new(
         WAIT_FOR_WINDOW,
-        "Wait until a visible top-level window matches all supplied criteria. Provide at least one criterion. Returns matched=false and timed_out=true normally when the deadline expires.",
+        "Wait for a visible top-level window matching all supplied criteria. Requires at least one criterion. Timeout returns matched=false and timed_out=true.",
         object_schema(properties, &[]),
     )
     .with_annotations(
@@ -508,7 +508,7 @@ fn wait_for_window_tool() -> Tool {
 fn move_mouse_tool() -> Tool {
     Tool::new(
         MOVE_MOUSE,
-        "Move the pointer to display-local physical-pixel coordinates, then return a screenshot of that display. Supports smooth movement within or between displays; never clicks or types.",
+        "Move the pointer within or between displays using display-local physical pixels.",
         object_schema(pointer_properties(), &["display_id", "x", "y"]),
     )
     .with_raw_output_schema(pointer_action_output_schema())
@@ -535,7 +535,7 @@ fn click_mouse_tool() -> Tool {
     properties.insert("modifiers".to_owned(), modifier_schema());
     Tool::new(
         CLICK_MOUSE,
-        "Move to display-local physical-pixel coordinates, atomically perform one to three left, right, or middle clicks with optional modifiers, then return a post-action screenshot.",
+        "Click at display-local physical-pixel coordinates. Clicks and modifiers execute as one input sequence.",
         object_schema(properties, &["display_id", "x", "y", "button"]),
     )
     .with_raw_output_schema(pointer_action_output_schema())
@@ -564,7 +564,7 @@ fn drag_mouse_tool() -> Tool {
     add_observation(&mut properties);
     Tool::new(
         DRAG_MOUSE,
-        "Atomically move to a start point, hold the selected mouse button and optional modifiers, drag within or between displays, release all held inputs, then return a post-action screenshot. No raw button-down state is exposed.",
+        "Drag within or between displays. Hold the button and modifiers for the drag, then release all held inputs.",
         object_schema(properties, &["start_display_id", "start_x", "start_y", "end_display_id", "end_x", "end_y", "button"]),
     )
     .with_raw_output_schema(pointer_action_output_schema())
@@ -600,7 +600,7 @@ fn scroll_mouse_tool() -> Tool {
     );
     Tool::new(
         SCROLL_MOUSE,
-        "Move to display-local physical-pixel coordinates, scroll vertically and optionally horizontally, wait briefly for the UI to update, then return a screenshot of that display.",
+        "Move to display-local physical-pixel coordinates and scroll vertically or horizontally.",
         object_schema(properties, &["display_id", "x", "y", "delta_y"]),
     )
     .with_raw_output_schema(pointer_action_output_schema())
@@ -629,7 +629,7 @@ fn press_keys_tool() -> Tool {
     add_observation(&mut properties);
     Tool::new(
         PRESS_KEYS,
-        "Send one explicit key or keyboard chord to the current foreground window, then return a bounded screenshot of the resulting foreground display. Call focus_window first when the target is uncertain.",
+        "Send a key or chord to the foreground window. Call focus_window first if the target is uncertain.",
         object_schema(properties, &["keys"]),
     )
     .with_raw_output_schema(action_output_schema(false))
@@ -656,7 +656,7 @@ fn type_text_tool() -> Tool {
     add_observation(&mut properties);
     Tool::new(
         TYPE_TEXT,
-        "Type Unicode text into the current foreground window without using the clipboard, then return a bounded screenshot of the foreground display. Call focus_window first when the target is uncertain.",
+        "Type Unicode text into the foreground window without using the clipboard. Call focus_window first if the target is uncertain.",
         object_schema(properties, &["text"]),
     )
     .with_raw_output_schema(action_output_schema(false))
