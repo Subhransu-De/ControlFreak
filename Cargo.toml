@@ -18,7 +18,7 @@ version = "0.1.0-alpha"
 controlfreak-core = { version = "=0.1.0-alpha", path = "crates/controlfreak-core" }
 controlfreak-mcp = { version = "=0.1.0-alpha", path = "crates/controlfreak-mcp" }
 controlfreak-platform = { version = "=0.1.0-alpha", path = "crates/controlfreak-platform" }
-rmcp = { version = "=3.1.2", default-features = false, features = ["server", "transport-io"] }
+rmcp = { version = "=3.2.0", default-features = false, features = ["server", "transport-io"] }
 base64 = "0.23"
 png = "0.18"
 serde = { version = "1.0", features = ["derive"] }
