@@ -4,8 +4,8 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: daily
-      time: "09:00"
+      interval: cron
+      cronjob: "0 9 * * *"
     open-pull-requests-limit: 10
     commit-message:
       prefix: "chore(deps)"
@@ -13,8 +13,8 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: daily
-      time: "09:15"
+      interval: cron
+      cronjob: "15 9 * * *"
     open-pull-requests-limit: 10
     commit-message:
       prefix: "chore(deps-actions)"

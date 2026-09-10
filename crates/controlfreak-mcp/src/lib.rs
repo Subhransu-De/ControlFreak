@@ -1055,7 +1055,7 @@ impl ServerHandler for ControlFreakServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "ControlFreak provides local Windows capture, OCR, visual baselines, pointer and keyboard input, windows, and virtual desktops. Observation-only tools stay dark. Before a multi-step desktop task, call begin_control_session; after the final state-changing step, call end_control_session. A one-shot mutation opens and times out its own short session. Input actions already return post-action evidence; do not call capture_display again unless that evidence is insufficient. Use observation.region to crop evidence, or metadata/none when an image is unnecessary. Before state-changing actions, capture_visual_baseline and then wait_for_change_since. Prefer click_text for a unique visible label over stale coordinates. Read structuredContent directly, always inspect isError and text error blocks, and never stringify the full MCP response because image blocks contain base64 data.",
+                "ControlFreak is a computer-use MCP server. For tasks with multiple input actions, call begin_control_session first and end_control_session when finished. Actions return screenshots by default. Reuse them; capture again only when needed. Choose targets from current observations. Prefer click_text for unique visible labels. Check isError and error text. Read structuredContent without serializing image data. Never repeat an action when retry_action=false.",
             )
     }
 
