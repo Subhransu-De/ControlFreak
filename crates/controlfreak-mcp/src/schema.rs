@@ -229,7 +229,7 @@ fn wait_for_change_since_tool() -> Tool {
     );
     Tool::new(
         WAIT_FOR_CHANGE_SINCE,
-        "Wait for a region to differ from its saved baseline and settle, then return a screenshot. Timeout is normal. Baselines remain reusable for five minutes.",
+        "Wait for a region to differ from its saved baseline and settle, then return a screenshot. Timeout is normal. Baselines expire after five minutes and can be reused while retained.",
         object_schema(properties, &["baseline_id"]),
     )
     .with_annotations(
