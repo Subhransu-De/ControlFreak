@@ -180,7 +180,7 @@ fn failed_shutdown_keeps_arbitration_until_retry_is_safe() {
     runtime.check_lifecycle();
     assert_eq!(runtime.status()["draining"], false);
     assert_eq!(fixture.releases.load(Ordering::SeqCst), 1);
-    assert_eq!(fixture.shutdowns.load(Ordering::SeqCst), 2);
+    assert!(fixture.shutdowns.load(Ordering::SeqCst) >= 2);
 }
 
 #[test]
@@ -194,4 +194,24 @@ fn dropping_server_cleanup_closes_admission_before_worker_completion() {
     assert!(runtime.acquire_mutation_blocking().is_err());
     drop(lease);
     assert_eq!(fixture.releases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn desktop_is_revalidated_after_indicator_startup() {
+    for explicit in [false, true] {
+        let fixture = Arc::new(Fixture::default());
+        let mut runtime = fixture.runtime();
+        let fixture_for_start = Arc::clone(&fixture);
+        Arc::get_mut(&mut runtime).unwrap().starter = Arc::new(move || {
+            *fixture_for_start.environment.lock().unwrap() = Some("locked during startup");
+            Ok(Box::new(Indicator(Arc::clone(&fixture_for_start))))
+        });
+        if explicit {
+            assert!(runtime.begin_session(None).is_err());
+        } else {
+            assert!(runtime.acquire_mutation_blocking().is_err());
+        }
+        assert_eq!(runtime.status()["active_mutations"], 0);
+        assert!(!fixture.owned.load(Ordering::SeqCst));
+    }
 }

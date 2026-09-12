@@ -428,6 +428,7 @@ impl IndicatorRuntime {
             return Err(reason);
         }
         self.ensure_indicator_level(IndicatorLevel::Acting)?;
+        self.check_environment()?;
         let mut state = self
             .state
             .lock()
@@ -481,6 +482,7 @@ impl IndicatorRuntime {
             IndicatorLevel::Armed
         };
         self.ensure_indicator_level(level)?;
+        self.check_environment()?;
         let mut state = self
             .state
             .lock()
