@@ -1053,11 +1053,20 @@ impl Drop for IndicatorRuntime {
             .state
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(mut control) = state.control.take() {
-            // Ownership cannot outlive the input/indicator cleanup barrier.
-            while control.shutdown().is_err() && state.session.owns_arbitration {
-                thread::sleep(Duration::from_millis(50));
-            }
+        if let Some(mut control) = state.control.take()
+            && control.shutdown().is_err()
+            && state.session.owns_arbitration
+        {
+            // A failed shutdown must not block Drop or surrender ownership.
+            // Transfer both resources together; release only after safe cleanup.
+            let arbitrator = Arc::clone(&self.arbitrator);
+            thread::spawn(move || {
+                while control.shutdown().is_err() {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                arbitrator.release();
+            });
+            return;
         }
         self.safety_indicator.mark_stopping();
         if state.session.owns_arbitration {
@@ -1870,6 +1879,21 @@ impl Drop for ServerCleanup {
     }
 }
 
+async fn wait_for_cleanup(runtime: &IndicatorRuntime, timeout: Duration) -> std::io::Result<()> {
+    tokio::time::timeout(timeout, async {
+        while runtime.status()["draining"] == true {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "control-session cleanup is still draining",
+        )
+    })
+}
+
 async fn serve_stdio_inner(
     backend: Box<dyn PlatformBackend>,
     safety_indicator: SafetyIndicator,
@@ -1916,9 +1940,7 @@ async fn serve_stdio_inner(
         }
     };
     if let Some(runtime) = &cleanup.0 {
-        while runtime.status()["draining"] == true {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        wait_for_cleanup(runtime, Duration::from_secs(30)).await?;
     }
     match result {
         Ok(reason) => {

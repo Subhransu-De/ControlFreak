@@ -238,3 +238,36 @@ async fn eof_closes_admission_before_response_drain() {
     assert_eq!(runtime.status()["last_cleanup_reason"], "disconnect");
     assert_eq!(fixture.releases.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn persistent_shutdown_failure_has_a_bounded_wait_without_releasing_ownership() {
+    let fixture = Arc::new(Fixture::default());
+    let runtime = fixture.runtime();
+    runtime.begin_session(None).unwrap();
+    fixture.shutdown_failed.store(true, Ordering::SeqCst);
+    assert!(runtime.close_session("shutdown", true).is_err());
+    let error = wait_for_cleanup(&runtime, Duration::from_millis(1))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    let (dropped, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        drop(runtime);
+        dropped.send(()).unwrap();
+    });
+    let result = receiver.recv_timeout(Duration::from_secs(2));
+    let retained = fixture.owned.load(Ordering::SeqCst);
+    // Always let cleanup finish, including when an assertion fails.
+    fixture.shutdown_failed.store(false, Ordering::SeqCst);
+    assert!(
+        result.is_ok(),
+        "runtime Drop blocked on failed indicator shutdown"
+    );
+    assert!(retained);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while fixture.owned.load(Ordering::SeqCst) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!fixture.owned.load(Ordering::SeqCst));
+    assert_eq!(fixture.releases.load(Ordering::SeqCst), 1);
+}
