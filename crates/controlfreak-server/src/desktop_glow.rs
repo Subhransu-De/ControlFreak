@@ -31,12 +31,13 @@ pub(crate) struct DesktopGlow {
     health: Arc<Mutex<IndicatorHealth>>,
     cancellation: MutationControl,
     containment: (&'static str, Option<String>),
-    draining: Option<JoinHandle<()>>,
+    draining: Option<JoinHandle<Result<(), String>>>,
+    shutdown_failure: Option<String>,
 }
 
 struct GlowActor {
     sender: mpsc::SyncSender<ActorRequest>,
-    thread: Option<JoinHandle<()>>,
+    thread: Option<JoinHandle<Result<(), String>>>,
 }
 
 enum ActorRequest {
@@ -83,6 +84,7 @@ impl DesktopGlow {
             return Ok(Self {
                 actor: None,
                 draining: None,
+                shutdown_failure: None,
                 health,
                 cancellation,
                 containment: (
@@ -115,11 +117,12 @@ impl DesktopGlow {
                     &health_for_actor,
                     &cancellation_for_actor,
                     elevated,
-                );
+                )
             })
             .map_err(|error| format!("desktop glow actor could not start: {error}"))?;
         Ok(Self {
             draining: None,
+            shutdown_failure: None,
             actor: Some(GlowActor {
                 sender,
                 thread: Some(actor),
@@ -130,8 +133,16 @@ impl DesktopGlow {
         })
     }
 
+    fn finish_shutdown(&mut self, result: Result<(), String>) -> Result<(), String> {
+        let result = finish_actor_shutdown(&mut self.draining, result);
+        if self.draining.is_none() {
+            self.shutdown_failure = result.as_ref().err().cloned();
+        }
+        result
+    }
+
     fn command(&self, command: GlowCommand) -> Result<(), String> {
-        if self.draining.is_some() {
+        if self.draining.is_some() || self.shutdown_failure.is_some() {
             return Err("desktop glow actor is still draining".to_owned());
         }
         let Some(actor) = self.actor.as_ref() else {
@@ -161,8 +172,11 @@ impl ActivityIndicator for DesktopGlow {
     }
 
     fn shutdown(&mut self) -> Result<(), String> {
+        if let Some(reason) = &self.shutdown_failure {
+            return Err(reason.clone());
+        }
         if self.draining.is_some() {
-            return finish_actor_shutdown(&mut self.draining, Ok(()));
+            return self.finish_shutdown(Ok(()));
         }
         let Some(mut actor) = self.actor.take() else {
             return Ok(());
@@ -178,7 +192,7 @@ impl ActivityIndicator for DesktopGlow {
                 .map_err(|error| format!("desktop glow shutdown timed out: {error}"))?
         });
         self.draining = actor.thread.take();
-        finish_actor_shutdown(&mut self.draining, result)
+        self.finish_shutdown(result)
     }
 
     fn health(&self) -> IndicatorHealth {
@@ -204,7 +218,7 @@ impl Drop for DesktopGlow {
 }
 
 fn finish_actor_shutdown(
-    thread: &mut Option<JoinHandle<()>>,
+    thread: &mut Option<JoinHandle<Result<(), String>>>,
     result: Result<(), String>,
 ) -> Result<(), String> {
     let Some(handle) = thread.as_ref() else {
@@ -218,8 +232,11 @@ fn finish_actor_shutdown(
         thread::sleep(Duration::from_millis(20));
     }
     if handle.is_finished() {
-        let _ = thread.take().expect("actor handle is present").join();
-        Ok(())
+        thread
+            .take()
+            .expect("actor handle is present")
+            .join()
+            .map_err(|_| "desktop glow actor panicked before confirming helper exit".to_owned())?
     } else {
         Err("desktop glow actor is still draining after bounded shutdown".to_owned())
     }
@@ -233,7 +250,7 @@ fn actor_loop(
     health: &Mutex<IndicatorHealth>,
     cancellation: &MutationControl,
     elevated: bool,
-) {
+) -> Result<(), String> {
     let mut sequence = 1_u64;
     let mut pending = HashMap::<u64, PendingCommand>::new();
     let mut visible = false;
@@ -305,8 +322,8 @@ fn actor_loop(
                         }
                     } else {
                         let result = stop_process_bounded(&mut process);
-                        let _ = reply.send(result);
-                        return;
+                        let _ = reply.send(result.clone());
+                        return result;
                     }
                 }
             }
@@ -367,7 +384,7 @@ fn actor_loop(
             );
             fail_pending(&mut pending, "desktop glow helper exited");
             join_readers(&mut process);
-            return;
+            return Ok(());
         }
 
         let now = Instant::now();
@@ -411,8 +428,7 @@ fn actor_loop(
             && (shutdown_acknowledged
                 || !matches!(current_health(health), IndicatorHealth::Healthy))
         {
-            let _ = stop_process_bounded(&mut process);
-            return;
+            return stop_process_bounded(&mut process);
         }
     }
 }
@@ -683,6 +699,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let actor = std::thread::spawn(move || {
             let _ = release_rx.recv();
+            Ok(())
         });
         let started = std::time::Instant::now();
 
@@ -696,6 +713,24 @@ mod tests {
         let _ = release_tx.send(());
         finish_actor_shutdown(&mut actor, Ok(())).unwrap();
         assert!(actor.is_none());
+    }
+
+    #[test]
+    fn actor_exit_preserves_unconfirmed_helper_termination_on_every_retry() {
+        let mut glow = DesktopGlow {
+            actor: None,
+            health: std::sync::Arc::new(std::sync::Mutex::new(IndicatorHealth::Healthy)),
+            cancellation: controlfreak_core::MutationControl::default(),
+            containment: ("unavailable", None),
+            draining: Some(std::thread::spawn(|| {
+                Err("helper termination failed".to_owned())
+            })),
+            shutdown_failure: None,
+        };
+        for _ in 0..2 {
+            assert_eq!(glow.shutdown().unwrap_err(), "helper termination failed");
+            assert!(glow.hide().is_err());
+        }
     }
 
     #[test]
