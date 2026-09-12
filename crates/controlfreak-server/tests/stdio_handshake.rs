@@ -223,8 +223,29 @@ fn stdio_capture_display_returns_png_image_content() {
     assert_argument_errors_are_structured(&mut child, &mut reader, &display_id);
     assert_ocr_helper_errors_are_structured(&mut child, &mut reader, &display_id);
 
+    // EOF must close an armed session without waiting for its inactivity timeout.
+    send_request(
+        &mut child,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 16, "method": "tools/call",
+            "params": { "name": "begin_control_session", "arguments": { "expected_seconds": 120 } }
+        }),
+    );
+    assert_eq!(read_response(&mut reader)["result"]["isError"], false);
     drop(child.stdin.take());
-    assert!(child.wait().expect("wait for server").success());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll server exit") {
+            assert!(status.success());
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("client disconnect did not close the armed session");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 #[cfg(target_os = "windows")]

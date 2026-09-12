@@ -31,6 +31,9 @@ pub(crate) struct DesktopGlow {
     health: Arc<Mutex<IndicatorHealth>>,
     cancellation: MutationControl,
     containment: (&'static str, Option<String>),
+    draining: Option<JoinHandle<()>>,
+    // Terminal actor panic only; helper termination errors are retried by the actor.
+    shutdown_failure: Option<String>,
 }
 
 struct GlowActor {
@@ -81,6 +84,8 @@ impl DesktopGlow {
         if cfg!(debug_assertions) && std::env::var_os(TEST_DISABLE_ENV).is_some() {
             return Ok(Self {
                 actor: None,
+                draining: None,
+                shutdown_failure: None,
                 health,
                 cancellation,
                 containment: (
@@ -117,6 +122,8 @@ impl DesktopGlow {
             })
             .map_err(|error| format!("desktop glow actor could not start: {error}"))?;
         Ok(Self {
+            draining: None,
+            shutdown_failure: None,
             actor: Some(GlowActor {
                 sender,
                 thread: Some(actor),
@@ -127,7 +134,18 @@ impl DesktopGlow {
         })
     }
 
+    fn finish_shutdown(&mut self, result: Result<(), String>) -> Result<(), String> {
+        let result = finish_actor_shutdown(&mut self.draining, result);
+        if self.draining.is_none() {
+            self.shutdown_failure = result.as_ref().err().cloned();
+        }
+        result
+    }
+
     fn command(&self, command: GlowCommand) -> Result<(), String> {
+        if self.draining.is_some() || self.shutdown_failure.is_some() {
+            return Err("desktop glow actor is still draining".to_owned());
+        }
         let Some(actor) = self.actor.as_ref() else {
             return Ok(());
         };
@@ -155,6 +173,12 @@ impl ActivityIndicator for DesktopGlow {
     }
 
     fn shutdown(&mut self) -> Result<(), String> {
+        if let Some(reason) = &self.shutdown_failure {
+            return Err(reason.clone());
+        }
+        if self.draining.is_some() {
+            return self.finish_shutdown(Ok(()));
+        }
         let Some(mut actor) = self.actor.take() else {
             return Ok(());
         };
@@ -168,7 +192,8 @@ impl ActivityIndicator for DesktopGlow {
                 .recv_timeout(COMMAND_TIMEOUT + PROCESS_EXIT_TIMEOUT)
                 .map_err(|error| format!("desktop glow shutdown timed out: {error}"))?
         });
-        finish_actor_shutdown(actor.thread.take(), result)
+        self.draining = actor.thread.take();
+        self.finish_shutdown(result)
     }
 
     fn health(&self) -> IndicatorHealth {
@@ -194,31 +219,27 @@ impl Drop for DesktopGlow {
 }
 
 fn finish_actor_shutdown(
-    thread: Option<JoinHandle<()>>,
+    thread: &mut Option<JoinHandle<()>>,
     result: Result<(), String>,
 ) -> Result<(), String> {
-    let Some(thread) = thread else {
+    let Some(handle) = thread.as_ref() else {
         return result;
     };
-    if result.is_err() {
-        if thread.is_finished() {
-            let _ = thread.join();
-        }
+    if result.is_err() && !handle.is_finished() {
         return result;
     }
-
     let deadline = Instant::now() + PROCESS_EXIT_TIMEOUT;
-    while !thread.is_finished() && Instant::now() < deadline {
+    while !handle.is_finished() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
-    if thread.is_finished() {
-        let _ = thread.join();
-        Ok(())
+    if handle.is_finished() {
+        thread
+            .take()
+            .expect("actor handle is present")
+            .join()
+            .map_err(|_| "desktop glow actor panicked before confirming helper exit".to_owned())
     } else {
-        Err(
-            "desktop glow actor did not exit after bounded shutdown; cleanup was detached"
-                .to_owned(),
-        )
+        Err("desktop glow actor is still draining after bounded shutdown".to_owned())
     }
 }
 
@@ -302,7 +323,11 @@ fn actor_loop(
                         }
                     } else {
                         let result = stop_process_bounded(&mut process);
+                        let failed = result.is_err();
                         let _ = reply.send(result);
+                        if failed {
+                            drain_until_stopped(|| stop_process_bounded(&mut process));
+                        }
                         return;
                     }
                 }
@@ -408,7 +433,7 @@ fn actor_loop(
             && (shutdown_acknowledged
                 || !matches!(current_health(health), IndicatorHealth::Healthy))
         {
-            let _ = stop_process_bounded(&mut process);
+            drain_until_stopped(|| stop_process_bounded(&mut process));
             return;
         }
     }
@@ -522,6 +547,14 @@ fn fail_pending(pending: &mut HashMap<u64, PendingCommand>, reason: &str) {
         if let Some(reply) = command.reply {
             let _ = reply.send(Err(reason.to_owned()));
         }
+    }
+}
+
+// Keep the process and pipe handles in the actor until exit is confirmed.
+// Callers wait only for the bounded shutdown attempt and can retry later.
+fn drain_until_stopped(mut stop: impl FnMut() -> Result<(), String>) {
+    while stop().is_err() {
+        thread::sleep(ACTOR_POLL);
     }
 }
 
@@ -683,12 +716,59 @@ mod tests {
         });
         let started = std::time::Instant::now();
 
+        let mut actor = Some(actor);
         let error =
-            finish_actor_shutdown(Some(actor), Err("shutdown timed out".to_owned())).unwrap_err();
+            finish_actor_shutdown(&mut actor, Err("shutdown timed out".to_owned())).unwrap_err();
 
         assert_eq!(error, "shutdown timed out");
         assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert!(actor.is_some());
         let _ = release_tx.send(());
+        finish_actor_shutdown(&mut actor, Ok(())).unwrap();
+        assert!(actor.is_none());
+    }
+
+    #[test]
+    fn failed_helper_termination_is_retried_before_actor_exit() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        let stopped = Arc::new(AtomicBool::new(false));
+        let actor_stopped = Arc::clone(&stopped);
+        let (attempted, receiver) = mpsc::channel();
+        let actor = std::thread::spawn(move || {
+            super::drain_until_stopped(|| {
+                if actor_stopped.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    let _ = attempted.send(());
+                    Err("helper termination failed".to_owned())
+                }
+            });
+        });
+        let mut glow = DesktopGlow {
+            actor: None,
+            health: Arc::new(std::sync::Mutex::new(IndicatorHealth::Healthy)),
+            cancellation: controlfreak_core::MutationControl::default(),
+            containment: ("unavailable", None),
+            draining: Some(actor),
+            shutdown_failure: None,
+        };
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let failed = glow.finish_shutdown(Err("helper termination failed".to_owned()));
+        let still_draining = glow.draining.is_some();
+        let hidden = glow.hide();
+        stopped.store(true, Ordering::Release);
+        assert!(failed.is_err());
+        assert!(still_draining);
+        assert!(hidden.is_err());
+        glow.shutdown().unwrap();
+        glow.shutdown().unwrap();
+        assert!(glow.draining.is_none());
     }
 
     #[test]

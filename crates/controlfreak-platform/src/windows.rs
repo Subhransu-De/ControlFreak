@@ -441,6 +441,10 @@ fn ocr_helper_failure(status: std::process::ExitStatus, stderr: &[u8]) -> String
 }
 
 impl BackendMetadata for Backend {
+    fn check_control_environment(&self) -> Result<(), PlatformError> {
+        ensure_interactive_input_desktop("control_session")
+    }
+
     fn identity(&self) -> BackendIdentity {
         BackendIdentity {
             platform: Platform::Windows,

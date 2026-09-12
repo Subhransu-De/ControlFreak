@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+mod cleanup_tests;
 mod handlers;
 mod results;
 mod schema;
@@ -26,7 +28,7 @@ use std::{
     error::Error,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -306,6 +308,8 @@ struct IndicatorRuntimeState {
     control: Option<IndicatorControl>,
     active_mutations: usize,
     generation: u64,
+    last_cleanup_reason: Option<String>,
+    cancellation: MutationControl,
     session: ControlSession,
 }
 
@@ -315,6 +319,8 @@ struct IndicatorRuntime {
     idle_worker: Mutex<Option<IdleWorker>>,
     safety_indicator: SafetyIndicator,
     starter: IndicatorStarter,
+    environment: Option<Arc<dyn PlatformBackend>>,
+    terminated: AtomicBool,
     arbitrator: Arc<dyn ActivityArbitrator>,
     short_hold: Duration,
     session_hold: Duration,
@@ -324,7 +330,7 @@ struct IndicatorRuntime {
 }
 
 enum IdleCommand {
-    Schedule { generation: u64, delay: Duration },
+    Schedule { generation: u64, deadline: Instant },
     Shutdown,
 }
 
@@ -371,6 +377,8 @@ impl IndicatorRuntime {
                 control: None,
                 active_mutations: 0,
                 generation: 0,
+                last_cleanup_reason: None,
+                cancellation: MutationControl::default(),
                 session: ControlSession::dormant(timing.short_hold),
             }),
             lifecycle: Mutex::new(()),
@@ -380,6 +388,8 @@ impl IndicatorRuntime {
                 start_indicator().map(|control| Box::new(control) as IndicatorControl)
             }),
             arbitrator,
+            environment: None,
+            terminated: AtomicBool::new(false),
             short_hold: timing.short_hold,
             session_hold: timing.session_hold,
             max_hold: timing.max_hold,
@@ -411,8 +421,14 @@ impl IndicatorRuntime {
             .lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.check_environment()?;
         self.ensure_session_owned()?;
+        if let Err(reason) = self.schedule_close(0, self.max_hold) {
+            let _ = self.close_session_locked("admission_failure", false);
+            return Err(reason);
+        }
         self.ensure_indicator_level(IndicatorLevel::Acting)?;
+        self.check_environment()?;
         let mut state = self
             .state
             .lock()
@@ -439,7 +455,7 @@ impl IndicatorRuntime {
         self.safety_indicator.mark_visible();
         Ok(OperationLease {
             runtime: Arc::clone(self),
-            control,
+            control: control.with_cancellation(state.cancellation.clone()),
         })
     }
 
@@ -448,7 +464,12 @@ impl IndicatorRuntime {
             .lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.check_environment()?;
         self.ensure_session_owned()?;
+        if let Err(reason) = self.schedule_close(0, self.max_hold) {
+            let _ = self.close_session_locked("admission_failure", false);
+            return Err(reason);
+        }
         let active = self
             .state
             .lock()
@@ -461,6 +482,7 @@ impl IndicatorRuntime {
             IndicatorLevel::Armed
         };
         self.ensure_indicator_level(level)?;
+        self.check_environment()?;
         let mut state = self
             .state
             .lock()
@@ -482,11 +504,108 @@ impl IndicatorRuntime {
         if active {
             Ok(())
         } else {
-            self.schedule_close(generation, delay)
+            self.schedule_close(generation, delay).inspect_err(|_| {
+                let _ = self.close_session_locked("admission_failure", false);
+            })
         }
     }
 
     fn end_session(&self) -> Result<(), String> {
+        self.close_session("explicit_end", false)
+    }
+
+    fn close_session(&self, reason: &str, terminate: bool) -> Result<(), String> {
+        if terminate {
+            self.terminated.store(true, Ordering::Release);
+        }
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.close_session_locked(reason, terminate)
+    }
+
+    // The lifecycle lock serializes admission and teardown. The last mutation
+    // guard finishes closure only after the backend's compensating input releases.
+    fn close_session_locked(&self, reason: &str, terminate: bool) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if terminate {
+            self.terminated.store(true, Ordering::Release);
+        }
+        if !state.session.owns_arbitration {
+            if terminate && state.last_cleanup_reason.is_none() {
+                state.last_cleanup_reason = Some(reason.to_owned());
+            }
+            return Ok(());
+        }
+        if state.session.state != ControlSessionState::Closing {
+            state.last_cleanup_reason = Some(reason.to_owned());
+            state.session.state = ControlSessionState::Closing;
+            state.session.close_deadline = None;
+            state.generation = state.generation.wrapping_add(1);
+        }
+        if reason != "explicit_end" {
+            state.cancellation.cancel();
+        }
+        if state.active_mutations != 0 {
+            return Ok(());
+        }
+        drop(state);
+        self.finish_session_close()
+    }
+
+    fn check_environment(&self) -> Result<(), String> {
+        if self.terminated.load(Ordering::Acquire) {
+            return Err("the server is shutting down".to_owned());
+        }
+        if let Some(backend) = &self.environment
+            && let Err(error) = backend.check_control_environment()
+        {
+            let reason = error.to_string();
+            let _ = self.close_session_locked(&reason, false);
+            return Err(reason);
+        }
+        Ok(())
+    }
+
+    fn check_lifecycle(&self) {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .session
+            .owns_arbitration
+        {
+            return;
+        }
+        if !self.terminated.load(Ordering::Acquire) && self.check_environment().is_err() {
+            return;
+        }
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let closing = state.session.state == ControlSessionState::Closing;
+        let failure = state
+            .control
+            .as_ref()
+            .and_then(|control| indicator_failure_reason(control.as_ref()));
+        drop(state);
+        if closing {
+            let _ = self.finish_session_close();
+        } else if failure.is_some() {
+            let _ = self.close_session_locked("indicator_failure", false);
+        }
+    }
+
+    fn release_mutation(self: &Arc<Self>) {
         let _lifecycle = self
             .lifecycle
             .lock()
@@ -495,85 +614,50 @@ impl IndicatorRuntime {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.session.state == ControlSessionState::Dormant {
-            let owns_arbitration = state.session.owns_arbitration;
-            drop(state);
-            if owns_arbitration {
-                self.close_owned_session();
-            }
-            return Ok(());
-        }
-        state.session.state = ControlSessionState::Closing;
-        state.session.close_deadline = None;
-        state.generation = state.generation.wrapping_add(1);
+        state.active_mutations = state.active_mutations.saturating_sub(1);
+        state.session.last_mutation_finished = Some(Instant::now());
         if state.active_mutations != 0 {
-            return Ok(());
+            return;
         }
-        drop(state);
-        self.finish_session_close()
-    }
-
-    fn release_mutation(self: &Arc<Self>) {
-        let _lifecycle = self
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let outcome = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.active_mutations = state.active_mutations.saturating_sub(1);
-            state.session.last_mutation_finished = Some(Instant::now());
-            if state.active_mutations != 0 {
-                return;
-            }
-            let failure_reason = state
-                .control
-                .as_ref()
-                .and_then(|control| indicator_failure_reason(control.as_ref()));
-            if let Some(reason) = failure_reason {
-                self.safety_indicator.mark_failed(reason);
-                let retired = state.control.take();
-                state.session.state = ControlSessionState::Closing;
-                Some((retired, None))
-            } else if state.session.state == ControlSessionState::Closing {
-                Some((None, None))
-            } else {
-                let hold = if state.session.explicitly_begun {
-                    state.session.hold
-                } else {
-                    self.hold_for_session(&state.session)
-                };
-                let armed = state
+        if state.session.state == ControlSessionState::Closing {
+            drop(state);
+            let _ = self.finish_session_close();
+            return;
+        }
+        let failure = state
+            .control
+            .as_ref()
+            .and_then(|control| indicator_failure_reason(control.as_ref()));
+        let armed = failure.map_or_else(
+            || {
+                state
                     .control
                     .as_mut()
-                    .map_or(Ok(()), |control| control.set_level(IndicatorLevel::Armed));
-                if let Err(reason) = armed {
-                    let retired = state.control.take();
-                    self.safety_indicator.mark_failed(reason);
-                    state.session.state = ControlSessionState::Closing;
-                    Some((retired, None))
-                } else {
-                    state.session.state = ControlSessionState::Armed;
-                    state.session.hold = hold;
-                    state.session.close_deadline = Some(Instant::now() + hold);
-                    state.generation = state.generation.wrapping_add(1);
-                    self.safety_indicator.mark_idle_pending();
-                    Some((None, Some((state.generation, hold))))
-                }
-            }
-        };
-        let Some((retired, schedule)) = outcome else {
-            return;
-        };
-        shutdown_control(retired);
-        if schedule.is_none() {
-            let _ = self.finish_session_close();
-        } else if let Some((generation, delay)) = schedule
-            && let Err(reason) = self.schedule_close(generation, delay)
-        {
+                    .map_or(Ok(()), |control| control.set_level(IndicatorLevel::Armed))
+            },
+            Err,
+        );
+        if let Err(reason) = armed {
             self.safety_indicator.mark_failed(reason);
+            drop(state);
+            let _ = self.close_session_locked("indicator_failure", false);
+            return;
+        }
+        let hold = if state.session.explicitly_begun {
+            state.session.hold
+        } else {
+            self.hold_for_session(&state.session)
+        };
+        state.session.state = ControlSessionState::Armed;
+        state.session.hold = hold;
+        state.session.close_deadline = Some(Instant::now() + hold);
+        state.generation = state.generation.wrapping_add(1);
+        let generation = state.generation;
+        self.safety_indicator.mark_idle_pending();
+        drop(state);
+        if let Err(reason) = self.schedule_close(generation, hold) {
+            self.safety_indicator.mark_failed(reason);
+            let _ = self.close_session_locked("admission_failure", false);
         }
     }
 
@@ -582,6 +666,9 @@ impl IndicatorRuntime {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.terminated.load(Ordering::Acquire) {
+            return Err("the server is shutting down".to_owned());
+        }
         if state.session.owns_arbitration && state.session.state != ControlSessionState::Closing {
             return Ok(());
         }
@@ -601,6 +688,7 @@ impl IndicatorRuntime {
         })?;
         state.session = ControlSession::dormant(self.short_hold);
         state.session.owns_arbitration = true;
+        state.cancellation = MutationControl::default();
         Ok(())
     }
 
@@ -649,10 +737,19 @@ impl IndicatorRuntime {
                 Ok(()) => return Ok(()),
                 Err(reason) => {
                     let (retired, can_restart) = self.retire_failed_control(&reason);
-                    shutdown_control(retired);
+                    if let Some(mut retired) = retired
+                        && let Err(error) = retired.shutdown()
+                    {
+                        self.state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .control = Some(retired);
+                        let _ = self.close_session_locked("admission_failure", false);
+                        return Err(error);
+                    }
                     if !can_restart || attempt == MAX_INDICATOR_RESTARTS {
                         if can_restart {
-                            self.close_owned_session();
+                            let _ = self.close_session_locked("admission_failure", false);
                         }
                         self.safety_indicator.mark_failed(reason.clone());
                         return Err(reason);
@@ -674,7 +771,8 @@ impl IndicatorRuntime {
             if let Some(control) = state.control.as_ref() {
                 control.mutation_control().cancel();
             }
-            state.session.state = ControlSessionState::Closing;
+            drop(state);
+            let _ = self.close_session_locked("admission_failure", false);
             (None, false)
         } else {
             (state.control.take(), true)
@@ -732,7 +830,10 @@ impl IndicatorRuntime {
             .as_ref()
             .ok_or_else(|| "desktop glow session worker was unavailable".to_owned())?
             .sender
-            .send(IdleCommand::Schedule { generation, delay })
+            .send(IdleCommand::Schedule {
+                generation,
+                deadline: Instant::now() + delay,
+            })
             .map_err(|error| format!("desktop glow session worker stopped: {error}"))
     }
 
@@ -741,20 +842,14 @@ impl IndicatorRuntime {
             .lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let should_close = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.active_mutations != 0 || state.generation != generation {
-                false
-            } else {
-                state.session.state = ControlSessionState::Closing;
-                true
-            }
-        };
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let should_close = state.active_mutations == 0 && state.generation == generation;
+        drop(state);
         if should_close {
-            let _ = self.finish_session_close();
+            let _ = self.close_session_locked("timeout", false);
         }
     }
 
@@ -766,42 +861,46 @@ impl IndicatorRuntime {
         if state.active_mutations != 0 {
             return Ok(());
         }
-        let failure_reason = state
-            .control
+        let mut control = state.control.take();
+        let terminated = self.terminated.load(Ordering::Acquire);
+        drop(state);
+        let failure = control
             .as_ref()
             .and_then(|control| indicator_failure_reason(control.as_ref()));
-        if let Some(reason) = failure_reason {
+        let unhealthy = failure.is_some();
+        let result = if let Some(reason) = failure {
             self.safety_indicator.mark_failed(reason);
-            let retired = state.control.take();
-            let owned = state.session.owns_arbitration;
-            state.session = ControlSession::dormant(self.short_hold);
-            drop(state);
-            shutdown_control(retired);
-            if owned {
-                self.arbitrator.release();
+            Ok(())
+        } else {
+            control.as_mut().map_or(Ok(()), |control| control.hide())
+        };
+        if unhealthy || result.is_err() || terminated {
+            if let Some(indicator) = control.as_mut()
+                && let Err(reason) = indicator.shutdown()
+            {
+                self.safety_indicator.mark_failed(reason.clone());
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .control = control;
+                return Err(reason);
             }
-            return Ok(());
+            control = None;
         }
-        let result = state
-            .control
-            .as_mut()
-            .map_or(Ok(()), |control| control.hide());
-        if let Err(reason) = result {
-            let retired = state.control.take();
-            drop(state);
-            shutdown_control(retired);
-            self.close_owned_session();
+        if let Err(reason) = &result
+            && !self.safety_indicator.is_failed()
+        {
             self.safety_indicator.mark_failed(reason.clone());
-            return Err(reason);
         }
-        if state.session.owns_arbitration {
-            self.arbitrator.release();
-        }
-        state.session = ControlSession::dormant(self.short_hold);
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .control = control;
+        self.close_owned_session();
         if !self.safety_indicator.is_failed() {
             self.safety_indicator.mark_hidden();
         }
-        Ok(())
+        result
     }
 
     fn status(&self) -> Value {
@@ -823,6 +922,8 @@ impl IndicatorRuntime {
         );
         json!({
             "state": state.session.state.as_str(),
+            "last_cleanup_reason": state.last_cleanup_reason,
+            "draining": state.session.state == ControlSessionState::Closing,
             "call_count": state.session.call_count,
             "active_mutations": state.active_mutations,
             "hold_ms": u64::try_from(state.session.hold.as_millis()).unwrap_or(u64::MAX),
@@ -866,12 +967,6 @@ fn duration_from_env(name: &str) -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
-fn shutdown_control(mut control: Option<IndicatorControl>) {
-    if let Some(control) = control.as_mut() {
-        let _ = control.shutdown();
-    }
-}
-
 fn indicator_failure_reason(control: &dyn ActivityIndicator) -> Option<String> {
     match control.health() {
         IndicatorHealth::Healthy if control.mutation_control().is_cancelled() => {
@@ -886,29 +981,33 @@ fn idle_worker_loop(
     runtime: &std::sync::Weak<IndicatorRuntime>,
     receiver: &mpsc::Receiver<IdleCommand>,
 ) {
-    let mut pending = None;
+    let mut pending: Option<(u64, Instant)> = None;
     loop {
-        let command = match pending {
-            Some((generation, delay)) => match receiver.recv_timeout(delay) {
-                Ok(command) => command,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let Some(runtime) = runtime.upgrade() else {
-                        break;
-                    };
+        let delay = pending.map_or(Duration::from_millis(50), |(_, deadline)| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(50))
+        });
+        match receiver.recv_timeout(delay) {
+            Ok(IdleCommand::Schedule {
+                generation,
+                deadline,
+            }) => {
+                pending = Some((generation, deadline));
+            }
+            Ok(IdleCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let Some(runtime) = runtime.upgrade() else {
+                    break;
+                };
+                runtime.check_lifecycle();
+                if let Some((generation, deadline)) = pending
+                    && Instant::now() >= deadline
+                {
                     runtime.close_if_idle(generation);
                     pending = None;
-                    continue;
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            },
-            None => match receiver.recv() {
-                Ok(command) => command,
-                Err(_) => break,
-            },
-        };
-        match command {
-            IdleCommand::Schedule { generation, delay } => pending = Some((generation, delay)),
-            IdleCommand::Shutdown => break,
+            }
         }
     }
 }
@@ -937,7 +1036,6 @@ impl Drop for OperationLease {
 
 impl Drop for IndicatorRuntime {
     fn drop(&mut self) {
-        self.safety_indicator.mark_stopping();
         if let Some(mut worker) = self
             .idle_worker
             .get_mut()
@@ -955,11 +1053,24 @@ impl Drop for IndicatorRuntime {
             .state
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(mut control) = state.control.take()
+            && control.shutdown().is_err()
+            && state.session.owns_arbitration
+        {
+            // A failed shutdown must not block Drop or surrender ownership.
+            // Transfer both resources together; release only after safe cleanup.
+            let arbitrator = Arc::clone(&self.arbitrator);
+            thread::spawn(move || {
+                while control.shutdown().is_err() {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                arbitrator.release();
+            });
+            return;
+        }
+        self.safety_indicator.mark_stopping();
         if state.session.owns_arbitration {
             self.arbitrator.release();
-        }
-        if let Some(mut control) = state.control.take() {
-            let _ = control.shutdown();
         }
     }
 }
@@ -1725,13 +1836,78 @@ where
     serve_stdio_inner(backend, safety_indicator, Some(indicator_runtime)).await
 }
 
+// rmcp drains responses after EOF. Close admission at EOF itself, before that drain.
+struct DisconnectReader<R> {
+    inner: R,
+    runtime: Option<Arc<IndicatorRuntime>>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for DisconnectReader<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buffer.filled().len();
+        let has_capacity = buffer.remaining() != 0;
+        let result = std::pin::Pin::new(&mut this.inner).poll_read(context, buffer);
+        if has_capacity
+            && matches!(&result, std::task::Poll::Ready(result) if result.is_err() || buffer.filled().len() == before)
+            && let Some(runtime) = this.runtime.take()
+        {
+            runtime.terminated.store(true, Ordering::Release);
+            tokio::task::spawn_blocking(move || runtime.close_session("disconnect", true));
+        }
+        result
+    }
+}
+
+struct ServerCleanup(Option<Arc<IndicatorRuntime>>);
+
+impl ServerCleanup {
+    fn close(&self, reason: &str) {
+        if let Some(runtime) = &self.0 {
+            let _ = runtime.close_session(reason, true);
+        }
+    }
+}
+
+impl Drop for ServerCleanup {
+    fn drop(&mut self) {
+        self.close("shutdown");
+    }
+}
+
+async fn wait_for_cleanup(runtime: &IndicatorRuntime, timeout: Duration) -> std::io::Result<()> {
+    tokio::time::timeout(timeout, async {
+        while runtime.status()["draining"] == true {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "control-session cleanup is still draining",
+        )
+    })
+}
+
 async fn serve_stdio_inner(
     backend: Box<dyn PlatformBackend>,
     safety_indicator: SafetyIndicator,
     indicator_runtime: Option<Arc<IndicatorRuntime>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let server =
-        ControlFreakServer::with_indicator(Arc::from(backend), safety_indicator, indicator_runtime);
+    let backend: Arc<dyn PlatformBackend> = Arc::from(backend);
+    let mut indicator_runtime = indicator_runtime;
+    if let Some(runtime) = indicator_runtime.as_mut() {
+        Arc::get_mut(runtime)
+            .expect("runtime is not shared before serving")
+            .environment = Some(Arc::clone(&backend));
+    }
+    let cleanup = ServerCleanup(indicator_runtime.clone());
+    let server = ControlFreakServer::with_indicator(backend, safety_indicator, indicator_runtime);
     let instance_id = server.diagnostics.instance_id.clone();
     eprintln!(
         "{}",
@@ -1742,8 +1918,31 @@ async fn serve_stdio_inner(
             "version": env!("CARGO_PKG_VERSION"),
         })
     );
-    let service = server.serve(stdio()).await?;
-    match service.waiting().await {
+    let (stdin, stdout) = stdio();
+    let reader = DisconnectReader {
+        inner: stdin,
+        runtime: cleanup.0.clone(),
+    };
+    let service = server.serve((reader, stdout)).await?;
+    let cancellation = service.cancellation_token();
+    let waiting = service.waiting();
+    tokio::pin!(waiting);
+    let result = tokio::select! {
+        result = &mut waiting => {
+            cleanup.close("disconnect");
+            result
+        }
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            cleanup.close("shutdown");
+            cancellation.cancel();
+            waiting.await
+        }
+    };
+    if let Some(runtime) = &cleanup.0 {
+        wait_for_cleanup(runtime, Duration::from_secs(30)).await?;
+    }
+    match result {
         Ok(reason) => {
             eprintln!(
                 "{}",
@@ -1793,6 +1992,14 @@ mod tests {
         SafetyIndicator, handlers::run_platform_operation, parse_arguments, pointer_result,
         schema::json_object, tool_error, tool_execution_error, tools,
     };
+
+    fn wait_for_status(indicator: &SafetyIndicator, expected: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while indicator.status() != expected && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(indicator.status(), expected);
+    }
 
     struct RecordingIndicator {
         events: Arc<Mutex<Vec<&'static str>>>,
@@ -1949,8 +2156,7 @@ mod tests {
 
         drop(second_lease);
         assert_eq!(indicator.status(), "idle_pending");
-        thread::sleep(Duration::from_millis(40));
-        assert_eq!(indicator.status(), "hidden");
+        wait_for_status(&indicator, "hidden");
         assert_eq!(
             *events.lock().unwrap(),
             ["acting", "acting", "armed", "hide"]
@@ -2010,8 +2216,7 @@ mod tests {
         assert_eq!(*events.lock().unwrap(), ["acting", "armed", "acting"]);
 
         drop(second_lease);
-        thread::sleep(Duration::from_millis(60));
-        assert_eq!(indicator.status(), "hidden");
+        wait_for_status(&indicator, "hidden");
         assert_eq!(
             *events.lock().unwrap(),
             ["acting", "armed", "acting", "armed", "hide"]
@@ -2038,9 +2243,7 @@ mod tests {
             drop(runtime.acquire().await.unwrap());
         }
         assert_eq!(runtime.idle_worker_start_count(), 1);
-        thread::sleep(Duration::from_millis(40));
-
-        assert_eq!(indicator.status(), "hidden");
+        wait_for_status(&indicator, "hidden");
         assert_eq!(
             events
                 .lock()
@@ -2070,9 +2273,7 @@ mod tests {
 
         let lease = runtime.acquire().await.unwrap();
         drop(lease);
-        thread::sleep(Duration::from_millis(30));
-
-        assert_eq!(indicator.status(), "failed");
+        wait_for_status(&indicator, "failed");
         assert_eq!(indicator.failure_reason().as_deref(), Some("hide failed"));
         assert_eq!(
             *events.lock().unwrap(),
@@ -2117,8 +2318,7 @@ mod tests {
         ));
 
         drop(runtime.acquire().await.unwrap());
-        thread::sleep(Duration::from_millis(30));
-        assert_eq!(indicator.status(), "failed");
+        wait_for_status(&indicator, "failed");
 
         drop(runtime.acquire().await.unwrap());
         thread::sleep(Duration::from_millis(30));
@@ -2326,6 +2526,7 @@ mod tests {
         );
         assert_eq!(failed_starts.load(Ordering::Relaxed), 3);
         assert_eq!(first.status()["owns_arbitration"], false);
+        assert_eq!(first.status()["last_cleanup_reason"], "admission_failure");
 
         second.begin_session(None).unwrap();
         second.end_session().unwrap();
@@ -2384,9 +2585,7 @@ mod tests {
         acquisition.abort();
         continue_tx.send(()).unwrap();
         let _ = acquisition.await;
-        thread::sleep(Duration::from_millis(40));
-
-        assert_eq!(indicator.status(), "hidden");
+        wait_for_status(&indicator, "hidden");
         assert_eq!(*events.lock().unwrap(), ["acting", "armed", "hide"]);
     }
 
@@ -2423,8 +2622,7 @@ mod tests {
         assert_eq!(*events.lock().unwrap(), ["acting"]);
 
         finish_tx.send(()).unwrap();
-        thread::sleep(Duration::from_millis(40));
-        assert_eq!(indicator.status(), "stopping");
+        wait_for_status(&indicator, "stopping");
         assert_eq!(*events.lock().unwrap(), ["acting", "armed", "shutdown"]);
     }
 
