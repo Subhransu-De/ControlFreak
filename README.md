@@ -138,15 +138,14 @@ Add this to `%USERPROFILE%\.config\opencode\opencode.json`:
 ## Development
 
 The workspace separates domain logic, native Windows integration, the MCP adapter, and the server
-executable into dedicated crates.
+executable into dedicated crates. With GNU Make installed, run the standard local checks:
 
 ```powershell
-cargo fmt --all -- --check
-cargo build --workspace --locked
-cargo test --workspace --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo doc --workspace --no-deps --locked
+make check
 ```
+
+Individual gates are available as `make fmt-check`, `make lint`, `make test`, and `make release`.
+Generate API documentation with `cargo doc --workspace --no-deps --locked`.
 
 Run the server locally with `cargo run -p controlfreak-server`. Inspect its declared capabilities
 with `cargo run -p controlfreak-server -- --print-capabilities`.

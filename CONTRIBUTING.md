@@ -4,14 +4,13 @@ ControlFreak targets 64-bit Windows and uses the Rust toolchain pinned in `rust-
 
 ## Local checks
 
-Install the Microsoft C++ Build Tools, then run these commands from the workspace root before opening a pull request:
+Install GNU Make and the Microsoft C++ Build Tools, then run this command from the workspace root before opening a pull request:
 
 ```powershell
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
-cargo build -p controlfreak-server --release --locked
+make check
 ```
+
+The root `Makefile` runs formatting verification, workspace Clippy with warnings denied, workspace tests, and the release server build in sequence. During development, run individual gates with `make fmt-check`, `make lint`, `make test`, or `make release`. For focused tests, use Cargo directly, for example `cargo test -p controlfreak-core --locked`.
 
 CI also validates generated documentation, dependency policy, workflow syntax, and unsafe-code boundaries.
 
