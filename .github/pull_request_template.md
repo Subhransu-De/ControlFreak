@@ -4,7 +4,5 @@
 
 ## Checks
 
-- [ ] `cargo fmt --all -- --check`
-- [ ] `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- [ ] `cargo test --workspace --locked`
+- [ ] `make check` (formatting, Clippy, tests, and release build)
 - [ ] User-visible changes are documented
