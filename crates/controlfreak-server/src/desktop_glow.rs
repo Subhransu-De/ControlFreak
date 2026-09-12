@@ -31,6 +31,7 @@ pub(crate) struct DesktopGlow {
     health: Arc<Mutex<IndicatorHealth>>,
     cancellation: MutationControl,
     containment: (&'static str, Option<String>),
+    draining: Option<JoinHandle<()>>,
 }
 
 struct GlowActor {
@@ -81,6 +82,7 @@ impl DesktopGlow {
         if cfg!(debug_assertions) && std::env::var_os(TEST_DISABLE_ENV).is_some() {
             return Ok(Self {
                 actor: None,
+                draining: None,
                 health,
                 cancellation,
                 containment: (
@@ -117,6 +119,7 @@ impl DesktopGlow {
             })
             .map_err(|error| format!("desktop glow actor could not start: {error}"))?;
         Ok(Self {
+            draining: None,
             actor: Some(GlowActor {
                 sender,
                 thread: Some(actor),
@@ -128,6 +131,9 @@ impl DesktopGlow {
     }
 
     fn command(&self, command: GlowCommand) -> Result<(), String> {
+        if self.draining.is_some() {
+            return Err("desktop glow actor is still draining".to_owned());
+        }
         let Some(actor) = self.actor.as_ref() else {
             return Ok(());
         };
@@ -155,6 +161,9 @@ impl ActivityIndicator for DesktopGlow {
     }
 
     fn shutdown(&mut self) -> Result<(), String> {
+        if self.draining.is_some() {
+            return finish_actor_shutdown(&mut self.draining, Ok(()));
+        }
         let Some(mut actor) = self.actor.take() else {
             return Ok(());
         };
@@ -168,7 +177,8 @@ impl ActivityIndicator for DesktopGlow {
                 .recv_timeout(COMMAND_TIMEOUT + PROCESS_EXIT_TIMEOUT)
                 .map_err(|error| format!("desktop glow shutdown timed out: {error}"))?
         });
-        finish_actor_shutdown(actor.thread.take(), result)
+        self.draining = actor.thread.take();
+        finish_actor_shutdown(&mut self.draining, result)
     }
 
     fn health(&self) -> IndicatorHealth {
@@ -194,31 +204,24 @@ impl Drop for DesktopGlow {
 }
 
 fn finish_actor_shutdown(
-    thread: Option<JoinHandle<()>>,
+    thread: &mut Option<JoinHandle<()>>,
     result: Result<(), String>,
 ) -> Result<(), String> {
-    let Some(thread) = thread else {
+    let Some(handle) = thread.as_ref() else {
         return result;
     };
-    if result.is_err() {
-        if thread.is_finished() {
-            let _ = thread.join();
-        }
+    if result.is_err() && !handle.is_finished() {
         return result;
     }
-
     let deadline = Instant::now() + PROCESS_EXIT_TIMEOUT;
-    while !thread.is_finished() && Instant::now() < deadline {
+    while !handle.is_finished() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
-    if thread.is_finished() {
-        let _ = thread.join();
+    if handle.is_finished() {
+        let _ = thread.take().expect("actor handle is present").join();
         Ok(())
     } else {
-        Err(
-            "desktop glow actor did not exit after bounded shutdown; cleanup was detached"
-                .to_owned(),
-        )
+        Err("desktop glow actor is still draining after bounded shutdown".to_owned())
     }
 }
 
@@ -683,12 +686,16 @@ mod tests {
         });
         let started = std::time::Instant::now();
 
+        let mut actor = Some(actor);
         let error =
-            finish_actor_shutdown(Some(actor), Err("shutdown timed out".to_owned())).unwrap_err();
+            finish_actor_shutdown(&mut actor, Err("shutdown timed out".to_owned())).unwrap_err();
 
         assert_eq!(error, "shutdown timed out");
         assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert!(actor.is_some());
         let _ = release_tx.send(());
+        finish_actor_shutdown(&mut actor, Ok(())).unwrap();
+        assert!(actor.is_none());
     }
 
     #[test]

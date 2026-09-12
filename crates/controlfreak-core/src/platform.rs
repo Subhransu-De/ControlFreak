@@ -44,6 +44,11 @@ pub trait BackendMetadata: Send + Sync + 'static {
     fn capabilities(&self) -> Vec<CapabilityDescriptor>;
     fn permissions(&self) -> Vec<PermissionDescriptor>;
 
+    /// Validate that mutation admission is safe in the current desktop environment.
+    fn check_control_environment(&self) -> Result<(), PlatformError> {
+        Ok(())
+    }
+
     fn security_context(&self) -> SecurityContext {
         SecurityContext::default()
     }
