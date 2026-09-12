@@ -2,7 +2,6 @@ use super::*;
 use controlfreak_core::{
     BackendMetadata, DisplayBackend, KeyboardBackend, OcrBackend, PointerBackend, WindowBackend,
 };
-use std::sync::atomic::AtomicBool;
 
 struct Environment(Arc<Mutex<Option<&'static str>>>);
 impl BackendMetadata for Environment {
@@ -214,4 +213,28 @@ fn desktop_is_revalidated_after_indicator_startup() {
         assert_eq!(runtime.status()["active_mutations"], 0);
         assert!(!fixture.owned.load(Ordering::SeqCst));
     }
+}
+
+#[tokio::test]
+async fn eof_closes_admission_before_response_drain() {
+    use tokio::io::AsyncReadExt;
+    let fixture = Arc::new(Fixture::default());
+    let runtime = fixture.runtime();
+    let lease = runtime.acquire_mutation_blocking().unwrap();
+    let mut reader = DisconnectReader {
+        inner: &b"x"[..],
+        runtime: Some(Arc::clone(&runtime)),
+    };
+    assert_eq!(reader.read(&mut []).await.unwrap(), 0);
+    assert_eq!(reader.read(&mut [0_u8; 1]).await.unwrap(), 1);
+    assert!(!runtime.terminated.load(Ordering::Acquire));
+    assert_eq!(reader.read(&mut [0_u8; 1]).await.unwrap(), 0);
+    assert!(runtime.acquire_mutation_blocking().is_err());
+    // Response draining can continue while the mutation retains ownership.
+    assert!(fixture.owned.load(Ordering::SeqCst));
+    runtime.close_session("disconnect", true).unwrap();
+    assert!(lease.control.is_cancelled());
+    drop(lease);
+    assert_eq!(runtime.status()["last_cleanup_reason"], "disconnect");
+    assert_eq!(fixture.releases.load(Ordering::SeqCst), 1);
 }

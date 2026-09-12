@@ -28,7 +28,7 @@ use std::{
     error::Error,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -309,7 +309,6 @@ struct IndicatorRuntimeState {
     active_mutations: usize,
     generation: u64,
     last_cleanup_reason: Option<String>,
-    terminated: bool,
     cancellation: MutationControl,
     session: ControlSession,
 }
@@ -321,6 +320,7 @@ struct IndicatorRuntime {
     safety_indicator: SafetyIndicator,
     starter: IndicatorStarter,
     environment: Option<Arc<dyn PlatformBackend>>,
+    terminated: AtomicBool,
     arbitrator: Arc<dyn ActivityArbitrator>,
     short_hold: Duration,
     session_hold: Duration,
@@ -378,7 +378,6 @@ impl IndicatorRuntime {
                 active_mutations: 0,
                 generation: 0,
                 last_cleanup_reason: None,
-                terminated: false,
                 cancellation: MutationControl::default(),
                 session: ControlSession::dormant(timing.short_hold),
             }),
@@ -390,6 +389,7 @@ impl IndicatorRuntime {
             }),
             arbitrator,
             environment: None,
+            terminated: AtomicBool::new(false),
             short_hold: timing.short_hold,
             session_hold: timing.session_hold,
             max_hold: timing.max_hold,
@@ -515,6 +515,9 @@ impl IndicatorRuntime {
     }
 
     fn close_session(&self, reason: &str, terminate: bool) -> Result<(), String> {
+        if terminate {
+            self.terminated.store(true, Ordering::Release);
+        }
         let _lifecycle = self
             .lifecycle
             .lock()
@@ -529,7 +532,9 @@ impl IndicatorRuntime {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.terminated |= terminate;
+        if terminate {
+            self.terminated.store(true, Ordering::Release);
+        }
         if !state.session.owns_arbitration {
             if terminate && state.last_cleanup_reason.is_none() {
                 state.last_cleanup_reason = Some(reason.to_owned());
@@ -553,6 +558,9 @@ impl IndicatorRuntime {
     }
 
     fn check_environment(&self) -> Result<(), String> {
+        if self.terminated.load(Ordering::Acquire) {
+            return Err("the server is shutting down".to_owned());
+        }
         if let Some(backend) = &self.environment
             && let Err(error) = backend.check_control_environment()
         {
@@ -577,7 +585,7 @@ impl IndicatorRuntime {
         {
             return;
         }
-        if self.check_environment().is_err() {
+        if !self.terminated.load(Ordering::Acquire) && self.check_environment().is_err() {
             return;
         }
         let state = self
@@ -658,7 +666,7 @@ impl IndicatorRuntime {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.terminated {
+        if self.terminated.load(Ordering::Acquire) {
             return Err("the server is shutting down".to_owned());
         }
         if state.session.owns_arbitration && state.session.state != ControlSessionState::Closing {
@@ -854,7 +862,7 @@ impl IndicatorRuntime {
             return Ok(());
         }
         let mut control = state.control.take();
-        let terminated = state.terminated;
+        let terminated = self.terminated.load(Ordering::Acquire);
         drop(state);
         let failure = control
             .as_ref()
@@ -1819,6 +1827,33 @@ where
     serve_stdio_inner(backend, safety_indicator, Some(indicator_runtime)).await
 }
 
+// rmcp drains responses after EOF. Close admission at EOF itself, before that drain.
+struct DisconnectReader<R> {
+    inner: R,
+    runtime: Option<Arc<IndicatorRuntime>>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for DisconnectReader<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buffer.filled().len();
+        let has_capacity = buffer.remaining() != 0;
+        let result = std::pin::Pin::new(&mut this.inner).poll_read(context, buffer);
+        if has_capacity
+            && matches!(&result, std::task::Poll::Ready(result) if result.is_err() || buffer.filled().len() == before)
+            && let Some(runtime) = this.runtime.take()
+        {
+            runtime.terminated.store(true, Ordering::Release);
+            tokio::task::spawn_blocking(move || runtime.close_session("disconnect", true));
+        }
+        result
+    }
+}
+
 struct ServerCleanup(Option<Arc<IndicatorRuntime>>);
 
 impl ServerCleanup {
@@ -1859,7 +1894,12 @@ async fn serve_stdio_inner(
             "version": env!("CARGO_PKG_VERSION"),
         })
     );
-    let service = server.serve(stdio()).await?;
+    let (stdin, stdout) = stdio();
+    let reader = DisconnectReader {
+        inner: stdin,
+        runtime: cleanup.0.clone(),
+    };
+    let service = server.serve((reader, stdout)).await?;
     let cancellation = service.cancellation_token();
     let waiting = service.waiting();
     tokio::pin!(waiting);
