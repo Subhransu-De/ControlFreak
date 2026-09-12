@@ -31,13 +31,14 @@ pub(crate) struct DesktopGlow {
     health: Arc<Mutex<IndicatorHealth>>,
     cancellation: MutationControl,
     containment: (&'static str, Option<String>),
-    draining: Option<JoinHandle<Result<(), String>>>,
+    draining: Option<JoinHandle<()>>,
+    // Terminal actor panic only; helper termination errors are retried by the actor.
     shutdown_failure: Option<String>,
 }
 
 struct GlowActor {
     sender: mpsc::SyncSender<ActorRequest>,
-    thread: Option<JoinHandle<Result<(), String>>>,
+    thread: Option<JoinHandle<()>>,
 }
 
 enum ActorRequest {
@@ -117,7 +118,7 @@ impl DesktopGlow {
                     &health_for_actor,
                     &cancellation_for_actor,
                     elevated,
-                )
+                );
             })
             .map_err(|error| format!("desktop glow actor could not start: {error}"))?;
         Ok(Self {
@@ -218,7 +219,7 @@ impl Drop for DesktopGlow {
 }
 
 fn finish_actor_shutdown(
-    thread: &mut Option<JoinHandle<Result<(), String>>>,
+    thread: &mut Option<JoinHandle<()>>,
     result: Result<(), String>,
 ) -> Result<(), String> {
     let Some(handle) = thread.as_ref() else {
@@ -236,7 +237,7 @@ fn finish_actor_shutdown(
             .take()
             .expect("actor handle is present")
             .join()
-            .map_err(|_| "desktop glow actor panicked before confirming helper exit".to_owned())?
+            .map_err(|_| "desktop glow actor panicked before confirming helper exit".to_owned())
     } else {
         Err("desktop glow actor is still draining after bounded shutdown".to_owned())
     }
@@ -250,7 +251,7 @@ fn actor_loop(
     health: &Mutex<IndicatorHealth>,
     cancellation: &MutationControl,
     elevated: bool,
-) -> Result<(), String> {
+) {
     let mut sequence = 1_u64;
     let mut pending = HashMap::<u64, PendingCommand>::new();
     let mut visible = false;
@@ -322,8 +323,12 @@ fn actor_loop(
                         }
                     } else {
                         let result = stop_process_bounded(&mut process);
-                        let _ = reply.send(result.clone());
-                        return result;
+                        let failed = result.is_err();
+                        let _ = reply.send(result);
+                        if failed {
+                            drain_until_stopped(|| stop_process_bounded(&mut process));
+                        }
+                        return;
                     }
                 }
             }
@@ -384,7 +389,7 @@ fn actor_loop(
             );
             fail_pending(&mut pending, "desktop glow helper exited");
             join_readers(&mut process);
-            return Ok(());
+            return;
         }
 
         let now = Instant::now();
@@ -428,7 +433,8 @@ fn actor_loop(
             && (shutdown_acknowledged
                 || !matches!(current_health(health), IndicatorHealth::Healthy))
         {
-            return stop_process_bounded(&mut process);
+            drain_until_stopped(|| stop_process_bounded(&mut process));
+            return;
         }
     }
 }
@@ -541,6 +547,14 @@ fn fail_pending(pending: &mut HashMap<u64, PendingCommand>, reason: &str) {
         if let Some(reply) = command.reply {
             let _ = reply.send(Err(reason.to_owned()));
         }
+    }
+}
+
+// Keep the process and pipe handles in the actor until exit is confirmed.
+// Callers wait only for the bounded shutdown attempt and can retry later.
+fn drain_until_stopped(mut stop: impl FnMut() -> Result<(), String>) {
+    while stop().is_err() {
+        thread::sleep(ACTOR_POLL);
     }
 }
 
@@ -699,7 +713,6 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let actor = std::thread::spawn(move || {
             let _ = release_rx.recv();
-            Ok(())
         });
         let started = std::time::Instant::now();
 
@@ -716,21 +729,46 @@ mod tests {
     }
 
     #[test]
-    fn actor_exit_preserves_unconfirmed_helper_termination_on_every_retry() {
+    fn failed_helper_termination_is_retried_before_actor_exit() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        let stopped = Arc::new(AtomicBool::new(false));
+        let actor_stopped = Arc::clone(&stopped);
+        let (attempted, receiver) = mpsc::channel();
+        let actor = std::thread::spawn(move || {
+            super::drain_until_stopped(|| {
+                if actor_stopped.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    let _ = attempted.send(());
+                    Err("helper termination failed".to_owned())
+                }
+            });
+        });
         let mut glow = DesktopGlow {
             actor: None,
-            health: std::sync::Arc::new(std::sync::Mutex::new(IndicatorHealth::Healthy)),
+            health: Arc::new(std::sync::Mutex::new(IndicatorHealth::Healthy)),
             cancellation: controlfreak_core::MutationControl::default(),
             containment: ("unavailable", None),
-            draining: Some(std::thread::spawn(|| {
-                Err("helper termination failed".to_owned())
-            })),
+            draining: Some(actor),
             shutdown_failure: None,
         };
-        for _ in 0..2 {
-            assert_eq!(glow.shutdown().unwrap_err(), "helper termination failed");
-            assert!(glow.hide().is_err());
-        }
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let failed = glow.finish_shutdown(Err("helper termination failed".to_owned()));
+        let still_draining = glow.draining.is_some();
+        let hidden = glow.hide();
+        stopped.store(true, Ordering::Release);
+        assert!(failed.is_err());
+        assert!(still_draining);
+        assert!(hidden.is_err());
+        glow.shutdown().unwrap();
+        glow.shutdown().unwrap();
+        assert!(glow.draining.is_none());
     }
 
     #[test]
