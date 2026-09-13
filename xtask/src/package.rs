@@ -133,7 +133,7 @@ pub fn archive_name(version: &str) -> String {
     format!("controlfreak-v{version}-x86_64-pc-windows-msvc.zip")
 }
 pub fn installer_name(version: &str) -> String {
-    format!("ControlFreak-{version}-Setup.exe")
+    format!("ControlFreak-{version}.exe")
 }
 
 pub fn build(
@@ -252,7 +252,7 @@ pub fn publish(directory: &Path, tag: &str, version: &str) -> Result<()> {
         }
         command.arg(artifact).arg(checksum);
     }
-    command.args(["--notes", "Windows x64: download the Setup.exe for installation and optional MCP client configuration, or the ZIP for portable use. These binaries are unsigned. SHA-256 checksums are included; each package contains license information and SBOMs."]);
+    command.args(["--notes", "Windows x64: download the EXE installer for installation and optional MCP client configuration, or the ZIP for portable use. These binaries are unsigned. SHA-256 checksums are included; each package contains license information and SBOMs."]);
     process::checked(&mut command, Duration::from_mins(3))?;
     println!("GitHub release published.");
     Ok(())

@@ -15,7 +15,7 @@ MCP clients over STDIO.
 
 ## Install on Windows
 
-Download `ControlFreak-<version>-Setup.exe` from [GitHub Releases](https://github.com/Subhransu-De/ControlFreak/releases).
+Download `ControlFreak-<version>.exe` from [GitHub Releases](https://github.com/Subhransu-De/ControlFreak/releases).
 The installer supports Windows 10 version 2004 (build 19041) or newer and Windows 11 on x86-64.
 Rust and Microsoft C++ Build Tools are not needed for packaged releases. OCR requires an installed
 Windows OCR language pack. The setup executable and portable binaries are currently **unsigned**.
