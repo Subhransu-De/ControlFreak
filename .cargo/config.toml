@@ -1,0 +1,6 @@
+[alias]
+xtask = "run --locked --package xtask --"
+
+[target.x86_64-pc-windows-msvc]
+# Windows packages must run without the developer toolchain or VC runtime installer.
+rustflags = ["-C", "target-feature=+crt-static"]

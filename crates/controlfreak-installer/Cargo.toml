@@ -1,0 +1,19 @@
+[package]
+name = "controlfreak-installer"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+controlfreak-platform.workspace = true
+jsonc-parser = { version = "0.33.2", features = ["cst", "serde", "serde_json"], default-features = false }
+semver = "1.0.28"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tempfile = "3.27.0"
+toml_edit = { version = "0.25.15", features = ["serde"] }
+
+[lints]
+workspace = true

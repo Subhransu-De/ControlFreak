@@ -14,6 +14,17 @@ compile_error!("ControlFreak v0.1.0-alpha supports Windows only");
 mod windows;
 
 #[cfg(target_os = "windows")]
+#[path = "windows/installer_files.rs"]
+mod installer_files;
+
+#[cfg(target_os = "windows")]
+pub use installer_files::copy_configuration_permissions;
+
+#[cfg(all(target_os = "windows", feature = "packaging-tests"))]
+#[path = "windows/packaging_tests.rs"]
+pub mod packaging_tests;
+
+#[cfg(target_os = "windows")]
 use windows as implementation;
 
 #[cfg(target_os = "windows")]

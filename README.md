@@ -13,6 +13,76 @@ MCP clients over STDIO.
 - Inspect and switch between discoverable Windows virtual desktops.
 - Show a click-through animated desktop-edge glow while a client owns a mutating control session.
 
+## Install on Windows
+
+Download `ControlFreak-<version>.exe` from [GitHub Releases](https://github.com/Subhransu-De/ControlFreak/releases).
+The installer supports Windows 10 version 2004 (build 19041) or newer and Windows 11 on x86-64.
+Rust and Microsoft C++ Build Tools are not needed for packaged releases. OCR requires an installed
+Windows OCR language pack. The setup executable and portable binaries are currently **unsigned**.
+
+Setup installs for the current user and does not request administrator privileges. Run it from a
+normal, non-elevated session. The wizard asks for an installation directory, then offers checkboxes
+for Codex, Claude Code, Claude Desktop, Pi, and OpenCode before installing. The default directory is
+`%LOCALAPPDATA%\Programs\ControlFreak`. Selecting a client configures its MCP connection; it does not
+install that client. Selecting no clients installs only ControlFreak.
+
+Pi additionally requires `pi install npm:pi-mcp-adapter`; setup does not download or install the
+adapter. Quit and reopen selected clients afterward.
+Project-specific or managed client configuration can take precedence over these user settings.
+
+Setup preserves other settings and servers, including TOML and JSONC comments. For each selected
+client, setup installs or updates its ControlFreak entry automatically. Before changing an
+existing file, setup saves a uniquely named `<filename>.controlfreak-backup-*.bak` beside it. Treat
+these backups as private: they can contain credentials from the original configuration. Malformed,
+duplicate-key, unsupported, or concurrently changed configurations are left for manual recovery.
+Existing files are updated through an exclusive Windows handle after their backup is flushed.
+This blocks competing writes and renames during the update. A write failure attempts rollback;
+an interrupted process or power loss can require restoring the backup manually.
+The finish page and `setup-results.txt` in the install directory report each client's result.
+If a client fails to configure, the application remains installed; fix the reported problem and
+rerun setup, or configure the client manually using the executable's full path.
+
+| Client | Default file edited by setup | Supported environment override |
+| --- | --- | --- |
+| Codex | `%USERPROFILE%\.codex\config.toml` | `CODEX_HOME` |
+| Claude Code | `%USERPROFILE%\.claude.json` | `CLAUDE_CONFIG_DIR` (uses `.claude.json` inside it) |
+| Claude Desktop | `%APPDATA%\Claude\claude_desktop_config.json` | `APPDATA` |
+| Pi | `%USERPROFILE%\.pi\agent\mcp.json` | `PI_CODING_AGENT_DIR` |
+| OpenCode | `%USERPROFILE%\.config\opencode\opencode.json` or existing `.jsonc` | `XDG_CONFIG_HOME`, `OPENCODE_CONFIG_DIR`, `OPENCODE_CONFIG` |
+
+Directory/file overrides must be absolute. If both OpenCode JSON and JSONC files exist, setup refuses
+to guess which to edit. Pi configuration is written to its own override file, not the shared MCP
+configuration used by other applications. Setup does not alter PATH, start the server, add a
+service, enable elevated operation, or install an auto-updater.
+
+### Upgrade and uninstall
+
+Stop MCP clients using the installed executable before upgrading or uninstalling. Setup retains
+the installation directory and refuses downgrades, including prerelease downgrades. To move an
+installation, uninstall it first. Locked files cause setup to stop for a retry; it does not terminate
+clients or schedule executable replacement at reboot.
+
+Uninstall from Windows Settings or run `unins000.exe` in the install directory. Uninstall offers to
+remove the MCP entries written by setup, and removes an entry only if its complete value still
+matches the recorded value. User-modified entries, other servers, unrelated files, and configuration
+backups are retained. Replaced pre-install entries can be recovered from the backup; uninstall does
+not automatically restore them.
+
+For unattended installation, use `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`, optionally followed by
+`/DIR="C:\Tools\ControlFreak"` and `/CLIENTS=codex,claude-code,claude-desktop,pi,opencode`.
+Selected clients are updated automatically. Omitting `/CLIENTS` configures no clients.
+Exit code `10` means the application
+was installed but at least one client configuration failed; see `setup-results.txt`. Other setup
+failures use Inno Setup's standard nonzero exit codes. Silent uninstall retains client entries unless
+`/REMOVECONFIG=1` is supplied.
+
+### Portable ZIP
+
+Alternatively, extract the Windows ZIP from the same release into a stable folder and configure the
+MCP client with the full path to `controlfreak.exe`. Both downloads have `.sha256` checksum files and
+contain license information and SBOMs. The separate `controlfreak-installer.exe` is a private setup
+utility, not an MCP server; clients must launch `controlfreak.exe`.
+
 ## Install from source
 
 Requirements:
@@ -68,6 +138,9 @@ executable; it does not launch PowerShell or compile UI code at runtime.
 ## Configure an MCP client
 
 Replace `<username>` with your Windows username and restart the client after adding ControlFreak.
+The examples below use the Cargo installation path. For setup or portable installations, substitute
+the actual installed executable path, such as
+`C:\Users\<username>\AppData\Local\Programs\ControlFreak\controlfreak.exe`.
 
 <details>
 <summary><strong>Codex</strong></summary>
@@ -88,6 +161,25 @@ Run:
 
 ```powershell
 claude mcp add --scope user controlfreak -- 'C:\Users\<username>\.cargo\bin\controlfreak.exe'
+```
+
+</details>
+
+<details>
+<summary><strong>Claude Desktop</strong></summary>
+
+Add this server to `%APPDATA%\Claude\claude_desktop_config.json`, preserving existing servers and
+preferences, then quit and reopen Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "controlfreak": {
+      "command": "C:\\Users\\<username>\\AppData\\Local\\Programs\\ControlFreak\\controlfreak.exe",
+      "args": []
+    }
+  }
+}
 ```
 
 </details>

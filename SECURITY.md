@@ -17,6 +17,14 @@ input can still reach functionality exposed by an already-running desktop applic
 
 ## Process integrity and elevation
 
+The optional Windows setup program and its separate `controlfreak-installer.exe` utility edit only
+the explicitly selected clients' MCP configuration. These are installation features, not MCP tools.
+Setup creates private configuration backups alongside existing files; those backups may contain
+credentials and are intentionally retained after uninstall. The setup utility reports fixed error
+messages rather than configuration contents. It never enables `--allow-elevated` in generated client
+entries, starts a server, or changes the server's desktop-control checks. Run setup as the intended
+non-elevated user so configuration changes apply to that user.
+
 ControlFreak inherits the Windows access token of the MCP client that starts it. It never requests
 elevation itself, but an elevated client would otherwise make ControlFreak elevated too. The server
 therefore inspects its token before opening the MCP transport and refuses an elevated token by
