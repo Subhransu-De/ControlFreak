@@ -105,7 +105,10 @@ pub fn run(directory: &Path, output: &Path, version: &str, production: bool) -> 
 fn exercise(fixture: &Fixture, installer: &Path, directory: &Path, version: &str) -> Result<()> {
     fs::create_dir_all(&fixture.profile)?;
     let config = fixture.profile.join(".claude.json");
-    fs::write(&config, r#"{"preferences":{"synthetic":true}}"#)?;
+    fs::write(
+        &config,
+        r#"{"preferences":{"synthetic":true},"mcpServers":{"controlfreak":{"command":"old-synthetic.exe"},"other":{"command":"other-synthetic.exe"}}}"#,
+    )?;
     native::restrict_fixture_permissions(&config)?;
     let permissions = native::configuration_permissions(&config)?;
     if fixture.setup(installer, true)? != 0 {
@@ -129,6 +132,7 @@ fn exercise(fixture: &Fixture, installer: &Path, directory: &Path, version: &str
     if backups.len() != 1 || native::configuration_permissions(&backups[0].path())? != permissions {
         return Err("Backup permissions changed".into());
     }
+    verify_updated_entry(fixture, &config)?;
     let portable = fixture.output.join("portable comparison");
     verify::extract(&directory.join(package::archive_name(version)), &portable)?;
     for binary in package::BINARIES {
@@ -191,5 +195,22 @@ fn exercise(fixture: &Fixture, installer: &Path, directory: &Path, version: &str
     println!(
         "Installer lifecycle: client configuration, permissions, upgrades, refusals, partial failure and uninstall passed."
     );
+    Ok(())
+}
+
+fn verify_updated_entry(fixture: &Fixture, config: &Path) -> Result<()> {
+    let updated: serde_json::Value = serde_json::from_str(&fs::read_to_string(config)?)?;
+    let command = updated["mcpServers"]["controlfreak"]["command"]
+        .as_str()
+        .ok_or("Updated client command is missing")?;
+    if Path::new(command).canonicalize()?
+        != fixture.install.join("controlfreak.exe").canonicalize()?
+        || updated["mcpServers"]["other"]["command"] != "other-synthetic.exe"
+        || updated["preferences"]["synthetic"] != true
+    {
+        return Err(
+            "Install did not update the existing entry while preserving other settings".into(),
+        );
+    }
     Ok(())
 }

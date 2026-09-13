@@ -27,12 +27,11 @@ for Codex, Claude Code, Claude Desktop, Pi, and OpenCode before installing. The 
 install that client. Selecting no clients installs only ControlFreak.
 
 Pi additionally requires `pi install npm:pi-mcp-adapter`; setup does not download or install the
-adapter. Client detection uses existing configuration files/directories and commands on PATH as
-hints, not proof that a client or adapter is installed. Quit and reopen selected clients afterward.
+adapter. Quit and reopen selected clients afterward.
 Project-specific or managed client configuration can take precedence over these user settings.
 
-Setup preserves other settings and servers, including TOML and JSONC comments. Existing ControlFreak
-entries are kept unless **Replace existing ControlFreak entries** is selected. Before changing an
+Setup preserves other settings and servers, including TOML and JSONC comments. For each selected
+client, setup installs or updates its ControlFreak entry automatically. Before changing an
 existing file, setup saves a uniquely named `<filename>.controlfreak-backup-*.bak` beside it. Treat
 these backups as private: they can contain credentials from the original configuration. Malformed,
 duplicate-key, unsupported, or concurrently changed configurations are left for manual recovery.
@@ -70,8 +69,9 @@ backups are retained. Replaced pre-install entries can be recovered from the bac
 not automatically restore them.
 
 For unattended installation, use `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`, optionally followed by
-`/DIR="C:\Tools\ControlFreak"`, `/CLIENTS=codex,claude-code,claude-desktop,pi,opencode`, and
-`/REPLACECLIENTS=1`. Omitting `/CLIENTS` configures no clients. Exit code `10` means the application
+`/DIR="C:\Tools\ControlFreak"` and `/CLIENTS=codex,claude-code,claude-desktop,pi,opencode`.
+Selected clients are updated automatically. Omitting `/CLIENTS` configures no clients.
+Exit code `10` means the application
 was installed but at least one client configuration failed; see `setup-results.txt`. Other setup
 failures use Inno Setup's standard nonzero exit codes. Silent uninstall retains client entries unless
 `/REMOVECONFIG=1` is supplied.

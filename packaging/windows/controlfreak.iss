@@ -72,8 +72,7 @@ Type: dirifempty; Name: "{app}\installer-state"
 var
   ClientsPage: TInputOptionWizardPage;
   Details: TNewMemo;
-  ReplaceEntries: TNewCheckBox;
-  ClientIds, ClientNames, ClientNotes: TArrayOfString;
+  ClientIds, ClientNames: TArrayOfString;
   SetupResults: String;
   ConfigurationFailed: Boolean;
 
@@ -112,16 +111,6 @@ begin
     FileAvailable(AddBackslash(Directory) + 'controlfreak-installer.exe');
 end;
 
-procedure RefreshDetails(Sender: TObject);
-var
-  I: Integer;
-begin
-  Details.Lines.Clear;
-  Details.Lines.Add('Destination: ' + ExpandConstant('{app}'));
-  for I := 0 to 4 do
-    Details.Lines.Add(ClientNames[I] + ': ' + ClientNotes[I]);
-end;
-
 procedure InitializeWizard;
 var
   I: Integer;
@@ -130,27 +119,12 @@ var
 begin
   ClientIds := ['codex', 'claude-code', 'claude-desktop', 'pi', 'opencode'];
   ClientNames := ['Codex', 'Claude Code', 'Claude Desktop', 'Pi', 'OpenCode'];
-  SetArrayLength(ClientNotes, 5);
   ExtractTemporaryFile('controlfreak-installer.exe');
   ClientsPage := CreateInputOptionPage(wpSelectDir, 'Configure MCP clients',
     'Choose which existing clients can use ControlFreak.',
-    'Changes apply to the current user. Close selected clients before installing. You can leave every box unchecked.', False, False);
+    'Select clients to install or update their ControlFreak connection. Close selected clients before installing.', False, False);
   ClientsPage.CheckListBox.Height := ScaleY(125);
   for I := 0 to 4 do ClientsPage.Add(ClientNames[I]);
-  ReplaceEntries := TNewCheckBox.Create(WizardForm);
-  ReplaceEntries.Parent := ClientsPage.Surface;
-  ReplaceEntries.Top := ClientsPage.CheckListBox.Top + ClientsPage.CheckListBox.Height + ScaleY(8);
-  ReplaceEntries.Width := ClientsPage.SurfaceWidth;
-  ReplaceEntries.Caption := 'Replace existing ControlFreak entries in selected clients (back up first)';
-  ReplaceEntries.Checked := ExpandConstant('{param:REPLACECLIENTS|0}') = '1';
-  Details := TNewMemo.Create(WizardForm);
-  Details.Parent := ClientsPage.Surface;
-  Details.Top := ReplaceEntries.Top + ScaleY(30);
-  Details.Width := ClientsPage.SurfaceWidth;
-  Details.Height := ClientsPage.SurfaceHeight - Details.Top;
-  Details.ReadOnly := True;
-  Details.ScrollBars := ssVertical;
-  Details.WordWrap := True;
   Selection := ExpandConstant('{param:CLIENTS|}');
   if Selection <> '' then begin
     Selected := StringSplit(Selection, [','], stExcludeEmpty);
@@ -164,25 +138,21 @@ begin
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
-var
-  I, Code: Integer;
-  Report: String;
 begin
-  if CurPageID = ClientsPage.ID then begin
-    for I := 0 to 4 do begin
-      Report := ExpandConstant('{tmp}\probe-') + ClientIds[I] + '.ini';
-      DeleteFile(Report);
-      InvokeHelper('probe ' + ClientIds[I] + ' ' + Quote(ExpandConstant('{app}\controlfreak.exe')) + ' ' + Quote(Report), Code);
-      ClientNotes[I] := GetIniString('result', 'message', 'Could not inspect configuration; setup will report any configuration error.', Report);
-    end;
-    RefreshDetails(nil);
+  if CurPageID = ClientsPage.ID then
     WizardForm.NextButton.Caption := 'Install';
-  end;
   if CurPageID = wpFinished then begin
     WizardForm.FinishedLabel.Caption := 'ControlFreak is installed at ' + ExpandConstant('{app}') + '.' + #13#10 +
       'Quit and reopen configured clients. Pi requires pi-mcp-adapter.' + #13#10 +
       'Configuration results are saved in setup-results.txt in the installation directory.';
-    Details.Parent := WizardForm.FinishedPage;
+    if Details = nil then begin
+      Details := TNewMemo.Create(WizardForm);
+      Details.Parent := WizardForm.FinishedPage;
+      Details.Width := ClientsPage.SurfaceWidth;
+      Details.ReadOnly := True;
+      Details.ScrollBars := ssVertical;
+      Details.WordWrap := True;
+    end;
     Details.Top := WizardForm.FinishedLabel.Top + WizardForm.FinishedLabel.Height + ScaleY(12);
     Details.Height := WizardForm.FinishedPage.Height - Details.Top;
     Details.Text := SetupResults;
@@ -216,11 +186,9 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   I, Code: Integer;
-  Report, MessageText, Policy: String;
+  Report, MessageText: String;
 begin
   if CurStep <> ssPostInstall then exit;
-  Policy := 'keep';
-  if ReplaceEntries.Checked then Policy := 'replace';
   SetupResults := '';
   for I := 0 to 4 do begin
     if ClientsPage.Values[I] then begin
@@ -228,7 +196,7 @@ begin
       Report := ExpandConstant('{tmp}\configure-') + ClientIds[I] + '.ini';
       DeleteFile(Report);
       if (not InvokeHelper('configure ' + ClientIds[I] + ' ' + Quote(ExpandConstant('{app}\controlfreak.exe')) + ' ' +
-        Quote(ExpandConstant('{app}\installer-state')) + ' ' + Quote(Report) + ' ' + Policy, Code)) or (Code <> 0) then
+        Quote(ExpandConstant('{app}\installer-state')) + ' ' + Quote(Report) + ' replace', Code)) or (Code <> 0) then
         ConfigurationFailed := True;
       MessageText := GetIniString('result', 'message', 'Configuration failed. Re-run setup or use the manual README instructions.', Report);
     end else MessageText := 'Not selected; configuration unchanged.';

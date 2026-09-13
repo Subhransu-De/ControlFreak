@@ -14,7 +14,7 @@ change before the first release.
 
 - Unsigned per-user Windows x64 setup executable with location selection, optional MCP configuration
   for Codex, Claude Code, Claude Desktop, Pi, and OpenCode, and per-client installation results.
-- Configuration backups, explicit conflict replacement, upgrade/downgrade checks, silent setup,
+- Configuration backups, automatic updates for selected clients, upgrade/downgrade checks, silent setup,
   and conditional removal of installer-created MCP entries during uninstall.
 - Installer and portable release verification before publication, including checksums, executable
   version identity, piped MCP startup, synthetic client profiles, and installation lifecycle checks.
