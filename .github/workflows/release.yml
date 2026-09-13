@@ -50,7 +50,7 @@ jobs:
         run: cargo auditable build -p controlfreak-server -p controlfreak-installer --release --locked
 
       - name: Generate CycloneDX SBOMs
-        run: cargo cyclonedx --format json --target x86_64-pc-windows-msvc --override-filename controlfreak.cdx.json
+        run: cargo cyclonedx --format json --target x86_64-pc-windows-msvc --override-filename controlfreak.cdx
 
       - name: Build installer and portable archive
         run: |
