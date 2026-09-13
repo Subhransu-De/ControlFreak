@@ -89,13 +89,13 @@ jobs:
         run: cargo xtask compiler --output "$env:RUNNER_TEMP/inno"
 
       - name: Build Windows installer and portable package
-        run: cargo xtask package --compiler "$env:RUNNER_TEMP/inno/compiler/ISCC.exe" --output target/installer-check --test-setup
+        run: cargo xtask package --compiler "$env:RUNNER_TEMP/inno/compiler/ISCC.exe" --output "$env:RUNNER_TEMP/installer-package" --test-setup
 
       - name: Verify portable executable and package checksums
-        run: cargo xtask verify --package target/installer-check --output "$env:RUNNER_TEMP/portable test 日本語"
+        run: cargo xtask verify --package "$env:RUNNER_TEMP/installer-package" --output "$env:RUNNER_TEMP/portable test 日本語"
 
       - name: Verify installation lifecycle with synthetic client profiles
-        run: cargo xtask test-installer --package target/installer-check --output "$env:RUNNER_TEMP/installer-test"
+        run: cargo xtask test-installer --package "$env:RUNNER_TEMP/installer-package" --output "$env:RUNNER_TEMP/installer-test"
 
   dependencies:
     name: Dependency policy
