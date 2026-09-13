@@ -12,6 +12,14 @@ change before the first release.
 
 ### Added
 
+- Unsigned per-user Windows x64 setup executable with location selection, optional MCP configuration
+  for Codex, Claude Code, Claude Desktop, Pi, and OpenCode, and per-client installation results.
+- Configuration backups, explicit conflict replacement, upgrade/downgrade checks, silent setup,
+  and conditional removal of installer-created MCP entries during uninstall.
+- Installer and portable release verification before publication, including checksums, executable
+  version identity, piped MCP startup, synthetic client profiles, and installation lifecycle checks.
+- Statically linked MSVC runtime for Windows packages, avoiding a separate VC runtime installation.
+
 - Native Windows STDIO MCP server with twenty-four computer-use tools.
 - Multi-display discovery, proportional screenshots, bounded region and window capture, and cursor
   markers.

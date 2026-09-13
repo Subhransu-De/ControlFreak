@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/controlfreak-core",
+    "crates/controlfreak-installer",
     "crates/controlfreak-mcp",
     "crates/controlfreak-platform",
     "crates/controlfreak-server",

@@ -14,4 +14,4 @@ test:
 	cargo test --workspace --locked
 
 release:
-	cargo build -p controlfreak-server --release --locked
+	cargo build -p controlfreak-server -p controlfreak-installer --release --locked

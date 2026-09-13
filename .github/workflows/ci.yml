@@ -82,8 +82,21 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
-      - name: Build optimized server
-        run: cargo build -p controlfreak-server --release --locked
+      - name: Build optimized server and installer helper
+        run: cargo build -p controlfreak-server -p controlfreak-installer --release --locked
+
+      - name: Build Windows installer and portable package
+        run: |
+          $compiler = ./scripts/install-inno.ps1 -Destination "$env:RUNNER_TEMP/inno"
+          ./scripts/package-windows.ps1 -Compiler $compiler -OutputDirectory target/installer-check -TestSetup
+
+      - name: Verify portable executable and package checksums
+        run: |
+          $version = ./scripts/package-windows.ps1 -ValidateOnly
+          ./scripts/verify-windows-package.ps1 -PackageDirectory target/installer-check -TestDirectory "$env:RUNNER_TEMP/portable test 日本語" -ExpectedVersion $version
+
+      - name: Verify installation lifecycle with synthetic client profiles
+        run: ./scripts/test-windows-installer.ps1 -PackageDirectory target/installer-check -TestDirectory "$env:RUNNER_TEMP/installer-test"
 
   dependencies:
     name: Dependency policy
