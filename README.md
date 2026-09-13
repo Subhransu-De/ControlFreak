@@ -36,6 +36,9 @@ entries are kept unless **Replace existing ControlFreak entries** is selected. B
 existing file, setup saves a uniquely named `<filename>.controlfreak-backup-*.bak` beside it. Treat
 these backups as private: they can contain credentials from the original configuration. Malformed,
 duplicate-key, unsupported, or concurrently changed configurations are left for manual recovery.
+Existing files are updated through an exclusive Windows handle after their backup is flushed.
+This blocks competing writes and renames during the update. A write failure attempts rollback;
+an interrupted process or power loss can require restoring the backup manually.
 The finish page and `setup-results.txt` in the install directory report each client's result.
 If a client fails to configure, the application remains installed; fix the reported problem and
 rerun setup, or configure the client manually using the executable's full path.

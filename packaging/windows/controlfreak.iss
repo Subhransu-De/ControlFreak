@@ -1,4 +1,4 @@
-; Build through scripts/package-windows.ps1. No signing or runtime downloads.
+; Build through cargo xtask package. No signing or runtime downloads.
 #if VER != 0x06070100
   #error Inno Setup 6.7.1 is required
 #endif

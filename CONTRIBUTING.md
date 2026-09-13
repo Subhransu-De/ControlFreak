@@ -22,6 +22,8 @@ CI also validates generated documentation, dependency policy, workflow syntax, a
 - `controlfreak-server` wires the production backend to STDIO transport.
 - `controlfreak-installer` is a separate setup-only configuration utility. It cannot be invoked
   through the MCP protocol and does not perform desktop control.
+- `xtask` is developer-only Rust automation for packaging and release verification. It is never
+  installed with ControlFreak or called by the application.
 
 Keep Windows API calls inside the platform crate. New unsafe operations belong in the smallest practical module, require a nearby `SAFETY` explanation, and must pass the Hawk and Clippy checks.
 
@@ -29,33 +31,38 @@ Keep Windows API calls inside the platform crate. New unsafe operations belong i
 
 `make release` builds both the server and the setup helper. The Windows target statically links
 the MSVC runtime through `.cargo/config.toml`. Keep installer-only dependencies out of the server:
-`toml_edit` and `jsonc-parser` preserve configuration formatting, `tempfile` stages atomic file
-updates and unique backups, and `semver` compares installed versions, including prereleases.
+`toml_edit` and `jsonc-parser` preserve configuration formatting, `tempfile` stages new files
+and unique backups, and `semver` compares installed versions, including prereleases.
 
-Use PowerShell 7 and the checksum-pinned portable Inno Setup compiler:
+Run the Rust packaging tool through the workspace's `cargo xtask` alias. Cargo builds it on demand;
+there is no separate script runner to install. Compiler downloads use Windows' built-in `curl.exe`.
 
 ```powershell
 make release
-$compiler = ./scripts/install-inno.ps1 -Destination "$env:TEMP/controlfreak-inno"
-./scripts/package-windows.ps1 -Compiler $compiler -OutputDirectory target/package-test -TestSetup
-./scripts/verify-windows-package.ps1 -PackageDirectory target/package-test `
-  -TestDirectory "$env:TEMP/controlfreak-portable-check" -ExpectedVersion 0.1.0-alpha
-./scripts/test-windows-installer.ps1 -PackageDirectory target/package-test `
-  -TestDirectory "$env:TEMP/controlfreak-installer-check"
+cargo xtask compiler --output target/inno
+cargo xtask package --compiler target/inno/compiler/ISCC.exe --output target/package-test --test-setup
+cargo xtask verify --package target/package-test --output target/portable-check
+cargo xtask test-installer --package target/package-test --output target/installer-check
 ```
 
-Use fresh output/test directories for every invocation. Local lifecycle tests require `-TestSetup`,
+Use fresh output/test directories for every invocation. Local lifecycle tests require `--test-setup`,
 which gives the installer a separate Windows application identity. The tests create synthetic user
-profiles, preserve unrelated fixture files, and restore their process environment afterward. Never
+profiles and preserve unrelated fixture files. Environment overrides apply only to child processes. Never
 use real MCP client profiles as fixtures. Test output and configuration backups must not be uploaded
 as CI artifacts. The production-installer test switch is reserved for disposable GitHub Actions
 runners; it exercises the exact release executable before publication.
 
 The release workflow validates the tag before building, runs release-mode tests, builds both binaries
-with `cargo-auditable`, and generates CycloneDX SBOMs. `package-windows.ps1 -RequireSbom` requires a
-generated `controlfreak.cdx.json` for every crate. Development packages can omit SBOM generation and
+with `cargo-auditable`, and generates CycloneDX SBOMs. `cargo xtask package --require-sbom` requires a
+generated `controlfreak.cdx.json` for every product crate (excluding `xtask`). Development packages can omit SBOM generation and
 contain an explicitly labeled placeholder instead. Each public release contains the setup EXE,
 portable ZIP, and two SHA-256 files; package contents include SBOMs. Signing is not configured.
+
+The automation uses `zip` for archives, `sha2` for checksums, and `clap` for typed command arguments.
+Its `packaging-tests` platform feature exposes native version-resource, registry and fixture-permission
+checks only to developer tooling. These dependencies and checks are not part of the shipped server.
+Run `cargo test -p xtask --locked` for its focused tests. CI uses the same commands shown above;
+`cargo xtask publish` is restricted to the tag-triggered GitHub Actions release environment.
 
 Automated package checks make only version/capability and MCP initialize, tools/list and server-status
 requests. They do not capture desktop content or inject input. An elevated runner additionally checks

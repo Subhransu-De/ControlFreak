@@ -20,6 +20,10 @@ mod installer_files;
 #[cfg(target_os = "windows")]
 pub use installer_files::copy_configuration_permissions;
 
+#[cfg(all(target_os = "windows", feature = "packaging-tests"))]
+#[path = "windows/packaging_tests.rs"]
+pub mod packaging_tests;
+
 #[cfg(target_os = "windows")]
 use windows as implementation;
 

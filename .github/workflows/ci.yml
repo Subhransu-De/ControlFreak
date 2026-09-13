@@ -85,18 +85,17 @@ jobs:
       - name: Build optimized server and installer helper
         run: cargo build -p controlfreak-server -p controlfreak-installer --release --locked
 
+      - name: Install pinned portable compiler
+        run: cargo xtask compiler --output "$env:RUNNER_TEMP/inno"
+
       - name: Build Windows installer and portable package
-        run: |
-          $compiler = ./scripts/install-inno.ps1 -Destination "$env:RUNNER_TEMP/inno"
-          ./scripts/package-windows.ps1 -Compiler $compiler -OutputDirectory target/installer-check -TestSetup
+        run: cargo xtask package --compiler "$env:RUNNER_TEMP/inno/compiler/ISCC.exe" --output target/installer-check --test-setup
 
       - name: Verify portable executable and package checksums
-        run: |
-          $version = ./scripts/package-windows.ps1 -ValidateOnly
-          ./scripts/verify-windows-package.ps1 -PackageDirectory target/installer-check -TestDirectory "$env:RUNNER_TEMP/portable test 日本語" -ExpectedVersion $version
+        run: cargo xtask verify --package target/installer-check --output "$env:RUNNER_TEMP/portable test 日本語"
 
       - name: Verify installation lifecycle with synthetic client profiles
-        run: ./scripts/test-windows-installer.ps1 -PackageDirectory target/installer-check -TestDirectory "$env:RUNNER_TEMP/installer-test"
+        run: cargo xtask test-installer --package target/installer-check --output "$env:RUNNER_TEMP/installer-test"
 
   dependencies:
     name: Dependency policy

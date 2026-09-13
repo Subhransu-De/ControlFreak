@@ -28,20 +28,16 @@ jobs:
         run: rustup toolchain install 1.97.1 --profile minimal
 
       - name: Validate release version before building
-        id: version
-        run: |
-          $version = ./scripts/package-windows.ps1 -ValidateOnly -Tag $env:GITHUB_REF_NAME
-          "version=$version" >> $env:GITHUB_OUTPUT
+        run: cargo xtask version --tag $env:GITHUB_REF_NAME
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
-      - name: Install release tools
-        run: |
-          cargo install cargo-auditable --version 0.7.5 --locked
-          if ($LASTEXITCODE -ne 0) { throw "cargo-auditable installation failed" }
-          cargo install cargo-cyclonedx --version 0.5.9 --locked
-          if ($LASTEXITCODE -ne 0) { throw "cargo-cyclonedx installation failed" }
+      - name: Install cargo-auditable
+        run: cargo install cargo-auditable --version 0.7.5 --locked
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
 
       - name: Test release configuration
         run: cargo test --workspace --release --locked
@@ -52,30 +48,20 @@ jobs:
       - name: Generate CycloneDX SBOMs
         run: cargo cyclonedx --format json --target x86_64-pc-windows-msvc --override-filename controlfreak.cdx
 
+      - name: Install pinned portable compiler
+        run: cargo xtask compiler --output "$env:RUNNER_TEMP/inno"
+
       - name: Build installer and portable archive
-        run: |
-          $compiler = ./scripts/install-inno.ps1 -Destination "$env:RUNNER_TEMP/inno"
-          ./scripts/package-windows.ps1 -Compiler $compiler -OutputDirectory dist -Tag $env:GITHUB_REF_NAME -RequireSbom
+        run: cargo xtask package --compiler "$env:RUNNER_TEMP/inno/compiler/ISCC.exe" --output dist --tag $env:GITHUB_REF_NAME --require-sbom
 
       - name: Verify packaged executable and checksums
-        env:
-          RELEASE_VERSION: ${{ steps.version.outputs.version }}
-        run: ./scripts/verify-windows-package.ps1 -PackageDirectory dist -TestDirectory "$env:RUNNER_TEMP/portable test 日本語" -ExpectedVersion $env:RELEASE_VERSION
+        run: cargo xtask verify --package dist --output "$env:RUNNER_TEMP/portable test 日本語"
 
       - name: Verify the production installer in a synthetic profile
-        run: ./scripts/test-windows-installer.ps1 -PackageDirectory dist -TestDirectory "$env:RUNNER_TEMP/installer-test" -ProductionInstaller
+        run: cargo xtask test-installer --package dist --output "$env:RUNNER_TEMP/installer-test" --production-installer
 
       - name: Publish GitHub release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          $assets = @(Get-ChildItem dist -File | Where-Object { $_.Extension -in ".exe", ".zip", ".sha256" })
-          if ($assets.Count -ne 4) { throw "Expected installer, ZIP, and their two checksum files." }
-          $releaseKind = @()
-          if ($env:RELEASE_VERSION -match "-") {
-            $releaseKind = @("--prerelease")
-          }
-
-          gh release create $env:GITHUB_REF_NAME @($assets.FullName) @releaseKind --verify-tag --generate-notes --title $env:GITHUB_REF_NAME --notes "Windows x64: download the Setup.exe for installation and optional MCP client configuration, or the ZIP for portable use. These binaries are unsigned. SHA-256 checksums are included; each package contains license information and SBOMs."
+        run: cargo xtask publish --package dist --tag $env:GITHUB_REF_NAME
