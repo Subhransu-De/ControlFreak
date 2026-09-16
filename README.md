@@ -66,8 +66,9 @@ with its PID. If Windows cannot identify a blocker, check folder permissions and
 using this installation. Setup does not terminate clients or schedule executable
 replacement at reboot. A running server must be restarted to use the new version.
 
-Uninstall retains unreadable or malformed client configuration. If the configuration helper is
-missing or cannot start, application removal continues and client entries must be removed manually.
+Uninstall leaves malformed or unreadable client configuration unchanged. It also retains entries
+whose receipts are damaged or unreadable. If the configuration helper is missing or cannot start,
+application removal continues and client entries must be removed manually.
 Reconfiguring a client at a new profile path preserves the previous installation receipt so
 uninstall can clean unchanged installer-owned entries at both paths. Receipts claim ownership only
 after a successful configuration write; interrupted or failed setup may require manual entry cleanup.

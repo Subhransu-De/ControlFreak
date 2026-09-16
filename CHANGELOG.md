@@ -11,8 +11,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ### Added
 
-- Uninstall retains malformed client configuration and continues when its cleanup helper is
-  unavailable. Configuration ownership is retained across client profile path changes and is
+- Uninstall retains malformed client configuration and damaged receipts, and continues when
+  its cleanup helper is unavailable. Configuration ownership is retained across client profile path changes and is
   committed only after a successful configuration write.
 
 - Manual release workflow that prepares version files and dated changelog entries, verifies

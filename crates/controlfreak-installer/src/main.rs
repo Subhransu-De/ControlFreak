@@ -279,8 +279,16 @@ fn remove(state: &Path) -> Result<String> {
     let mut retained = false;
     for id in clients::CLIENTS {
         let path = state.join(format!("{id}.json"));
-        if let Some(text) = storage::read(&path)? {
-            for receipt in receipts(&text, id)? {
+        let Ok(stored) = storage::read(&path) else {
+            retained = true;
+            continue;
+        };
+        if let Some(text) = stored {
+            let Ok(verified_receipts) = receipts(&text, id) else {
+                retained = true;
+                continue;
+            };
+            for receipt in verified_receipts {
                 if !receipt.committed {
                     retained = true;
                     continue;

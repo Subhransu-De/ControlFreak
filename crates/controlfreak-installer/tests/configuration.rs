@@ -511,3 +511,32 @@ fn successful_update_replaces_ownership_only_for_the_same_path() {
         first
     );
 }
+
+#[test]
+fn damaged_receipts_retain_their_config_without_blocking_other_cleanup() {
+    for damage in ["truncated", "invalid-utf8", "unreadable"] {
+        let f = Fixture::new();
+        assert!(f.configure("codex", "replace").status.success());
+        assert!(f.configure("claude-code", "replace").status.success());
+        let original = fs::read(f.path("user/.codex/config.toml")).unwrap();
+        match damage {
+            "truncated" => f.write("state/codex.json", "{ broken synthetic receipt"),
+            "invalid-utf8" => fs::write(f.path("state/codex.json"), [0xff, 0xfe]).unwrap(),
+            _ => {
+                fs::remove_file(f.path("state/codex.json")).unwrap();
+                fs::create_dir(f.path("state/codex.json")).unwrap();
+            }
+        }
+        assert!(f.remove().status.success(), "{}", f.report());
+        assert_eq!(
+            fs::read(f.path("user/.codex/config.toml")).unwrap(),
+            original
+        );
+        assert!(f.path("state/codex.json").exists());
+        assert!(
+            f.json("user/.claude.json")["mcpServers"]
+                .get("controlfreak")
+                .is_none()
+        );
+    }
+}

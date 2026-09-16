@@ -9,6 +9,14 @@ pub fn prepare(metadata: &Metadata, version: &str, date: &str) -> Result<()> {
     let changelog_path = metadata.workspace_root.join("CHANGELOG.md");
     let changelog = fs::read_to_string(&changelog_path)?;
     let (manifest, changelog) = prepare_text(&manifest, &changelog, version, date)?;
+    // xtask's build need not fetch packages used only by other workspace crates.
+    // Populate the complete locked graph before an offline workspace resolution.
+    process::checked(
+        Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+            .current_dir(&metadata.workspace_root)
+            .args(["fetch", "--locked"]),
+        Duration::from_mins(5),
+    )?;
     fs::write(manifest_path, manifest)?;
     fs::write(changelog_path, changelog)?;
     // Cargo updates workspace package versions while keeping locked external

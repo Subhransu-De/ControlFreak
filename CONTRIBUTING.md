@@ -95,7 +95,8 @@ Keep changes under `## Unreleased` in `CHANGELOG.md` during development. To rele
 3. Enter a semantic version without `v`, such as `0.1.0-alpha` or `0.1.0`.
 
 The workflow updates the workspace version and local dependency requirements in `Cargo.toml`,
-uses Cargo to update workspace versions in `Cargo.lock`, and moves Unreleased entries into
+fetches the complete locked dependency graph before using Cargo to update workspace versions in
+`Cargo.lock`, and moves Unreleased entries into
 `## [<version>] - YYYY-MM-DD` using the UTC date. Existing changelog history is preserved.
 Versions cannot decrease or reuse an existing release section/tag, and empty releases are refused.
 `semver` validates versions and `toml_edit` preserves the manifest layout; both are also used by
