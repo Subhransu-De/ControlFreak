@@ -90,7 +90,7 @@ fn run(args: &[String]) -> Result<()> {
             )
         }
         [command, state, report] if command == "remove" => {
-            report_result(Path::new(report), remove(Path::new(state)))
+            report_cleanup(Path::new(report), remove(Path::new(state)))
         }
         _ => Err("Invalid installer helper arguments."),
     }
@@ -274,69 +274,140 @@ fn configure(id: &str, executable: &Path, state: &Path, policy: &str) -> Result<
     ))
 }
 
-fn remove(state: &Path) -> Result<String> {
+#[derive(Default)]
+struct CleanupReport {
+    retained: Vec<&'static str>,
+    recovery: Vec<&'static str>,
+}
+
+fn report_cleanup(path: &Path, result: Result<CleanupReport>) -> Result<()> {
+    let report = match result {
+        Ok(report) => report,
+        Err(error) => return report_result(path, Err(error)),
+    };
+    let mut message = String::new();
+    if !report.retained.is_empty() {
+        write!(message, "Cleanup incomplete for: {}. Entries or setup receipts were retained; remove remaining ControlFreak entries manually. ", report.retained.join(", ")).map_err(|_| "Cannot format cleanup result.")?;
+    }
+    if !report.recovery.is_empty() {
+        write!(message, "Configuration write and rollback failed for: {}. Restore the configuration from its adjacent .controlfreak-backup-*.bak file before using that client. ", report.recovery.join(", ")).map_err(|_| "Cannot format cleanup result.")?;
+    }
+    let status = if message.is_empty() {
+        message.push_str("Installer-created MCP entries removed. ");
+        "ok"
+    } else {
+        "warning"
+    };
+    message.push_str("Configuration backups were retained.");
+    fs::write(
+        path,
+        format!("[result]\r\nstatus={status}\r\nmessage={message}\r\n"),
+    )
+    .map_err(|_| "Cannot write setup result.")?;
+    Ok(())
+}
+
+fn remove(state: &Path) -> Result<CleanupReport> {
     let _lock = lock()?;
-    let mut retained = false;
+    let mut report = CleanupReport::default();
     for id in clients::CLIENTS {
         let path = state.join(format!("{id}.json"));
         let Ok(stored) = storage::read(&path) else {
-            retained = true;
+            report.retained.push(id);
             continue;
         };
-        if let Some(text) = stored {
-            let Ok(verified_receipts) = receipts(&text, id) else {
-                retained = true;
-                continue;
-            };
-            for receipt in verified_receipts {
-                if !receipt.committed {
+        let Some(text) = stored else {
+            continue;
+        };
+        let Ok(receipts) = receipts(&text, id) else {
+            report.retained.push(id);
+            continue;
+        };
+        let mut retained = false;
+        let mut recovery = false;
+        let total = receipts.len();
+        let mut remaining = Vec::new();
+        for receipt in receipts {
+            match remove_entry(&receipt) {
+                storage::CleanupOutcome::Complete => (),
+                storage::CleanupOutcome::Retained => {
                     retained = true;
-                    continue;
+                    remaining.push(receipt);
                 }
-                let client = clients::Client {
-                    id: id.to_owned(),
-                    path: receipt.path,
-                    detected: true,
-                    note: "",
-                };
-                let Ok((original, mut document)) = load_document(&client) else {
-                    retained = true;
-                    continue;
-                };
-                let Ok(entry) = document.entry(clients::group(id)) else {
-                    retained = true;
-                    continue;
-                };
-                if entry
-                    .as_deref()
-                    .is_some_and(|entry| config::equivalent(entry, &receipt.entry, id == "codex"))
-                {
-                    document.set(clients::group(id), None)?;
-                    if !storage::remove_if_unchanged(
-                        &client.path,
-                        original.as_deref(),
-                        &document.render(),
-                    )? {
-                        retained = true;
-                    }
-                } else {
-                    retained = true;
+                storage::CleanupOutcome::RecoveryRequired => {
+                    recovery = true;
+                    remaining.push(receipt);
                 }
-            }
-            if fs::remove_file(path).is_err() {
-                retained = true;
             }
         }
+        // Keep unfinished profiles, dropping completed ownership records where
+        // possible. Receipt maintenance is optional and never stops other clients.
+        if remaining.is_empty() {
+            retained |= fs::remove_file(path).is_err();
+        } else if remaining.len() != total {
+            match serde_json::to_string(&remaining) {
+                Ok(updated) => {
+                    retained |= storage::write(&path, Some(&text), &updated, false).is_err();
+                }
+                Err(_) => retained = true,
+            }
+        }
+        if retained {
+            report.retained.push(id);
+        }
+        if recovery {
+            report.recovery.push(id);
+        }
     }
-    if retained {
-        Ok(
-            "Modified, unverified, unreadable or missing entries were left unchanged. Some setup receipts may remain. Configuration backups were retained."
-                .to_owned(),
-        )
-    } else {
-        Ok(
-            "Installer-created MCP entries removed. Configuration backups were retained."
-                .to_owned(),
-        )
+    Ok(report)
+}
+
+fn remove_entry(receipt: &Receipt) -> storage::CleanupOutcome {
+    use storage::CleanupOutcome;
+    if !receipt.committed {
+        return CleanupOutcome::Retained;
+    }
+    let client = clients::Client {
+        id: receipt.client.clone(),
+        path: receipt.path.clone(),
+        detected: true,
+        note: "",
+    };
+    let Ok((original, mut document)) = load_document(&client) else {
+        return CleanupOutcome::Retained;
+    };
+    let group = clients::group(&receipt.client);
+    let Ok(entry) = document.entry(group) else {
+        return CleanupOutcome::Retained;
+    };
+    let Some(entry) = entry else {
+        return CleanupOutcome::Complete;
+    };
+    if !config::equivalent(&entry, &receipt.entry, receipt.client == "codex")
+        || document.set(group, None).is_err()
+    {
+        return CleanupOutcome::Retained;
+    }
+    storage::remove_if_unchanged(&client.path, original.as_deref(), &document.render())
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_report_identifies_client_and_backup_without_exposing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("result.ini");
+        let report = CleanupReport {
+            retained: vec!["codex"],
+            recovery: vec!["claude-code"],
+        };
+        assert!(report_cleanup(&path, Ok(report)).is_ok());
+        let report = fs::read_to_string(path).unwrap();
+        assert!(report.contains("status=warning"));
+        assert!(report.contains("Cleanup incomplete for: codex"));
+        assert!(report.contains("rollback failed for: claude-code"));
+        assert!(report.contains(".controlfreak-backup-*.bak"));
     }
 }

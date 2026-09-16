@@ -57,80 +57,96 @@ fn lock_existing(path: &Path, original: &str) -> Result<File> {
     Ok(file)
 }
 
+/// Distinguishes completed work, retained data and failed recovery.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CleanupOutcome {
+    Complete,
+    Retained,
+    RecoveryRequired,
+}
+
 pub fn write(path: &Path, original: Option<&str>, updated: &str, backup: bool) -> Result<()> {
-    write_checked(path, original, updated, backup, false).map(|_| ())
-}
-
-/// A conflict before any write leaves the client configuration untouched.
-pub fn remove_if_unchanged(path: &Path, original: Option<&str>, updated: &str) -> Result<bool> {
-    if original.is_none() {
-        return Ok(false);
+    if let Some(original) = original {
+        let mut file = prepare_existing(path, original, backup)?;
+        return match update_existing(&mut file, original, updated, overwrite) {
+            CleanupOutcome::Complete => Ok(()),
+            CleanupOutcome::Retained => {
+                Err("Configuration update failed; original content was restored.")
+            }
+            CleanupOutcome::RecoveryRequired if backup => {
+                Err("Configuration update and rollback failed; restore the private backup.")
+            }
+            CleanupOutcome::RecoveryRequired => Err(
+                "Setup receipt update and rollback failed; client entries may require manual cleanup.",
+            ),
+        };
     }
-    write_checked(path, original, updated, true, true)
-}
-
-fn write_checked(
-    path: &Path,
-    original: Option<&str>,
-    updated: &str,
-    backup: bool,
-    retain_on_conflict: bool,
-) -> Result<bool> {
     let parent = path
         .parent()
         .ok_or("Configuration has no parent directory.")?;
     fs::create_dir_all(parent).map_err(|_| "Cannot create configuration directory.")?;
-    let mut file = match original.map(|text| lock_existing(path, text)).transpose() {
-        Ok(file) => file,
-        Err(_) if retain_on_conflict => return Ok(false),
-        Err(error) => return Err(error),
+    let mut replacement =
+        NamedTempFile::new_in(parent).map_err(|_| "Cannot stage configuration.")?;
+    replacement
+        .write_all(updated.as_bytes())
+        .map_err(|_| "Cannot write staged configuration.")?;
+    replacement
+        .as_file()
+        .sync_all()
+        .map_err(|_| "Cannot flush staged configuration.")?;
+    // If a client created the previously missing path, keep its content.
+    replacement
+        .persist_noclobber(path)
+        .map_err(|_| "Configuration appeared during setup; close the client and retry.")?;
+    Ok(())
+}
+
+/// Every preparation failure is non-mutating. Optional cleanup retains that file.
+/// A failed write is separately distinguished from a failed rollback.
+pub fn remove_if_unchanged(path: &Path, original: Option<&str>, updated: &str) -> CleanupOutcome {
+    let Some(original) = original else {
+        return CleanupOutcome::Retained;
     };
-    let updated = if original.is_some_and(|text| text.starts_with('\u{feff}')) {
+    let Ok(mut file) = prepare_existing(path, original, true) else {
+        return CleanupOutcome::Retained;
+    };
+    update_existing(&mut file, original, updated, overwrite)
+}
+
+fn prepare_existing(path: &Path, original: &str, backup: bool) -> Result<File> {
+    let file = lock_existing(path, original)?;
+    if backup {
+        // Inspect the locked source before creating or writing any backup.
+        validate_backup_attributes(
+            file.metadata()
+                .map_err(|_| "Cannot inspect configuration.")?
+                .file_attributes(),
+        )?;
+        save_backup(path, original)?;
+    }
+    Ok(file)
+}
+
+fn update_existing(
+    file: &mut File,
+    original: &str,
+    updated: &str,
+    mut write: impl FnMut(&mut File, &[u8]) -> std::io::Result<()>,
+) -> CleanupOutcome {
+    let updated = if original.starts_with('\u{feff}') {
         format!("\u{feff}{updated}")
     } else {
         updated.to_owned()
     };
-    if let (Some(file), Some(original)) = (file.as_mut(), original) {
-        if backup {
-            // Check the locked source before creating or writing any backup.
-            let protection = validate_backup_attributes(
-                file.metadata()
-                    .map_err(|_| "Cannot inspect configuration.")?
-                    .file_attributes(),
-            );
-            if retain_on_conflict && protection.is_err() {
-                return Ok(false);
-            }
-            protection?;
-            save_backup(path, original)?;
-        }
-        // A path-based atomic replace cannot retain an exclusive Windows handle
-        // on its destination. Write through the verified handle instead: no
-        // intervening client write/rename can invalidate the comparison.
-        if overwrite(file, updated.as_bytes()).is_err() {
-            if overwrite(file, original.as_bytes()).is_err() {
-                return Err(
-                    "Configuration update and rollback failed; restore the private backup.",
-                );
-            }
-            return Err("Configuration update failed; original content was restored.");
-        }
+    // Retain the exclusive handle through update and rollback. No competing
+    // writer or rename can invalidate the snapshot in either operation.
+    if write(file, updated.as_bytes()).is_ok() {
+        CleanupOutcome::Complete
+    } else if write(file, original.as_bytes()).is_ok() {
+        CleanupOutcome::Retained
     } else {
-        let mut replacement =
-            NamedTempFile::new_in(parent).map_err(|_| "Cannot stage configuration.")?;
-        replacement
-            .write_all(updated.as_bytes())
-            .map_err(|_| "Cannot write staged configuration.")?;
-        replacement
-            .as_file()
-            .sync_all()
-            .map_err(|_| "Cannot flush staged configuration.")?;
-        // If a client created the previously missing path, keep its content.
-        replacement
-            .persist_noclobber(path)
-            .map_err(|_| "Configuration appeared during setup; close the client and retry.")?;
+        CleanupOutcome::RecoveryRequired
     }
-    Ok(true)
 }
 
 fn validate_backup_attributes(attributes: u32) -> Result<()> {
@@ -190,14 +206,80 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         fs::write(&path, "newer").unwrap();
-        assert!(!remove_if_unchanged(&path, Some("original"), "removed").unwrap());
+        assert_eq!(
+            remove_if_unchanged(&path, Some("original"), "removed"),
+            CleanupOutcome::Retained
+        );
         let guard = lock_existing(&path, "newer").unwrap();
-        assert!(!remove_if_unchanged(&path, Some("newer"), "removed").unwrap());
+        assert_eq!(
+            remove_if_unchanged(&path, Some("newer"), "removed"),
+            CleanupOutcome::Retained
+        );
         drop(guard);
         assert_eq!(fs::read_to_string(&path).unwrap(), "newer");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
-        assert!(remove_if_unchanged(&path, Some("newer"), "removed").unwrap());
+        assert_eq!(
+            remove_if_unchanged(&path, Some("newer"), "removed"),
+            CleanupOutcome::Complete
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), "removed");
+    }
+
+    #[test]
+    fn backup_failure_happens_before_any_configuration_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{}.json", "x".repeat(235)));
+        fs::write(&path, "original").unwrap();
+        assert!(lock_existing(&path, "original").is_ok());
+        assert_eq!(
+            prepare_existing(&path, "original", true).unwrap_err(),
+            "Cannot create configuration backup."
+        );
+        assert_eq!(
+            remove_if_unchanged(&path, Some("original"), "updated"),
+            CleanupOutcome::Retained
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_update_distinguishes_restored_content_from_recovery() {
+        for fail_rollback in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.json");
+            fs::write(&path, "original").unwrap();
+            let mut file = prepare_existing(&path, "original", true).unwrap();
+            let mut attempts = 0;
+            let outcome = update_existing(&mut file, "original", "updated", |file, bytes| {
+                attempts += 1;
+                if attempts == 1 || fail_rollback {
+                    overwrite(file, b"partial")?;
+                    return Err(std::io::Error::other("synthetic write failure"));
+                }
+                overwrite(file, bytes)
+            });
+            drop(file);
+            assert_eq!(attempts, 2);
+            assert_eq!(
+                outcome,
+                if fail_rollback {
+                    CleanupOutcome::RecoveryRequired
+                } else {
+                    CleanupOutcome::Retained
+                }
+            );
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                if fail_rollback { "partial" } else { "original" }
+            );
+            let backup = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|item| item.unwrap().path())
+                .find(|item| item.extension().is_some_and(|ext| ext == "bak"))
+                .unwrap();
+            assert_eq!(fs::read_to_string(backup).unwrap(), "original");
+        }
     }
 
     #[test]

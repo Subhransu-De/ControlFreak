@@ -50,7 +50,10 @@ impl Fixture {
                 .arg(format!("/DIR={}", self.install.display()))
                 .arg("/CLIENTS=codex,claude-code,claude-desktop,pi,opencode");
         } else {
-            command.arg("/REMOVECONFIG=1");
+            command.arg("/REMOVECONFIG=1").arg(format!(
+                "/LOG={}",
+                self.output.join("uninstall.log").display()
+            ));
         }
         let result = process::run(&mut command, "", Duration::from_mins(1))?;
         result
@@ -105,6 +108,12 @@ pub fn run(directory: &Path, output: &Path, version: &str, production: bool) -> 
     // exits. A second scenario must not reinstall into that same directory.
     fixture.install = fixture.output.join("Missing helper/ControlFreak");
     verify_missing_helper_uninstall(&fixture, &installer)?;
+    fixture.install = fixture.output.join("Cleanup unavailable/ControlFreak");
+    fixture.profile = fixture.output.join("cleanup-unavailable-profile");
+    verify_failed_cleanup_uninstall(&fixture, &installer)?;
+    fixture.install = fixture.output.join("Cleanup warning/ControlFreak");
+    fixture.profile = fixture.output.join("cleanup-warning-profile");
+    verify_retained_cleanup_uninstall(&fixture, &installer)?;
     println!(
         "Installer lifecycle: client configuration, permissions, upgrades, refusals, partial failure and uninstall passed."
     );
@@ -227,6 +236,78 @@ fn verify_missing_helper_uninstall(fixture: &Fixture, installer: &Path) -> Resul
         if fs::read(fixture.profile.join(path))? != original {
             return Err("Missing-helper uninstall changed client configuration".into());
         }
+    }
+    Ok(())
+}
+
+fn verify_failed_cleanup_uninstall(fixture: &Fixture, installer: &Path) -> Result<()> {
+    if fixture.setup(installer, true)? != 0 {
+        return Err("Cleanup-failure fixture installation failed".into());
+    }
+    let configs = CLIENT_PATHS
+        .iter()
+        .map(|path| fs::read(fixture.profile.join(path)))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    // Make the real helper return an error before touching any configuration.
+    // This checks the installer's failure policy, not only helper exit codes.
+    let guard = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.profile.join("local/ControlFreak/installer.lock"))?;
+    guard.try_lock()?;
+    if fixture.setup(&fixture.install.join("unins000.exe"), false)? != 0
+        || fixture.install.join("controlfreak.exe").exists()
+        || fixture.registration.location()?.is_some()
+    {
+        return Err("Optional configuration cleanup failure prevented uninstall".into());
+    }
+    for (path, original) in CLIENT_PATHS.iter().zip(configs) {
+        if fs::read(fixture.profile.join(path))? != original {
+            return Err("Unavailable cleanup modified client configuration".into());
+        }
+    }
+    Ok(())
+}
+
+fn verify_retained_cleanup_uninstall(fixture: &Fixture, installer: &Path) -> Result<()> {
+    if fixture.setup(installer, true)? != 0 {
+        return Err("Cleanup-warning fixture installation failed".into());
+    }
+    let config = fixture.profile.join(CLIENT_PATHS[0]);
+    let original = fs::read(&config)?;
+    let _guard = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&config)?;
+    if fixture.setup(&fixture.install.join("unins000.exe"), false)? != 0
+        || fixture.install.join("controlfreak.exe").exists()
+        || fixture.registration.location()?.is_some()
+    {
+        return Err("Retained configuration prevented uninstall".into());
+    }
+    if fs::read(&config)? != original
+        || !fixture.install.join("installer-state/codex.json").exists()
+    {
+        return Err("Cleanup warning lost retained configuration or receipt".into());
+    }
+    for path in CLIENT_PATHS.iter().skip(1) {
+        if fs::read_to_string(fixture.profile.join(path))?.contains("controlfreak") {
+            return Err("Retained configuration prevented other client cleanup".into());
+        }
+    }
+    let bytes = fs::read(fixture.output.join("uninstall.log"))?;
+    let log = if bytes.starts_with(&[0xff, 0xfe]) {
+        String::from_utf16(
+            &bytes[2..]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect::<Vec<_>>(),
+        )?
+    } else {
+        String::from_utf8(bytes)?
+    };
+    if !log.contains("Cleanup incomplete for: codex") {
+        return Err("Successful helper exit concealed a cleanup warning".into());
     }
     Ok(())
 }

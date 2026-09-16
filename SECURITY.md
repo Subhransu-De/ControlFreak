@@ -20,7 +20,9 @@ input can still reach functionality exposed by an already-running desktop applic
 The optional Windows setup program and its separate `controlfreak-installer.exe` utility edit only
 the explicitly selected clients' MCP configuration. These are installation features, not MCP tools.
 Setup creates private configuration backups alongside existing files; those backups may contain
-credentials and are intentionally retained after uninstall. The setup utility reports fixed error
+credentials and are intentionally retained after uninstall. Backups preserve access permissions;
+EFS-encrypted source configurations are refused before backup creation. Optional uninstall cleanup
+retains data it cannot safely change and reports failed rollback as requiring backup recovery. The setup utility reports fixed error
 messages rather than configuration contents. It never enables `--allow-elevated` in generated client
 entries, starts a server, or changes the server's desktop-control checks. Run setup as the intended
 non-elevated user so configuration changes apply to that user.

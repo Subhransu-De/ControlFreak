@@ -569,3 +569,94 @@ fn undeletable_receipt_does_not_block_configuration_cleanup() {
     );
     drop(guard);
 }
+
+#[test]
+fn backup_preparation_failure_retains_config_and_continues_other_clients() {
+    let f = Fixture::new();
+    // A valid source filename whose added backup suffix exceeds NTFS's
+    // component limit forces backup creation failure without changing ACLs.
+    let config = f.path(&format!("user/{}.json", "x".repeat(235)));
+    assert!(f.configure("opencode", "replace").status.success());
+    fs::rename(f.path("user/.config/opencode/opencode.json"), &config).unwrap();
+    let mut receipt = f.json("state/opencode.json");
+    receipt[0]["path"] = serde_json::to_value(&config).unwrap();
+    f.write("state/opencode.json", &receipt.to_string());
+    let original = fs::read(&config).unwrap();
+    assert!(f.configure("codex", "replace").status.success());
+    assert!(f.remove().status.success(), "{}", f.report());
+    assert_eq!(fs::read(&config).unwrap(), original);
+    assert!(f.path("state/opencode.json").exists());
+    assert!(!f.path("state/codex.json").exists());
+    assert!(f.report().contains("status=warning"));
+    assert!(f.report().contains("opencode"));
+    assert!(
+        !fs::read_to_string(f.path("user/.codex/config.toml"))
+            .unwrap()
+            .contains("controlfreak")
+    );
+}
+
+#[test]
+fn busy_configuration_is_reported_and_can_be_retried_from_retained_receipt() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = Fixture::new();
+    assert!(f.configure("codex", "replace").status.success());
+    assert!(f.configure("claude-code", "replace").status.success());
+    let path = f.path("user/.codex/config.toml");
+    let original = fs::read(&path).unwrap();
+    let guard = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&path)
+        .unwrap();
+    assert!(f.remove().status.success(), "{}", f.report());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(f.path("state/codex.json").exists());
+    assert!(!f.path("state/claude-code.json").exists());
+    assert!(f.report().contains("status=warning"));
+    drop(guard);
+    assert!(f.remove().status.success(), "{}", f.report());
+    assert!(!f.path("state/codex.json").exists());
+    assert!(f.report().contains("status=ok"));
+    assert!(!fs::read_to_string(path).unwrap().contains("controlfreak"));
+}
+
+#[test]
+fn partial_profile_cleanup_drops_completed_ownership_and_retains_retry_state() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = Fixture::new();
+    assert!(f.configure("codex", "replace").status.success());
+    let second = f.path("user/second-codex");
+    let result = f
+        .command()
+        .env("CODEX_HOME", &second)
+        .arg("configure")
+        .arg("codex")
+        .arg(f.path("Apps/controlfreak.exe"))
+        .arg(f.path("state"))
+        .arg(f.path("result.ini"))
+        .arg("replace")
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", f.report());
+    let second_config = second.join("config.toml");
+    let original = fs::read(&second_config).unwrap();
+    let guard = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(f.path("user/.codex/config.toml"))
+        .unwrap();
+    assert!(f.remove().status.success(), "{}", f.report());
+    assert_eq!(f.json("state/codex.json").as_array().unwrap().len(), 1);
+    assert!(
+        !fs::read_to_string(&second_config)
+            .unwrap()
+            .contains("controlfreak")
+    );
+    // A manually recreated entry in the completed profile is no longer owned.
+    fs::write(&second_config, &original).unwrap();
+    drop(guard);
+    assert!(f.remove().status.success(), "{}", f.report());
+    assert_eq!(fs::read(second_config).unwrap(), original);
+    assert!(!f.path("state/codex.json").exists());
+}

@@ -11,13 +11,12 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ### Added
 
+- Optional uninstall configuration cleanup handles each client independently and never blocks
+  application removal. Unchanged files are retained when preparation fails; failed writes attempt
+  rollback, with explicit recovery warnings if rollback fails. Unfinished profiles retain receipts.
 - Configuration backups refuse EFS-encrypted source files rather than exposing plaintext.
-  Uninstall retains busy or concurrently changed configuration and continues cleanup,
-  including when a setup receipt cannot be deleted.
-
-- Uninstall retains malformed client configuration and damaged receipts, and continues when
-  its cleanup helper is unavailable. Configuration ownership is retained across client profile path changes and is
-  committed only after a successful configuration write.
+- Configuration ownership is preserved across client profile path changes and committed only
+  after a successful write. Malformed configurations and damaged receipts remain untouched.
 
 - Manual release workflow that prepares version files and dated changelog entries, verifies
   Windows packages, and creates the release commit, Git tag, and GitHub Release.
