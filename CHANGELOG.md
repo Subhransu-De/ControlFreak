@@ -20,6 +20,7 @@ change before the first release.
   version identity, piped MCP startup, synthetic client profiles, and installation lifecycle checks.
 - Statically linked MSVC runtime for Windows packages, avoiding a separate VC runtime installation.
 - Rust `cargo xtask` commands for compiler setup, packaging, verification, and release publication.
+- Blocking process names and PIDs in setup/uninstall diagnostics, using read-only Windows Restart Manager queries.
 
 - Native Windows STDIO MCP server with twenty-four computer-use tools.
 - Multi-display discovery, proportional screenshots, bounded region and window capture, and cursor

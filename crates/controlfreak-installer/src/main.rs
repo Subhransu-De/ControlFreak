@@ -50,6 +50,9 @@ fn run(args: &[String]) -> Result<()> {
         [command, id, executable, report] if command == "probe" => {
             report_result(Path::new(report), probe(id, Path::new(executable)))
         }
+        [command, directory, report] if command == "blockers" => {
+            blockers_report(Path::new(directory), Path::new(report))
+        }
         [command, id, executable, state, report, policy] if command == "configure" => {
             report_result(
                 Path::new(report),
@@ -61,6 +64,37 @@ fn run(args: &[String]) -> Result<()> {
         }
         _ => Err("Invalid installer helper arguments."),
     }
+}
+
+fn blockers_report(directory: &Path, report: &Path) -> Result<()> {
+    if !directory.is_absolute() {
+        return Err("Installation directory must be absolute.");
+    }
+    let files: Vec<_> = ["controlfreak.exe", "controlfreak-installer.exe"]
+        .iter()
+        .map(|name| directory.join(name))
+        .filter(|path| path.is_file())
+        .collect();
+    let message = match controlfreak_platform::installer_blockers(&files) {
+        Ok(blockers) => {
+            let names: Vec<_> = blockers.into_iter().filter(|item| item.pid != std::process::id())
+                .map(|item| format!("{} (PID {})", item.name, item.pid)).collect();
+            if names.is_empty() {
+                "No blocking process could be identified. Check write permissions for the installation folder and try again.".to_owned()
+            } else {
+                format!("Processes using this installation: {}. Stop these processes or disconnect their MCP clients, then try again.", names.join("; "))
+            }
+        }
+        Err(_) => "Windows could not identify the blocking processes. Close MCP clients using this installation and check folder permissions.".to_owned(),
+    };
+    // Windows' INI reader expects UTF-16 with BOM for non-ASCII application names.
+    // This private temporary report is read by Setup, never printed or uploaded.
+    let text = format!("[result]\r\nmessage={message}\r\n");
+    let bytes: Vec<_> = std::iter::once(0xfeff_u16)
+        .chain(text.encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    fs::write(report, bytes).map_err(|_| "Cannot write blocker diagnostics.")
 }
 
 fn report_result(path: &Path, result: Result<String>) -> Result<()> {

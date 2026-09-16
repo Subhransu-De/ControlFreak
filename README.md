@@ -59,8 +59,11 @@ service, enable elevated operation, or install an auto-updater.
 
 Stop MCP clients using the installed executable before upgrading or uninstalling. Setup retains
 the installation directory and refuses downgrades, including prerelease downgrades. To move an
-installation, uninstall it first. Locked files cause setup to stop for a retry; it does not terminate
-clients or schedule executable replacement at reboot.
+installation, uninstall it first. Locked files cause setup to stop and show process names and PIDs
+reported by Windows Restart Manager. Stop those processes or disconnect their MCP clients, then
+click Back and Install to retry. If Windows cannot identify a blocker, check folder permissions
+and close clients using this installation. Setup does not terminate clients or schedule executable
+replacement at reboot. A running server must be restarted to use the new version.
 
 Uninstall from Windows Settings or run `unins000.exe` in the install directory. Uninstall offers to
 remove the MCP entries written by setup, and removes an entry only if its complete value still

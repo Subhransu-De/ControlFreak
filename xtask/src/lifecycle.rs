@@ -1,10 +1,11 @@
 use crate::{Result, package, process, verify};
 use controlfreak_platform::packaging_tests::{self as native, Registration};
 use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::process::CommandExt;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::Duration,
 };
 
@@ -133,6 +134,7 @@ fn exercise(fixture: &Fixture, installer: &Path, directory: &Path, version: &str
         return Err("Backup permissions changed".into());
     }
     verify_updated_entry(fixture, &config)?;
+    verify_blocker_pid(fixture)?;
     let portable = fixture.output.join("portable comparison");
     verify::extract(&directory.join(package::archive_name(version)), &portable)?;
     for binary in package::BINARIES {
@@ -196,6 +198,47 @@ fn exercise(fixture: &Fixture, installer: &Path, directory: &Path, version: &str
         "Installer lifecycle: client configuration, permissions, upgrades, refusals, partial failure and uninstall passed."
     );
     Ok(())
+}
+
+fn verify_blocker_pid(fixture: &Fixture) -> Result<()> {
+    // This owned server waits for STDIO requests. No capture or mutation is sent.
+    let mut child = fixture
+        .command(&fixture.install.join("controlfreak.exe"))
+        .arg("--allow-elevated")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(0x0800_0000)
+        .spawn()?;
+    let result = (|| -> Result<()> {
+        let report = fixture.output.join("blockers.ini");
+        process::checked(
+            fixture
+                .command(&fixture.install.join("controlfreak-installer.exe"))
+                .arg("blockers")
+                .arg(&fixture.install)
+                .arg(&report),
+            Duration::from_secs(20),
+        )?;
+        let bytes = fs::read(report)?;
+        let words: Vec<_> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let text = String::from_utf16(&words)?;
+        if !text.contains(&format!("PID {}", child.id())) {
+            return Err("Blocker diagnostics did not identify the owned server PID".into());
+        }
+        if child.try_wait()?.is_some() {
+            return Err("Blocker inspection stopped the server".into());
+        }
+        Ok(())
+    })();
+    // Only terminate the server this fixture just started, retaining its handle
+    // through termination and reaping. Never terminate a process by name.
+    let _ = child.kill();
+    let _ = child.wait();
+    result
 }
 
 fn verify_updated_entry(fixture: &Fixture, config: &Path) -> Result<()> {

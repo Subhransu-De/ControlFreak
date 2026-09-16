@@ -20,6 +20,13 @@ mod installer_files;
 #[cfg(target_os = "windows")]
 pub use installer_files::copy_configuration_permissions;
 
+#[cfg(target_os = "windows")]
+#[path = "windows/installer_processes.rs"]
+mod installer_processes;
+
+#[cfg(target_os = "windows")]
+pub use installer_processes::{InstallerBlocker, installer_blockers};
+
 #[cfg(all(target_os = "windows", feature = "packaging-tests"))]
 #[path = "windows/packaging_tests.rs"]
 pub mod packaging_tests;

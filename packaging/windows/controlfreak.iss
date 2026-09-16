@@ -111,6 +111,18 @@ begin
     FileAvailable(AddBackslash(Directory) + 'controlfreak-installer.exe');
 end;
 
+function BlockingMessage(Directory, Helper: String): String;
+var
+  Report: String;
+  Code: Integer;
+begin
+  Report := ExpandConstant('{tmp}\controlfreak-blockers.ini');
+  DeleteFile(Report);
+  Exec(Helper, 'blockers ' + Quote(Directory) + ' ' + Quote(Report), '', SW_HIDE, ewWaitUntilTerminated, Code);
+  Result := GetIniString('result', 'message',
+    'Could not identify the blocking processes. Close MCP clients using this installation and check folder permissions.', Report);
+end;
+
 procedure InitializeWizard;
 var
   I: Integer;
@@ -180,7 +192,9 @@ begin
     end;
   end;
   if not InstalledFilesAvailable(ExpandConstant('{app}')) then
-    Result := 'ControlFreak files are in use or not writable. Stop the MCP clients using this installation, then click Retry. Setup never stops them automatically.';
+    Result := 'ControlFreak files cannot be updated.' + #13#10 + #13#10 +
+      BlockingMessage(ExpandConstant('{app}'), HelperPath) + #13#10 + #13#10 +
+      'Click Back, then Install to retry. Setup does not stop processes automatically.';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -216,7 +230,8 @@ function InitializeUninstall: Boolean;
 begin
   Result := InstalledFilesAvailable(ExpandConstant('{app}'));
   if not Result then
-    SuppressibleMsgBox('Stop the MCP clients using ControlFreak and retry uninstall. No processes were stopped.', mbError, MB_OK, IDOK);
+    SuppressibleMsgBox(BlockingMessage(ExpandConstant('{app}'), ExpandConstant('{app}\controlfreak-installer.exe')) + #13#10 +
+      'Run uninstall again after resolving the problem. No processes were stopped.', mbError, MB_OK, IDOK);
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
