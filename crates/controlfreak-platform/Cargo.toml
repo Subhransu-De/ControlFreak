@@ -28,6 +28,7 @@ windows = { workspace = true, features = [
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_RemoteDesktop",
+    "Win32_System_RestartManager",
     "Win32_System_Pipes",
     "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",
@@ -36,6 +37,10 @@ windows = { workspace = true, features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+winreg = { version = "0.56.0", optional = true }
 
 [lints]
 workspace = true
+
+[features]
+packaging-tests = ["dep:winreg", "windows/Win32_Storage_FileSystem", "windows/Win32_Security_Authorization"]

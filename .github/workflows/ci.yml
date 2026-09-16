@@ -82,8 +82,20 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
-      - name: Build optimized server
-        run: cargo build -p controlfreak-server --release --locked
+      - name: Build optimized server and installer helper
+        run: cargo build -p controlfreak-server -p controlfreak-installer --release --locked
+
+      - name: Install pinned portable compiler
+        run: cargo xtask compiler --output "$env:RUNNER_TEMP/inno"
+
+      - name: Build Windows installer and portable package
+        run: cargo xtask package --compiler "$env:RUNNER_TEMP/inno/compiler/ISCC.exe" --output "$env:RUNNER_TEMP/installer-package" --test-setup
+
+      - name: Verify portable executable and package checksums
+        run: cargo xtask verify --package "$env:RUNNER_TEMP/installer-package" --output "$env:RUNNER_TEMP/portable test 日本語"
+
+      - name: Verify installation lifecycle with synthetic client profiles
+        run: cargo xtask test-installer --package "$env:RUNNER_TEMP/installer-package" --output "$env:RUNNER_TEMP/installer-test"
 
   dependencies:
     name: Dependency policy

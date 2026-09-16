@@ -4,13 +4,35 @@ All notable changes to ControlFreak are documented in this file.
 
 The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-No version has been released yet. There is no tag and no published artifact. Everything below is
-unreleased and describes the current state of `main`. Tool contracts and installation details may
-change before the first release.
+Changes are collected under Unreleased. The release workflow moves them into a dated,
+versioned section and uses that section for the corresponding GitHub Release notes.
 
 ## Unreleased
 
 ### Added
+
+- Optional uninstall configuration cleanup handles each client independently and never blocks
+  application removal. Unchanged files are retained when preparation fails; failed writes attempt
+  rollback, with explicit recovery warnings if rollback fails. Ownership is invalidated before
+  cleanup so leftover receipts cannot claim recreated manual entries. Unfinished profiles retain receipts.
+- Configuration backups refuse EFS-encrypted source files rather than exposing plaintext.
+- Configuration ownership is preserved across client profile path changes and committed only
+  after a successful write. Malformed configurations and damaged receipts remain untouched.
+
+- Manual release workflow that prepares version files and dated changelog entries, verifies
+  Windows packages, and creates the release commit, Git tag, and GitHub Release.
+
+- Unsigned per-user Windows x64 setup executable with location selection, optional MCP configuration
+  for Codex, Claude Code, Claude Desktop, Pi, and OpenCode, and per-client installation results.
+- Configuration backups, automatic updates for selected clients, upgrade/downgrade checks, silent setup,
+  and conditional removal of installer-created MCP entries during uninstall.
+- Installer and portable release verification before publication, including checksums, executable
+  version identity, piped MCP startup, synthetic client profiles, and installation lifecycle checks.
+- Statically linked MSVC runtime for Windows packages, avoiding a separate VC runtime installation.
+- Rust `cargo xtask` commands for compiler setup, packaging, verification, and release publication.
+- Blocking process names and PIDs in separate bullet points, clear file-in-use instructions,
+  and a Try Again button that repeats installation checks. Diagnostics use read-only Windows
+  Restart Manager queries.
 
 - Native Windows STDIO MCP server with twenty-four computer-use tools.
 - Multi-display discovery, proportional screenshots, bounded region and window capture, and cursor

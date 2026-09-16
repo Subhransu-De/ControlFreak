@@ -1,12 +1,18 @@
 name: Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (without v), for example 0.1.0-alpha"
+        required: true
+        type: string
   push:
     tags:
       - "v*"
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-publication
   cancel-in-progress: false
 
 permissions:
@@ -14,15 +20,16 @@ permissions:
 
 jobs:
   release:
-    name: Build Windows release
+    name: Build and verify Windows release
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         run: rustup toolchain install 1.97.1 --profile minimal
@@ -30,67 +37,82 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
-      - name: Install release tools
+      - name: Prepare and validate release version and changelog
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
-          cargo install cargo-auditable --version 0.7.5 --locked
-          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and $env:GITHUB_REF -eq 'refs/heads/main') {
+            cargo xtask prepare-release --version $env:REQUESTED_VERSION --date (Get-Date -AsUTC -Format 'yyyy-MM-dd')
+            if ($LASTEXITCODE -ne 0) { throw 'Release preparation failed.' }
+            git show-ref --verify --quiet "refs/tags/v$env:REQUESTED_VERSION"
+            if ($LASTEXITCODE -eq 0) { throw 'This version is already tagged. Choose a new version or retry the existing tag.' }
+            if ($LASTEXITCODE -ne 1) { throw 'Could not check existing tags.' }
+          } elseif ($env:GITHUB_REF.StartsWith('refs/tags/')) {
+            if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and $env:GITHUB_REF_NAME -ne "v$env:REQUESTED_VERSION") {
+              throw 'The requested version must match the selected tag.'
+            }
+            cargo xtask version --tag $env:GITHUB_REF_NAME
+            if ($LASTEXITCODE -ne 0) { throw 'Release tag does not match the workspace.' }
+          } else {
+            throw 'Start a new release from main, or select an existing tag to retry publication.'
+          }
+          $releaseVersion = cargo xtask version
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot determine release version.' }
+          "RELEASE_TAG=v$releaseVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          cargo xtask release-notes --output "$env:RUNNER_TEMP/release-notes.md"
+          if ($LASTEXITCODE -ne 0) { throw 'Release changelog is missing or empty.' }
+
+      - name: Install cargo-auditable
+        run: cargo install cargo-auditable --version 0.7.5 --locked
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
 
       - name: Test release configuration
         run: cargo test --workspace --release --locked
 
-      - name: Build auditable server
-        run: cargo auditable build -p controlfreak-server --release --locked
+      - name: Build auditable server and setup helper
+        run: cargo auditable build -p controlfreak-server -p controlfreak-installer --release --locked
 
       - name: Generate CycloneDX SBOMs
-        run: cargo cyclonedx --format json --target x86_64-pc-windows-msvc --override-filename controlfreak.cdx.json
+        run: cargo cyclonedx --format json --target x86_64-pc-windows-msvc --override-filename controlfreak.cdx
 
-      - name: Package release
-        shell: pwsh
+      - name: Install pinned portable compiler
+        run: cargo xtask compiler --output "$env:RUNNER_TEMP/inno"
+
+      - name: Build installer and portable archive
+        run: cargo xtask package --compiler "$env:RUNNER_TEMP/inno/compiler/ISCC.exe" --output dist --tag $env:RELEASE_TAG --require-sbom
+
+      - name: Verify packaged executable and checksums
+        run: cargo xtask verify --package dist --output "$env:RUNNER_TEMP/portable test 日本語"
+
+      - name: Verify the production installer in a synthetic profile
+        run: cargo xtask test-installer --package dist --output "$env:RUNNER_TEMP/installer-test" --production-installer
+
+      - name: Commit release version and create tag
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $version = $env:GITHUB_REF_NAME
-          $packageName = "controlfreak-$version-x86_64-pc-windows-msvc"
-          $packageDir = Join-Path dist $packageName
-          New-Item -ItemType Directory -Path (Join-Path $packageDir "sbom") -Force | Out-Null
+          git add -- Cargo.toml Cargo.lock CHANGELOG.md
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { throw 'Release diff validation failed.' }
+          git diff --cached
+          if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the release diff.' }
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "chore: release $env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'Release commit failed.' }
+          git tag $env:RELEASE_TAG
+          if ($LASTEXITCODE -ne 0) { throw 'Tag creation failed.' }
+          gh auth setup-git
+          if ($LASTEXITCODE -ne 0) { throw 'Could not configure release authentication.' }
+          # Both refs move together. Concurrent changes to main fail without moving the tag.
+          git push --atomic origin HEAD:refs/heads/main "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'Release push failed. Check whether main advanced or branch rules blocked the push.' }
 
-          Copy-Item target/release/controlfreak.exe $packageDir
-          Copy-Item README.md, CHANGELOG.md, SECURITY.md, LICENSE, Cargo.lock $packageDir
-
-          if (Test-Path controlfreak.cdx.json) {
-            Copy-Item controlfreak.cdx.json (Join-Path $packageDir "sbom/workspace.cdx.json")
-          }
-
-          Get-ChildItem crates -Recurse -Filter controlfreak.cdx.json | ForEach-Object {
-            $crateName = Split-Path $_.DirectoryName -Leaf
-            Copy-Item $_.FullName (Join-Path $packageDir "sbom/$crateName.cdx.json")
-          }
-
-          $archive = Join-Path dist "$packageName.zip"
-          Compress-Archive -Path "$packageDir/*" -DestinationPath $archive
-          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
-          "$hash  $packageName.zip" | Set-Content "$archive.sha256"
-
+      # GITHUB_TOKEN-created tags do not trigger another push workflow. Publish
+      # here after verification, using the exact commit just tagged.
       - name: Publish GitHub release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          $assets = Get-ChildItem dist -File | Where-Object { $_.Extension -in ".zip", ".sha256" }
-          $versions = @(
-            (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages.version |
-              Sort-Object -Unique
-          )
-          if ($versions.Count -ne 1) {
-            throw "Workspace packages must share one version before a release can be published."
-          }
-
-          $workspaceVersion = $versions[0]
-          if ($env:GITHUB_REF_NAME -ne "v$workspaceVersion") {
-            throw "Tag $env:GITHUB_REF_NAME does not match workspace version $workspaceVersion."
-          }
-
-          $releaseKind = @()
-          if ($workspaceVersion -match "-") {
-            $releaseKind = @("--prerelease")
-          }
-
-          gh release create $env:GITHUB_REF_NAME @($assets.FullName) @releaseKind --verify-tag --generate-notes --title $env:GITHUB_REF_NAME
+        run: cargo xtask publish --package dist --tag $env:RELEASE_TAG
