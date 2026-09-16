@@ -312,7 +312,13 @@ fn remove(state: &Path) -> Result<String> {
                     .is_some_and(|entry| config::equivalent(entry, &receipt.entry, id == "codex"))
                 {
                     document.set(clients::group(id), None)?;
-                    storage::write(&client.path, original.as_deref(), &document.render(), true)?;
+                    if !storage::remove_if_unchanged(
+                        &client.path,
+                        original.as_deref(),
+                        &document.render(),
+                    )? {
+                        retained = true;
+                    }
                 } else {
                     retained = true;
                 }

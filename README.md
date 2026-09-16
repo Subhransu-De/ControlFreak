@@ -32,8 +32,9 @@ Project-specific or managed client configuration can take precedence over these 
 
 Setup preserves other settings and servers, including TOML and JSONC comments. For each selected
 client, setup installs or updates its ControlFreak entry automatically. Before changing an
-existing file, setup saves a uniquely named `<filename>.controlfreak-backup-*.bak` beside it. Treat
-these backups as private: they can contain credentials from the original configuration. Malformed,
+existing file, setup saves a uniquely named `<filename>.controlfreak-backup-*.bak` beside it.
+EFS-encrypted configuration files require manual setup; setup refuses to create a plaintext backup.
+Treat these backups as private: they can contain credentials from the original configuration. Malformed,
 duplicate-key, unsupported, or concurrently changed configurations are left for manual recovery.
 Existing files are updated through an exclusive Windows handle after their backup is flushed.
 This blocks competing writes and renames during the update. A write failure attempts rollback;
@@ -66,7 +67,7 @@ with its PID. If Windows cannot identify a blocker, check folder permissions and
 using this installation. Setup does not terminate clients or schedule executable
 replacement at reboot. A running server must be restarted to use the new version.
 
-Uninstall leaves malformed or unreadable client configuration unchanged. It also retains entries
+Uninstall leaves malformed, unreadable, busy or concurrently changed client configuration unchanged. It also retains entries
 whose receipts are damaged or unreadable. If the configuration helper is missing or cannot start,
 application removal continues and client entries must be removed manually.
 Reconfiguring a client at a new profile path preserves the previous installation receipt so

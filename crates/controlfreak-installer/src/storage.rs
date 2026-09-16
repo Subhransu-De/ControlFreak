@@ -3,7 +3,7 @@ use crate::config::Result;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::windows::fs::OpenOptionsExt,
+    os::windows::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
 };
 use tempfile::NamedTempFile;
@@ -58,11 +58,33 @@ fn lock_existing(path: &Path, original: &str) -> Result<File> {
 }
 
 pub fn write(path: &Path, original: Option<&str>, updated: &str, backup: bool) -> Result<()> {
+    write_checked(path, original, updated, backup, false).map(|_| ())
+}
+
+/// A conflict before any write leaves the client configuration untouched.
+pub fn remove_if_unchanged(path: &Path, original: Option<&str>, updated: &str) -> Result<bool> {
+    if original.is_none() {
+        return Ok(false);
+    }
+    write_checked(path, original, updated, true, true)
+}
+
+fn write_checked(
+    path: &Path,
+    original: Option<&str>,
+    updated: &str,
+    backup: bool,
+    retain_on_conflict: bool,
+) -> Result<bool> {
     let parent = path
         .parent()
         .ok_or("Configuration has no parent directory.")?;
     fs::create_dir_all(parent).map_err(|_| "Cannot create configuration directory.")?;
-    let mut file = original.map(|text| lock_existing(path, text)).transpose()?;
+    let mut file = match original.map(|text| lock_existing(path, text)).transpose() {
+        Ok(file) => file,
+        Err(_) if retain_on_conflict => return Ok(false),
+        Err(error) => return Err(error),
+    };
     let updated = if original.is_some_and(|text| text.starts_with('\u{feff}')) {
         format!("\u{feff}{updated}")
     } else {
@@ -70,6 +92,16 @@ pub fn write(path: &Path, original: Option<&str>, updated: &str, backup: bool) -
     };
     if let (Some(file), Some(original)) = (file.as_mut(), original) {
         if backup {
+            // Check the locked source before creating or writing any backup.
+            let protection = validate_backup_attributes(
+                file.metadata()
+                    .map_err(|_| "Cannot inspect configuration.")?
+                    .file_attributes(),
+            );
+            if retain_on_conflict && protection.is_err() {
+                return Ok(false);
+            }
+            protection?;
             save_backup(path, original)?;
         }
         // A path-based atomic replace cannot retain an exclusive Windows handle
@@ -97,6 +129,14 @@ pub fn write(path: &Path, original: Option<&str>, updated: &str, backup: bool) -
         replacement
             .persist_noclobber(path)
             .map_err(|_| "Configuration appeared during setup; close the client and retry.")?;
+    }
+    Ok(true)
+}
+
+fn validate_backup_attributes(attributes: u32) -> Result<()> {
+    const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x4000;
+    if attributes & FILE_ATTRIBUTE_ENCRYPTED != 0 {
+        return Err("Encrypted configurations require manual setup; no backup was created.");
     }
     Ok(())
 }
@@ -139,6 +179,27 @@ fn save_backup(path: &Path, original: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn encrypted_configuration_backup_is_refused() {
+        assert!(validate_backup_attributes(0x4020).is_err());
+        assert!(validate_backup_attributes(0x20).is_ok());
+    }
+
+    #[test]
+    fn uninstall_retains_a_changed_or_busy_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(&path, "newer").unwrap();
+        assert!(!remove_if_unchanged(&path, Some("original"), "removed").unwrap());
+        let guard = lock_existing(&path, "newer").unwrap();
+        assert!(!remove_if_unchanged(&path, Some("newer"), "removed").unwrap());
+        drop(guard);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "newer");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert!(remove_if_unchanged(&path, Some("newer"), "removed").unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "removed");
+    }
+
     #[test]
     fn verified_handle_excludes_competing_writes_and_replacements() {
         let dir = tempfile::tempdir().unwrap();
