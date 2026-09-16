@@ -13,7 +13,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 - Optional uninstall configuration cleanup handles each client independently and never blocks
   application removal. Unchanged files are retained when preparation fails; failed writes attempt
-  rollback, with explicit recovery warnings if rollback fails. Unfinished profiles retain receipts.
+  rollback, with explicit recovery warnings if rollback fails. Ownership is invalidated before
+  cleanup so leftover receipts cannot claim recreated manual entries. Unfinished profiles retain receipts.
 - Configuration backups refuse EFS-encrypted source files rather than exposing plaintext.
 - Configuration ownership is preserved across client profile path changes and committed only
   after a successful write. Malformed configurations and damaged receipts remain untouched.

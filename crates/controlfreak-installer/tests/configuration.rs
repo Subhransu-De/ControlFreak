@@ -542,7 +542,7 @@ fn damaged_receipts_retain_their_config_without_blocking_other_cleanup() {
 }
 
 #[test]
-fn undeletable_receipt_does_not_block_configuration_cleanup() {
+fn unavailable_receipt_retains_its_config_without_blocking_other_cleanup() {
     use std::os::windows::fs::OpenOptionsExt;
     let f = Fixture::new();
     assert!(f.configure("codex", "replace").status.success());
@@ -558,7 +558,7 @@ fn undeletable_receipt_does_not_block_configuration_cleanup() {
     assert!(receipt.exists());
     assert!(!f.path("state/claude-code.json").exists());
     assert!(
-        !fs::read_to_string(f.path("user/.codex/config.toml"))
+        fs::read_to_string(f.path("user/.codex/config.toml"))
             .unwrap()
             .contains("controlfreak")
     );

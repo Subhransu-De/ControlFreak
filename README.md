@@ -70,7 +70,9 @@ replacement at reboot. A running server must be restarted to use the new version
 Optional MCP configuration cleanup never blocks application removal. Each client is handled
 independently. Malformed, unreadable, busy, concurrently changed or unverified configurations are
 retained, as are files whose backups cannot be safely created. Unfinished profiles keep their receipts
-for retry or recovery. Cleanup warnings identify affected clients; if a write and its rollback both
+for retry or recovery. Cleanup invalidates recorded ownership before touching a configuration;
+if that cannot be saved, the configuration is retained. Interrupted cleanup can leave uncommitted
+receipts that require manual cleanup. Cleanup warnings identify affected clients; if a write and its rollback both
 fail, restore that client's configuration from its adjacent `.controlfreak-backup-*.bak` file.
 A missing or failing helper leaves cleanup for manual inspection. Interactive uninstall displays
 warnings; unattended uninstall continues and records available warnings in its Inno `/LOG` output.

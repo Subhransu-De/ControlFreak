@@ -14,7 +14,7 @@ use std::{
     process::ExitCode,
 };
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Receipt {
     client: String,
@@ -323,9 +323,15 @@ fn remove(state: &Path) -> Result<CleanupReport> {
             report.retained.push(id);
             continue;
         };
+        // Invalidate persistent ownership before touching client data. If the
+        // helper is interrupted or final receipt maintenance fails, the journal
+        // cannot claim a subsequently recreated manual entry.
+        let Ok(pending) = invalidate_receipts(&path, &text, &receipts) else {
+            report.retained.push(id);
+            continue;
+        };
         let mut retained = false;
         let mut recovery = false;
-        let total = receipts.len();
         let mut remaining = Vec::new();
         for receipt in receipts {
             match remove_entry(&receipt) {
@@ -336,22 +342,15 @@ fn remove(state: &Path) -> Result<CleanupReport> {
                 }
                 storage::CleanupOutcome::RecoveryRequired => {
                     recovery = true;
-                    remaining.push(receipt);
+                    let mut unverified = receipt;
+                    unverified.committed = false;
+                    remaining.push(unverified);
                 }
             }
         }
-        // Keep unfinished profiles, dropping completed ownership records where
-        // possible. Receipt maintenance is optional and never stops other clients.
-        if remaining.is_empty() {
-            retained |= fs::remove_file(path).is_err();
-        } else if remaining.len() != total {
-            match serde_json::to_string(&remaining) {
-                Ok(updated) => {
-                    retained |= storage::write(&path, Some(&text), &updated, false).is_err();
-                }
-                Err(_) => retained = true,
-            }
-        }
+        // Only untouched or successfully restored profiles may regain ownership.
+        // Failure leaves the uncommitted journal, never stale completed ownership.
+        retained |= finish_receipts(&path, &pending, &remaining).is_err();
         if retained {
             report.retained.push(id);
         }
@@ -360,6 +359,26 @@ fn remove(state: &Path) -> Result<CleanupReport> {
         }
     }
     Ok(report)
+}
+
+fn invalidate_receipts(path: &Path, original: &str, receipts: &[Receipt]) -> Result<String> {
+    let mut journal = receipts.to_vec();
+    for receipt in &mut journal {
+        receipt.committed = false;
+    }
+    let pending = serde_json::to_string(&journal).map_err(|_| "Cannot encode setup receipt.")?;
+    storage::write(path, Some(original), &pending, false)?;
+    Ok(pending)
+}
+
+fn finish_receipts(path: &Path, pending: &str, remaining: &[Receipt]) -> Result<()> {
+    if remaining.is_empty() {
+        fs::remove_file(path).map_err(|_| "Cannot remove setup receipt.")
+    } else {
+        let updated =
+            serde_json::to_string(remaining).map_err(|_| "Cannot encode setup receipt.")?;
+        storage::write(path, Some(pending), &updated, false)
+    }
 }
 
 fn remove_entry(receipt: &Receipt) -> storage::CleanupOutcome {
@@ -394,6 +413,49 @@ fn remove_entry(receipt: &Receipt) -> storage::CleanupOutcome {
 #[cfg(test)]
 mod cleanup_tests {
     use super::*;
+
+    #[test]
+    fn failed_receipt_deletion_cannot_claim_a_recreated_manual_entry() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("client.json");
+        let receipt_path = dir.path().join("receipt.json");
+        let entry = r#"{"command":"synthetic.exe","args":[]}"#;
+        let original_config = format!("{{\"mcpServers\":{{\"controlfreak\":{entry}}}}}");
+        fs::write(&config_path, &original_config).unwrap();
+        let receipt = Receipt {
+            client: "claude-code".into(),
+            path: config_path.clone(),
+            entry: entry.into(),
+            committed: true,
+        };
+        let original_receipt = serde_json::to_string(&vec![receipt.clone()]).unwrap();
+        fs::write(&receipt_path, &original_receipt).unwrap();
+        let pending = invalidate_receipts(
+            &receipt_path,
+            &original_receipt,
+            std::slice::from_ref(&receipt),
+        )
+        .unwrap();
+        assert_eq!(remove_entry(&receipt), storage::CleanupOutcome::Complete);
+        // A handle appearing after cleanup can deny final receipt deletion.
+        let guard = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&receipt_path)
+            .unwrap();
+        assert!(finish_receipts(&receipt_path, &pending, &[]).is_err());
+        drop(guard);
+        fs::write(&config_path, &original_config).unwrap();
+        let retained =
+            receipts(&fs::read_to_string(&receipt_path).unwrap(), "claude-code").unwrap();
+        assert!(!retained[0].committed);
+        assert_eq!(
+            remove_entry(&retained[0]),
+            storage::CleanupOutcome::Retained
+        );
+        assert_eq!(fs::read_to_string(config_path).unwrap(), original_config);
+    }
 
     #[test]
     fn recovery_report_identifies_client_and_backup_without_exposing_config() {
