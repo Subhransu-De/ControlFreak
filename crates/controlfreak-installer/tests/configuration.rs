@@ -540,3 +540,32 @@ fn damaged_receipts_retain_their_config_without_blocking_other_cleanup() {
         );
     }
 }
+
+#[test]
+fn undeletable_receipt_does_not_block_configuration_cleanup() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = Fixture::new();
+    assert!(f.configure("codex", "replace").status.success());
+    assert!(f.configure("claude-code", "replace").status.success());
+    let receipt = f.path("state/codex.json");
+    // Allow reads but deny deletion until the synthetic guard is released.
+    let guard = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&receipt)
+        .unwrap();
+    assert!(f.remove().status.success(), "{}", f.report());
+    assert!(receipt.exists());
+    assert!(!f.path("state/claude-code.json").exists());
+    assert!(
+        !fs::read_to_string(f.path("user/.codex/config.toml"))
+            .unwrap()
+            .contains("controlfreak")
+    );
+    assert!(
+        f.json("user/.claude.json")["mcpServers"]
+            .get("controlfreak")
+            .is_none()
+    );
+    drop(guard);
+}

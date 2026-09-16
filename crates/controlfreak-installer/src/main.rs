@@ -323,12 +323,14 @@ fn remove(state: &Path) -> Result<String> {
                     retained = true;
                 }
             }
-            fs::remove_file(path).map_err(|_| "Cannot remove setup receipt.")?;
+            if fs::remove_file(path).is_err() {
+                retained = true;
+            }
         }
     }
     if retained {
         Ok(
-            "Modified, unverified, unreadable or missing entries were left unchanged. Configuration backups were retained."
+            "Modified, unverified, unreadable or missing entries were left unchanged. Some setup receipts may remain. Configuration backups were retained."
                 .to_owned(),
         )
     } else {

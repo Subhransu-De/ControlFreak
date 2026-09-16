@@ -12,7 +12,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 ### Added
 
 - Configuration backups refuse EFS-encrypted source files rather than exposing plaintext.
-  Uninstall retains busy or concurrently changed configuration and continues cleanup.
+  Uninstall retains busy or concurrently changed configuration and continues cleanup,
+  including when a setup receipt cannot be deleted.
 
 - Uninstall retains malformed client configuration and damaged receipts, and continues when
   its cleanup helper is unavailable. Configuration ownership is retained across client profile path changes and is
