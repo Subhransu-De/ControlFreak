@@ -226,8 +226,15 @@ fn verify_blocker_pid(fixture: &Fixture) -> Result<()> {
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         let text = String::from_utf16(&words)?;
-        if !text.contains(&format!("PID {}", child.id())) {
+        if !text.contains(&format!("PID: {}", child.id())) {
             return Err("Blocker diagnostics did not identify the owned server PID".into());
+        }
+        if !text
+            .lines()
+            .any(|line| line.starts_with("process0=") && line.contains("PID: "))
+            || !text.contains("\r\naction=")
+        {
+            return Err("Blocker report must separate instructions and process entries".into());
         }
         if child.try_wait()?.is_some() {
             return Err("Blocker inspection stopped the server".into());

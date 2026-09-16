@@ -75,6 +75,10 @@ var
   ClientIds, ClientNames: TArrayOfString;
   SetupResults: String;
   ConfigurationFailed: Boolean;
+  FilesBlocked: Boolean;
+  BlockerDetails: TNewMemo;
+  RetryButton: TNewButton;
+  BlockerText: String;
 
 function Quote(Value: String): String;
 begin
@@ -114,13 +118,30 @@ end;
 function BlockingMessage(Directory, Helper: String): String;
 var
   Report: String;
-  Code: Integer;
+  Code, I, Count: Integer;
 begin
   Report := ExpandConstant('{tmp}\controlfreak-blockers.ini');
   DeleteFile(Report);
   Exec(Helper, 'blockers ' + Quote(Directory) + ' ' + Quote(Report), '', SW_HIDE, ewWaitUntilTerminated, Code);
   Result := GetIniString('result', 'message',
-    'Could not identify the blocking processes. Close MCP clients using this installation and check folder permissions.', Report);
+    'Setup cannot replace the ControlFreak files.', Report) + #13#10 + #13#10 +
+    GetIniString('result', 'action',
+      'Close clients using ControlFreak and check that you can write to the installation folder. Blocking processes could not be identified.', Report);
+  Count := GetIniInt('result', 'count', 0, 0, 4096, Report);
+  if Count > 0 then begin
+    Result := Result + #13#10 + #13#10 + 'Processes to stop:';
+    for I := 0 to Count - 1 do
+      Result := Result + #13#10 + '  ' + #$2022 + ' ' + GetIniString('result', 'process' + IntToStr(I), '', Report);
+  end;
+end;
+
+procedure RetryInstall(Sender: TObject);
+begin
+  RetryButton.Enabled := False;
+  // Re-enter preparation through normal wizard navigation so every check runs
+  // again. Advancing directly from a failed wpPreparing would exit Setup.
+  WizardForm.BackButton.OnClick(WizardForm.BackButton);
+  WizardForm.NextButton.OnClick(WizardForm.NextButton);
 end;
 
 procedure InitializeWizard;
@@ -132,6 +153,23 @@ begin
   ClientIds := ['codex', 'claude-code', 'claude-desktop', 'pi', 'opencode'];
   ClientNames := ['Codex', 'Claude Code', 'Claude Desktop', 'Pi', 'OpenCode'];
   ExtractTemporaryFile('controlfreak-installer.exe');
+  BlockerDetails := TNewMemo.Create(WizardForm);
+  BlockerDetails.Parent := WizardForm.PreparingPage;
+  BlockerDetails.SetBounds(WizardForm.PreparingLabel.Left, WizardForm.PreparingLabel.Top,
+    WizardForm.PreparingLabel.Width, WizardForm.PreparingPage.Height - WizardForm.PreparingLabel.Top);
+  BlockerDetails.ReadOnly := True;
+  BlockerDetails.BorderStyle := bsNone;
+  BlockerDetails.Color := WizardForm.PreparingPage.Color;
+  BlockerDetails.ScrollBars := ssNone;
+  BlockerDetails.WordWrap := True;
+  BlockerDetails.Visible := False;
+  RetryButton := TNewButton.Create(WizardForm);
+  RetryButton.Parent := WizardForm.NextButton.Parent;
+  RetryButton.SetBounds(WizardForm.NextButton.Left, WizardForm.NextButton.Top,
+    WizardForm.NextButton.Width, WizardForm.NextButton.Height);
+  RetryButton.Caption := 'Try Again';
+  RetryButton.OnClick := @RetryInstall;
+  RetryButton.Visible := False;
   ClientsPage := CreateInputOptionPage(wpSelectDir, 'Configure MCP clients',
     'Choose which existing clients can use ControlFreak.',
     'Select clients to install or update their ControlFreak connection. Close selected clients before installing.', False, False);
@@ -151,6 +189,16 @@ end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
+  RetryButton.Visible := (CurPageID = wpPreparing) and FilesBlocked;
+  BlockerDetails.Visible := RetryButton.Visible;
+  if RetryButton.Visible then begin
+    WizardForm.PreparingLabel.Visible := False;
+    BlockerDetails.Text := BlockerText;
+    WizardForm.NextButton.Visible := False;
+    RetryButton.Enabled := True;
+    RetryButton.Default := True;
+    if not WizardSilent then WizardForm.ActiveControl := RetryButton;
+  end else RetryButton.Default := False;
   if CurPageID = ClientsPage.ID then
     WizardForm.NextButton.Caption := 'Install';
   if CurPageID = wpFinished then begin
@@ -177,6 +225,7 @@ var
   Code: Integer;
 begin
   Result := '';
+  FilesBlocked := False;
   if RegQueryStringValue(HKCU64, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#Identity}_is1', 'InstallLocation', PreviousDirectory) then begin
     if CompareText(RemoveBackslashUnlessRoot(PreviousDirectory), RemoveBackslashUnlessRoot(ExpandConstant('{app}'))) <> 0 then begin
       Result := 'Use the existing installation directory when upgrading, or uninstall ControlFreak before moving it.';
@@ -191,10 +240,13 @@ begin
       exit;
     end;
   end;
-  if not InstalledFilesAvailable(ExpandConstant('{app}')) then
-    Result := 'ControlFreak files cannot be updated.' + #13#10 + #13#10 +
-      BlockingMessage(ExpandConstant('{app}'), HelperPath) + #13#10 + #13#10 +
-      'Click Back, then Install to retry. Setup does not stop processes automatically.';
+  if not InstalledFilesAvailable(ExpandConstant('{app}')) then begin
+    FilesBlocked := True;
+    BlockerText := BlockingMessage(ExpandConstant('{app}'), HelperPath) + #13#10 + #13#10 +
+      'When finished, click Try Again to continue installation.';
+    // Keep process details out of Inno Setup's automatic failure log.
+    Result := 'ControlFreak files cannot be updated.';
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);

@@ -8,6 +8,7 @@ use config::{Document, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     env,
+    fmt::Write as _,
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
     process::ExitCode,
@@ -75,21 +76,44 @@ fn blockers_report(directory: &Path, report: &Path) -> Result<()> {
         .map(|name| directory.join(name))
         .filter(|path| path.is_file())
         .collect();
-    let message = match controlfreak_platform::installer_blockers(&files) {
+    let (message, action, names) = match controlfreak_platform::installer_blockers(&files) {
         Ok(blockers) => {
-            let names: Vec<_> = blockers.into_iter().filter(|item| item.pid != std::process::id())
-                .map(|item| format!("{} (PID {})", item.name, item.pid)).collect();
+            let names: Vec<_> = blockers
+                .into_iter()
+                .filter(|item| item.pid != std::process::id())
+                .map(|item| format!("{} - PID: {}", item.name, item.pid))
+                .collect();
             if names.is_empty() {
-                "No blocking process could be identified. Check write permissions for the installation folder and try again.".to_owned()
+                (
+                    "Setup cannot replace the ControlFreak files.",
+                    "Close clients using ControlFreak and check that you can write to the installation folder. Windows could not identify a blocking process.",
+                    names,
+                )
             } else {
-                format!("Processes using this installation: {}. Stop these processes or disconnect their MCP clients, then try again.", names.join("; "))
+                (
+                    "ControlFreak is in use. Setup cannot update it while these processes are running.",
+                    "Close the clients using ControlFreak, or open Task Manager > Details and end the processes listed below.",
+                    names,
+                )
             }
         }
-        Err(_) => "Windows could not identify the blocking processes. Close MCP clients using this installation and check folder permissions.".to_owned(),
+        Err(_) => (
+            "Setup cannot replace the ControlFreak files.",
+            "Close clients using ControlFreak and check that you can write to the installation folder. Windows could not identify the blocking processes.",
+            Vec::new(),
+        ),
     };
     // Windows' INI reader expects UTF-16 with BOM for non-ASCII application names.
+    // Keep each process on its own key: INI values cannot contain line breaks.
     // This private temporary report is read by Setup, never printed or uploaded.
-    let text = format!("[result]\r\nmessage={message}\r\n");
+    let mut text = format!(
+        "[result]\r\nmessage={message}\r\naction={action}\r\ncount={}\r\n",
+        names.len()
+    );
+    for (index, name) in names.iter().enumerate() {
+        write!(text, "process{index}={name}\r\n")
+            .map_err(|_| "Cannot format blocker diagnostics.")?;
+    }
     let bytes: Vec<_> = std::iter::once(0xfeff_u16)
         .chain(text.encode_utf16())
         .flat_map(u16::to_le_bytes)
