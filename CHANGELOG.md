@@ -9,6 +9,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+## [0.1.0-alpha] - 2026-09-16
+
 ### Added
 
 - Optional uninstall configuration cleanup handles each client independently and never blocks
