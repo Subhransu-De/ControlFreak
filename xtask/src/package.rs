@@ -225,22 +225,64 @@ pub fn build(
     Ok(())
 }
 
-pub fn publish(directory: &Path, tag: &str, version: &str) -> Result<()> {
-    if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
-        || std::env::var("GITHUB_REF").as_deref() != Ok(format!("refs/tags/{tag}").as_str())
-    {
-        return Err("Publication is restricted to the tag release workflow".into());
+pub fn publish(directory: &Path, tag: &str, metadata: &Metadata) -> Result<()> {
+    let version = metadata.version()?;
+    let event = std::env::var("GITHUB_EVENT_NAME").unwrap_or_default();
+    let reference = std::env::var("GITHUB_REF").unwrap_or_default();
+    let tag_ref = format!("refs/tags/{tag}");
+    let allowed = (event == "push" && reference == tag_ref)
+        || (event == "workflow_dispatch"
+            && (reference == "refs/heads/main" || reference == tag_ref));
+    if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true") || !allowed {
+        return Err("Publication is restricted to the GitHub Actions release workflow".into());
     }
+    let repository = std::env::var("GITHUB_REPOSITORY")?;
+    let remote = process::checked(
+        Command::new("gh").args([
+            "api",
+            &format!("repos/{repository}/git/ref/tags/{tag}"),
+            "--jq",
+            ".object",
+        ]),
+        Duration::from_mins(1),
+    )?;
+    let mut object: serde_json::Value = serde_json::from_str(&remote.stdout)?;
+    // Peel annotated tags as well as accepting lightweight tags, without
+    // accidentally resolving a branch that has the same name as the tag.
+    for _ in 0..8 {
+        if object["type"] != "tag" {
+            break;
+        }
+        let sha = object["sha"].as_str().ok_or("Missing tag object SHA")?;
+        let target = process::checked(
+            Command::new("gh").args([
+                "api",
+                &format!("repos/{repository}/git/tags/{sha}"),
+                "--jq",
+                ".object",
+            ]),
+            Duration::from_mins(1),
+        )?;
+        object = serde_json::from_str(&target.stdout)?;
+    }
+    let head = process::checked(
+        Command::new("git").args(["rev-parse", "HEAD"]),
+        Duration::from_secs(10),
+    )?;
+    if object["type"] != "commit" || object["sha"].as_str() != Some(head.stdout.trim()) {
+        return Err("Release tag does not point to the built commit".into());
+    }
+    let changelog = fs::read_to_string(metadata.workspace_root.join("CHANGELOG.md"))?;
+    let notes_path = directory.join("release-notes.md");
+    let notes = crate::release::notes(&changelog, version)?;
+    fs::write(
+        &notes_path,
+        format!(
+            "{notes}\nWindows x64: download the EXE installer for installation and optional MCP client configuration, or the ZIP for portable use. These binaries are unsigned. SHA-256 checksums are included; each package contains license information and SBOMs.\n"
+        ),
+    )?;
     let mut command = Command::new("gh");
-    command.args([
-        "release",
-        "create",
-        tag,
-        "--verify-tag",
-        "--generate-notes",
-        "--title",
-        tag,
-    ]);
+    command.args(["release", "create", tag, "--verify-tag", "--title", tag]);
     if version.contains('-') {
         command.arg("--prerelease");
     }
@@ -252,7 +294,7 @@ pub fn publish(directory: &Path, tag: &str, version: &str) -> Result<()> {
         }
         command.arg(artifact).arg(checksum);
     }
-    command.args(["--notes", "Windows x64: download the EXE installer for installation and optional MCP client configuration, or the ZIP for portable use. These binaries are unsigned. SHA-256 checksums are included; each package contains license information and SBOMs."]);
+    command.arg("--notes-file").arg(notes_path);
     process::checked(&mut command, Duration::from_mins(3))?;
     println!("GitHub release published.");
     Ok(())

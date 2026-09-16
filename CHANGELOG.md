@@ -4,13 +4,15 @@ All notable changes to ControlFreak are documented in this file.
 
 The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-No version has been released yet. There is no tag and no published artifact. Everything below is
-unreleased and describes the current state of `main`. Tool contracts and installation details may
-change before the first release.
+Changes are collected under Unreleased. The release workflow moves them into a dated,
+versioned section and uses that section for the corresponding GitHub Release notes.
 
 ## Unreleased
 
 ### Added
+
+- Manual release workflow that prepares version files and dated changelog entries, verifies
+  Windows packages, and creates the release commit, Git tag, and GitHub Release.
 
 - Unsigned per-user Windows x64 setup executable with location selection, optional MCP configuration
   for Codex, Claude Code, Claude Desktop, Pi, and OpenCode, and per-client installation results.

@@ -52,7 +52,7 @@ use real MCP client profiles as fixtures. Test output and configuration backups 
 as CI artifacts. The production-installer test switch is reserved for disposable GitHub Actions
 runners; it exercises the exact release executable before publication.
 
-The release workflow validates the tag before building, runs release-mode tests, builds both binaries
+The release workflow validates the version and changelog before building, runs release-mode tests, builds both binaries
 with `cargo-auditable`, and generates CycloneDX SBOMs. `cargo xtask package --require-sbom` requires a
 generated `controlfreak.cdx.json` for every product crate (excluding `xtask`). Development packages can omit SBOM generation and
 contain an explicitly labeled placeholder instead. Each public release contains the setup EXE,
@@ -62,7 +62,8 @@ The automation uses `zip` for archives, `sha2` for checksums, and `clap` for typ
 Its `packaging-tests` platform feature exposes native version-resource, registry and fixture-permission
 checks only to developer tooling. These dependencies and checks are not part of the shipped server.
 Run `cargo test -p xtask --locked` for its focused tests. CI uses the same commands shown above;
-`cargo xtask publish` is restricted to the tag-triggered GitHub Actions release environment.
+`cargo xtask publish` is restricted to the GitHub Actions release workflow and verifies that the
+remote tag points to the built commit. Release notes come from the matching changelog section.
 
 Automated package checks make only version/capability and MCP initialize, tools/list and server-status
 requests. They do not capture desktop content or inject input. An elevated runner additionally checks
@@ -84,3 +85,32 @@ Keep each pull request focused, update tests for behavior changes, and update `C
 ## License
 
 ControlFreak uses the [MIT License](LICENSE). Contributions are accepted under the same license.
+
+## Publishing a release
+
+Keep changes under `## Unreleased` in `CHANGELOG.md` during development. To release:
+
+1. Merge the intended changes into `main`.
+2. Open GitHub Actions, select **Release**, then **Run workflow** on `main`.
+3. Enter a semantic version without `v`, such as `0.1.0-alpha` or `0.1.0`.
+
+The workflow updates the workspace version and local dependency requirements in `Cargo.toml`,
+uses Cargo to update workspace versions in `Cargo.lock`, and moves Unreleased entries into
+`## [<version>] - YYYY-MM-DD` using the UTC date. Existing changelog history is preserved.
+Versions cannot decrease or reuse an existing release section/tag, and empty releases are refused.
+`semver` validates versions and `toml_edit` preserves the manifest layout; both are also used by
+the setup helper, and the release preparation commands remain developer-only.
+
+After the tests and package checks pass, the workflow commits those three files and pushes `main`
+and the version tag atomically. If `main` advances during the build, the push fails without adding
+a tag; run again from the updated `main`. Repository rules must permit the workflow token to push
+this release commit. No personal access token is required. The same workflow then publishes the
+installer, ZIP, checksums and the version's changelog notes. Alpha/beta/RC versions are prereleases.
+
+Manual tag pushes remain supported for versions whose manifest and dated changelog section have
+already been prepared. If publication fails after the tag was pushed, dispatch **Release** against
+that existing tag with its matching version using
+`gh workflow run release.yml --ref v0.1.0-alpha -f version=0.1.0-alpha` (substitute the version).
+This retries the same source without bumping versions or moving tags. An already published release is never overwritten; inspect it before any retry.
+
+The workflow does not create a release until explicitly started or a version tag is pushed.

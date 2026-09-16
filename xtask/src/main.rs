@@ -2,6 +2,7 @@
 mod lifecycle;
 mod package;
 mod process;
+mod release;
 mod verify;
 
 use clap::{Parser, Subcommand};
@@ -22,6 +23,18 @@ enum Task {
     Version {
         #[arg(long)]
         tag: Option<String>,
+    },
+    /// Prepare a release version and move Unreleased changes into a dated section.
+    PrepareRelease {
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        date: String,
+    },
+    /// Validate the versioned changelog and write release notes.
+    ReleaseNotes {
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Fetch and verify the pinned portable Inno Setup compiler.
     Compiler {
@@ -57,7 +70,7 @@ enum Task {
         #[arg(long)]
         production_installer: bool,
     },
-    /// Publish verified artifacts from the tag-triggered release workflow.
+    /// Publish verified artifacts from the GitHub Actions release workflow.
     Publish {
         #[arg(long)]
         package: PathBuf,
@@ -83,6 +96,11 @@ fn run(cli: Cli) -> Result<()> {
             metadata.validate_tag(tag.as_deref())?;
             println!("{}", metadata.version()?);
         }
+        Task::PrepareRelease { version, date } => release::prepare(&metadata, &version, &date)?,
+        Task::ReleaseNotes { output } => {
+            let changelog = std::fs::read_to_string(metadata.workspace_root.join("CHANGELOG.md"))?;
+            std::fs::write(output, release::notes(&changelog, metadata.version()?)?)?;
+        }
         Task::Compiler { output } => println!("{}", package::compiler(&output)?.display()),
         Task::Package {
             compiler,
@@ -104,7 +122,7 @@ fn run(cli: Cli) -> Result<()> {
         } => lifecycle::run(&package, &output, metadata.version()?, production_installer)?,
         Task::Publish { package, tag } => {
             metadata.validate_tag(Some(&tag))?;
-            package::publish(&package, &tag, metadata.version()?)?;
+            package::publish(&package, &tag, &metadata)?;
         }
     }
     Ok(())
