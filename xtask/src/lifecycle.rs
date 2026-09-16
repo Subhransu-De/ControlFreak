@@ -94,13 +94,21 @@ pub fn run(directory: &Path, output: &Path, version: &str, production: bool) -> 
         return Err("An installation is already registered; refusing test".into());
     }
     let output = package::fresh(output)?;
-    let fixture = Fixture {
+    let mut fixture = Fixture {
         profile: output.join("synthetic-profile"),
         install: output.join("Apps with spaces 日本語/ControlFreak"),
         registration,
         output,
     };
-    exercise(&fixture, &installer, directory, version)
+    exercise(&fixture, &installer, directory, version)?;
+    // Inno's uninstaller can finish deleting its old files after its launcher
+    // exits. A second scenario must not reinstall into that same directory.
+    fixture.install = fixture.output.join("Missing helper/ControlFreak");
+    verify_missing_helper_uninstall(&fixture, &installer)?;
+    println!(
+        "Installer lifecycle: client configuration, permissions, upgrades, refusals, partial failure and uninstall passed."
+    );
+    Ok(())
 }
 
 fn exercise(fixture: &Fixture, installer: &Path, directory: &Path, version: &str) -> Result<()> {
@@ -194,10 +202,6 @@ fn exercise(fixture: &Fixture, installer: &Path, directory: &Path, version: &str
             return Err("Installer-created configuration remains".into());
         }
     }
-    verify_missing_helper_uninstall(fixture, installer)?;
-    println!(
-        "Installer lifecycle: client configuration, permissions, upgrades, refusals, partial failure and uninstall passed."
-    );
     Ok(())
 }
 
@@ -209,8 +213,10 @@ fn verify_missing_helper_uninstall(fixture: &Fixture, installer: &Path) -> Resul
     let configs = CLIENT_PATHS
         .iter()
         .map(|path| fs::read(fixture.profile.join(path)))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    fs::remove_file(fixture.install.join("controlfreak-installer.exe"))?;
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|_| "Missing-helper fixture configuration was not created")?;
+    fs::remove_file(fixture.install.join("controlfreak-installer.exe"))
+        .map_err(|_| "Missing-helper fixture executable was not installed")?;
     if fixture.setup(&fixture.install.join("unins000.exe"), false)? != 0
         || fixture.install.join("controlfreak.exe").exists()
         || fixture.registration.location()?.is_some()
