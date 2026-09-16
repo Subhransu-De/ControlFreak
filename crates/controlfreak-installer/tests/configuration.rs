@@ -401,7 +401,8 @@ fn reconfiguration_preserves_legacy_receipts_at_previous_paths() {
     let f = Fixture::new();
     assert!(f.configure("codex", "replace").status.success());
     // Emulate the single-receipt format written by older installers.
-    let first = f.json("state/codex.json")[0].clone();
+    let mut first = f.json("state/codex.json")[0].clone();
+    first.as_object_mut().unwrap().remove("committed");
     f.write("state/codex.json", &first.to_string());
     let result = f
         .command()
@@ -452,4 +453,61 @@ fn uninstall_retains_malformed_configs_and_cleans_other_clients() {
                 .contains("controlfreak")
         );
     }
+}
+
+#[test]
+fn failed_write_does_not_claim_a_later_matching_manual_entry() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = Fixture::new();
+    f.write("user/.claude.json", "{}");
+    // Permit the initial read but deny the helper's later write handle.
+    let locked = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(f.path("user/.claude.json"))
+        .unwrap();
+    assert!(!f.configure("claude-code", "replace").status.success());
+    drop(locked);
+    assert_eq!(
+        fs::read_to_string(f.path("user/.claude.json")).unwrap(),
+        "{}"
+    );
+    let pending = f.json("state/claude-code.json")[0].clone();
+    assert_eq!(pending["committed"], false);
+    let entry: Value = serde_json::from_str(pending["entry"].as_str().unwrap()).unwrap();
+    let manually_added = serde_json::json!({"mcpServers":{"controlfreak":entry}}).to_string();
+    f.write("user/.claude.json", &manually_added);
+    assert!(f.remove().status.success(), "{}", f.report());
+    assert_eq!(
+        fs::read_to_string(f.path("user/.claude.json")).unwrap(),
+        manually_added
+    );
+}
+
+#[test]
+fn successful_update_replaces_ownership_only_for_the_same_path() {
+    let f = Fixture::new();
+    assert!(f.configure("claude-code", "replace").status.success());
+    let first = fs::read_to_string(f.path("user/.claude.json")).unwrap();
+    let result = f
+        .command()
+        .arg("configure")
+        .arg("claude-code")
+        .arg(f.path("Different/controlfreak.exe"))
+        .arg(f.path("state"))
+        .arg(f.path("result.ini"))
+        .arg("replace")
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", f.report());
+    assert_eq!(
+        f.json("state/claude-code.json").as_array().unwrap().len(),
+        1
+    );
+    f.write("user/.claude.json", &first);
+    assert!(f.remove().status.success());
+    assert_eq!(
+        fs::read_to_string(f.path("user/.claude.json")).unwrap(),
+        first
+    );
 }

@@ -20,6 +20,12 @@ struct Receipt {
     client: String,
     path: PathBuf,
     entry: String,
+    #[serde(default = "legacy_receipt_committed")]
+    committed: bool,
+}
+
+fn legacy_receipt_committed() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -238,6 +244,7 @@ fn configure(id: &str, executable: &Path, state: &Path, policy: &str) -> Result<
         entry: document
             .entry(group)?
             .ok_or("Cannot verify configured entry.")?,
+        committed: false,
     };
     let receipt_path = state.join(format!("{id}.json"));
     let old_receipt = storage::read(&receipt_path)?;
@@ -246,19 +253,21 @@ fn configure(id: &str, executable: &Path, state: &Path, policy: &str) -> Result<
         .map(|text| receipts(text, id))
         .transpose()?
         .unwrap_or_default();
-    // Preserve ownership at earlier paths and versions, including a previous
-    // entry if the following config write fails. Removal still requires an exact match.
-    if !history
-        .iter()
-        .any(|old| old.path == receipt.path && old.entry == receipt.entry)
-    {
-        history.push(receipt);
-    }
-    let encoded = serde_json::to_string(&history).map_err(|_| "Cannot encode setup receipt.")?;
-    // Journal ownership first. If interrupted before replacement, uninstall's
-    // exact-entry comparison refuses to remove the old configuration entry.
-    storage::write(&receipt_path, old_receipt.as_deref(), &encoded, false)?;
+    // Journal the attempted write without claiming ownership. An interrupted or
+    // failed configuration write must not authorize deleting a later manual entry.
+    history.retain(|old| old.committed);
+    history.push(receipt);
+    let pending = serde_json::to_string(&history).map_err(|_| "Cannot encode setup receipt.")?;
+    storage::write(&receipt_path, old_receipt.as_deref(), &pending, false)?;
     storage::write(&client.path, original.as_deref(), &document.render(), true)?;
+    let mut written = history.pop().ok_or("Missing pending receipt.")?;
+    written.committed = true;
+    // Only the latest successful write owns this path. Older profile paths
+    // remain tracked, but a user reverting an entry must not match stale history.
+    history.retain(|old| old.path != written.path);
+    history.push(written);
+    let committed = serde_json::to_string(&history).map_err(|_| "Cannot encode setup receipt.")?;
+    storage::write(&receipt_path, Some(&pending), &committed, false)?;
     Ok(format!(
         "Configured. Existing file backed up beside the configuration when present. {}",
         client.note
@@ -272,6 +281,10 @@ fn remove(state: &Path) -> Result<String> {
         let path = state.join(format!("{id}.json"));
         if let Some(text) = storage::read(&path)? {
             for receipt in receipts(&text, id)? {
+                if !receipt.committed {
+                    retained = true;
+                    continue;
+                }
                 let client = clients::Client {
                     id: id.to_owned(),
                     path: receipt.path,
@@ -301,7 +314,7 @@ fn remove(state: &Path) -> Result<String> {
     }
     if retained {
         Ok(
-            "Modified, unreadable or missing entries were left unchanged. Configuration backups were retained."
+            "Modified, unverified, unreadable or missing entries were left unchanged. Configuration backups were retained."
                 .to_owned(),
         )
     } else {
