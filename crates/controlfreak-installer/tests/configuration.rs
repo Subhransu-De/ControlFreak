@@ -395,3 +395,61 @@ fn unowned_identical_entry_is_not_claimed_or_removed() {
         original
     );
 }
+
+#[test]
+fn reconfiguration_preserves_legacy_receipts_at_previous_paths() {
+    let f = Fixture::new();
+    assert!(f.configure("codex", "replace").status.success());
+    // Emulate the single-receipt format written by older installers.
+    let first = f.json("state/codex.json")[0].clone();
+    f.write("state/codex.json", &first.to_string());
+    let result = f
+        .command()
+        .env("CODEX_HOME", f.path("other-codex"))
+        .arg("configure")
+        .arg("codex")
+        .arg(f.path("Apps/controlfreak.exe"))
+        .arg(f.path("state"))
+        .arg(f.path("result.ini"))
+        .arg("replace")
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", f.report());
+    assert_eq!(f.json("state/codex.json").as_array().unwrap().len(), 2);
+    assert!(f.remove().status.success(), "{}", f.report());
+    for path in ["user/.codex/config.toml", "other-codex/config.toml"] {
+        assert!(
+            !fs::read_to_string(f.path(path))
+                .unwrap()
+                .contains("controlfreak")
+        );
+    }
+}
+
+#[test]
+fn uninstall_retains_malformed_configs_and_cleans_other_clients() {
+    for (id, path, _) in CLIENTS {
+        let f = Fixture::new();
+        assert!(f.configure(id, "replace").status.success());
+        let other = if id == "codex" {
+            "claude-code"
+        } else {
+            "codex"
+        };
+        assert!(f.configure(other, "replace").status.success());
+        let malformed = "{ synthetic broken configuration [";
+        f.write(path, malformed);
+        assert!(f.remove().status.success(), "{}", f.report());
+        assert_eq!(fs::read_to_string(f.path(path)).unwrap(), malformed);
+        let other_path = CLIENTS
+            .iter()
+            .find(|(client, _, _)| *client == other)
+            .unwrap()
+            .1;
+        assert!(
+            !fs::read_to_string(f.path(other_path))
+                .unwrap()
+                .contains("controlfreak")
+        );
+    }
+}

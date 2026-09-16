@@ -66,6 +66,11 @@ with its PID. If Windows cannot identify a blocker, check folder permissions and
 using this installation. Setup does not terminate clients or schedule executable
 replacement at reboot. A running server must be restarted to use the new version.
 
+Uninstall retains unreadable or malformed client configuration. If the configuration helper is
+missing or cannot start, application removal continues and client entries must be removed manually.
+Reconfiguring a client at a new profile path preserves the previous installation receipt so
+uninstall can clean unchanged installer-owned entries at both paths.
+
 Uninstall from Windows Settings or run `unins000.exe` in the install directory. Uninstall offers to
 remove the MCP entries written by setup, and removes an entry only if its complete value still
 matches the recorded value. User-modified entries, other servers, unrelated files, and configuration

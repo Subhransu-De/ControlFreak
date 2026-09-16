@@ -194,9 +194,34 @@ fn exercise(fixture: &Fixture, installer: &Path, directory: &Path, version: &str
             return Err("Installer-created configuration remains".into());
         }
     }
+    verify_missing_helper_uninstall(fixture, installer)?;
     println!(
         "Installer lifecycle: client configuration, permissions, upgrades, refusals, partial failure and uninstall passed."
     );
+    Ok(())
+}
+
+fn verify_missing_helper_uninstall(fixture: &Fixture, installer: &Path) -> Result<()> {
+    // A deleted/quarantined helper must not prevent removing the application.
+    if fixture.setup(installer, true)? != 0 {
+        return Err("Missing-helper fixture installation failed".into());
+    }
+    let configs = CLIENT_PATHS
+        .iter()
+        .map(|path| fs::read(fixture.profile.join(path)))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    fs::remove_file(fixture.install.join("controlfreak-installer.exe"))?;
+    if fixture.setup(&fixture.install.join("unins000.exe"), false)? != 0
+        || fixture.install.join("controlfreak.exe").exists()
+        || fixture.registration.location()?.is_some()
+    {
+        return Err("Missing cleanup helper prevented uninstall".into());
+    }
+    for (path, original) in CLIENT_PATHS.iter().zip(configs) {
+        if fs::read(fixture.profile.join(path))? != original {
+            return Err("Missing-helper uninstall changed client configuration".into());
+        }
+    }
     Ok(())
 }
 

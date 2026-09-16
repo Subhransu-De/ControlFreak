@@ -299,7 +299,11 @@ begin
   if RemoveEntries then begin
     Report := ExpandConstant('{tmp}\controlfreak-remove.ini');
     DeleteFile(Report);
-    if (not Exec(ExpandConstant('{app}\controlfreak-installer.exe'), 'remove ' + Quote(ExpandConstant('{app}\installer-state')) + ' ' + Quote(Report), '', SW_HIDE, ewWaitUntilTerminated, Code)) or (Code <> 0) then begin
+    if not Exec(ExpandConstant('{app}\controlfreak-installer.exe'), 'remove ' + Quote(ExpandConstant('{app}\installer-state')) + ' ' + Quote(Report), '', SW_HIDE, ewWaitUntilTerminated, Code) then begin
+      SuppressibleMsgBox('The configuration helper is unavailable. Uninstall will continue and keep client configurations. Remove their ControlFreak entries manually.', mbInformation, MB_OK, IDOK);
+      exit;
+    end;
+    if Code <> 0 then begin
       MessageText := GetIniString('result', 'message', 'MCP configuration cleanup failed. Use the README manual configuration instructions.', Report);
       SuppressibleMsgBox(MessageText, mbError, MB_OK, IDOK);
       RaiseException('Configuration cleanup failed; fix the configuration and retry uninstall.');

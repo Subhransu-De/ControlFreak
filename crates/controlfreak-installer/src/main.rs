@@ -22,6 +22,29 @@ struct Receipt {
     entry: String,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ReceiptFile {
+    Legacy(Receipt),
+    Multiple(Vec<Receipt>),
+}
+
+fn receipts(text: &str, id: &str) -> Result<Vec<Receipt>> {
+    let stored: ReceiptFile =
+        serde_json::from_str(text).map_err(|_| "Invalid setup receipt; configuration retained.")?;
+    let receipts = match stored {
+        ReceiptFile::Legacy(receipt) => vec![receipt],
+        ReceiptFile::Multiple(receipts) => receipts,
+    };
+    if receipts
+        .iter()
+        .any(|receipt| receipt.client != id || !receipt.path.is_absolute())
+    {
+        return Err("Invalid setup receipt; configuration retained.");
+    }
+    Ok(receipts)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match run(&args) {
@@ -218,7 +241,20 @@ fn configure(id: &str, executable: &Path, state: &Path, policy: &str) -> Result<
     };
     let receipt_path = state.join(format!("{id}.json"));
     let old_receipt = storage::read(&receipt_path)?;
-    let encoded = serde_json::to_string(&receipt).map_err(|_| "Cannot encode setup receipt.")?;
+    let mut history = old_receipt
+        .as_deref()
+        .map(|text| receipts(text, id))
+        .transpose()?
+        .unwrap_or_default();
+    // Preserve ownership at earlier paths and versions, including a previous
+    // entry if the following config write fails. Removal still requires an exact match.
+    if !history
+        .iter()
+        .any(|old| old.path == receipt.path && old.entry == receipt.entry)
+    {
+        history.push(receipt);
+    }
+    let encoded = serde_json::to_string(&history).map_err(|_| "Cannot encode setup receipt.")?;
     // Journal ownership first. If interrupted before replacement, uninstall's
     // exact-entry comparison refuses to remove the old configuration entry.
     storage::write(&receipt_path, old_receipt.as_deref(), &encoded, false)?;
@@ -235,34 +271,37 @@ fn remove(state: &Path) -> Result<String> {
     for id in clients::CLIENTS {
         let path = state.join(format!("{id}.json"));
         if let Some(text) = storage::read(&path)? {
-            let receipt: Receipt = serde_json::from_str(&text)
-                .map_err(|_| "Invalid setup receipt; configuration retained.")?;
-            if receipt.client != id || !receipt.path.is_absolute() {
-                return Err("Invalid setup receipt; configuration retained.");
-            }
-            let client = clients::Client {
-                id: id.to_owned(),
-                path: receipt.path,
-                detected: true,
-                note: "",
-            };
-            let (original, mut document) = load_document(&client)?;
-            if document
-                .entry(clients::group(id))?
-                .as_deref()
-                .is_some_and(|entry| config::equivalent(entry, &receipt.entry, id == "codex"))
-            {
-                document.set(clients::group(id), None)?;
-                storage::write(&client.path, original.as_deref(), &document.render(), true)?;
-            } else {
-                retained = true;
+            for receipt in receipts(&text, id)? {
+                let client = clients::Client {
+                    id: id.to_owned(),
+                    path: receipt.path,
+                    detected: true,
+                    note: "",
+                };
+                let Ok((original, mut document)) = load_document(&client) else {
+                    retained = true;
+                    continue;
+                };
+                let Ok(entry) = document.entry(clients::group(id)) else {
+                    retained = true;
+                    continue;
+                };
+                if entry
+                    .as_deref()
+                    .is_some_and(|entry| config::equivalent(entry, &receipt.entry, id == "codex"))
+                {
+                    document.set(clients::group(id), None)?;
+                    storage::write(&client.path, original.as_deref(), &document.render(), true)?;
+                } else {
+                    retained = true;
+                }
             }
             fs::remove_file(path).map_err(|_| "Cannot remove setup receipt.")?;
         }
     }
     if retained {
         Ok(
-            "Modified or missing entries were left unchanged. Configuration backups were retained."
+            "Modified, unreadable or missing entries were left unchanged. Configuration backups were retained."
                 .to_owned(),
         )
     } else {
