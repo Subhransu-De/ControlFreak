@@ -52,7 +52,7 @@ use rmcp::{
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorCode,
         Implementation, JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
-        ServerInfo, Tool, ToolAnnotations,
+        ServerConfig, Tool, ToolAnnotations,
     },
     service::RequestContext,
     transport::io::stdio,
@@ -1159,8 +1159,8 @@ impl ControlFreakServer {
 }
 
 impl ServerHandler for ControlFreakServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "controlfreak",
                 env!("CARGO_PKG_VERSION"),

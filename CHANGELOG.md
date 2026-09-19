@@ -9,6 +9,11 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Changed
+
+- Upgrade the MCP SDK to 3.4.0 for lifecycle-aware cancellation and first-request
+  dispatch fixes, and migrate server configuration to its supported API name.
+
 ## [0.1.0-alpha] - 2026-09-16
 
 ### Added
