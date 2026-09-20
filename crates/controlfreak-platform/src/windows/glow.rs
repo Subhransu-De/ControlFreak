@@ -47,8 +47,13 @@ use windows::{
 };
 
 const PROTOCOL_PREFIX: &str = "CFP/1";
-const PARTICLE_COUNT: usize = 800;
-const BAND_THICKNESS: i32 = 132;
+// Physical pixels: this helper is per-monitor DPI aware.
+const BAND_THICKNESS: i32 = 230;
+const GLOW_OPACITY: f64 = 0.42;
+const CORE_WIDTH: f64 = 0.39;
+const CORE_OPACITY: f64 = 0.26;
+const BREATHING_AMOUNT: f64 = 0.18;
+const BREATHING_SECONDS: f64 = 4.7;
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const TOPOLOGY_INTERVAL: Duration = Duration::from_millis(500);
 const MINIMUM_VISIBLE: Duration = Duration::from_millis(800);
@@ -242,7 +247,7 @@ impl Level {
     }
 
     const fn target_opacity(self) -> f64 {
-        if self.acting() { 1.0 } else { 0.42 }
+        if self.acting() { 1.0 } else { 0.48 }
     }
 }
 
@@ -501,9 +506,9 @@ impl Renderer {
         let monitors = enumerate_monitors()?;
         if monitors != self.monitors {
             let mut replacement = Vec::with_capacity(monitors.len() * 4);
-            for (monitor_index, monitor) in monitors.iter().copied().enumerate() {
+            for monitor in monitors.iter().copied() {
                 for side in Side::ALL {
-                    replacement.push(LayerWindow::create(monitor, side, monitor_index)?);
+                    replacement.push(LayerWindow::create(monitor, side)?);
                 }
             }
             self.windows = replacement;
@@ -571,10 +576,9 @@ impl Renderer {
     }
 
     fn render(&mut self, seconds: f64, level: Level, opacity: f64) -> io::Result<()> {
-        let pulse = 0.93 + (seconds * std::f64::consts::TAU / 6.8).sin() * 0.07;
-        let opacity = (opacity * pulse).clamp(0.0, 1.0);
+        let opacity = (opacity * breathing_opacity(seconds)).clamp(0.0, 1.0);
         for window in &mut self.windows {
-            window.render(seconds, level, opacity)?;
+            window.render(level, opacity)?;
         }
         Ok(())
     }
@@ -608,16 +612,6 @@ enum Side {
 
 impl Side {
     const ALL: [Self; 4] = [Self::Left, Self::Right, Self::Top, Self::Bottom];
-
-    const fn seed(self, monitor_index: usize) -> u64 {
-        let base = match self {
-            Self::Left => 1103,
-            Self::Right => 2207,
-            Self::Top => 3301,
-            Self::Bottom => 4409,
-        };
-        base + monitor_index as u64
-    }
 
     const fn band_rect(self, monitor: MonitorRect) -> MonitorRect {
         let thickness = if matches!(self, Self::Left | Self::Right) {
@@ -657,11 +651,10 @@ struct LayerWindow {
     bounds: MonitorRect,
     side: Side,
     surface: DibSurface,
-    particles: Vec<Particle>,
 }
 
 impl LayerWindow {
-    fn create(monitor: MonitorRect, side: Side, monitor_index: usize) -> io::Result<Self> {
+    fn create(monitor: MonitorRect, side: Side) -> io::Result<Self> {
         let bounds = side.band_rect(monitor);
         let width = bounds.width();
         let height = bounds.height();
@@ -708,16 +701,11 @@ impl LayerWindow {
                 return Err(error);
             }
         };
-        let mut random = Random::new(side.seed(monitor_index));
-        let particles = (0..PARTICLE_COUNT)
-            .map(|index| Particle::new(index, &mut random))
-            .collect();
         let window = Self {
             hwnd,
             bounds,
             side,
             surface,
-            particles,
         };
         window.position(false)?;
         Ok(window)
@@ -744,86 +732,17 @@ impl LayerWindow {
         .map_err(|error| windows_error("SetWindowPos", &error))
     }
 
-    fn render(&mut self, seconds: f64, level: Level, opacity: f64) -> io::Result<()> {
+    fn render(&mut self, level: Level, opacity: f64) -> io::Result<()> {
         let width = self.surface.width;
         let height = self.surface.height;
-        let width_f64 = f64::from(u32::try_from(width).unwrap_or(u32::MAX));
-        let height_f64 = f64::from(u32::try_from(height).unwrap_or(u32::MAX));
-        let length = if matches!(self.side, Side::Left | Side::Right) {
-            height_f64
-        } else {
-            width_f64
-        };
-        let thickness = if matches!(self.side, Side::Left | Side::Right) {
-            width_f64
-        } else {
-            height_f64
-        };
-        let visible_count = if level.acting() {
-            self.particles.len()
-        } else {
-            (self.particles.len() * 55).div_ceil(100)
-        };
-        let colors = if level.elevated() {
-            &RED_PARTICLES
-        } else {
-            &BLUE_PARTICLES
-        };
-        let halo = if level.elevated() {
-            RED_HALO
-        } else {
-            BLUE_HALO
-        };
-        let pixels = self.surface.pixels();
-        pixels.fill(0);
-
-        for (index, particle) in self.particles[..visible_count].iter().copied().enumerate() {
-            let direction = if index % 2 == 0 { 1.0 } else { -1.0 };
-            let mut along = particle.long_position * length
-                + (seconds * particle.long_speed + particle.phase).sin()
-                    * particle.long_drift
-                    * direction;
-            along %= length;
-            if along < 0.0 {
-                along += length;
-            }
-            let inward = (particle.distance * (thickness - 4.0).max(1.0)
-                + (seconds * particle.cross_speed + particle.phase_two).sin() * particle.sway)
-                .clamp(0.0, thickness);
-            let pulse = 0.88 + (seconds * 1.6 + particle.phase_two).sin() * 0.12;
-            let radius_x = particle.width * pulse * 0.5;
-            let radius_y = particle.height * pulse * 0.5;
-            let (x, y) = match self.side {
-                Side::Left => (inward, along),
-                Side::Right => (width_f64 - inward, along),
-                Side::Top => (along, inward),
-                Side::Bottom => (along, height_f64 - inward),
-            };
-            if particle.has_halo {
-                draw_ellipse(
-                    pixels,
-                    width,
-                    height,
-                    x,
-                    y,
-                    radius_x * 3.1,
-                    radius_y * 3.1,
-                    halo,
-                    opacity,
-                );
-            }
-            draw_ellipse(
-                pixels,
-                width,
-                height,
-                x,
-                y,
-                radius_x,
-                radius_y,
-                colors[particle.color_index],
-                opacity,
-            );
-        }
+        render_glow(
+            self.surface.pixels(),
+            width,
+            height,
+            self.side,
+            level,
+            opacity,
+        );
         self.surface.present(self.hwnd, self.bounds)
     }
 }
@@ -969,146 +888,109 @@ impl Drop for DibSurface {
 }
 
 #[derive(Clone, Copy)]
-struct Particle {
-    long_position: f64,
-    distance: f64,
-    width: f64,
-    height: f64,
-    long_drift: f64,
-    sway: f64,
-    long_speed: f64,
-    cross_speed: f64,
-    phase: f64,
-    phase_two: f64,
-    color_index: usize,
-    has_halo: bool,
-}
-
-impl Particle {
-    fn new(index: usize, random: &mut Random) -> Self {
-        let curve = if index.is_multiple_of(3) { 1.1 } else { 2.6 };
-        let size = 0.55 + random.unit().powf(2.0) * 2.1;
-        Self {
-            long_position: random.unit(),
-            distance: random.unit().powf(curve),
-            width: size,
-            height: size * (0.72 + random.unit() * 0.7),
-            long_drift: 24.0 + random.unit() * 96.0,
-            sway: 3.0 + random.unit() * 14.0,
-            long_speed: 0.55 + random.unit() * 0.95,
-            cross_speed: 0.95 + random.unit() * 1.65,
-            phase: random.unit() * std::f64::consts::TAU,
-            phase_two: random.unit() * std::f64::consts::TAU,
-            color_index: random.index(BLUE_PARTICLES.len()),
-            has_halo: index.is_multiple_of(19),
-        }
-    }
-}
-
-struct Random(u64);
-
-impl Random {
-    const fn new(seed: u64) -> Self {
-        Self(seed | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        let mut value = self.0;
-        value ^= value << 13;
-        value ^= value >> 7;
-        value ^= value << 17;
-        self.0 = value;
-        value
-    }
-
-    fn unit(&mut self) -> f64 {
-        let sample = u32::try_from(self.next() >> 32).unwrap_or(u32::MAX);
-        f64::from(sample) / f64::from(u32::MAX)
-    }
-
-    fn index(&mut self, length: usize) -> usize {
-        usize::try_from(self.next() % length as u64).unwrap_or(0)
-    }
-}
-
-#[derive(Clone, Copy)]
 struct Color {
-    alpha: u8,
     red: u8,
     green: u8,
     blue: u8,
 }
 
-const BLUE_PARTICLES: [Color; 6] = [
-    Color::new(0xB8, 0x34, 0x47, 0x72),
-    Color::new(0xC8, 0x3C, 0x52, 0x87),
-    Color::new(0xD8, 0x45, 0x5B, 0x94),
-    Color::new(0xE0, 0x53, 0x69, 0xAB),
-    Color::new(0xE8, 0x5F, 0x77, 0xC2),
-    Color::new(0xF0, 0x77, 0x95, 0xE6),
-];
-
-const RED_PARTICLES: [Color; 6] = [
-    Color::new(0xB8, 0x72, 0x22, 0x22),
-    Color::new(0xC8, 0x87, 0x26, 0x26),
-    Color::new(0xD8, 0x9C, 0x2B, 0x2B),
-    Color::new(0xE0, 0xB2, 0x32, 0x32),
-    Color::new(0xE8, 0xCB, 0x3A, 0x3A),
-    Color::new(0xF0, 0xE6, 0x49, 0x49),
-];
-
-const BLUE_HALO: Color = Color::new(0x32, 0x53, 0x69, 0xAB);
-const RED_HALO: Color = Color::new(0x42, 0xB2, 0x32, 0x32);
-
 impl Color {
-    const fn new(alpha: u8, red: u8, green: u8, blue: u8) -> Self {
-        Self {
-            alpha,
-            red,
-            green,
-            blue,
-        }
+    const fn new(red: u8, green: u8, blue: u8) -> Self {
+        Self { red, green, blue }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+const BLUE_GLOW: Color = Color::new(0x26, 0x7d, 0xff);
+const BLUE_CORE: Color = Color::new(0x9a, 0xdb, 0xff);
+const RED_GLOW: Color = Color::new(0xee, 0x30, 0x41);
+const RED_CORE: Color = Color::new(0xff, 0xa9, 0xa3);
+
+// Linear stop interpolation matches the continuous edge fade, without particles or a hard line.
+const GLOW_STOPS: [(f64, f64); 7] = [
+    (0.0, 0.98),
+    (0.10, 0.96),
+    (0.25, 0.86),
+    (0.45, 0.60),
+    (0.65, 0.30),
+    (0.82, 0.09),
+    (1.0, 0.0),
+];
+const CORE_STOPS: [(f64, f64); 3] = [
+    (0.0, CORE_OPACITY),
+    (0.35, CORE_OPACITY * (0.26 / 0.72)),
+    (1.0, 0.0),
+];
+
+fn breathing_opacity(seconds: f64) -> f64 {
+    GLOW_OPACITY
+        * (1.0 - BREATHING_AMOUNT
+            + BREATHING_AMOUNT * (seconds * std::f64::consts::TAU / BREATHING_SECONDS).sin())
+}
+
+fn gradient_alpha(position: f64, stops: &[(f64, f64)]) -> f64 {
+    for pair in stops.windows(2) {
+        let [(start, from), (end, to)] = [pair[0], pair[1]];
+        if position <= end {
+            let progress = ((position - start) / (end - start)).clamp(0.0, 1.0);
+            return from + (to - from) * progress;
+        }
+    }
+    0.0
+}
+
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn draw_ellipse(
+fn glow_pixel(distance: f64, level: Level, opacity: f64) -> u32 {
+    let (glow, core) = if level.elevated() {
+        (RED_GLOW, RED_CORE)
+    } else {
+        (BLUE_GLOW, BLUE_CORE)
+    };
+    let position = distance / f64::from(BAND_THICKNESS);
+    let mut pixel = 0;
+    for (color, alpha) in [
+        (glow, gradient_alpha(position, &GLOW_STOPS)),
+        (core, gradient_alpha(position / CORE_WIDTH, &CORE_STOPS)),
+    ] {
+        // Rounded, bounded alpha is the only float-to-integer conversion in the renderer.
+        let alpha = (alpha * opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+        blend_pixel(&mut pixel, color, alpha);
+    }
+    pixel
+}
+
+fn render_glow(
     pixels: &mut [u32],
     width: usize,
     height: usize,
-    center_x: f64,
-    center_y: f64,
-    radius_x: f64,
-    radius_y: f64,
-    color: Color,
+    side: Side,
+    level: Level,
     opacity: f64,
 ) {
-    let radius_x = radius_x.max(0.55);
-    let radius_y = radius_y.max(0.55);
-    let left = ((center_x - radius_x - 1.0).floor() as i32).max(0);
-    let right = ((center_x + radius_x + 1.0).ceil() as i32)
-        .min(i32::try_from(width).unwrap_or(i32::MAX) - 1);
-    let top = ((center_y - radius_y - 1.0).floor() as i32).max(0);
-    let bottom = ((center_y + radius_y + 1.0).ceil() as i32)
-        .min(i32::try_from(height).unwrap_or(i32::MAX) - 1);
-    for y in top..=bottom {
-        for x in left..=right {
-            let dx = (f64::from(x) + 0.5 - center_x) / radius_x;
-            let dy = (f64::from(y) + 0.5 - center_y) / radius_y;
-            let distance = (dx * dx + dy * dy).sqrt();
-            let coverage = ((1.15 - distance) * 3.4).clamp(0.0, 1.0);
-            if coverage <= 0.0 {
-                continue;
-            }
-            let alpha = (f64::from(color.alpha) * opacity * coverage)
-                .round()
-                .clamp(0.0, 255.0) as u8;
-            if alpha == 0 {
-                continue;
-            }
-            let index = usize::try_from(y).unwrap_or(0) * width + usize::try_from(x).unwrap_or(0);
-            blend_pixel(&mut pixels[index], color, alpha);
+    // The gradient is uniform along each edge. Compute at most 230 colors per frame, then
+    // copy/fill rows instead of evaluating a gradient for every display pixel. No frame allocation.
+    let mut ramp = [0_u32; BAND_THICKNESS as usize];
+    let thickness = if matches!(side, Side::Left | Side::Right) {
+        width
+    } else {
+        height
+    };
+    for (index, pixel) in ramp[..thickness].iter_mut().enumerate() {
+        let distance = if matches!(side, Side::Right | Side::Bottom) {
+            thickness - 1 - index
+        } else {
+            index
+        };
+        *pixel = glow_pixel(
+            f64::from(u32::try_from(distance).unwrap_or(u32::MAX)) + 0.5,
+            level,
+            opacity,
+        );
+    }
+    for (y, row) in pixels.chunks_exact_mut(width).enumerate() {
+        if matches!(side, Side::Left | Side::Right) {
+            row.copy_from_slice(&ramp[..width]);
+        } else {
+            row.fill(ramp[y]);
         }
     }
 }
@@ -1345,21 +1227,160 @@ mod tests {
     }
 
     #[test]
-    fn elevated_palette_contains_red_without_orange_bias() {
-        assert!(
-            RED_PARTICLES
-                .iter()
-                .all(|color| color.red > color.green && color.green == color.blue)
-        );
-        assert_eq!(RED_HALO.green, RED_HALO.blue);
+    fn premultiplied_blending_preserves_transparency() {
+        let mut pixel = 0_u32;
+        blend_pixel(&mut pixel, Color::new(200, 40, 40), 128);
+        assert_eq!(pixel >> 24, 128);
+        assert_eq!((pixel >> 16) & 0xff, 100);
     }
 
     #[test]
-    fn premultiplied_blending_preserves_transparency() {
-        let mut pixel = 0_u32;
-        blend_pixel(&mut pixel, Color::new(255, 200, 40, 40), 128);
-        assert_eq!(pixel >> 24, 128);
-        assert_eq!((pixel >> 16) & 0xff, 100);
+    fn glow_fades_smoothly_to_transparent_without_a_hard_inner_edge() {
+        for level in [Level::Acting, Level::ElevatedActing] {
+            let alpha: Vec<_> = (0..=230)
+                .map(|distance| glow_pixel(f64::from(distance), level, 0.42) >> 24)
+                .collect();
+            assert!(alpha[0] > 100, "outer edge remains visible");
+            assert!(alpha[90] > alpha[180]);
+            assert!(alpha.windows(2).all(|pair| pair[0] >= pair[1]));
+            assert!(alpha.windows(2).all(|pair| pair[0] - pair[1] <= 3));
+            assert_eq!(alpha[230], 0);
+            assert_eq!(glow_pixel(300.0, level, 0.42), 0);
+            assert_eq!(glow_pixel(0.0, level, 0.0), 0);
+        }
+    }
+
+    #[test]
+    fn glow_layers_match_reference_source_over_colors() {
+        // Independently calculated float source-over reference for the two outer-edge layers:
+        // base alpha .98*.42, core alpha .26*.42, then premultiply. Integer blending may round.
+        for (level, expected) in [
+            (Level::Acting, [121_u32, 31, 70, 121]),
+            (Level::ElevatedActing, [121_u32, 115, 36, 42]),
+        ] {
+            let pixel = glow_pixel(0.0, level, 0.42);
+            for (shift, expected) in [24, 16, 8, 0].into_iter().zip(expected) {
+                assert!(((pixel >> shift) & 255).abs_diff(expected) <= 2);
+            }
+            for distance in 0..230 {
+                let pixel = glow_pixel(f64::from(distance), level, 0.42);
+                let alpha = pixel >> 24;
+                for shift in [16, 8, 0] {
+                    assert!((pixel >> shift) & 255 <= alpha);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn breathing_and_armed_strength_match_the_profile() {
+        let peak = breathing_opacity(4.7 / 4.0);
+        let trough = breathing_opacity(4.7 * 3.0 / 4.0);
+        assert!((peak - 0.42).abs() < 1e-12);
+        assert!((trough - 0.42 * 0.64).abs() < 1e-12);
+        assert!((breathing_opacity(4.7) - breathing_opacity(0.0)).abs() < 1e-12);
+        for level in [Level::Armed, Level::ElevatedArmed] {
+            assert!((level.target_opacity() - 0.48).abs() < 1e-12);
+            let pixel = glow_pixel(0.0, level, peak * level.target_opacity());
+            assert!(pixel >> 24 > 0);
+            assert!(pixel >> 24 < glow_pixel(0.0, Level::Acting, peak) >> 24);
+        }
+    }
+
+    #[test]
+    fn edge_rasters_are_uniform_and_mirrored_in_physical_pixels() {
+        for (width, height) in [(230, 480), (230, 2160), (1, 1), (17, 40)] {
+            let mut left = vec![0; width * height];
+            let mut right = left.clone();
+            render_glow(&mut left, width, height, Side::Left, Level::Acting, 0.42);
+            render_glow(&mut right, width, height, Side::Right, Level::Acting, 0.42);
+            for (a, b) in left.chunks_exact(width).zip(right.chunks_exact(width)) {
+                assert_eq!(a, &left[..width]);
+                assert!(a.iter().eq(b.iter().rev()));
+            }
+        }
+        for (width, height) in [(1920, 230), (3840, 230), (1, 1), (40, 17)] {
+            let mut top = vec![0; width * height];
+            let mut bottom = top.clone();
+            render_glow(&mut top, width, height, Side::Top, Level::Acting, 0.42);
+            render_glow(
+                &mut bottom,
+                width,
+                height,
+                Side::Bottom,
+                Level::Acting,
+                0.42,
+            );
+            for (a, b) in top
+                .chunks_exact(width)
+                .zip(bottom.chunks_exact(width).rev())
+            {
+                assert!(a.iter().all(|pixel| *pixel == a[0]));
+                assert_eq!(a, b);
+            }
+            render_glow(&mut top, width, height, Side::Top, Level::Armed, 0.0);
+            assert!(
+                top.iter().all(|pixel| *pixel == 0),
+                "no stale glow after fade"
+            );
+        }
+    }
+
+    #[test]
+    fn bands_stay_on_negative_origin_and_small_displays() {
+        let monitor = MonitorRect {
+            left: -1920,
+            top: -300,
+            right: 0,
+            bottom: 780,
+        };
+        assert_eq!(Side::Left.band_rect(monitor).right, -1690);
+        assert_eq!(Side::Right.band_rect(monitor).left, -230);
+        assert_eq!(Side::Top.band_rect(monitor).bottom, -70);
+        assert_eq!(Side::Bottom.band_rect(monitor).top, 550);
+        let tiny = MonitorRect {
+            left: -30,
+            top: -10,
+            right: 50,
+            bottom: 90,
+        };
+        for side in Side::ALL {
+            assert_eq!(side.band_rect(tiny), tiny);
+        }
+    }
+
+    #[test]
+    #[ignore = "synthetic CPU raster timing; excludes native window presentation"]
+    fn benchmark_two_4k_display_glow_rasters() {
+        let mut frames: Vec<_> = (0..2)
+            .flat_map(|_| Side::ALL)
+            .map(|side| {
+                let (width, height) = if matches!(side, Side::Left | Side::Right) {
+                    (230, 2160)
+                } else {
+                    (3840, 230)
+                };
+                (side, width, height, vec![0_u32; width * height])
+            })
+            .collect();
+        let started = Instant::now();
+        for frame in 0..120 {
+            for (side, width, height, pixels) in &mut frames {
+                render_glow(
+                    pixels,
+                    *width,
+                    *height,
+                    *side,
+                    Level::Acting,
+                    breathing_opacity(f64::from(frame) / 30.0),
+                );
+                std::hint::black_box(&*pixels);
+            }
+        }
+        eprintln!(
+            "two synthetic 4K displays: {:.3} ms/frame CPU raster (120 frames)",
+            started.elapsed().as_secs_f64() * 1000.0 / 120.0
+        );
     }
 
     #[test]
@@ -1381,7 +1402,7 @@ mod tests {
         ensure_dpi_awareness().unwrap();
         register_window_class().unwrap();
         let monitor = enumerate_monitors().unwrap().remove(0);
-        let window = LayerWindow::create(monitor, Side::Left, 0).unwrap();
+        let window = LayerWindow::create(monitor, Side::Left).unwrap();
         window.position(true).unwrap();
         let point = POINT {
             x: window.bounds.left + 1,
