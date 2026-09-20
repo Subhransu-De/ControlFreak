@@ -124,6 +124,11 @@ the same session stays visible at the lower `ARMED` level, so a model's thinking
 the glow blink. A one-shot action closes after 8 seconds. Multi-step sessions use a longer bounded
 hold based on recent gaps.
 
+The continuous glow fades inward across 230 physical pixels on each display. It uses 42% base
+opacity, a soft bright core spanning 39% of that width at 26% core opacity, and an 18% breathing
+modulation over 4.7 seconds. `ARMED` uses 48% of the `ACTING` strength. Display scaling does not
+enlarge the physical-pixel width.
+
 For a long task, call `begin_control_session` before the first action. It reserves the desktop and
 shows `ARMED`; `expected_seconds` is always clamped by `CONTROLFREAK_GLOW_MAX_HOLD_MS`. Call
 `end_control_session` after the final desktop action. The timeout remains a backstop when a client
@@ -146,8 +151,8 @@ controlfreak --allow-elevated
 ```
 
 For JSON client configurations, add `"--allow-elevated"` after the executable path; for clients with
-a separate arguments field, add it there. Elevated sessions replace the standard blue particles and
-their glow with red counterparts; all other indicator behavior and styling remains the same. The
+a separate arguments field, add it there. Elevated sessions replace the standard blue glow and
+its bright core with red counterparts; all other indicator behavior and styling remains the same. The
 option does not bypass the lock screen, UAC secure desktop, non-default input desktops, or
 higher-integrity target checks. See [SECURITY.md](SECURITY.md) for the full privilege-inheritance
 policy. The capture-excluded indicator is rendered by a native Rust helper mode in the ControlFreak

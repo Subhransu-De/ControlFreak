@@ -48,7 +48,7 @@ blocked even when `--allow-elevated` is present.
 
 `get_server_status` and `--print-capabilities` report `server_elevated`, the Windows integrity level,
 and whether elevated operation was explicitly allowed. Elevated mutation sessions replace the
-standard blue particles and their glow with red counterparts; all other indicator behavior and
+standard blue glow and its bright core with red counterparts; all other indicator behavior and
 styling remains unchanged. The capture-excluded indicator runs as a native Rust helper
 mode of the same executable, without launching PowerShell or materializing executable scripts. A
 per-helper Windows job object contains it when one can be created; if that fails the helper still

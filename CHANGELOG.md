@@ -11,6 +11,9 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ### Changed
 
+- Replace the desktop-edge particles with a continuous, inward-fading glow spanning 230 physical
+  pixels, with a soft bright core and a 4.7-second breathing cycle. Between-action sessions retain
+  the glow at 48% strength; elevated sessions retain red styling.
 - Upgrade the MCP SDK to 3.4.0 for lifecycle-aware cancellation and first-request
   dispatch fixes, and migrate server configuration to its supported API name.
 
