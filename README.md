@@ -16,6 +16,29 @@ MCP clients over STDIO.
 Text clicks require exactly one matching OCR line across the requested region, regardless of
 text-search result limits. Matching ignores surrounding whitespace and, by default, letter case.
 
+## Action results
+
+Mouse, keyboard, OCR-click, window-focus, and desktop-switch results report input dispatch
+separately from observation. `input.input_outcome` is `not_started`, `input_sent`,
+`partially_sent`, or `unknown`. `input.sent_events` counts known accepted input events across
+all batches, excluding cleanup and cursor/window API calls. It is not a character count or
+proof that text reached an application.
+
+`observation_status` is `succeeded`, `failed`, or `not_attempted`. A successful observation
+can omit the screenshot when requested. `effect_verification` is currently always `unverified`:
+input acceptance and a screenshot do not establish that a submission succeeded or a checkbox changed.
+`input.cleanup` reports `not_needed`, `succeeded`, or `unknown` for release cleanup.
+
+Normal results retain `action`, `observation`, and the pointer `position` where applicable.
+Incomplete results retain the error or warning and report `status` as `completed_unverified`,
+`partially_sent`, `unknown`, or `not_started`. All variants conform to the tool's published
+output schema. Partial and uncertain delivery are non-error results so clients must read
+`status`, not just `isError`. Diagnostics preserve these statuses without recording input contents.
+
+Action results set `retry_action=false`. After incomplete or uncertain delivery, observe the
+desktop before choosing a recovery action. Do not replay the entire action or switch input
+methods merely because observation or delivery verification failed.
+
 ## Install on Windows
 
 Download `ControlFreak-<version>.exe` from [GitHub Releases](https://github.com/Subhransu-De/ControlFreak/releases).

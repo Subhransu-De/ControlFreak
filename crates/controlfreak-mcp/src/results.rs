@@ -202,6 +202,55 @@ pub(super) fn tool_error(error: &PlatformError) -> CallToolResult {
     }))
 }
 
+pub(super) fn with_progress(
+    response: super::CallToolResponse,
+    mut progress: controlfreak_core::MutationProgress,
+) -> super::CallToolResponse {
+    use controlfreak_core::InputOutcome;
+    let super::CallToolResponse::Complete(mut result) = response else {
+        return response;
+    };
+    let Some(metadata) = result.structured_content.as_mut() else {
+        return super::CallToolResponse::Complete(result);
+    };
+    let observation_failed = metadata["status"] == "completed_unverified";
+    if result.is_error != Some(true) || observation_failed {
+        progress.input_outcome = InputOutcome::InputSent;
+    }
+    let status = match progress.input_outcome {
+        InputOutcome::NotStarted => "not_started",
+        InputOutcome::PartiallySent => "partially_sent",
+        InputOutcome::Unknown => "unknown",
+        InputOutcome::InputSent if result.is_error == Some(true) || observation_failed => {
+            "completed_unverified"
+        }
+        InputOutcome::InputSent => "completed",
+    };
+    metadata["status"] = json!(status);
+    metadata["input"] = json!(progress);
+    metadata["observation_status"] = json!(if status == "completed" {
+        "succeeded"
+    } else if status == "completed_unverified" {
+        "failed"
+    } else {
+        "not_attempted"
+    });
+    metadata["effect_verification"] = json!("unverified");
+    // Even a refusal needs a new decision, not an automatic retry loop.
+    metadata["retry_action"] = json!(false);
+    if progress.input_outcome != InputOutcome::NotStarted {
+        result.is_error = Some(false);
+    }
+    // Keep the text fallback and structured content identical, retaining any image blocks.
+    result
+        .content
+        .retain(|block| !matches!(block, ContentBlock::Text(_)));
+    result
+        .content
+        .push(ContentBlock::text(metadata.to_string()));
+    super::CallToolResponse::Complete(result)
+}
+
 pub(super) fn tool_execution_error(error: &ErrorData) -> CallToolResult {
     let code = if error.code == ErrorCode::INVALID_PARAMS {
         "invalid_arguments"

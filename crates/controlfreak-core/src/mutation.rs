@@ -1,12 +1,12 @@
 use std::{
     fmt,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
 
-use crate::PlatformError;
+use crate::{CleanupStatus, InputOutcome, MutationProgress, PlatformError};
 
 /// Cooperative cancellation shared by one admitted desktop mutation and the
 /// safety-indicator health monitor.
@@ -14,6 +14,7 @@ use crate::PlatformError;
 pub struct MutationControl {
     cancelled: Arc<AtomicBool>,
     parent: Option<Arc<Self>>,
+    progress: Arc<Mutex<MutationProgress>>,
 }
 
 impl MutationControl {
@@ -23,7 +24,67 @@ impl MutationControl {
         Self {
             cancelled: Arc::clone(&self.cancelled),
             parent: Some(Arc::new(parent)),
+            progress: Arc::default(),
         }
+    }
+
+    /// Keep cancellation links but start an independent operation's progress.
+    #[must_use]
+    pub fn for_operation(&self) -> Self {
+        Self {
+            progress: Arc::default(),
+            ..self.clone()
+        }
+    }
+
+    pub fn progress(&self) -> MutationProgress {
+        *self
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Call immediately before dispatch, after validation. A panic or provider failure
+    /// before acknowledgement must leave delivery unknown.
+    pub fn dispatch_started(&self) -> InputOutcome {
+        let mut previous = InputOutcome::NotStarted;
+        self.update_progress(|progress| {
+            previous = progress.input_outcome;
+            progress.input_outcome = InputOutcome::Unknown;
+        });
+        previous
+    }
+
+    /// Restore known progress when the provider confirms that no new events were accepted.
+    pub fn dispatch_rejected(&self, previous: InputOutcome) {
+        self.update_progress(|progress| progress.input_outcome = previous);
+    }
+
+    /// Record accepted events cumulatively, excluding cleanup. For cursor/window APIs,
+    /// pass zero: acknowledgement still records that a mutation occurred.
+    pub fn dispatch_accepted(&self, events: u64) {
+        self.update_progress(|progress| {
+            progress.sent_events = progress.sent_events.saturating_add(events);
+            progress.input_outcome = InputOutcome::PartiallySent;
+        });
+    }
+
+    /// Call once all dispatch is done, before any post-action observation.
+    pub fn input_complete(&self) {
+        self.update_progress(|progress| progress.input_outcome = InputOutcome::InputSent);
+    }
+
+    pub fn cleanup_status(&self, status: CleanupStatus) {
+        self.update_progress(|progress| progress.cleanup = status);
+    }
+
+    fn update_progress(&self, update: impl FnOnce(&mut MutationProgress)) {
+        update(
+            &mut self
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
     }
 
     pub fn cancel(&self) {

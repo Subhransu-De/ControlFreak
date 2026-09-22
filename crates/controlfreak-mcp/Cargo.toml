@@ -17,3 +17,6 @@ tokio.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+jsonschema = { version = "0.57.0", default-features = false }

@@ -14,6 +14,11 @@ versioned section and uses that section for the corresponding GitHub Release not
 - Check text-click uniqueness across all recognized lines before clicking, so search result
   limits cannot hide duplicate or unique exact matches. Apply case and surrounding-whitespace
   handling consistently when selecting click targets.
+- Preserve cumulative input delivery and release-cleanup status across action failures,
+  cancellation, and worker failure. Report post-action observation failures separately and
+  prevent automatic replay of partial or uncertain input.
+- Make normal, partial, and unverified action results conform to published MCP output schemas,
+  with client-side schema validation over a synthetic MCP transport.
 
 ### Changed
 

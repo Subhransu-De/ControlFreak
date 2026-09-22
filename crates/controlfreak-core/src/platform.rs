@@ -155,7 +155,7 @@ pub trait OcrBackend {
         control: &MutationControl,
     ) -> Result<ClickTextResult, PlatformError> {
         control.check("click_text")?;
-        self.click_text(request)
+        legacy_mutation(control, || self.click_text(request))
     }
 }
 
@@ -177,7 +177,7 @@ pub trait PointerBackend {
         control: &MutationControl,
     ) -> Result<PointerActionResult, PlatformError> {
         control.check("move_mouse")?;
-        self.move_mouse(request)
+        legacy_mutation(control, || self.move_mouse(request))
     }
 
     fn click_mouse(
@@ -196,7 +196,7 @@ pub trait PointerBackend {
         control: &MutationControl,
     ) -> Result<PointerActionResult, PlatformError> {
         control.check("click_mouse")?;
-        self.click_mouse(request)
+        legacy_mutation(control, || self.click_mouse(request))
     }
 
     fn drag_mouse(
@@ -215,7 +215,7 @@ pub trait PointerBackend {
         control: &MutationControl,
     ) -> Result<PointerActionResult, PlatformError> {
         control.check("drag_mouse")?;
-        self.drag_mouse(request)
+        legacy_mutation(control, || self.drag_mouse(request))
     }
 
     fn scroll_mouse(
@@ -234,7 +234,7 @@ pub trait PointerBackend {
         control: &MutationControl,
     ) -> Result<PointerActionResult, PlatformError> {
         control.check("scroll_mouse")?;
-        self.scroll_mouse(request)
+        legacy_mutation(control, || self.scroll_mouse(request))
     }
 }
 
@@ -270,7 +270,7 @@ pub trait WindowBackend {
         control: &MutationControl,
     ) -> Result<VirtualDesktopSwitchResult, PlatformError> {
         control.check("switch_virtual_desktop")?;
-        self.switch_virtual_desktop(request)
+        legacy_mutation(control, || self.switch_virtual_desktop(request))
     }
 
     fn focus_window(
@@ -289,7 +289,7 @@ pub trait WindowBackend {
         control: &MutationControl,
     ) -> Result<WindowFocusResult, PlatformError> {
         control.check("focus_window")?;
-        self.focus_window(request)
+        legacy_mutation(control, || self.focus_window(request))
     }
 
     fn capture_window(
@@ -331,7 +331,7 @@ pub trait KeyboardBackend {
         control: &MutationControl,
     ) -> Result<KeyboardActionResult, PlatformError> {
         control.check("press_keys")?;
-        self.press_keys(request)
+        legacy_mutation(control, || self.press_keys(request))
     }
 
     fn type_text(
@@ -350,7 +350,7 @@ pub trait KeyboardBackend {
         control: &MutationControl,
     ) -> Result<KeyboardActionResult, PlatformError> {
         control.check("type_text")?;
-        self.type_text(request)
+        legacy_mutation(control, || self.type_text(request))
     }
 }
 
@@ -368,4 +368,45 @@ impl<T> PlatformBackend for T where
         + WindowBackend
         + KeyboardBackend
 {
+}
+
+// Legacy implementations cannot expose dispatch progress. Treat their failures as uncertain,
+// except explicit unsupported responses, which promise that no action was available.
+fn legacy_mutation<T>(
+    control: &MutationControl,
+    operation: impl FnOnce() -> Result<T, PlatformError>,
+) -> Result<T, PlatformError> {
+    let previous = control.dispatch_started();
+    let result = operation();
+    if matches!(result, Err(PlatformError::Unsupported { .. })) {
+        control.dispatch_rejected(previous);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::InputOutcome;
+
+    #[test]
+    fn legacy_backend_errors_do_not_claim_input_was_never_sent() {
+        for (error, expected) in [
+            (
+                PlatformError::unsupported("synthetic", "unsupported"),
+                InputOutcome::NotStarted,
+            ),
+            (
+                PlatformError::Unavailable {
+                    reason: "provider disconnected".into(),
+                },
+                InputOutcome::Unknown,
+            ),
+        ] {
+            let control = MutationControl::default();
+            let result: Result<(), _> = legacy_mutation(&control, || Err(error));
+            assert!(result.is_err());
+            assert_eq!(control.progress().input_outcome, expected);
+        }
+    }
 }
