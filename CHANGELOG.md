@@ -9,6 +9,12 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Fixed
+
+- Check text-click uniqueness across all recognized lines before clicking, so search result
+  limits cannot hide duplicate or unique exact matches. Apply case and surrounding-whitespace
+  handling consistently when selecting click targets.
+
 ### Changed
 
 - Replace the desktop-edge particles with a continuous, inward-fading glow spanning 230 physical

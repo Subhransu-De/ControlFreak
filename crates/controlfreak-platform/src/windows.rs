@@ -701,14 +701,16 @@ impl OcrBackend for Backend {
         request: &ClickTextRequest,
         control: &MutationControl,
     ) -> Result<ClickTextResult, PlatformError> {
-        let ocr_matches = self.find_text_on_screen(&FindTextRequest {
-            region: request.region.clone(),
-            query: request.query.clone(),
-            case_sensitive: request.case_sensitive,
-            max_results: MAX_OCR_RESULTS,
-        })?;
+        if request.query.trim().is_empty() {
+            return Err(PlatformError::InvalidArgument {
+                argument: "query".to_owned(),
+                reason: "must not be empty".to_owned(),
+            });
+        }
+        let ocr = self.recognize_text(&request.region)?;
+        // Search result limits must not hide eligible lines from the uniqueness check.
         let candidate = unique_text_candidate(
-            ocr_matches.matches,
+            ocr.lines,
             &request.query,
             request.case_sensitive,
             request.exact_match,
@@ -1188,21 +1190,27 @@ impl KeyboardBackend for Backend {
 }
 
 fn unique_text_candidate(
-    matches: Vec<TextMatch>,
+    lines: Vec<OcrLine>,
     query: &str,
     case_sensitive: bool,
     exact_match: bool,
 ) -> Result<TextMatch, PlatformError> {
     let query = query.trim();
-    let normalized_query = (!case_sensitive).then(|| query.to_lowercase());
-    let mut candidates = matches.into_iter().filter(|candidate| {
-        if !exact_match {
-            return true;
-        }
-        if case_sensitive {
-            candidate.text.trim() == query
+    let normalized_query = if case_sensitive {
+        query.to_owned()
+    } else {
+        query.to_lowercase()
+    };
+    let mut candidates = lines.into_iter().filter(|line| {
+        let text = if case_sensitive {
+            line.text.trim().to_owned()
         } else {
-            candidate.text.trim().to_lowercase() == *normalized_query.as_ref().unwrap()
+            line.text.trim().to_lowercase()
+        };
+        if exact_match {
+            text == normalized_query
+        } else {
+            text.contains(&normalized_query)
         }
     });
     let first = candidates
@@ -1221,7 +1229,13 @@ fn unique_text_candidate(
             ),
         });
     }
-    Ok(first)
+    Ok(TextMatch {
+        text: first.text,
+        x: first.x,
+        y: first.y,
+        width: first.width,
+        height: first.height,
+    })
 }
 
 impl Backend {
@@ -1565,19 +1579,23 @@ mod tests {
         assert_eq!(word_union(&words), Some((100, 48, 100, 24)));
     }
 
-    #[test]
-    fn semantic_click_selection_is_fail_closed_for_zero_or_ambiguous_matches() {
-        let match_at = |text: &str, x| controlfreak_core::TextMatch {
+    fn ocr_line(text: &str, x: u32) -> controlfreak_core::OcrLine {
+        controlfreak_core::OcrLine {
             text: text.to_owned(),
             x,
             y: 20,
             width: 100,
             height: 30,
-        };
+            words: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn semantic_click_selection_is_fail_closed_for_zero_or_ambiguous_matches() {
         assert!(unique_text_candidate(Vec::new(), "Save", false, true).is_err());
         assert!(matches!(
             unique_text_candidate(
-                vec![match_at("Save", 10), match_at("SAVE", 200)],
+                vec![ocr_line("Save", 10), ocr_line("SAVE", 200)],
                 "save",
                 false,
                 true
@@ -1585,14 +1603,75 @@ mod tests {
             Err(PlatformError::InvalidArgument { .. })
         ));
         assert_eq!(
-            unique_text_candidate(vec![match_at("Save", 10)], "save", false, true)
+            unique_text_candidate(vec![ocr_line("Save", 10)], "save", false, true)
                 .unwrap()
                 .x,
             10
         );
         assert!(
-            unique_text_candidate(vec![match_at("Save changes", 10)], "Save", false, true).is_err()
+            unique_text_candidate(vec![ocr_line("Save changes", 10)], "Save", false, true).is_err()
         );
+    }
+
+    #[test]
+    fn semantic_click_checks_exact_matches_beyond_the_search_limit() {
+        for case_sensitive in [false, true] {
+            let mut lines = vec![ocr_line("Save", 10)];
+            lines.extend((1..super::MAX_OCR_RESULTS).map(|x| ocr_line("Save changes", x)));
+            lines.push(ocr_line("Save", 200));
+            assert!(matches!(
+                unique_text_candidate(lines.clone(), "Save", case_sensitive, true),
+                Err(PlatformError::InvalidArgument { .. })
+            ));
+
+            lines[0] = ocr_line("Save as", 10);
+            let candidate = unique_text_candidate(lines, "Save", case_sensitive, true).unwrap();
+            assert_eq!(
+                candidate,
+                controlfreak_core::TextMatch {
+                    text: "Save".to_owned(),
+                    x: 200,
+                    y: 20,
+                    width: 100,
+                    height: 30,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_click_applies_the_final_predicate_to_all_lines() {
+        for (text, query, case_sensitive, exact_match, found) in [
+            (" \tSave\n", " Save ", true, true, true),
+            (" SAVE ", " save ", false, true, true),
+            ("SAVE", "save", true, true, false),
+            ("Save changes", " Save ", true, false, true),
+            ("SAVE changes", " save ", false, false, true),
+            ("SAVE changes", "save", true, false, false),
+            ("Cancel", "Save", false, false, false),
+            (" ÉDITER ", " éditer ", false, true, true),
+        ] {
+            let result =
+                unique_text_candidate(vec![ocr_line(text, 10)], query, case_sensitive, exact_match);
+            assert_eq!(
+                result.is_ok(),
+                found,
+                "{text:?}, {query:?}, {case_sensitive}, {exact_match}"
+            );
+        }
+        assert!(matches!(
+            unique_text_candidate(
+                vec![
+                    ocr_line("Cancel", 0),
+                    ocr_line("Save as", 10),
+                    ocr_line("SAVE changes", 200)
+                ],
+                " save ",
+                false,
+                false,
+            ),
+            Err(PlatformError::InvalidArgument { .. })
+        ));
     }
 
     #[test]
