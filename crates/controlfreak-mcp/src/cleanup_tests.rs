@@ -264,9 +264,11 @@ async fn persistent_shutdown_failure_has_a_bounded_wait_without_releasing_owners
         "runtime Drop blocked on failed indicator shutdown"
     );
     assert!(retained);
-    tests::wait_until("cleanup to release desktop ownership", || {
-        !fixture.owned.load(Ordering::SeqCst)
-    })
+    tests::wait_until(
+        "cleanup to release desktop ownership",
+        Duration::from_secs(5),
+        || !fixture.owned.load(Ordering::SeqCst),
+    )
     .await;
     assert_eq!(fixture.releases.load(Ordering::SeqCst), 1);
 }

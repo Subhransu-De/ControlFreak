@@ -1992,8 +1992,11 @@ mod tests {
         schema::json_object, tool_error, tool_execution_error, tools,
     };
 
-    pub(super) async fn wait_until(expected: &str, mut ready: impl FnMut() -> bool) {
-        let timeout = Duration::from_secs(5);
+    pub(super) async fn wait_until(
+        expected: &str,
+        timeout: Duration,
+        mut ready: impl FnMut() -> bool,
+    ) {
         tokio::time::timeout(timeout, async {
             while !ready() {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -2004,9 +2007,11 @@ mod tests {
     }
 
     async fn wait_for_status(indicator: &SafetyIndicator, expected: &str) {
-        wait_until(&format!("indicator status {expected}"), || {
-            indicator.status() == expected
-        })
+        wait_until(
+            &format!("indicator status {expected}"),
+            Duration::from_secs(5),
+            || indicator.status() == expected,
+        )
         .await;
     }
 
@@ -2036,9 +2041,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "timed out after 5s waiting for indicator status hidden")]
-    async fn missing_status_transition_has_a_bounded_failure() {
-        wait_for_status(&SafetyIndicator::dormant(), "hidden").await;
+    #[should_panic(expected = "timed out after 0ns waiting for missing transition")]
+    async fn missing_transition_has_a_bounded_failure() {
+        wait_until("missing transition", Duration::ZERO, || false).await;
     }
 
     struct RecordingIndicator {
