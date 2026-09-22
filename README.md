@@ -13,6 +13,9 @@ MCP clients over STDIO.
 - Inspect and switch between discoverable Windows virtual desktops.
 - Show a click-through animated desktop-edge glow while a client owns a mutating control session.
 
+Text clicks require exactly one matching OCR line across the requested region, regardless of
+text-search result limits. Matching ignores surrounding whitespace and, by default, letter case.
+
 ## Install on Windows
 
 Download `ControlFreak-<version>.exe` from [GitHub Releases](https://github.com/Subhransu-De/ControlFreak/releases).

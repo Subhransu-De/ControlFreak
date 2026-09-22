@@ -291,7 +291,7 @@ fn click_text_tool() -> Tool {
         "query".to_owned(),
         json!({
             "type": "string", "minLength": 1,
-            "description": "OCR text to click. The action is rejected unless exactly one matching line remains."
+            "description": "OCR text to click. Surrounding whitespace is ignored. The action is rejected unless exactly one matching line exists in the entire region."
         }),
     );
     properties.insert(
