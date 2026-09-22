@@ -1976,7 +1976,6 @@ mod tests {
             atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc,
         },
-        thread,
         time::Duration,
     };
 
@@ -1993,12 +1992,53 @@ mod tests {
         schema::json_object, tool_error, tool_execution_error, tools,
     };
 
-    fn wait_for_status(indicator: &SafetyIndicator, expected: &str) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while indicator.status() != expected && std::time::Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(indicator.status(), expected);
+    pub(super) async fn wait_until(expected: &str, mut ready: impl FnMut() -> bool) {
+        let timeout = Duration::from_secs(5);
+        tokio::time::timeout(timeout, async {
+            while !ready() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out after {timeout:?} waiting for {expected}"));
+    }
+
+    async fn wait_for_status(indicator: &SafetyIndicator, expected: &str) {
+        wait_until(&format!("indicator status {expected}"), || {
+            indicator.status() == expected
+        })
+        .await;
+    }
+
+    // Keep scheduled deadlines queued so tests can deliver timeout callbacks in
+    // an exact order, without racing the OS clock or changing production timing.
+    fn manual_timeouts(runtime: &IndicatorRuntime) -> mpsc::Receiver<super::IdleCommand> {
+        let (sender, receiver) = mpsc::channel();
+        *runtime.idle_worker.lock().unwrap() = Some(super::IdleWorker {
+            sender,
+            thread: None,
+        });
+        receiver
+    }
+
+    fn expire_current_timeout(runtime: &IndicatorRuntime) {
+        let generation = runtime.state.lock().unwrap().generation;
+        runtime.close_if_idle(generation);
+    }
+
+    #[tokio::test]
+    async fn status_wait_yields_to_the_task_that_completes_the_transition() {
+        let indicator = SafetyIndicator::dormant();
+        let updated = indicator.clone();
+        let task = tokio::spawn(async move { updated.mark_hidden() });
+        wait_for_status(&indicator, "hidden").await;
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "timed out after 5s waiting for indicator status hidden")]
+    async fn missing_status_transition_has_a_bounded_failure() {
+        wait_for_status(&SafetyIndicator::dormant(), "hidden").await;
     }
 
     struct RecordingIndicator {
@@ -2137,6 +2177,7 @@ mod tests {
             },
             Duration::from_millis(20),
         ));
+        let _timeouts = manual_timeouts(&runtime);
 
         assert_eq!(starts.load(Ordering::Relaxed), 0);
         assert_eq!(indicator.status(), "dormant");
@@ -2151,12 +2192,13 @@ mod tests {
         assert_eq!(*events.lock().unwrap(), ["acting", "acting"]);
 
         drop(first_lease);
-        thread::sleep(Duration::from_millis(40));
+        expire_current_timeout(&runtime);
         assert_eq!(*events.lock().unwrap(), ["acting", "acting"]);
 
         drop(second_lease);
         assert_eq!(indicator.status(), "idle_pending");
-        wait_for_status(&indicator, "hidden");
+        expire_current_timeout(&runtime);
+        wait_for_status(&indicator, "hidden").await;
         assert_eq!(
             *events.lock().unwrap(),
             ["acting", "acting", "armed", "hide"]
@@ -2205,18 +2247,23 @@ mod tests {
             },
             Duration::from_millis(40),
         ));
+        let _timeouts = manual_timeouts(&runtime);
 
         let first_lease = runtime.acquire().await.unwrap();
         drop(first_lease);
-        thread::sleep(Duration::from_millis(10));
+        let stale_generation = runtime.state.lock().unwrap().generation;
 
         let second_lease = runtime.acquire().await.unwrap();
-        thread::sleep(Duration::from_millis(50));
+        runtime.close_if_idle(stale_generation);
+        expire_current_timeout(&runtime);
         assert_eq!(indicator.status(), "visible");
         assert_eq!(*events.lock().unwrap(), ["acting", "armed", "acting"]);
 
         drop(second_lease);
-        wait_for_status(&indicator, "hidden");
+        runtime.close_if_idle(stale_generation);
+        assert_eq!(indicator.status(), "idle_pending");
+        expire_current_timeout(&runtime);
+        wait_for_status(&indicator, "hidden").await;
         assert_eq!(
             *events.lock().unwrap(),
             ["acting", "armed", "acting", "armed", "hide"]
@@ -2241,9 +2288,9 @@ mod tests {
 
         for _ in 0..20 {
             drop(runtime.acquire().await.unwrap());
+            wait_for_status(&indicator, "hidden").await;
         }
         assert_eq!(runtime.idle_worker_start_count(), 1);
-        wait_for_status(&indicator, "hidden");
         assert_eq!(
             events
                 .lock()
@@ -2251,7 +2298,7 @@ mod tests {
                 .iter()
                 .filter(|event| **event == "hide")
                 .count(),
-            1
+            20
         );
     }
 
@@ -2273,7 +2320,7 @@ mod tests {
 
         let lease = runtime.acquire().await.unwrap();
         drop(lease);
-        wait_for_status(&indicator, "failed");
+        wait_for_status(&indicator, "failed").await;
         assert_eq!(indicator.failure_reason().as_deref(), Some("hide failed"));
         assert_eq!(
             *events.lock().unwrap(),
@@ -2318,10 +2365,10 @@ mod tests {
         ));
 
         drop(runtime.acquire().await.unwrap());
-        wait_for_status(&indicator, "failed");
+        wait_for_status(&indicator, "failed").await;
 
         drop(runtime.acquire().await.unwrap());
-        thread::sleep(Duration::from_millis(30));
+        wait_for_status(&indicator, "hidden").await;
         assert_eq!(starts.load(Ordering::Relaxed), 2);
         assert_eq!(indicator.status(), "hidden");
     }
@@ -2403,13 +2450,19 @@ mod tests {
                 max_hold: Duration::from_secs(2),
             },
         ));
+        let _timeouts = manual_timeouts(&runtime);
 
         runtime.begin_session(Some(2)).unwrap();
         drop(runtime.acquire().await.unwrap());
 
         assert_eq!(runtime.status()["state"], "armed");
         assert_eq!(runtime.status()["hold_ms"], 2_000);
-        assert!(runtime.status()["time_until_close_ms"].as_u64().unwrap() > 1_500);
+        let state = runtime.state.lock().unwrap();
+        assert!(
+            state.session.close_deadline.unwrap()
+                >= state.session.last_mutation_finished.unwrap() + state.session.hold
+        );
+        drop(state);
 
         runtime.end_session().unwrap();
     }
@@ -2563,14 +2616,19 @@ mod tests {
         let indicator = SafetyIndicator::dormant();
         let events = Arc::new(Mutex::new(Vec::new()));
         let events_for_runtime = Arc::clone(&events);
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_for_worker = Arc::clone(&started);
         let (continue_tx, continue_rx) = mpsc::sync_channel(1);
         let continue_rx = Arc::new(Mutex::new(continue_rx));
         let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
             indicator.clone(),
             move || {
-                started_tx.send(()).unwrap();
-                continue_rx.lock().unwrap().recv().unwrap();
+                started_for_worker.notify_one();
+                continue_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
                 Ok(RecordingIndicator {
                     events: Arc::clone(&events_for_runtime),
                     fail_hide: false,
@@ -2581,11 +2639,13 @@ mod tests {
 
         let runtime_for_acquisition = Arc::clone(&runtime);
         let acquisition = tokio::spawn(async move { runtime_for_acquisition.acquire().await });
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("timed out waiting for blocking worker startup");
         acquisition.abort();
         continue_tx.send(()).unwrap();
         let _ = acquisition.await;
-        wait_for_status(&indicator, "hidden");
+        wait_for_status(&indicator, "hidden").await;
         assert_eq!(*events.lock().unwrap(), ["acting", "armed", "hide"]);
     }
 
@@ -2604,25 +2664,30 @@ mod tests {
             },
             Duration::from_millis(10),
         ));
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_for_worker = Arc::clone(&started);
         let (finish_tx, finish_rx) = mpsc::sync_channel(1);
 
         let lease = runtime.acquire().await.unwrap();
         let request = tokio::spawn(run_platform_operation(Some(lease), move || {
-            started_tx.send(()).unwrap();
-            finish_rx.recv().unwrap();
+            started_for_worker.notify_one();
+            finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         }));
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("timed out waiting for blocking worker startup");
+        let retained_runtime = Arc::downgrade(&runtime);
         drop(runtime);
         request.abort();
         let _ = request.await;
-        thread::sleep(Duration::from_millis(40));
+        // Deliver a timeout while only the blocking work owns the runtime.
+        expire_current_timeout(&retained_runtime.upgrade().unwrap());
 
         assert_eq!(indicator.status(), "visible");
         assert_eq!(*events.lock().unwrap(), ["acting"]);
 
         finish_tx.send(()).unwrap();
-        wait_for_status(&indicator, "stopping");
+        wait_for_status(&indicator, "stopping").await;
         assert_eq!(*events.lock().unwrap(), ["acting", "armed", "shutdown"]);
     }
 
