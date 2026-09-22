@@ -376,10 +376,17 @@ fn legacy_mutation<T>(
     control: &MutationControl,
     operation: impl FnOnce() -> Result<T, PlatformError>,
 ) -> Result<T, PlatformError> {
+    let previous_cleanup = control.progress().cleanup;
     let previous = control.dispatch_started();
+    // Legacy implementations cannot acknowledge release cleanup, including during unwinding.
+    control.cleanup_status(crate::CleanupStatus::Unknown);
     let result = operation();
-    if matches!(result, Err(PlatformError::Unsupported { .. })) {
+    let unsupported = matches!(result, Err(PlatformError::Unsupported { .. }));
+    if unsupported {
         control.dispatch_rejected(previous);
+    }
+    if result.is_ok() || unsupported {
+        control.cleanup_status(previous_cleanup);
     }
     result
 }
@@ -387,26 +394,41 @@ fn legacy_mutation<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::InputOutcome;
+    use crate::{CleanupStatus, InputOutcome};
 
     #[test]
-    fn legacy_backend_errors_do_not_claim_input_was_never_sent() {
-        for (error, expected) in [
+    fn legacy_results_preserve_only_known_delivery_and_cleanup() {
+        for (result, expected_input, expected_cleanup) in [
+            (Ok(()), InputOutcome::Unknown, CleanupStatus::NotNeeded),
             (
-                PlatformError::unsupported("synthetic", "unsupported"),
+                Err(PlatformError::unsupported("synthetic", "unsupported")),
                 InputOutcome::NotStarted,
+                CleanupStatus::NotNeeded,
             ),
             (
-                PlatformError::Unavailable {
+                Err(PlatformError::Unavailable {
                     reason: "provider disconnected".into(),
-                },
+                }),
                 InputOutcome::Unknown,
+                CleanupStatus::Unknown,
             ),
         ] {
             let control = MutationControl::default();
-            let result: Result<(), _> = legacy_mutation(&control, || Err(error));
-            assert!(result.is_err());
-            assert_eq!(control.progress().input_outcome, expected);
+            let expected_result = result.clone();
+            assert_eq!(legacy_mutation(&control, || result), expected_result);
+            assert_eq!(control.progress().input_outcome, expected_input);
+            assert_eq!(control.progress().cleanup, expected_cleanup);
         }
+    }
+
+    #[test]
+    fn legacy_panic_leaves_delivery_and_cleanup_unknown() {
+        let control = MutationControl::default();
+        let result = std::panic::catch_unwind(|| {
+            legacy_mutation::<()>(&control, || panic!("injected provider panic"))
+        });
+        assert!(result.is_err());
+        assert_eq!(control.progress().input_outcome, InputOutcome::Unknown);
+        assert_eq!(control.progress().cleanup, CleanupStatus::Unknown);
     }
 }
