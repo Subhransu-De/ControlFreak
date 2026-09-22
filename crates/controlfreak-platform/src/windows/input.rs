@@ -445,13 +445,7 @@ where
         send_cleanup(&releases, control, native_send_inputs);
         return Err(error);
     }
-    send_releasing(
-        "drag_mouse",
-        &releases,
-        &releases,
-        control,
-        native_send_inputs,
-    )
+    release_inputs(&releases, control, native_send_inputs)
 }
 
 pub(super) fn send_scroll<F>(
@@ -529,6 +523,36 @@ fn send_releasing(
                 Err(error) => error,
             })
         }
+    }
+}
+
+fn release_inputs(
+    releases: &[INPUT],
+    control: &MutationControl,
+    mut send: impl FnMut(&[INPUT]) -> Result<usize, PlatformError>,
+) -> Result<(), PlatformError> {
+    let inserted = match dispatch_inputs(releases, control, &mut send) {
+        Ok(inserted) => inserted,
+        Err(error) => {
+            send_cleanup(releases, control, &mut send);
+            return Err(error);
+        }
+    };
+    if inserted == releases.len() {
+        control.cleanup_status(controlfreak_core::CleanupStatus::NotNeeded);
+        Ok(())
+    } else {
+        // Preserve the original release order without replaying already accepted key-ups.
+        send_cleanup(
+            &releases[inserted.min(releases.len())..],
+            control,
+            &mut send,
+        );
+        Err(incomplete_input_error(
+            "drag_mouse",
+            inserted,
+            releases.len(),
+        ))
     }
 }
 
@@ -671,6 +695,33 @@ mod progress_tests {
                     InputOutcome::PartiallySent
                 }
             );
+        }
+    }
+
+    #[test]
+    fn drag_cleanup_sends_only_unaccepted_releases() {
+        let releases = pointer_release_inputs(MouseButton::Left, &[Key::Ctrl, Key::Shift]);
+        for accepted in 0..=releases.len() {
+            let control = MutationControl::default();
+            control.dispatch_accepted(3);
+            let mut calls = Vec::new();
+            let result = release_inputs(&releases, &control, |inputs| {
+                calls.push(inputs.len());
+                Ok(if calls.len() == 1 {
+                    accepted
+                } else {
+                    inputs.len()
+                })
+            });
+            assert_eq!(result.is_ok(), accepted == releases.len());
+            assert_eq!(control.progress().sent_events, 3 + accepted as u64);
+            if accepted == releases.len() {
+                assert_eq!(calls, [3]);
+                assert_eq!(control.progress().cleanup, CleanupStatus::NotNeeded);
+            } else {
+                assert_eq!(calls, [3, 3 - accepted]);
+                assert_eq!(control.progress().cleanup, CleanupStatus::Succeeded);
+            }
         }
     }
 
