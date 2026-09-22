@@ -7,6 +7,7 @@ mod error;
 mod keyboard;
 mod mutation;
 mod ocr;
+mod outcome;
 mod permission;
 mod platform;
 mod report;
@@ -32,6 +33,7 @@ pub use ocr::{
     ClickTextRequest, ClickTextResult, FindTextRequest, FindTextResult, OcrLine, OcrRegionRequest,
     OcrResult, OcrWord, TextMatch,
 };
+pub use outcome::{CleanupStatus, InputOutcome, MutationProgress};
 pub use permission::{PermissionDescriptor, PermissionId, PermissionState};
 pub use platform::{
     BackendIdentity, BackendMetadata, DisplayBackend, DisplayServer, KeyboardBackend, OcrBackend,

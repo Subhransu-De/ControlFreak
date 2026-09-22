@@ -24,10 +24,13 @@ where
     control.check(operation)?;
     if duration_ms == 0 {
         validate_target(target)?;
+        control.dispatch_started();
         // SAFETY: SetCursorPos accepts any pair of i32 virtual-screen coordinates and retains no
         // pointers or references.
-        return unsafe { SetCursorPos(target.x, target.y) }
-            .map_err(|error| win32_error("SetCursorPos", &error));
+        unsafe { SetCursorPos(target.x, target.y) }
+            .map_err(|error| win32_error("SetCursorPos", &error))?;
+        control.dispatch_accepted(0);
+        return Ok(());
     }
 
     let steps = u64::from(duration_ms).div_ceil(MOVE_FRAME_MS).max(1);
@@ -41,9 +44,11 @@ where
         let x = interpolate(start.x, target.x, step, steps);
         let y = interpolate(start.y, target.y, step, steps);
         validate_target(POINT { x, y })?;
+        control.dispatch_started();
         // SAFETY: SetCursorPos accepts any pair of i32 virtual-screen coordinates and retains no
         // pointers or references.
         unsafe { SetCursorPos(x, y) }.map_err(|error| win32_error("SetCursorPos", &error))?;
+        control.dispatch_accepted(0);
     }
     Ok(())
 }
@@ -162,19 +167,13 @@ where
     control.check(operation)?;
     let inputs = key_chord_inputs(keys);
     validate_target()?;
-    let inserted = send_inputs(&inputs)?;
-    if inserted == inputs.len() {
-        return Ok(());
-    }
-
     let releases: Vec<INPUT> = keys
         .iter()
         .rev()
         .copied()
         .map(|key| keyboard_input(key, true))
         .collect();
-    let _release_attempt = send_inputs(&releases);
-    Err(incomplete_input_error("press_keys", inserted, inputs.len()))
+    send_releasing(operation, &inputs, &releases, control, native_send_inputs)
 }
 
 pub(super) fn key_chord_inputs(keys: &[Key]) -> Vec<INPUT> {
@@ -192,10 +191,23 @@ pub(super) fn key_chord_inputs(keys: &[Key]) -> Vec<INPUT> {
 pub(super) fn send_unicode_text<F>(
     utf16: &[u16],
     control: &MutationControl,
-    mut validate_target: F,
+    validate_target: F,
 ) -> Result<(), PlatformError>
 where
     F: FnMut() -> Result<(), PlatformError>,
+{
+    send_unicode_text_with(utf16, control, validate_target, native_send_inputs)
+}
+
+fn send_unicode_text_with<F, S>(
+    utf16: &[u16],
+    control: &MutationControl,
+    mut validate_target: F,
+    mut send: S,
+) -> Result<(), PlatformError>
+where
+    F: FnMut() -> Result<(), PlatformError>,
+    S: FnMut(&[INPUT]) -> Result<usize, PlatformError>,
 {
     const UNITS_PER_BATCH: usize = 50;
     for batch in utf16.chunks(UNITS_PER_BATCH) {
@@ -205,17 +217,13 @@ where
             inputs.push(unicode_input(*unit, false));
             inputs.push(unicode_input(*unit, true));
         }
+        let releases: Vec<INPUT> = batch
+            .iter()
+            .copied()
+            .map(|unit| unicode_input(unit, true))
+            .collect();
         validate_target()?;
-        let inserted = send_inputs(&inputs)?;
-        if inserted != inputs.len() {
-            let releases: Vec<INPUT> = batch
-                .iter()
-                .copied()
-                .map(|unit| unicode_input(unit, true))
-                .collect();
-            let _release_attempt = send_inputs(&releases);
-            return Err(incomplete_input_error("type_text", inserted, inputs.len()));
-        }
+        send_releasing("type_text", &inputs, &releases, control, &mut send)?;
         if batch.len() == UNITS_PER_BATCH {
             thread::sleep(Duration::from_millis(2));
         }
@@ -370,6 +378,7 @@ pub(super) fn send_click<F>(
     button: MouseButton,
     click_count: u8,
     modifiers: &[Key],
+    control: &MutationControl,
     mut validate_target: F,
 ) -> Result<(), PlatformError>
 where
@@ -377,25 +386,20 @@ where
 {
     let inputs = click_inputs(button, click_count, modifiers);
     validate_target()?;
-    let inserted = send_inputs(&inputs)?;
-    if inserted == inputs.len() {
-        return Ok(());
-    }
-
-    // Always attempt the matching release after a partial insertion so a failed
-    // click cannot leave the logical mouse button held down.
     let releases = pointer_release_inputs(button, modifiers);
-    let _release_attempt = send_inputs(&releases);
-    Err(incomplete_input_error(
+    send_releasing(
         "click_mouse",
-        inserted,
-        inputs.len(),
-    ))
+        &inputs,
+        &releases,
+        control,
+        native_send_inputs,
+    )
 }
 
 pub(super) fn send_drag_press<F>(
     button: MouseButton,
     modifiers: &[Key],
+    control: &MutationControl,
     mut validate_target: F,
 ) -> Result<(), PlatformError>
 where
@@ -411,47 +415,43 @@ where
     );
     inputs.push(mouse_input(down, 0));
     validate_target()?;
-    let inserted = send_inputs(&inputs)?;
-    if inserted == inputs.len() {
-        Ok(())
-    } else {
-        let releases = pointer_release_inputs(button, modifiers);
-        let _release_attempt = send_inputs(&releases);
-        Err(incomplete_input_error("drag_mouse", inserted, inputs.len()))
-    }
+    let releases = pointer_release_inputs(button, modifiers);
+    send_releasing(
+        "drag_mouse",
+        &inputs,
+        &releases,
+        control,
+        native_send_inputs,
+    )
 }
 
 pub(super) fn send_drag_release<F>(
     button: MouseButton,
     modifiers: &[Key],
+    control: &MutationControl,
+    cleanup_only: bool,
     mut validate_target: F,
 ) -> Result<(), PlatformError>
 where
     F: FnMut() -> Result<(), PlatformError>,
 {
     let releases = pointer_release_inputs(button, modifiers);
+    if cleanup_only {
+        send_cleanup(&releases, control, native_send_inputs);
+        return Ok(());
+    }
     if let Err(error) = validate_target() {
-        // Releasing an already-held button is bounded cleanup, not a new action. Attempt it even
-        // when revalidation fails so a desktop transition cannot strand a logical button-down.
-        let _release_attempt = send_inputs(&releases);
+        // Bounded release cleanup must still run after revalidation fails.
+        send_cleanup(&releases, control, native_send_inputs);
         return Err(error);
     }
-    let inserted = send_inputs(&releases)?;
-    if inserted == releases.len() {
-        Ok(())
-    } else {
-        let _release_attempt = send_inputs(&releases[inserted.min(releases.len())..]);
-        Err(incomplete_input_error(
-            "drag_mouse",
-            inserted,
-            releases.len(),
-        ))
-    }
+    release_inputs(&releases, control, native_send_inputs)
 }
 
 pub(super) fn send_scroll<F>(
     delta_x: i32,
     delta_y: i32,
+    control: &MutationControl,
     mut validate_target: F,
 ) -> Result<(), PlatformError>
 where
@@ -459,7 +459,7 @@ where
 {
     let inputs = scroll_inputs(delta_x, delta_y);
     validate_target()?;
-    let inserted = send_inputs(&inputs)?;
+    let inserted = dispatch_inputs(&inputs, control, native_send_inputs)?;
     if inserted == inputs.len() {
         Ok(())
     } else {
@@ -471,7 +471,7 @@ where
     }
 }
 
-fn send_inputs(inputs: &[INPUT]) -> Result<usize, PlatformError> {
+fn native_send_inputs(inputs: &[INPUT]) -> Result<usize, PlatformError> {
     let input_size =
         i32::try_from(size_of::<INPUT>()).map_err(|_| PlatformError::OperationFailed {
             operation: "SendInput".to_owned(),
@@ -484,6 +484,88 @@ fn send_inputs(inputs: &[INPUT]) -> Result<usize, PlatformError> {
         operation: "SendInput".to_owned(),
         reason: "Windows returned an invalid inserted-input count".to_owned(),
     })
+}
+
+fn dispatch_inputs(
+    inputs: &[INPUT],
+    control: &MutationControl,
+    send: impl FnOnce(&[INPUT]) -> Result<usize, PlatformError>,
+) -> Result<usize, PlatformError> {
+    let previous = control.dispatch_started();
+    let inserted = send(inputs)?;
+    if inserted == 0 {
+        control.dispatch_rejected(previous);
+    } else {
+        control.dispatch_accepted(inserted as u64);
+    }
+    Ok(inserted)
+}
+
+fn send_releasing(
+    operation: &str,
+    inputs: &[INPUT],
+    releases: &[INPUT],
+    control: &MutationControl,
+    mut send: impl FnMut(&[INPUT]) -> Result<usize, PlatformError>,
+) -> Result<(), PlatformError> {
+    // If dispatch unwinds, release state is unknown until cleanup has acknowledged it.
+    control.cleanup_status(controlfreak_core::CleanupStatus::Unknown);
+    let result = dispatch_inputs(inputs, control, &mut send);
+    match result {
+        Ok(inserted) if inserted == inputs.len() => {
+            control.cleanup_status(controlfreak_core::CleanupStatus::NotNeeded);
+            Ok(())
+        }
+        result => {
+            send_cleanup(releases, control, send);
+            Err(match result {
+                Ok(inserted) => incomplete_input_error(operation, inserted, inputs.len()),
+                Err(error) => error,
+            })
+        }
+    }
+}
+
+fn release_inputs(
+    releases: &[INPUT],
+    control: &MutationControl,
+    mut send: impl FnMut(&[INPUT]) -> Result<usize, PlatformError>,
+) -> Result<(), PlatformError> {
+    let inserted = match dispatch_inputs(releases, control, &mut send) {
+        Ok(inserted) => inserted,
+        Err(error) => {
+            send_cleanup(releases, control, &mut send);
+            return Err(error);
+        }
+    };
+    if inserted == releases.len() {
+        control.cleanup_status(controlfreak_core::CleanupStatus::NotNeeded);
+        Ok(())
+    } else {
+        // Preserve the original release order without replaying already accepted key-ups.
+        send_cleanup(
+            &releases[inserted.min(releases.len())..],
+            control,
+            &mut send,
+        );
+        Err(incomplete_input_error(
+            "drag_mouse",
+            inserted,
+            releases.len(),
+        ))
+    }
+}
+
+fn send_cleanup(
+    inputs: &[INPUT],
+    control: &MutationControl,
+    send: impl FnOnce(&[INPUT]) -> Result<usize, PlatformError>,
+) {
+    use controlfreak_core::CleanupStatus;
+    control.cleanup_status(CleanupStatus::Unknown);
+    if send(inputs).is_ok_and(|sent| sent == inputs.len()) {
+        control.cleanup_status(CleanupStatus::Succeeded);
+    }
 }
 
 fn incomplete_input_error(operation: &str, inserted: usize, requested: usize) -> PlatformError {
@@ -513,4 +595,153 @@ pub(super) fn interpolate(start: i32, end: i32, step: u64, steps: u64) -> i32 {
     } else {
         i32::MAX
     })
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use controlfreak_core::{CleanupStatus, InputOutcome};
+
+    fn failure() -> PlatformError {
+        PlatformError::OperationFailed {
+            operation: "synthetic".into(),
+            reason: "injected".into(),
+        }
+    }
+
+    #[test]
+    fn text_batches_preserve_cumulative_progress_and_cleanup() {
+        let text: Vec<u16> = "a\u{1f980}".repeat(40).encode_utf16().collect();
+        for failed_batch in [0, 1, 2] {
+            for accepted in [0, 1, 7] {
+                for cleanup_succeeds in [false, true] {
+                    let control = MutationControl::default();
+                    let mut batch = 0;
+                    let result = send_unicode_text_with(
+                        &text,
+                        &control,
+                        || Ok(()),
+                        |inputs| {
+                            let current = batch;
+                            batch += 1;
+                            if current == failed_batch {
+                                Ok(accepted)
+                            } else if current > failed_batch && !cleanup_succeeds {
+                                Err(failure())
+                            } else {
+                                Ok(inputs.len())
+                            }
+                        },
+                    );
+                    assert!(result.is_err());
+                    let progress = control.progress();
+                    assert_eq!(progress.sent_events, failed_batch * 100 + accepted as u64);
+                    assert_eq!(
+                        progress.input_outcome,
+                        if failed_batch == 0 && accepted == 0 {
+                            InputOutcome::NotStarted
+                        } else {
+                            InputOutcome::PartiallySent
+                        }
+                    );
+                    assert_eq!(
+                        progress.cleanup,
+                        if cleanup_succeeds {
+                            CleanupStatus::Succeeded
+                        } else {
+                            CleanupStatus::Unknown
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn later_validation_cancellation_and_provider_failure_keep_earlier_batches() {
+        for mode in 0..3 {
+            let control = MutationControl::default();
+            let mut validations = 0;
+            let mut batches = 0;
+            let result = send_unicode_text_with(
+                &[65; 120],
+                &control,
+                || {
+                    validations += 1;
+                    if mode == 0 && validations == 2 {
+                        Err(failure())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |inputs| {
+                    batches += 1;
+                    if mode == 2 && batches == 2 {
+                        return Err(failure());
+                    }
+                    if mode == 1 {
+                        control.cancel();
+                    }
+                    Ok(inputs.len())
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(control.progress().sent_events, 100);
+            assert_eq!(
+                control.progress().input_outcome,
+                if mode == 2 {
+                    InputOutcome::Unknown
+                } else {
+                    InputOutcome::PartiallySent
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn drag_cleanup_sends_only_unaccepted_releases() {
+        let releases = pointer_release_inputs(MouseButton::Left, &[Key::Ctrl, Key::Shift]);
+        for accepted in 0..=releases.len() {
+            let control = MutationControl::default();
+            control.dispatch_accepted(3);
+            let mut calls = Vec::new();
+            let result = release_inputs(&releases, &control, |inputs| {
+                calls.push(inputs.len());
+                Ok(if calls.len() == 1 {
+                    accepted
+                } else {
+                    inputs.len()
+                })
+            });
+            assert_eq!(result.is_ok(), accepted == releases.len());
+            assert_eq!(control.progress().sent_events, 3 + accepted as u64);
+            if accepted == releases.len() {
+                assert_eq!(calls, [3]);
+                assert_eq!(control.progress().cleanup, CleanupStatus::NotNeeded);
+            } else {
+                assert_eq!(calls, [3, 3 - accepted]);
+                assert_eq!(control.progress().cleanup, CleanupStatus::Succeeded);
+            }
+        }
+    }
+
+    #[test]
+    fn complete_unicode_dispatch_counts_events_without_claiming_application_effect() {
+        let control = MutationControl::default();
+        let text: Vec<u16> = "\u{65e5}\u{672c}\u{8a9e}\u{1f980}"
+            .repeat(30)
+            .encode_utf16()
+            .collect();
+        send_unicode_text_with(&text, &control, || Ok(()), |inputs| Ok(inputs.len())).unwrap();
+        control.input_complete();
+        assert_eq!(control.progress().sent_events, text.len() as u64 * 2);
+        assert_eq!(control.progress().input_outcome, InputOutcome::InputSent);
+        assert_eq!(control.progress().cleanup, CleanupStatus::NotNeeded);
+        let next = control.for_operation();
+        assert_eq!(
+            next.progress(),
+            controlfreak_core::MutationProgress::default()
+        );
+        assert_ne!(control.progress(), next.progress());
+    }
 }

@@ -792,6 +792,7 @@ impl PointerBackend for Backend {
                     request.button,
                     request.click_count,
                     &request.modifiers,
+                    control,
                     || Self::ensure_point_input_target("click_mouse", target),
                 )?;
                 thread::sleep(Duration::from_millis(POST_INPUT_SETTLE_MS));
@@ -837,9 +838,10 @@ impl PointerBackend for Backend {
             |point| Self::ensure_point_input_target("drag_mouse", point),
         )?;
         control.check("drag_mouse")?;
-        send_drag_press(request.button, &request.modifiers, || {
+        send_drag_press(request.button, &request.modifiers, control, || {
             Self::ensure_point_input_target("drag_mouse", current_cursor_position()?)
         })?;
+        control.cleanup_status(controlfreak_core::CleanupStatus::Unknown);
         let movement = move_cursor(
             "drag_mouse",
             POINT {
@@ -851,12 +853,17 @@ impl PointerBackend for Backend {
             control,
             |point| Self::ensure_point_input_target("drag_mouse", point),
         );
-        let release = send_drag_release(request.button, &request.modifiers, || {
-            Self::ensure_point_input_target("drag_mouse", current_cursor_position()?)
-        });
+        let release = send_drag_release(
+            request.button,
+            &request.modifiers,
+            control,
+            movement.is_err(),
+            || Self::ensure_point_input_target("drag_mouse", current_cursor_position()?),
+        );
         movement?;
         release?;
         thread::sleep(Duration::from_millis(POST_INPUT_SETTLE_MS));
+        control.input_complete();
         Self::pointer_action_result("drag_mouse", foreground_before, &request.observation)
     }
 
@@ -901,7 +908,7 @@ impl PointerBackend for Backend {
             control,
             |control, target| {
                 control.check("scroll_mouse")?;
-                send_scroll(request.delta_x, request.delta_y, || {
+                send_scroll(request.delta_x, request.delta_y, control, || {
                     Self::ensure_point_input_target("scroll_mouse", target)
                 })?;
                 thread::sleep(Duration::from_millis(POST_INPUT_SETTLE_MS));
@@ -1001,6 +1008,7 @@ impl WindowBackend for Backend {
             )?;
             thread::sleep(Duration::from_millis(DESKTOP_SWITCH_SETTLE_MS));
         }
+        control.input_complete();
         let after = current_virtual_desktop_id(&manager);
         let observation = observe_foreground(&request.observation)
             .map_err(|error| post_action_error("switch_virtual_desktop", error.to_string()))?;
@@ -1033,6 +1041,7 @@ impl WindowBackend for Backend {
         let (hwnd, _) = parse_window_id(&request.window_id)?;
         Self::ensure_window_input_target("focus_window", hwnd)?;
 
+        control.dispatch_started();
         if window.is_minimized {
             restore_window(hwnd);
         }
@@ -1043,6 +1052,7 @@ impl WindowBackend for Backend {
                 reason: "Windows denied foreground activation; refresh list_windows and retry only if user activity did not change the target".to_owned(),
             });
         }
+        control.input_complete();
         let deadline = Instant::now() + Duration::from_millis(300);
         while foreground_window_handle() != hwnd && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
@@ -1057,8 +1067,10 @@ impl WindowBackend for Backend {
             });
         }
 
-        let focused = window_info(hwnd)?;
-        let observation = observe_display(&focused.display_id, &request.observation)?;
+        let focused = window_info(hwnd)
+            .map_err(|error| post_action_error("focus_window", error.to_string()))?;
+        let observation = observe_display(&focused.display_id, &request.observation)
+            .map_err(|error| post_action_error("focus_window", error.to_string()))?;
         Ok(WindowFocusResult {
             window: focused,
             observation,
@@ -1147,8 +1159,10 @@ impl KeyboardBackend for Backend {
             Self::ensure_foreground_input_target("press_keys")
         })?;
         thread::sleep(Duration::from_millis(POST_FOCUS_SETTLE_MS));
+        control.input_complete();
         Ok(KeyboardActionResult {
-            observation: observe_foreground(&request.observation)?,
+            observation: observe_foreground(&request.observation)
+                .map_err(|error| post_action_error("press_keys", error.to_string()))?,
         })
     }
 
@@ -1183,8 +1197,10 @@ impl KeyboardBackend for Backend {
             Self::ensure_foreground_input_target("type_text")
         })?;
         thread::sleep(Duration::from_millis(POST_FOCUS_SETTLE_MS));
+        control.input_complete();
         Ok(KeyboardActionResult {
-            observation: observe_foreground(&request.observation)?,
+            observation: observe_foreground(&request.observation)
+                .map_err(|error| post_action_error("type_text", error.to_string()))?,
         })
     }
 }
@@ -1293,9 +1309,16 @@ impl Backend {
             control,
             |point| Self::ensure_point_input_target(operation, point),
         )?;
+        // A move-only action is already dispatched. Its next cursor read is observation,
+        // whereas clicks and scrolls still need this read to validate their input target.
+        if operation == "move_mouse" {
+            control.input_complete();
+            return Self::pointer_action_result(operation, foreground_before, spec.observation);
+        }
         let actual_target = current_cursor_position()?;
         action(control, actual_target)?;
 
+        control.input_complete();
         Self::pointer_action_result(operation, foreground_before, spec.observation)
     }
 

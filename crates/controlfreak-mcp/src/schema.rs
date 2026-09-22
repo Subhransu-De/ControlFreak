@@ -847,7 +847,73 @@ fn action_output_schema(include_position: bool) -> Arc<JsonObject> {
             .expect("required is an array")
             .push(Value::String("position".to_owned()));
     }
-    Arc::new(json_object(schema))
+    let progress_properties = mutation_progress_properties();
+    let mut incomplete = json!({
+        "type": "object",
+        "properties": {
+            "operation": {"type": "string"},
+            "warning": {"type": "string"},
+            "error": {
+                "type": "object",
+                "properties": {"code": {"type": "string"}, "message": {"type": "string"}, "details": {}},
+                "required": ["code", "message"],
+                "additionalProperties": false
+            }
+        },
+        "required": [],
+        "additionalProperties": false,
+        "anyOf": [{"required": ["error"]}, {"required": ["operation", "warning"]}]
+    });
+    for variant in [&mut schema, &mut incomplete] {
+        for (name, property) in progress_properties.as_object().expect("properties object") {
+            variant["properties"][name] = property.clone();
+            variant["required"]
+                .as_array_mut()
+                .expect("required array")
+                .push(json!(name));
+        }
+    }
+    schema["properties"]["status"] = json!({"const": "completed"});
+    schema["properties"]["observation_status"] = json!({"const": "succeeded"});
+    schema["properties"]["input"]["properties"]["input_outcome"] = json!({"const": "input_sent"});
+    incomplete["properties"]["status"] =
+        json!({"enum": ["completed_unverified", "not_started", "partially_sent", "unknown"]});
+    incomplete["properties"]["observation_status"] = json!({"enum": ["failed", "not_attempted"]});
+    incomplete["oneOf"] = json!(
+        [
+            ("completed_unverified", "input_sent", "failed"),
+            ("not_started", "not_started", "not_attempted"),
+            ("partially_sent", "partially_sent", "not_attempted"),
+            ("unknown", "unknown", "not_attempted"),
+        ]
+        .map(|(status, input, observation)| json!({"properties": {
+            "status": {"const": status},
+            "input": {"properties": {"input_outcome": {"const": input}}},
+            "observation_status": {"const": observation}
+        }}))
+    );
+    Arc::new(json_object(
+        json!({"type": "object", "oneOf": [schema, incomplete]}),
+    ))
+}
+
+fn mutation_progress_properties() -> Value {
+    json!({
+        "status": {"enum": ["completed", "completed_unverified", "not_started", "partially_sent", "unknown"]},
+        "input": {
+            "type": "object",
+            "properties": {
+                "input_outcome": {"enum": ["not_started", "input_sent", "partially_sent", "unknown"]},
+                "sent_events": {"type": "integer", "minimum": 0},
+                "cleanup": {"enum": ["not_needed", "succeeded", "unknown"]}
+            },
+            "required": ["input_outcome", "sent_events", "cleanup"],
+            "additionalProperties": false
+        },
+        "observation_status": {"enum": ["succeeded", "failed", "not_attempted"]},
+        "effect_verification": {"const": "unverified"},
+        "retry_action": {"const": false}
+    })
 }
 
 fn screenshot_schema() -> Value {

@@ -1,3 +1,5 @@
+use controlfreak_core::{InputOutcome, MutationControl, MutationProgress, PlatformError};
+
 use super::{
     Arc, CallToolResponse, CallToolResult, CaptureDisplayInput, CaptureDisplayRequest,
     CaptureRegionInput, CaptureRegionRequest, CaptureWindowInput, CaptureWindowRequest,
@@ -34,21 +36,32 @@ where
 async fn run_mutation_operation<T, F>(
     operation_lease: Option<OperationLease>,
     operation: F,
-) -> Result<T, ErrorData>
+) -> (Result<T, PlatformError>, MutationProgress)
 where
     T: Send + 'static,
-    F: FnOnce(&controlfreak_core::MutationControl) -> T + Send + 'static,
+    F: FnOnce(&MutationControl) -> Result<T, PlatformError> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
-        let control = operation_lease.as_ref().map_or_else(
-            controlfreak_core::MutationControl::default,
-            OperationLease::mutation_control,
-        );
+    let control = operation_lease
+        .as_ref()
+        .map_or_else(MutationControl::default, OperationLease::mutation_control)
+        .for_operation();
+    let worker_control = control.clone();
+    let result = tokio::task::spawn_blocking(move || {
         let _operation_lease = operation_lease;
-        operation(&control)
+        operation(&worker_control)
     })
-    .await
-    .map_err(|error| join_error(&error))
+    .await;
+    let result = result.unwrap_or_else(|_| {
+        // A worker can fail while a native/provider call is in flight. Never replay it.
+        if control.progress().input_outcome == InputOutcome::NotStarted {
+            control.dispatch_started();
+        }
+        Err(PlatformError::OperationFailed {
+            operation: "mutation_worker".to_owned(),
+            reason: "mutation worker failed; observe the desktop before recovery".to_owned(),
+        })
+    });
+    (result, control.progress())
 }
 
 pub(super) fn call_get_server_status(
@@ -68,7 +81,7 @@ pub(super) fn call_get_server_status(
             json!({
                 "operation_id": operation.operation_id,
                 "tool": operation.tool,
-                "status": if operation.failed { "failed" } else { "completed" },
+                "status": operation.status,
                 "elapsed_ms": operation.elapsed_ms,
                 "gap_ms": operation.gap_ms,
             })
@@ -302,14 +315,15 @@ pub(super) async fn call_click_text(
         duration_ms: input.duration_ms,
         observation: input.observation.into(),
     };
-    let result = run_mutation_operation(operation_lease, move |control| {
+    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
         backend.click_text_controlled(&request, control)
     })
-    .await?;
+    .await;
     match result {
         Ok(result) => Ok(click_text_result(&result, &action).into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
+    .map(|response| super::results::with_progress(response, progress))
 }
 
 pub(super) async fn call_move_mouse(
@@ -325,14 +339,15 @@ pub(super) async fn call_move_mouse(
         duration_ms: input.duration_ms,
         observation: input.observation.into(),
     };
-    let result = run_mutation_operation(operation_lease, move |control| {
+    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
         backend.move_mouse_controlled(&request, control)
     })
-    .await?;
+    .await;
     match result {
         Ok(result) => Ok(pointer_result(&result, &json!({ "kind": "move" })).into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
+    .map(|response| super::results::with_progress(response, progress))
 }
 
 pub(super) async fn call_click_mouse(
@@ -352,10 +367,10 @@ pub(super) async fn call_click_mouse(
         duration_ms: input.duration_ms,
         observation: input.observation.into(),
     };
-    let result = run_mutation_operation(operation_lease, move |control| {
+    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
         backend.click_mouse_controlled(&click_request, control)
     })
-    .await?;
+    .await;
     match result {
         Ok(result) => Ok(pointer_result(
             &result,
@@ -369,6 +384,7 @@ pub(super) async fn call_click_mouse(
         .into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
+    .map(|response| super::results::with_progress(response, progress))
 }
 
 pub(super) async fn call_drag_mouse(
@@ -404,14 +420,15 @@ pub(super) async fn call_drag_mouse(
         duration_ms: input.duration_ms,
         observation: input.observation.into(),
     };
-    let result = run_mutation_operation(operation_lease, move |control| {
+    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
         backend.drag_mouse_controlled(&request, control)
     })
-    .await?;
+    .await;
     match result {
         Ok(result) => Ok(pointer_result(&result, &action).into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
+    .map(|response| super::results::with_progress(response, progress))
 }
 
 pub(super) async fn call_list_windows(
@@ -456,14 +473,15 @@ pub(super) async fn call_switch_virtual_desktop(
         steps: input.steps,
         observation: input.observation.into(),
     };
-    let result = run_mutation_operation(operation_lease, move |control| {
+    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
         backend.switch_virtual_desktop_controlled(&request, control)
     })
-    .await?;
+    .await;
     match result {
         Ok(result) => Ok(virtual_desktop_switch_result(&result).into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
+    .map(|response| super::results::with_progress(response, progress))
 }
 
 pub(super) async fn call_focus_window(
@@ -476,14 +494,15 @@ pub(super) async fn call_focus_window(
         window_id: input.window_id,
         observation: input.observation.into(),
     };
-    let result = run_mutation_operation(operation_lease, move |control| {
+    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
         backend.focus_window_controlled(&request, control)
     })
-    .await?;
+    .await;
     match result {
         Ok(result) => Ok(window_focus_result(&result).into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
+    .map(|response| super::results::with_progress(response, progress))
 }
 
 pub(super) async fn call_capture_window(
@@ -538,10 +557,10 @@ pub(super) async fn call_press_keys(
         keys: input.keys,
         observation: input.observation.into(),
     };
-    let result = run_mutation_operation(operation_lease, move |control| {
+    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
         backend.press_keys_controlled(&request, control)
     })
-    .await?;
+    .await;
     match result {
         Ok(result) => Ok(keyboard_result(
             &result,
@@ -550,6 +569,7 @@ pub(super) async fn call_press_keys(
         .into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
+    .map(|response| super::results::with_progress(response, progress))
 }
 
 pub(super) async fn call_type_text(
@@ -563,10 +583,10 @@ pub(super) async fn call_type_text(
         text: input.text,
         observation: input.observation.into(),
     };
-    let result = run_mutation_operation(operation_lease, move |control| {
+    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
         backend.type_text_controlled(&request, control)
     })
-    .await?;
+    .await;
     match result {
         Ok(result) => Ok(keyboard_result(
             &result,
@@ -575,6 +595,7 @@ pub(super) async fn call_type_text(
         .into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
+    .map(|response| super::results::with_progress(response, progress))
 }
 
 pub(super) async fn call_scroll_mouse(
@@ -594,10 +615,10 @@ pub(super) async fn call_scroll_mouse(
         duration_ms: input.duration_ms,
         observation: input.observation.into(),
     };
-    let result = run_mutation_operation(operation_lease, move |control| {
+    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
         backend.scroll_mouse_controlled(&scroll_request, control)
     })
-    .await?;
+    .await;
     match result {
         Ok(result) => Ok(pointer_result(
             &result,
@@ -610,4 +631,5 @@ pub(super) async fn call_scroll_mouse(
         .into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
+    .map(|response| super::results::with_progress(response, progress))
 }

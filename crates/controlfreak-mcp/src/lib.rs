@@ -3,6 +3,8 @@
 #[cfg(test)]
 mod cleanup_tests;
 mod handlers;
+#[cfg(test)]
+mod outcome_tests;
 mod results;
 mod schema;
 
@@ -1110,7 +1112,7 @@ struct Diagnostics {
 struct OperationRecord {
     operation_id: u64,
     tool: String,
-    failed: bool,
+    status: &'static str,
     elapsed_ms: u64,
     gap_ms: Option<u64>,
 }
@@ -1166,7 +1168,7 @@ impl ServerHandler for ControlFreakServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "ControlFreak is a computer-use MCP server. For tasks with multiple input actions, call begin_control_session first and end_control_session when finished. Actions return screenshots by default. Reuse them; capture again only when needed. Choose targets from current observations. Prefer click_text for unique visible labels. Check isError and error text. Read structuredContent without serializing image data. Never repeat an action when retry_action=false.",
+                "ControlFreak is a computer-use MCP server. For tasks with multiple input actions, call begin_control_session first and end_control_session when finished. Actions return screenshots by default. Reuse them; capture again only when needed. Choose targets from current observations. Prefer click_text for unique visible labels. Check isError, status, and error text. Input dispatch and observation do not verify application effects. Observe again before recovering from partial or unknown delivery. Read structuredContent without serializing image data. Never repeat an action when retry_action=false.",
             )
     }
 
@@ -1293,12 +1295,38 @@ impl ServerHandler for ControlFreakServer {
             };
             let outcome = match outcome {
                 Ok(response) => Ok(response),
-                Err(error) => Ok(tool_execution_error(&error).into()),
+                Err(error) => {
+                    let response = tool_execution_error(&error).into();
+                    Ok(if is_mutating_tool(&tool_name) {
+                        results::with_progress(
+                            response,
+                            controlfreak_core::MutationProgress::default(),
+                        )
+                    } else {
+                        response
+                    })
+                }
             };
             let failed = match &outcome {
                 Err(_) => true,
                 Ok(CallToolResponse::Complete(result)) => result.is_error == Some(true),
                 Ok(_) => false,
+            };
+            let status = match &outcome {
+                Ok(CallToolResponse::Complete(result)) => match result
+                    .structured_content
+                    .as_ref()
+                    .and_then(|value| value["status"].as_str())
+                {
+                    Some("completed_unverified") => "completed_unverified",
+                    Some("partially_sent") => "partially_sent",
+                    Some("unknown") => "unknown",
+                    Some("not_started") => "not_started",
+                    _ if failed => "failed",
+                    _ => "completed",
+                },
+                _ if failed => "failed",
+                _ => "completed",
             };
             if failed {
                 diagnostics.failed.fetch_add(1, Ordering::Relaxed);
@@ -1313,7 +1341,7 @@ impl ServerHandler for ControlFreakServer {
             diagnostics.record(OperationRecord {
                 operation_id,
                 tool: tool_name.clone(),
-                failed,
+                status,
                 elapsed_ms,
                 gap_ms,
             });
@@ -1324,7 +1352,7 @@ impl ServerHandler for ControlFreakServer {
                     "instance_id": diagnostics.instance_id,
                     "operation_id": operation_id,
                     "tool": tool_name,
-                    "status": if failed { "failed" } else { "completed" },
+                    "status": status,
                     "elapsed_ms": elapsed_ms,
                     "gap_ms": gap_ms,
                 })
