@@ -42,7 +42,7 @@ pub use platform::{
 };
 pub use report::CapabilityReport;
 pub use security::{IntegrityLevel, SecurityContext};
-pub use text_matching::{discover_text, select_text_candidate};
+pub use text_matching::{discover_text, select_text_candidate, validate_text_discovery};
 pub use window::{
     CaptureWindowRequest, FocusWindowRequest, WaitForWindowRequest, WindowBounds,
     WindowFocusResult, WindowInfo, WindowScreenshot, WindowWaitResult,

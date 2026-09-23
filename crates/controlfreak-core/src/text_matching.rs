@@ -211,6 +211,23 @@ fn matching(
     (Vec::new(), None)
 }
 
+/// Validate discovery arguments before capturing or recognizing desktop content.
+pub fn validate_text_discovery(
+    query: &str,
+    mode: TextMatchMode,
+    confusions: bool,
+    limit: u32,
+) -> Result<(), PlatformError> {
+    validate(query, mode, confusions)?;
+    if !(1..=100).contains(&limit) {
+        return Err(PlatformError::InvalidArgument {
+            argument: "max_results".into(),
+            reason: "must be between 1 and 100".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Bounded discovery only. The first nonempty tier wins, including ambiguous tiers.
 pub fn discover_text(
     lines: &[OcrLine],
@@ -221,13 +238,7 @@ pub fn discover_text(
     confusions: bool,
     limit: u32,
 ) -> Result<OcrMatchDetails, PlatformError> {
-    validate(query, mode, confusions)?;
-    if !(1..=100).contains(&limit) {
-        return Err(PlatformError::InvalidArgument {
-            argument: "max_results".into(),
-            reason: "must be between 1 and 100".into(),
-        });
-    }
+    validate_text_discovery(query, mode, confusions, limit)?;
     let (matches, tier) = matching(lines, region, query, case_sensitive, mode, confusions);
     Ok(bounded(&matches, tier, limit as usize))
 }

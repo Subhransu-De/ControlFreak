@@ -146,6 +146,7 @@ const MAX_DESKTOP_SWITCH_STEPS: u8 = 10;
 const DESKTOP_SWITCH_SETTLE_MS: u64 = 300;
 const VISUAL_BASELINE_TTL_MS: u32 = 300_000;
 const MAX_VISUAL_BASELINES: usize = 16;
+#[cfg(test)]
 const MAX_OCR_RESULTS: u32 = 100;
 
 #[derive(Clone)]
@@ -422,18 +423,12 @@ impl OcrBackend for Backend {
         &self,
         request: &FindTextRequest,
     ) -> Result<FindTextResult, PlatformError> {
-        if request.query.trim().is_empty() {
-            return Err(PlatformError::InvalidArgument {
-                argument: "query".to_owned(),
-                reason: "must not be empty".to_owned(),
-            });
-        }
-        if request.max_results == 0 || request.max_results > MAX_OCR_RESULTS {
-            return Err(PlatformError::InvalidArgument {
-                argument: "max_results".to_owned(),
-                reason: format!("must be between 1 and {MAX_OCR_RESULTS}"),
-            });
-        }
+        controlfreak_core::validate_text_discovery(
+            &request.query,
+            request.match_mode,
+            request.ocr_confusions,
+            request.max_results,
+        )?;
         let ocr = self.recognize_text(&request.region)?;
         let details = controlfreak_core::discover_text(
             &ocr.lines,
@@ -960,6 +955,33 @@ mod tests {
         ];
 
         assert_eq!(word_union(&words), Some((100, 48, 100, 24)));
+    }
+
+    #[test]
+    fn invalid_discovery_modes_are_rejected_before_display_access() {
+        use controlfreak_core::{FindTextRequest, OcrBackend, TextMatchMode};
+        for mode in [TextMatchMode::Exact, TextMatchMode::Substring] {
+            let error = Backend::new()
+                .find_text_on_screen(&FindTextRequest {
+                    region: OcrRegionRequest {
+                        display_id: "invalid-display-must-not-be-accessed".into(),
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                        language: None,
+                    },
+                    query: "Code".into(),
+                    case_sensitive: false,
+                    max_results: 20,
+                    match_mode: mode,
+                    ocr_confusions: true,
+                })
+                .unwrap_err();
+            assert!(
+                matches!(error, PlatformError::InvalidArgument { argument, .. } if argument == "ocr_confusions")
+            );
+        }
     }
 
     fn unique_text_candidate(
