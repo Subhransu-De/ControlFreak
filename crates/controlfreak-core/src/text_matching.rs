@@ -75,8 +75,10 @@ fn bounded(candidates: &[TextMatch], tier: Option<TextMatchTier>, limit: usize) 
         match_tier: tier,
         recovery: if tier.is_none() {
             "Refine the query using recognized text, refresh the region, or change match_mode for discovery."
+        } else if candidates.len() > 1 && tier == Some(TextMatchTier::Substring) {
+            "Narrow the region, refine the query, or use exact mode instead of substring matching."
         } else if candidates.len() > 1 {
-            "Narrow the region or refine the query. Use exact mode if substring matching is too broad."
+            "Narrow the region or refine the query."
         } else {
             "Discovery does not authorize input or verify control state. Confirm the target before acting."
         }.to_owned(),
@@ -327,6 +329,18 @@ mod tests {
         let result = discover(&lines, "save", false);
         assert_eq!(result.candidate_count, 2);
         assert_eq!(result.match_tier, Some(TextMatchTier::Exact));
+        assert!(!result.recovery.contains("exact mode"));
+        let substring = discover_text(
+            &lines,
+            &region(),
+            "save",
+            false,
+            TextMatchMode::Substring,
+            false,
+            20,
+        )
+        .unwrap();
+        assert!(substring.recovery.contains("exact mode"));
         let result = discover_text(
             &lines,
             &region(),
