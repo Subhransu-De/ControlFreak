@@ -20,7 +20,7 @@ const MAX_INDICATOR_RESTARTS: u8 = 2;
 
 #[derive(Clone)]
 pub struct SafetyIndicator {
-    pub(super) state: Arc<AtomicU8>,
+    state: Arc<AtomicU8>,
     failure_reason: Arc<Mutex<Option<String>>>,
 }
 
@@ -165,7 +165,7 @@ impl ActivityArbitrator for LocalArbitrator {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ControlSessionState {
+enum ControlSessionState {
     Dormant,
     Armed,
     Acting,
@@ -173,7 +173,7 @@ pub(super) enum ControlSessionState {
 }
 
 impl ControlSessionState {
-    pub(super) const fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Dormant => "dormant",
             Self::Armed => "armed",
@@ -184,7 +184,7 @@ impl ControlSessionState {
 }
 
 pub(super) struct ControlSession {
-    pub(super) state: ControlSessionState,
+    state: ControlSessionState,
     owns_arbitration: bool,
     explicitly_begun: bool,
     call_count: u64,
@@ -196,7 +196,7 @@ pub(super) struct ControlSession {
 }
 
 impl ControlSession {
-    pub(super) fn dormant(short_hold: Duration) -> Self {
+    fn dormant(short_hold: Duration) -> Self {
         Self {
             state: ControlSessionState::Dormant,
             owns_arbitration: false,
@@ -224,14 +224,14 @@ pub(super) struct IndicatorRuntime {
     pub(super) state: Mutex<IndicatorRuntimeState>,
     lifecycle: Mutex<()>,
     pub(super) idle_worker: Mutex<Option<IdleWorker>>,
-    pub(super) safety_indicator: SafetyIndicator,
+    safety_indicator: SafetyIndicator,
     pub(super) starter: IndicatorStarter,
     pub(super) environment: Option<Arc<dyn PlatformBackend>>,
     pub(super) terminated: AtomicBool,
-    pub(super) arbitrator: Arc<dyn ActivityArbitrator>,
-    pub(super) short_hold: Duration,
-    pub(super) session_hold: Duration,
-    pub(super) max_hold: Duration,
+    arbitrator: Arc<dyn ActivityArbitrator>,
+    short_hold: Duration,
+    session_hold: Duration,
+    max_hold: Duration,
     #[cfg(test)]
     idle_worker_starts: AtomicUsize,
 }

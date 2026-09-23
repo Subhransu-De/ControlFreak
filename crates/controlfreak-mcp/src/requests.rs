@@ -79,12 +79,12 @@ pub(super) struct WaitForChangeSinceInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct OcrRegionInput {
-    pub(super) display_id: String,
-    pub(super) x: u32,
-    pub(super) y: u32,
-    pub(super) width: u32,
-    pub(super) height: u32,
-    pub(super) language: Option<String>,
+    display_id: String,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    language: Option<String>,
 }
 
 impl OcrRegionInput {
@@ -103,17 +103,17 @@ impl OcrRegionInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct FindTextInput {
-    pub(super) display_id: String,
-    pub(super) x: u32,
-    pub(super) y: u32,
-    pub(super) width: u32,
-    pub(super) height: u32,
-    pub(super) language: Option<String>,
-    pub(super) query: String,
+    display_id: String,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    language: Option<String>,
+    query: String,
     #[serde(default)]
-    pub(super) case_sensitive: bool,
+    case_sensitive: bool,
     #[serde(default = "default_max_ocr_results")]
-    pub(super) max_results: u32,
+    max_results: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,21 +164,21 @@ impl FindTextInput {
 #[serde(deny_unknown_fields)]
 pub(super) struct ObservationInput {
     #[serde(default)]
-    pub(super) mode: ObservationMode,
-    pub(super) max_width: Option<u32>,
+    mode: ObservationMode,
+    max_width: Option<u32>,
     #[serde(default = "default_true")]
-    pub(super) include_cursor: bool,
+    include_cursor: bool,
     pub(super) region: Option<ObservationRegionInput>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ObservationRegionInput {
-    pub(super) display_id: String,
-    pub(super) x: u32,
-    pub(super) y: u32,
+    display_id: String,
+    x: u32,
+    y: u32,
     pub(super) width: u32,
-    pub(super) height: u32,
+    height: u32,
 }
 
 impl Default for ObservationInput {

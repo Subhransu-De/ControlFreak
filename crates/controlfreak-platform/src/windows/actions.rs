@@ -274,15 +274,12 @@ impl Backend {
         Self::ensure_window_input_target(operation, foreground_window_handle())
     }
 
-    pub(super) fn ensure_point_input_target(
-        operation: &str,
-        point: POINT,
-    ) -> Result<(), PlatformError> {
+    fn ensure_point_input_target(operation: &str, point: POINT) -> Result<(), PlatformError> {
         ensure_interactive_input_desktop(operation)?;
         privilege::ensure_point_integrity(operation, point)
     }
 
-    pub(super) fn perform_pointer_action<F>(
+    fn perform_pointer_action<F>(
         &self,
         operation: &str,
         spec: PointerActionSpec<'_>,
@@ -329,7 +326,7 @@ impl Backend {
         Self::pointer_action_result(operation, foreground_before, spec.observation)
     }
 
-    pub(super) fn pointer_action_result(
+    fn pointer_action_result(
         operation: &str,
         foreground_before: HWND,
         options: &ObservationOptions,
