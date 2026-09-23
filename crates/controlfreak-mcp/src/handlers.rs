@@ -54,8 +54,9 @@ where
     );
     let worker_control = control.clone();
     let result = tokio::task::spawn_blocking(move || {
+        let registered_work = work;
         let _operation_lease = operation_lease;
-        let _work = super::stop::CleanupOnDrop(work);
+        let _cleanup = super::stop::CleanupOnDrop(registered_work.clone());
         worker_control.check("mutation_worker")?;
         operation(&worker_control)
     })

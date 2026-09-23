@@ -217,6 +217,7 @@ pub(super) struct IndicatorRuntimeState {
     pub(super) generation: u64,
     last_cleanup_reason: Option<String>,
     cancellation: MutationControl,
+    stop_registration: Option<controlfreak_core::StopRegistration>,
     pub(super) session: ControlSession,
 }
 
@@ -288,6 +289,7 @@ impl IndicatorRuntime {
                 generation: 0,
                 last_cleanup_reason: None,
                 cancellation: MutationControl::default(),
+                stop_registration: None,
                 session: ControlSession::dormant(timing.short_hold),
             }),
             lifecycle: Mutex::new(()),
@@ -316,7 +318,9 @@ impl IndicatorRuntime {
                     .check("admission")
                     .map_err(|error| error.to_string())?;
             }
-            runtime.acquire_mutation_blocking()
+            runtime
+                .acquire_mutation_blocking()
+                .map(|lease| (lease, work))
         })
         .await
         .map_err(|error| {
@@ -325,7 +329,9 @@ impl IndicatorRuntime {
                 Some(json!({ "reason": error.to_string() })),
             )
         })?;
-        result.map_err(|reason| indicator_unavailable(&self.safety_indicator, &reason))
+        result
+            .map(|(lease, _work)| lease)
+            .map_err(|reason| indicator_unavailable(&self.safety_indicator, &reason))
     }
 
     #[cfg(test)]
@@ -604,6 +610,11 @@ impl IndicatorRuntime {
         if state.session.state == ControlSessionState::Closing {
             return Err("the prior control session is still closing".to_owned());
         }
+        let cancellation = MutationControl::default();
+        let stop_registration = self
+            .stop
+            .register(cancellation.clone())
+            .map_err(|error| error.to_string())?;
         self.arbitrator.try_acquire().map_err(|busy| {
             serde_json::to_string(&json!({
                 "code": "desktop_in_use",
@@ -617,7 +628,8 @@ impl IndicatorRuntime {
         })?;
         state.session = ControlSession::dormant(self.short_hold);
         state.session.owns_arbitration = true;
-        state.cancellation = MutationControl::default();
+        state.cancellation = cancellation;
+        state.stop_registration = Some(stop_registration);
         Ok(())
     }
 
@@ -717,6 +729,7 @@ impl IndicatorRuntime {
             self.arbitrator.release();
         }
         state.session = ControlSession::dormant(self.short_hold);
+        state.stop_registration = None;
     }
 
     fn hold_for_session(&self, session: &ControlSession) -> Duration {

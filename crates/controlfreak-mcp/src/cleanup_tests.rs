@@ -11,6 +11,84 @@ fn stop_and_status_do_not_wait_for_a_provider_holding_runtime_state() {
 }
 
 #[tokio::test]
+async fn cancelled_response_stays_draining_until_indicator_cleanup_returns() {
+    struct BlockingHide {
+        entered: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+        finish: Arc<Mutex<mpsc::Receiver<()>>>,
+    }
+    impl ActivityIndicator for BlockingHide {
+        fn set_level(&mut self, _: IndicatorLevel) -> Result<(), String> {
+            Ok(())
+        }
+        fn hide(&mut self) -> Result<(), String> {
+            self.entered
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
+            self.finish
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            Ok(())
+        }
+        fn shutdown(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    let (entered, hiding) = tokio::sync::oneshot::channel();
+    let entered = Arc::new(Mutex::new(Some(entered)));
+    let (finish, receiver) = mpsc::channel();
+    let receiver = Arc::new(Mutex::new(receiver));
+    let fixture = Arc::new(Fixture::default());
+    let runtime = Arc::new(IndicatorRuntime::new_with_timing(
+        SafetyIndicator::dormant(),
+        move || {
+            Ok(BlockingHide {
+                entered: Arc::clone(&entered),
+                finish: Arc::clone(&receiver),
+            })
+        },
+        fixture.clone(),
+        GlowTiming {
+            short_hold: Duration::from_secs(10),
+            session_hold: Duration::from_secs(10),
+            max_hold: Duration::from_secs(10),
+        },
+    ));
+    let lease = runtime.acquire_mutation_blocking().unwrap();
+    let work = stop::Work::new(&runtime.stop).unwrap();
+    let stopping = runtime.stop.clone();
+    let task = tokio::spawn(stop::WORK.scope(work, async move {
+        handlers::run_mutation_operation(Some(lease), move |_| {
+            stopping.stop();
+            Ok(())
+        })
+        .await
+    }));
+    tokio::time::timeout(Duration::from_secs(5), hiding)
+        .await
+        .unwrap()
+        .unwrap();
+    task.abort();
+    let _ = task.await;
+    assert_eq!(runtime.stop.status(), "draining");
+    assert!(fixture.owned.load(Ordering::SeqCst));
+    finish.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime.stop.status() == "draining" {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!fixture.owned.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn stop_keeps_blocked_worker_ownership_until_cleanup_finishes() {
     for cleanup_failed in [false, true] {
         let fixture = Arc::new(Fixture::default());
