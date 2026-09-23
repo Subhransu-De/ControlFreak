@@ -14,6 +14,12 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ### Added
 
+- Structured OCR no-match and ambiguity errors with bounded candidate metadata and recovery
+  guidance. Successful text clicks report the matching tier and selected bounds.
+- Opt-in tolerant OCR discovery with Unicode, whitespace and punctuation normalization,
+  bounded adjacent-line joining, and optional single-character OCR-confusion matching.
+  Strict click authorization remains separate from discovery.
+
 - Fixture-tested agent recipes for observation, crop mapping, verification, visual waits,
   partial-input recovery, and atomic dragging. Export published tool descriptions and schemas
   with `--print-tools`.

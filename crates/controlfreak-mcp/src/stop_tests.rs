@@ -76,6 +76,14 @@ impl DisplayBackend for WaitingBackend {
     }
 }
 impl OcrBackend for WaitingBackend {
+    fn find_text_on_screen_controlled(
+        &self,
+        _: &controlfreak_core::FindTextRequest,
+        control: &MutationControl,
+    ) -> Result<controlfreak_core::FindTextResult, PlatformError> {
+        self.wait(control)
+    }
+
     fn read_text_in_region_controlled(
         &self,
         _: &OcrRegionRequest,
@@ -95,6 +103,11 @@ async fn transport_stop_and_client_cancellation_reach_every_worker_kind() {
             (
                 WAIT_FOR_VISUAL_CHANGE,
                 json!({"display_id":"fixture","x":0,"y":0,"width":1,"height":1}),
+            ),
+            (
+                FIND_TEXT_ON_SCREEN,
+                json!({"display_id":"fixture","x":0,"y":0,"width":1,"height":1,
+                    "query":"synthetic", "match_mode":"tolerant", "ocr_confusions":true}),
             ),
             (
                 READ_TEXT_IN_REGION,

@@ -276,9 +276,11 @@ fn find_text_on_screen_tool() -> Tool {
         "max_results".to_owned(),
         json!({ "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }),
     );
+    properties.insert("match_mode".into(), json!({"type": "string", "enum": ["exact", "substring", "tolerant"], "default": "substring", "description": "Discovery only. Tolerant tries trimmed exact, NFKC/whitespace/punctuation normalization, two adjacent lines, then optional OCR confusions. The first nonempty tier wins even if ambiguous. No confidence scores or automatic input."}));
+    properties.insert("ocr_confusions".into(), json!({"type": "boolean", "default": false, "description": "Tolerant discovery only: allow one 0/O/o or 1/I/i/l/| substitution in a 4-64 character label."}));
     Tool::new(
         FIND_TEXT_ON_SCREEN,
-        "Find OCR lines matching query within a region. Return matching text and bounds in display-local physical pixels.",
+        "Discover OCR text within a region without authorizing input. Returns display-local bounds, match_tier, full candidate_count, and truncation flags. At most max_results candidates and 256 Unicode characters per candidate; ambiguity is never hidden by the limit.",
         object_schema(properties, &["display_id", "x", "y", "width", "height", "query"]),
     )
     .with_annotations(
@@ -327,7 +329,7 @@ fn click_text_tool() -> Tool {
     add_observation(&mut properties);
     Tool::new(
         CLICK_TEXT,
-        "Click the center of a unique matching OCR line in a region. No input occurs if there are zero or multiple matches.",
+        "Click the center of a unique exact or substring OCR line in a region. No tolerant fallback. Zero/multiple matches return ocr_no_match/ocr_ambiguous_match with recovery guidance and at most 20 candidates of 256 Unicode characters, with truncation flags. No input occurs on either outcome. Success reports matched_text bounds and match_tier.",
         object_schema(
             properties,
             &["display_id", "x", "y", "width", "height", "query"],

@@ -16,6 +16,52 @@ MCP clients over STDIO.
 Text clicks require exactly one matching OCR line across the requested region, regardless of
 text-search result limits. Matching ignores surrounding whitespace and, by default, letter case.
 
+## OCR matching and recovery
+
+`click_text` keeps strict trimmed equality by default, with optional Unicode lowercase comparison.
+`exact_match=false` selects substring matching. It checks every fully contained, nonempty OCR
+line in the requested region before input. Duplicate and overlapping matches remain ambiguous.
+Success includes `action.matched_text` with the original text and display-local physical-pixel
+bounds used for the click, plus `action.match_tier` as `exact` or `substring`.
+
+Failures use `ocr_no_match` or `ocr_ambiguous_match`. `error.details` contains up to 20 candidates,
+with at most 256 Unicode scalar values per text. `candidate_count` counts all eligible candidates;
+`candidates_truncated` and `text_truncated` report omitted candidates and shortened returned text.
+For no match, candidates are recognized lines from the requested region, not matches. For ambiguity,
+they are matching lines. Candidate limits never limit the uniqueness check. Narrow the region for
+repeated labels, refine the query using recognized text, or change the discovery mode when strict
+matching misses a label. Neither failure injects input or falls back to coordinates.
+
+`find_text_on_screen` is discovery only. Its explicit `match_mode` values are `substring`, the
+default, `exact`, and `tolerant`. Exact and substring ignore surrounding query whitespace and use
+`case_sensitive` consistently. Discovery returns `match_tier`, the full `candidate_count`,
+truncation flags, and up to `max_results` matches, each limited to 256 Unicode scalar values.
+A limited response containing one candidate does not establish uniqueness.
+
+Tolerant discovery tries these tiers in order and stops at the first nonempty tier, even when
+that tier is ambiguous:
+
+1. Trimmed exact equality with the requested case handling.
+2. Unicode NFKC normalization, Unicode whitespace collapsed to one space, curly single/double
+   quotes folded to ASCII, and U+2010 through U+2014 and U+2212 folded to ASCII hyphen.
+   NFKC also folds compatibility characters such as full-width letters and ellipsis.
+3. Normalized equality across two consecutive lines sorted by Y, X, dimensions, and text.
+   Lines must not overlap vertically, their vertical gap must not exceed the smaller line height,
+   and their left edges must differ by at most half that height. Joined text is limited to 256
+   Unicode scalar values. The returned bounds enclose both lines.
+4. Only with `ocr_confusions=true`, one substitution within `0/O/o` or `1/I/i/l/|` in a
+   normalized label of 4 to 64 Unicode scalar values. No insertions, deletions, or closest-label ranking.
+
+`ocr_confusions` is rejected outside tolerant discovery. Tolerant results never authorize a
+`click_text` action; inspect them, then choose a fresh strict query and region. Matching tiers
+are deterministic rules, not recognition confidence. Windows OCR supplies no confidence scores.
+No contrast adjustment or dark-theme inversion is enabled. Enabling preprocessing would first
+require OCR evaluation on synthetic light/dark, low-contrast, punctuation, Unicode, and checkbox images.
+
+Prefer capability-supported UI Automation patterns for checkbox, selection, and value operations
+when available through a client or another tool. OCR text and checkbox glyphs do not prove control
+state. ControlFreak does not currently implement UI Automation.
+
 ## Action results
 
 Mouse, keyboard, OCR-click, window-focus, and desktop-switch results report input dispatch

@@ -295,6 +295,11 @@ pub(super) async fn call_find_text_on_screen(
             "source_bounds": result.source_bounds,
             "language": result.language,
             "matches": result.matches,
+            "match_tier": result.details.match_tier,
+            "candidate_count": result.details.candidate_count,
+            "candidates_truncated": result.details.candidates_truncated,
+            "text_truncated": result.details.text_truncated,
+            "recovery": result.details.recovery,
         }))
         .into()),
         Err(error) => Ok(tool_error(&error).into()),
