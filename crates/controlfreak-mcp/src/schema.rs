@@ -8,7 +8,8 @@ use super::{
     WAIT_FOR_WINDOW, json,
 };
 
-pub(super) fn tools() -> Vec<Tool> {
+/// Tool descriptions and schemas used by both `tools/list` and offline contract export.
+pub fn tools() -> Vec<Tool> {
     vec![
         get_server_status_tool(),
         begin_control_session_tool(),

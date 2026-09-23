@@ -9,6 +9,12 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Added
+
+- Fixture-tested agent recipes for observation, crop mapping, verification, visual waits,
+  partial-input recovery, and atomic dragging. Export published tool descriptions and schemas
+  with `--print-tools`.
+
 ### Fixed
 
 - Check text-click uniqueness across all recognized lines before clicking, so search result

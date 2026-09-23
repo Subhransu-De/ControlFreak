@@ -34,6 +34,7 @@ Usage:
   controlfreak                       Run the local STDIO MCP server
   controlfreak --allow-elevated      Explicitly allow an elevated server token
   controlfreak --print-capabilities  Print the platform capability declaration
+  controlfreak --print-tools         Print tool descriptions and JSON schemas
   controlfreak --help                Show this help
   controlfreak --version             Show the version";
 
@@ -42,6 +43,7 @@ enum Command {
     Serve,
     OcrHelper,
     PrintCapabilities,
+    PrintTools,
     Help,
     Version,
 }
@@ -100,6 +102,13 @@ async fn try_main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Command::Serve => run_server(options.allow_elevated).await,
         Command::OcrHelper => run_ocr_helper(),
         Command::PrintCapabilities => print_capabilities(options.allow_elevated),
+        Command::PrintTools => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&controlfreak_mcp::tool_definitions())?
+            );
+            Ok(())
+        }
         Command::Help => {
             println!("{HELP}");
             Ok(())
@@ -122,6 +131,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> io::Result<Opti
         let next = match argument.as_str() {
             "--ocr-helper" => Command::OcrHelper,
             "--print-capabilities" => Command::PrintCapabilities,
+            "--print-tools" => Command::PrintTools,
             "--help" | "-h" => Command::Help,
             "--version" | "-V" => Command::Version,
             _ => {
@@ -142,7 +152,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> io::Result<Opti
     if allow_elevated
         && matches!(
             command,
-            Command::OcrHelper | Command::Help | Command::Version
+            Command::OcrHelper | Command::PrintTools | Command::Help | Command::Version
         )
     {
         return Err(io::Error::new(
@@ -293,5 +303,15 @@ mod tests {
         let options = parse_options(["--allow-elevated".to_owned()]).expect("valid options");
         assert_eq!(options.command, Command::Serve);
         assert!(options.allow_elevated);
+    }
+
+    #[test]
+    fn tool_export_is_a_standalone_command() {
+        let options = parse_options(["--print-tools".to_owned()]).unwrap();
+        assert_eq!(options.command, Command::PrintTools);
+        assert!(!options.allow_elevated);
+        for other in ["--print-capabilities", "--help", "--allow-elevated"] {
+            assert!(parse_options(["--print-tools".to_owned(), other.to_owned()]).is_err());
+        }
     }
 }

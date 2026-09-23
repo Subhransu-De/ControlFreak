@@ -278,6 +278,11 @@ Add this to `%USERPROFILE%\.config\opencode\opencode.json`:
 
 ## Development
 
+See the [tested agent recipes](examples/README.md) for observation, crop-coordinate mapping,
+verification, waits, partial-input recovery, and atomic dragging. These run against a synthetic
+fixture without interacting with the desktop. Export the current tool descriptions and schemas
+with `cargo run -p controlfreak-server --locked -- --print-tools`.
+
 The workspace separates domain logic, native Windows integration, the MCP adapter, and the server
 executable into dedicated crates. With GNU Make installed, run the standard local checks:
 
