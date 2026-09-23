@@ -9,6 +9,9 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+- Add an independent stop window, Ctrl+Alt+Pause shortcut, client stop tool and request cancellation. Keep ownership through draining and uncertain cleanup; require a user restart to re-arm.
+- Cancel queued input and visual waits, track OCR draining, and release only acknowledged held inputs after partial dispatch.
+
 ### Added
 
 - Fixture-tested agent recipes for observation, crop mapping, verification, visual waits,

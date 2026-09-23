@@ -24,6 +24,7 @@ where
     control.check(operation)?;
     if duration_ms == 0 {
         validate_target(target)?;
+        control.check(operation)?;
         control.dispatch_started();
         // SAFETY: SetCursorPos accepts any pair of i32 virtual-screen coordinates and retains no
         // pointers or references.
@@ -39,11 +40,12 @@ where
         control.check(operation)?;
         let target_elapsed = Duration::from_millis(u64::from(duration_ms) * step / steps);
         if let Some(remaining) = target_elapsed.checked_sub(started.elapsed()) {
-            thread::sleep(remaining);
+            control.wait(operation, remaining)?;
         }
         let x = interpolate(start.x, target.x, step, steps);
         let y = interpolate(start.y, target.y, step, steps);
         validate_target(POINT { x, y })?;
+        control.check(operation)?;
         control.dispatch_started();
         // SAFETY: SetCursorPos accepts any pair of i32 virtual-screen coordinates and retains no
         // pointers or references.
@@ -167,13 +169,7 @@ where
     control.check(operation)?;
     let inputs = key_chord_inputs(keys);
     validate_target()?;
-    let releases: Vec<INPUT> = keys
-        .iter()
-        .rev()
-        .copied()
-        .map(|key| keyboard_input(key, true))
-        .collect();
-    send_releasing(operation, &inputs, &releases, control, native_send_inputs)
+    send_releasing(operation, &inputs, control, native_send_inputs)
 }
 
 pub(super) fn key_chord_inputs(keys: &[Key]) -> Vec<INPUT> {
@@ -217,13 +213,8 @@ where
             inputs.push(unicode_input(*unit, false));
             inputs.push(unicode_input(*unit, true));
         }
-        let releases: Vec<INPUT> = batch
-            .iter()
-            .copied()
-            .map(|unit| unicode_input(unit, true))
-            .collect();
         validate_target()?;
-        send_releasing("type_text", &inputs, &releases, control, &mut send)?;
+        send_releasing("type_text", &inputs, control, &mut send)?;
         if batch.len() == UNITS_PER_BATCH {
             thread::sleep(Duration::from_millis(2));
         }
@@ -386,14 +377,7 @@ where
 {
     let inputs = click_inputs(button, click_count, modifiers);
     validate_target()?;
-    let releases = pointer_release_inputs(button, modifiers);
-    send_releasing(
-        "click_mouse",
-        &inputs,
-        &releases,
-        control,
-        native_send_inputs,
-    )
+    send_releasing("click_mouse", &inputs, control, native_send_inputs)
 }
 
 pub(super) fn send_drag_press<F>(
@@ -415,14 +399,7 @@ where
     );
     inputs.push(mouse_input(down, 0));
     validate_target()?;
-    let releases = pointer_release_inputs(button, modifiers);
-    send_releasing(
-        "drag_mouse",
-        &inputs,
-        &releases,
-        control,
-        native_send_inputs,
-    )
+    send_releasing("drag_mouse", &inputs, control, native_send_inputs)
 }
 
 pub(super) fn send_drag_release<F>(
@@ -459,6 +436,7 @@ where
 {
     let inputs = scroll_inputs(delta_x, delta_y);
     validate_target()?;
+    control.check("scroll_mouse")?;
     let inserted = dispatch_inputs(&inputs, control, native_send_inputs)?;
     if inserted == inputs.len() {
         Ok(())
@@ -471,7 +449,44 @@ where
     }
 }
 
+fn any_requested_input_held(inputs: &[INPUT], mut is_down: impl FnMut(i32) -> bool) -> bool {
+    for input in inputs {
+        // SAFETY: Each INPUT is locally constructed with its matching union tag;
+        // The query receives a virtual-key code and no native references.
+        let held = unsafe {
+            if input.r#type == INPUT_KEYBOARD {
+                let key = input.Anonymous.ki;
+                !key.dwFlags.contains(KEYEVENTF_KEYUP)
+                    && key.wVk.0 != 0
+                    && is_down(i32::from(key.wVk.0))
+            } else if input.r#type == INPUT_MOUSE {
+                let flags = input.Anonymous.mi.dwFlags;
+                [
+                    (MOUSEEVENTF_LEFTDOWN, 1),
+                    (MOUSEEVENTF_RIGHTDOWN, 2),
+                    (MOUSEEVENTF_MIDDLEDOWN, 4),
+                ]
+                .into_iter()
+                .any(|(down, key)| flags.contains(down) && is_down(key))
+            } else {
+                false
+            }
+        };
+        if held {
+            return true;
+        }
+    }
+    false
+}
+
 fn native_send_inputs(inputs: &[INPUT]) -> Result<usize, PlatformError> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    if any_requested_input_held(inputs, |key| {
+        // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
+        unsafe { GetAsyncKeyState(key) < 0 }
+    }) {
+        return Ok(0);
+    }
     let input_size =
         i32::try_from(size_of::<INPUT>()).map_err(|_| PlatformError::OperationFailed {
             operation: "SendInput".to_owned(),
@@ -504,10 +519,10 @@ fn dispatch_inputs(
 fn send_releasing(
     operation: &str,
     inputs: &[INPUT],
-    releases: &[INPUT],
     control: &MutationControl,
     mut send: impl FnMut(&[INPUT]) -> Result<usize, PlatformError>,
 ) -> Result<(), PlatformError> {
+    control.check(operation)?;
     // If dispatch unwinds, release state is unknown until cleanup has acknowledged it.
     control.cleanup_status(controlfreak_core::CleanupStatus::Unknown);
     let result = dispatch_inputs(inputs, control, &mut send);
@@ -516,14 +531,59 @@ fn send_releasing(
             control.cleanup_status(controlfreak_core::CleanupStatus::NotNeeded);
             Ok(())
         }
-        result => {
-            send_cleanup(releases, control, send);
-            Err(match result {
-                Ok(inserted) => incomplete_input_error(operation, inserted, inputs.len()),
-                Err(error) => error,
-            })
+        Ok(inserted) => {
+            let owned = owned_releases(&inputs[..inserted.min(inputs.len())]);
+            if owned.is_empty() {
+                control.cleanup_status(controlfreak_core::CleanupStatus::NotNeeded);
+            } else {
+                send_cleanup(&owned, control, send);
+            }
+            Err(incomplete_input_error(operation, inserted, inputs.len()))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+// Derive compensating releases only from acknowledged downs without matching ups.
+// This is also the cleanup hook for a future managed hold.
+fn owned_releases(inputs: &[INPUT]) -> Vec<INPUT> {
+    let mut held: Vec<((u32, u16, u16), INPUT)> = Vec::new();
+    for input in inputs {
+        // SAFETY: INPUT is constructed locally and the union member is selected by r#type.
+        let event = unsafe {
+            if input.r#type == INPUT_KEYBOARD {
+                let key = input.Anonymous.ki;
+                let identity = (0, key.wVk.0, key.wScan);
+                let mut release = *input;
+                release.Anonymous.ki.dwFlags |= KEYEVENTF_KEYUP;
+                Some((identity, !key.dwFlags.contains(KEYEVENTF_KEYUP), release))
+            } else if input.r#type == INPUT_MOUSE {
+                let flags = input.Anonymous.mi.dwFlags;
+                [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
+                    .into_iter()
+                    .find_map(|button| {
+                        let (down, up) = mouse_button_flags(button);
+                        if flags.contains(down) || flags.contains(up) {
+                            Some(((down.0, 0, 0), flags.contains(down), mouse_input(up, 0)))
+                        } else {
+                            None
+                        }
+                    })
+            } else {
+                None
+            }
+        };
+        if let Some((identity, down, release)) = event {
+            if down {
+                if !held.iter().any(|(key, _)| *key == identity) {
+                    held.push((identity, release));
+                }
+            } else {
+                held.retain(|(key, _)| *key != identity);
+            }
         }
     }
+    held.into_iter().rev().map(|(_, release)| release).collect()
 }
 
 fn release_inputs(
@@ -610,6 +670,52 @@ mod progress_tests {
     }
 
     #[test]
+    fn cancellation_after_target_validation_does_not_dispatch_or_release_unowned_keys() {
+        let control = MutationControl::default();
+        let result = send_unicode_text_with(
+            &[65, 66],
+            &control,
+            || {
+                control.cancel();
+                Ok(())
+            },
+            |_| panic!("cancelled batch must not dispatch or clean up unowned keys"),
+        );
+        assert!(result.is_err());
+        assert_eq!(control.progress().sent_events, 0);
+        assert_eq!(control.progress().cleanup, CleanupStatus::NotNeeded);
+    }
+
+    #[test]
+    fn partial_chords_release_only_acknowledged_unmatched_downs() {
+        let inputs = key_chord_inputs(&[Key::Ctrl, Key::Shift, Key::A]);
+        for (accepted, expected) in [(0, 0), (1, 1), (2, 2), (3, 3), (4, 2), (5, 1), (6, 0)] {
+            assert_eq!(owned_releases(&inputs[..accepted]).len(), expected);
+        }
+        let clicks = click_inputs(MouseButton::Left, 2, &[Key::Ctrl]);
+        for accepted in 0..=clicks.len() {
+            let releases = owned_releases(&clicks[..accepted]);
+            assert!(releases.len() <= 2);
+        }
+        assert!(owned_releases(&clicks).is_empty());
+    }
+
+    #[test]
+    fn overlapping_user_modifiers_are_refused_but_owned_releases_remain_available() {
+        let chord = key_chord_inputs(&[Key::Ctrl, Key::A]);
+        assert!(any_requested_input_held(&chord, |key| key == 0x11));
+        assert!(!any_requested_input_held(&chord, |_| false));
+        let releases = owned_releases(&chord[..2]);
+        assert!(!any_requested_input_held(&releases, |_| true));
+        let click = click_inputs(MouseButton::Left, 1, &[]);
+        assert!(any_requested_input_held(&click, |key| key == 1));
+        assert!(!any_requested_input_held(
+            &owned_releases(&click[..1]),
+            |_| true
+        ));
+    }
+
+    #[test]
     fn text_batches_preserve_cumulative_progress_and_cleanup() {
         let text: Vec<u16> = "a\u{1f980}".repeat(40).encode_utf16().collect();
         for failed_batch in [0, 1, 2] {
@@ -646,7 +752,9 @@ mod progress_tests {
                     );
                     assert_eq!(
                         progress.cleanup,
-                        if cleanup_succeeds {
+                        if accepted == 0 {
+                            CleanupStatus::NotNeeded
+                        } else if cleanup_succeeds {
                             CleanupStatus::Succeeded
                         } else {
                             CleanupStatus::Unknown
@@ -704,6 +812,7 @@ mod progress_tests {
         for accepted in 0..=releases.len() {
             let control = MutationControl::default();
             control.dispatch_accepted(3);
+            control.cancel();
             let mut calls = Vec::new();
             let result = release_inputs(&releases, &control, |inputs| {
                 calls.push(inputs.len());

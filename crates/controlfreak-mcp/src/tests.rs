@@ -728,6 +728,7 @@ fn tool_surface_includes_windows_and_keyboard() {
     assert_eq!(
         names,
         [
+            "stop_desktop_work",
             "get_server_status",
             "begin_control_session",
             "end_control_session",

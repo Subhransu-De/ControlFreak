@@ -221,6 +221,7 @@ pub(super) struct IndicatorRuntimeState {
 }
 
 pub(super) struct IndicatorRuntime {
+    pub(super) stop: controlfreak_core::StopController,
     pub(super) state: Mutex<IndicatorRuntimeState>,
     lifecycle: Mutex<()>,
     pub(super) idle_worker: Mutex<Option<IdleWorker>>,
@@ -280,6 +281,7 @@ impl IndicatorRuntime {
         G: ActivityIndicator + 'static,
     {
         Self {
+            stop: controlfreak_core::StopController::default(),
             state: Mutex::new(IndicatorRuntimeState {
                 control: None,
                 active_mutations: 0,
@@ -307,14 +309,22 @@ impl IndicatorRuntime {
 
     pub(super) async fn acquire_mutation(self: &Arc<Self>) -> Result<OperationLease, ErrorData> {
         let runtime = Arc::clone(self);
-        let result = tokio::task::spawn_blocking(move || runtime.acquire_mutation_blocking())
-            .await
-            .map_err(|error| {
-                ErrorData::internal_error(
-                    "ControlFreak safety indicator worker failed",
-                    Some(json!({ "reason": error.to_string() })),
-                )
-            })?;
+        let work = super::stop::current();
+        let result = tokio::task::spawn_blocking(move || {
+            if let Some(work) = &work {
+                work.control
+                    .check("admission")
+                    .map_err(|error| error.to_string())?;
+            }
+            runtime.acquire_mutation_blocking()
+        })
+        .await
+        .map_err(|error| {
+            ErrorData::internal_error(
+                "ControlFreak safety indicator worker failed",
+                Some(json!({ "reason": error.to_string() })),
+            )
+        })?;
         result.map_err(|reason| indicator_unavailable(&self.safety_indicator, &reason))
     }
 
@@ -362,7 +372,9 @@ impl IndicatorRuntime {
         self.safety_indicator.mark_visible();
         Ok(OperationLease {
             runtime: Arc::clone(self),
-            control: control.with_cancellation(state.cancellation.clone()),
+            control: control
+                .with_cancellation(state.cancellation.clone())
+                .for_operation(),
         })
     }
 
@@ -426,6 +438,7 @@ impl IndicatorRuntime {
 
     pub(super) fn close_session(&self, reason: &str, terminate: bool) -> Result<(), String> {
         if terminate {
+            self.stop.stop();
             self.terminated.store(true, Ordering::Release);
         }
         let _lifecycle = self
@@ -443,6 +456,7 @@ impl IndicatorRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if terminate {
+            self.stop.stop();
             self.terminated.store(true, Ordering::Release);
         }
         if !state.session.owns_arbitration {
@@ -470,6 +484,10 @@ impl IndicatorRuntime {
     fn check_environment(&self) -> Result<(), String> {
         if self.terminated.load(Ordering::Acquire) {
             return Err("the server is shutting down".to_owned());
+        }
+        if self.stop.is_stopped() {
+            let _ = self.close_session_locked("stop", false);
+            return Err("desktop work is stopped; the user must restart the server".to_owned());
         }
         if let Some(backend) = &self.environment
             && let Err(error) = backend.check_control_environment()
@@ -529,7 +547,8 @@ impl IndicatorRuntime {
         if state.active_mutations != 0 {
             return;
         }
-        if state.session.state == ControlSessionState::Closing {
+        if state.session.state == ControlSessionState::Closing || self.stop.is_stopped() {
+            state.session.state = ControlSessionState::Closing;
             drop(state);
             let _ = self.finish_session_close();
             return;
@@ -764,6 +783,9 @@ impl IndicatorRuntime {
     }
 
     fn finish_session_close(&self) -> Result<(), String> {
+        if self.stop.status() == "cleanup_failed" {
+            return Err("owned input cleanup could not be verified".to_owned());
+        }
         let mut state = self
             .state
             .lock()
@@ -818,6 +840,17 @@ impl IndicatorRuntime {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::status_snapshot(&state)
+    }
+
+    pub(super) fn try_status(&self) -> Value {
+        let Ok(state) = self.state.try_lock() else {
+            return json!({"state": "busy", "draining": self.stop.is_stopped(), "stop_state": self.stop.status()});
+        };
+        Self::status_snapshot(&state)
+    }
+
+    fn status_snapshot(state: &IndicatorRuntimeState) -> Value {
         let remaining_ms = state.session.close_deadline.map(|deadline| {
             u64::try_from(
                 deadline

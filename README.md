@@ -166,6 +166,31 @@ when the server exits. `get_server_status` reports the session state, active mut
 restart count, indicator health, whether a Windows job is enforcing helper containment, and the
 server's elevation and Windows integrity level.
 
+## Stop desktop work
+
+Click the native **STOP desktop work** window or press **Ctrl+Alt+Pause** to stop.
+The stop window and shortcut run independently of MCP requests, OCR and the glow helper.
+The shortcut samples only those three keys and does not record typed text.
+Clients can call `stop_desktop_work` or cancel an individual request with the MCP
+`notifications/cancelled` notification. Request cancellation affects that request;
+the stop button, shortcut and stop tool close admission for the server's lifetime.
+`begin_control_session` and `end_control_session` cannot clear a stop.
+
+`get_server_status.stop_state` reports `ready`, `draining`, `stopped`, or
+`cleanup_failed`. Read-only captures, lists, status and session cleanup remain available after stop. Queued
+mutations check cancellation before dispatch. Movement and visual waits use 10 ms cancellation polls between native calls; typing checks between bounded batches.
+Already-dispatched application operations cannot be undone. A blocked native call,
+including OCR, can still be draining. The private OCR helper forwards cancellation
+to WinRT recognition and retains its existing
+30-second deadline; stopping does not kill applications or lock the workstation.
+
+Cleanup releases only acknowledged, unmatched ControlFreak key and button downs.
+Input refuses a requested key or button that is already held. Desktop ownership
+and the glow remain until mutation workers finish cleanup. If release cleanup is
+uncertain, ownership stays reserved and status reports `cleanup_failed`.
+Only the user should restart the server to re-arm it, after checking that work has
+drained and resolving any held input. There is no MCP re-arm operation.
+
 ## Elevated operation
 
 ControlFreak inherits its MCP client's Windows token. An elevated server is refused by default with

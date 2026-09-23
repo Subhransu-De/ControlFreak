@@ -1,4 +1,85 @@
 use super::*;
+
+#[test]
+fn stop_and_status_do_not_wait_for_a_provider_holding_runtime_state() {
+    let fixture = Arc::new(Fixture::default());
+    let runtime = fixture.runtime();
+    let _state = runtime.state.lock().unwrap();
+    runtime.stop.stop();
+    assert_eq!(runtime.try_status()["state"], "busy");
+    assert_eq!(runtime.try_status()["draining"], true);
+}
+
+#[tokio::test]
+async fn stop_keeps_blocked_worker_ownership_until_cleanup_finishes() {
+    for cleanup_failed in [false, true] {
+        let fixture = Arc::new(Fixture::default());
+        let runtime = fixture.runtime();
+        let lease = runtime.acquire_mutation_blocking().unwrap();
+        let work = stop::Work::new(&runtime.stop).unwrap();
+        let control = work.control.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (finish, drain) = mpsc::channel();
+        let task = tokio::spawn(stop::WORK.scope(work, async move {
+            let _cancel = stop::CancelOnDrop(control);
+            handlers::run_mutation_operation(Some(lease), move |control| {
+                control.dispatch_accepted(1);
+                control.cleanup_status(controlfreak_core::CleanupStatus::Unknown);
+                started.send(()).unwrap();
+                drain.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(control.is_cancelled());
+                if !cleanup_failed {
+                    control.cleanup_status(controlfreak_core::CleanupStatus::Succeeded);
+                }
+                control.check("synthetic_drag")
+            })
+            .await
+        }));
+        ready.await.unwrap();
+        runtime.stop.stop();
+        assert_eq!(runtime.stop.status(), "draining");
+        assert!(runtime.acquire_mutation_blocking().is_err());
+        assert!(fixture.owned.load(Ordering::SeqCst));
+        // Simulate rmcp dropping a cancelled request future while its native call drains.
+        task.abort();
+        let _ = task.await;
+        assert_eq!(runtime.stop.status(), "draining");
+        finish.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.stop.status() == "draining" {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        runtime.check_lifecycle();
+        assert_eq!(
+            runtime.stop.status(),
+            if cleanup_failed {
+                "cleanup_failed"
+            } else {
+                "stopped"
+            }
+        );
+        assert_eq!(fixture.owned.load(Ordering::SeqCst), cleanup_failed);
+        assert!(runtime.begin_session(None).is_err());
+    }
+}
+
+#[test]
+fn stop_during_helper_startup_refuses_admission_after_helper_returns() {
+    let fixture = Arc::new(Fixture::default());
+    let mut runtime = fixture.runtime();
+    let stop = runtime.stop.clone();
+    let indicator_fixture = Arc::clone(&fixture);
+    Arc::get_mut(&mut runtime).unwrap().starter = Arc::new(move || {
+        stop.stop();
+        Ok(Box::new(Indicator(Arc::clone(&indicator_fixture))))
+    });
+    assert!(runtime.acquire_mutation_blocking().is_err());
+    assert_eq!(runtime.status()["active_mutations"], 0);
+    assert!(!fixture.owned.load(Ordering::SeqCst));
+}
 use controlfreak_core::{
     BackendMetadata, DisplayBackend, KeyboardBackend, OcrBackend, PointerBackend, WindowBackend,
 };

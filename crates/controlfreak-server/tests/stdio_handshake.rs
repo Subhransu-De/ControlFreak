@@ -73,6 +73,7 @@ fn stdio_handshake_reports_complete_windows_tool_surface() {
     assert_eq!(
         tool_names,
         [
+            "stop_desktop_work",
             "get_server_status",
             "begin_control_session",
             "end_control_session",

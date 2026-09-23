@@ -74,6 +74,8 @@ mod glow;
 mod input;
 mod privilege;
 mod process;
+mod stop;
+pub use stop::UserStop;
 
 pub use arbitration::DesktopArbitrator;
 pub use process::ManagedChild;
@@ -209,10 +211,14 @@ impl Backend {
         }
     }
 
-    fn recognize_text(&self, request: &OcrRegionRequest) -> Result<OcrResult, PlatformError> {
+    fn recognize_text(
+        &self,
+        request: &OcrRegionRequest,
+        control: &MutationControl,
+    ) -> Result<OcrResult, PlatformError> {
         self.ocr_helper.as_ref().map_or_else(
-            || recognize_text_in_process(request),
-            |command| recognize_text_with_helper(command, request),
+            || recognize_text_in_process(request, control),
+            |command| recognize_text_with_helper(command, request, control),
         )
     }
 }
@@ -305,6 +311,15 @@ impl DisplayBackend for Backend {
         &self,
         request: &WaitForVisualChangeRequest,
     ) -> Result<VisualChangeResult, PlatformError> {
+        self.wait_for_visual_change_controlled(request, &MutationControl::default())
+    }
+
+    fn wait_for_visual_change_controlled(
+        &self,
+        request: &WaitForVisualChangeRequest,
+        control: &MutationControl,
+    ) -> Result<VisualChangeResult, PlatformError> {
+        control.check("wait_for_visual_change")?;
         ensure_dpi_awareness()?;
         validate_visual_wait(request)?;
         let display = find_display(&request.display_id)?;
@@ -323,6 +338,7 @@ impl DisplayBackend for Backend {
             request.timeout_ms,
             request.stable_ms,
             request.difference_threshold,
+            control,
         )
     }
 
@@ -378,6 +394,15 @@ impl DisplayBackend for Backend {
         &self,
         request: &WaitForChangeSinceRequest,
     ) -> Result<VisualChangeResult, PlatformError> {
+        self.wait_for_change_since_controlled(request, &MutationControl::default())
+    }
+
+    fn wait_for_change_since_controlled(
+        &self,
+        request: &WaitForChangeSinceRequest,
+        control: &MutationControl,
+    ) -> Result<VisualChangeResult, PlatformError> {
+        control.check("wait_for_change_since")?;
         validate_wait_values(
             request.timeout_ms,
             request.stable_ms,
@@ -409,19 +434,38 @@ impl DisplayBackend for Backend {
             request.timeout_ms,
             request.stable_ms,
             request.difference_threshold,
+            control,
         )
     }
 }
 
 impl OcrBackend for Backend {
     fn read_text_in_region(&self, request: &OcrRegionRequest) -> Result<OcrResult, PlatformError> {
-        self.recognize_text(request)
+        self.read_text_in_region_controlled(request, &MutationControl::default())
+    }
+
+    fn read_text_in_region_controlled(
+        &self,
+        request: &OcrRegionRequest,
+        control: &MutationControl,
+    ) -> Result<OcrResult, PlatformError> {
+        control.check("read_text_in_region")?;
+        self.recognize_text(request, control)
     }
 
     fn find_text_on_screen(
         &self,
         request: &FindTextRequest,
     ) -> Result<FindTextResult, PlatformError> {
+        self.find_text_on_screen_controlled(request, &MutationControl::default())
+    }
+
+    fn find_text_on_screen_controlled(
+        &self,
+        request: &FindTextRequest,
+        control: &MutationControl,
+    ) -> Result<FindTextResult, PlatformError> {
+        control.check("find_text_on_screen")?;
         if request.query.trim().is_empty() {
             return Err(PlatformError::InvalidArgument {
                 argument: "query".to_owned(),
@@ -434,7 +478,7 @@ impl OcrBackend for Backend {
                 reason: format!("must be between 1 and {MAX_OCR_RESULTS}"),
             });
         }
-        let ocr = self.recognize_text(&request.region)?;
+        let ocr = self.recognize_text(&request.region, control)?;
         let needle = if request.case_sensitive {
             request.query.clone()
         } else {
@@ -484,7 +528,7 @@ impl OcrBackend for Backend {
                 reason: "must not be empty".to_owned(),
             });
         }
-        let ocr = self.recognize_text(&request.region)?;
+        let ocr = self.recognize_text(&request.region, control)?;
         // Search result limits must not hide eligible lines from the uniqueness check.
         let candidate = unique_text_candidate(
             ocr.lines,
@@ -594,7 +638,7 @@ impl WindowBackend for Backend {
             VirtualDesktopDirection::Left => Key::ArrowLeft,
             VirtualDesktopDirection::Right => Key::ArrowRight,
         };
-        let _guard = self.lock_input();
+        let _guard = self.lock_input(control)?;
         ensure_interactive_input_desktop("switch_virtual_desktop")?;
         for _ in 0..request.steps {
             control.check("switch_virtual_desktop")?;
@@ -632,7 +676,7 @@ impl WindowBackend for Backend {
     ) -> Result<WindowFocusResult, PlatformError> {
         ensure_dpi_awareness()?;
         validate_observation(&request.observation)?;
-        let _guard = self.lock_input();
+        let _guard = self.lock_input(control)?;
         ensure_interactive_input_desktop("focus_window")?;
         control.check("focus_window")?;
         let window = find_window(&request.window_id)?;
@@ -708,6 +752,15 @@ impl WindowBackend for Backend {
         &self,
         request: &WaitForWindowRequest,
     ) -> Result<WindowWaitResult, PlatformError> {
+        self.wait_for_window_controlled(request, &MutationControl::default())
+    }
+
+    fn wait_for_window_controlled(
+        &self,
+        request: &WaitForWindowRequest,
+        control: &MutationControl,
+    ) -> Result<WindowWaitResult, PlatformError> {
+        control.check("wait_for_window")?;
         ensure_dpi_awareness()?;
         validate_window_wait(request)?;
         let started = Instant::now();
@@ -733,7 +786,10 @@ impl WindowBackend for Backend {
                 });
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            thread::sleep(remaining.min(Duration::from_millis(VISUAL_POLL_MS)));
+            control.wait(
+                "wait_for_window",
+                remaining.min(Duration::from_millis(VISUAL_POLL_MS)),
+            )?;
         }
     }
 }
@@ -865,6 +921,28 @@ mod tests {
     }
 
     #[test]
+    fn queued_input_cancels_while_another_worker_still_owns_the_input_lock() {
+        use std::{
+            sync::{Arc, mpsc},
+            time::Duration,
+        };
+        let backend = Arc::new(Backend::new());
+        let owner = backend.input_lock.lock().unwrap();
+        let control = controlfreak_core::MutationControl::default();
+        let worker_control = control.clone();
+        let worker_backend = Arc::clone(&backend);
+        let (done, result) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            done.send(worker_backend.lock_input(&worker_control).is_err())
+                .unwrap();
+        });
+        control.cancel();
+        assert!(result.recv_timeout(Duration::from_secs(2)).unwrap());
+        drop(owner);
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn isolated_ocr_process_drains_output_before_exit() {
         use std::{process::Stdio, time::Duration};
 
@@ -884,6 +962,34 @@ mod tests {
 
         assert!(output.status.success());
         assert!(output.stdout.len() >= 512 * 1024);
+    }
+
+    #[test]
+    fn cancelled_ocr_helper_drains_without_waiting_for_its_kill_deadline() {
+        use std::{
+            process::Stdio,
+            time::{Duration, Instant},
+        };
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "windows::tests::ocr_large_output_test_helper",
+                "--nocapture",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let control = controlfreak_core::MutationControl::default();
+        control.cancel();
+        let started = Instant::now();
+        let error =
+            super::ocr::wait_for_ocr_helper_controlled(child, Duration::from_secs(30), &control)
+                .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(error.to_string().contains("cancelled"));
     }
 
     #[test]

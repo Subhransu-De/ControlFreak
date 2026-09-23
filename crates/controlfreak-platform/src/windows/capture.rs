@@ -10,7 +10,7 @@ use super::{
     SelectObject, SoftwareBitmap, SystemTime, UNIX_EPOCH, VISUAL_COMPARE_WIDTH, VISUAL_POLL_MS,
     VisualChangeResult, WaitForVisualChangeRequest, WindowBounds, WindowInfo, c_void,
     current_cursor_position, ensure_dpi_awareness, enumerate_displays, find_display,
-    foreground_window_handle, last_win32_error, size_of, thread, win32_error, window_info,
+    foreground_window_handle, last_win32_error, size_of, win32_error, window_info,
 };
 
 struct ScreenDc(HDC);
@@ -467,6 +467,7 @@ pub(super) fn wait_for_change(
     timeout_ms: u32,
     stable_ms: u32,
     difference_threshold: f64,
+    control: &controlfreak_core::MutationControl,
 ) -> Result<VisualChangeResult, PlatformError> {
     validate_wait_values(timeout_ms, stable_ms, difference_threshold)?;
     let started = Instant::now();
@@ -479,7 +480,10 @@ pub(super) fn wait_for_change(
 
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        thread::sleep(remaining.min(Duration::from_millis(VISUAL_POLL_MS)));
+        control.wait(
+            "wait_for_change",
+            remaining.min(Duration::from_millis(VISUAL_POLL_MS)),
+        )?;
         let frame = capture_comparison_frame(bounds)?;
         difference = image_difference(baseline, &frame)?;
         if difference >= difference_threshold {
@@ -503,6 +507,7 @@ pub(super) fn wait_for_change(
         previous = frame;
     }
 
+    control.check("wait_for_change")?;
     let screenshot = capture_display_bounds(display, bounds, Some(MAX_ACTION_IMAGE_WIDTH), true)?;
     Ok(VisualChangeResult {
         changed,
@@ -513,7 +518,11 @@ pub(super) fn wait_for_change(
     })
 }
 
-pub(super) fn recognize_text(request: &OcrRegionRequest) -> Result<OcrResult, PlatformError> {
+pub(super) fn recognize_text(
+    request: &OcrRegionRequest,
+    control: &controlfreak_core::MutationControl,
+) -> Result<OcrResult, PlatformError> {
+    control.check("windows_ocr")?;
     ensure_dpi_awareness()?;
     let _apartment = ComApartment::initialize()?;
     let display = find_display(&request.display_id)?;
@@ -564,10 +573,19 @@ pub(super) fn recognize_text(request: &OcrRegionRequest) -> Result<OcrResult, Pl
         .and_then(|language| language.LanguageTag())
         .map(|tag| tag.to_string())
         .map_err(ocr_error)?;
-    let recognized = engine
-        .RecognizeAsync(&bitmap)
-        .and_then(|operation| operation.join())
-        .map_err(ocr_error)?;
+    control.check("windows_ocr")?;
+    let operation = engine.RecognizeAsync(&bitmap).map_err(ocr_error)?;
+    // WinRT AsyncStatus::Started is zero. Request cancellation once, then drain
+    // the operation; a provider that ignores cancellation remains visibly draining.
+    while operation.Status().map_err(ocr_error)?.0 == 0 {
+        if control.is_cancelled() {
+            let _ = operation.Cancel();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let recognized = operation.join().map_err(ocr_error)?;
+    control.check("windows_ocr")?;
     let recognized_lines = recognized.Lines().map_err(ocr_error)?;
     let mut lines = Vec::with_capacity(recognized_lines.Size().map_err(ocr_error)? as usize);
     for index in 0..recognized_lines.Size().map_err(ocr_error)? {

@@ -94,7 +94,7 @@ impl PointerBackend for Backend {
         let (end_x, end_y) = end_display
             .bounds
             .to_virtual(request.end_x, request.end_y)?;
-        let _guard = self.lock_input();
+        let _guard = self.lock_input(control)?;
         let foreground_before = foreground_window_handle();
         ensure_interactive_input_desktop("drag_mouse")?;
         control.check("drag_mouse")?;
@@ -203,7 +203,7 @@ impl KeyboardBackend for Backend {
         ensure_dpi_awareness()?;
         validate_key_chord(request)?;
         validate_observation(&request.observation)?;
-        let _guard = self.lock_input();
+        let _guard = self.lock_input(control)?;
         ensure_interactive_input_desktop("press_keys")?;
         send_key_chord("press_keys", &request.keys, control, || {
             Self::ensure_foreground_input_target("press_keys")
@@ -241,7 +241,7 @@ impl KeyboardBackend for Backend {
             });
         }
 
-        let _guard = self.lock_input();
+        let _guard = self.lock_input(control)?;
         ensure_interactive_input_desktop("type_text")?;
         send_unicode_text(&utf16, control, || {
             Self::ensure_foreground_input_target("type_text")
@@ -256,10 +256,20 @@ impl KeyboardBackend for Backend {
 }
 
 impl Backend {
-    pub(super) fn lock_input(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.input_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    pub(super) fn lock_input(
+        &self,
+        control: &MutationControl,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, PlatformError> {
+        loop {
+            control.check("input_queue")?;
+            match self.input_lock.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    control.wait("input_queue", Duration::from_millis(10))?;
+                }
+            }
+        }
     }
 
     pub(super) fn ensure_window_input_target(
@@ -295,7 +305,7 @@ impl Backend {
 
         let display = find_display(spec.display_id)?;
         let (target_x, target_y) = display.bounds.to_virtual(spec.x, spec.y)?;
-        let _guard = self.lock_input();
+        let _guard = self.lock_input(control)?;
         ensure_interactive_input_desktop(operation)?;
         control.check(operation)?;
         let foreground_before = foreground_window_handle();

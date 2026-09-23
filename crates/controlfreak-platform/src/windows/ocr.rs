@@ -1,9 +1,9 @@
 use super::recognize_text_in_process;
 use crate::OcrHelperCommand;
-use controlfreak_core::{OcrRegionRequest, OcrResult, PlatformError};
+use controlfreak_core::{MutationControl, OcrRegionRequest, OcrResult, PlatformError};
 use serde::{Deserialize, Serialize};
 use std::{
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     thread,
     time::{Duration, Instant},
 };
@@ -21,6 +21,7 @@ enum OcrHelperResponse {
 pub(super) fn recognize_text_with_helper(
     command: &OcrHelperCommand,
     request: &OcrRegionRequest,
+    control: &MutationControl,
 ) -> Result<OcrResult, PlatformError> {
     use std::{
         os::windows::process::CommandExt,
@@ -28,6 +29,7 @@ pub(super) fn recognize_text_with_helper(
     };
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    control.check("windows_ocr_helper")?;
     let request_json =
         serde_json::to_vec(request).map_err(|error| PlatformError::OperationFailed {
             operation: "windows_ocr_helper".to_owned(),
@@ -45,9 +47,10 @@ pub(super) fn recognize_text_with_helper(
             reason: format!("could not start the isolated OCR process: {error}"),
         })?;
 
-    let send_error = match child.stdin.take() {
-        Some(mut stdin) => stdin
+    let send_error = match child.stdin.as_mut() {
+        Some(stdin) => stdin
             .write_all(&request_json)
+            .and_then(|()| stdin.write_all(b"\n"))
             .err()
             .map(|error| format!("could not send the OCR request: {error}")),
         None => Some("the isolated OCR process did not expose stdin".to_owned()),
@@ -60,7 +63,7 @@ pub(super) fn recognize_text_with_helper(
         });
     }
 
-    let output = wait_for_ocr_helper(child, OCR_HELPER_TIMEOUT)?;
+    let output = wait_for_ocr_helper_controlled(child, OCR_HELPER_TIMEOUT, control)?;
     if !output.status.success() {
         return Err(PlatformError::OperationFailed {
             operation: "windows_ocr_helper".to_owned(),
@@ -79,9 +82,18 @@ pub(super) fn recognize_text_with_helper(
     }
 }
 
+#[cfg(test)]
 pub(super) fn wait_for_ocr_helper(
+    child: std::process::Child,
+    timeout: Duration,
+) -> Result<std::process::Output, PlatformError> {
+    wait_for_ocr_helper_controlled(child, timeout, &MutationControl::default())
+}
+
+pub(super) fn wait_for_ocr_helper_controlled(
     mut child: std::process::Child,
     timeout: Duration,
+    control: &MutationControl,
 ) -> Result<std::process::Output, PlatformError> {
     let Some(stdout) = child.stdout.take() else {
         let cleanup = terminate_ocr_helper(&mut child);
@@ -126,6 +138,11 @@ pub(super) fn wait_for_ocr_helper(
     };
     let started = Instant::now();
     let process_result = loop {
+        if control.is_cancelled() {
+            // EOF requests cooperative cancellation inside the owned helper. Keep
+            // draining it until native recognition returns or its existing deadline expires.
+            drop(child.stdin.take());
+        }
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
             Ok(None) if started.elapsed() < timeout => {
@@ -151,6 +168,7 @@ pub(super) fn wait_for_ocr_helper(
 
     let stdout = join_ocr_pipe(stdout_reader, "stdout");
     let stderr = join_ocr_pipe(stderr_reader, "stderr");
+    control.check("windows_ocr_helper")?;
     match (process_result, stdout, stderr) {
         (Ok(status), Ok(stdout), Ok(stderr)) => Ok(std::process::Output {
             status,
@@ -196,13 +214,32 @@ fn terminate_ocr_helper(child: &mut std::process::Child) -> String {
 }
 
 pub(crate) fn serve_ocr_helper(
-    mut input: impl Read,
+    input: impl Read + Send + 'static,
     output: impl Write,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut request_json = Vec::new();
-    input.read_to_end(&mut request_json)?;
-    let request: OcrRegionRequest = serde_json::from_slice(&request_json)?;
-    let response = match recognize_text_in_process(&request) {
+    serve_ocr_helper_with(input, output, recognize_text_in_process)
+}
+
+fn serve_ocr_helper_with(
+    input: impl Read + Send + 'static,
+    output: impl Write,
+    recognize: impl FnOnce(&OcrRegionRequest, &MutationControl) -> Result<OcrResult, PlatformError>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut input = BufReader::new(input);
+    let mut request_json = String::new();
+    input.read_line(&mut request_json)?;
+    let request: OcrRegionRequest = serde_json::from_str(&request_json)?;
+    let control = MutationControl::default();
+    let cancellation = control.clone();
+    // The helper exits after its one response. This reader owns no desktop data;
+    // closing stdin requests cancellation even while WinRT recognition is active.
+    thread::Builder::new()
+        .name("controlfreak-ocr-cancel".to_owned())
+        .spawn(move || {
+            let _ = input.read(&mut [0_u8; 1]);
+            cancellation.cancel();
+        })?;
+    let response = match recognize(&request, &control) {
         Ok(result) => OcrHelperResponse::Success { result },
         Err(error) => OcrHelperResponse::Error { error },
     };
@@ -232,5 +269,27 @@ fn ocr_helper_failure(status: std::process::ExitStatus, stderr: &[u8]) -> String
             "the isolated OCR process exited {status}: {}",
             &stderr[tail_start..]
         )
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn stdin_closure_cancels_recognition_without_killing_the_helper() {
+        let input = std::io::Cursor::new(b"{\"display_id\":\"fixture\",\"x\":0,\"y\":0,\"width\":1,\"height\":1,\"language\":null}\n".to_vec());
+        let mut output = Vec::new();
+        let started = Instant::now();
+        serve_ocr_helper_with(input, &mut output, |_, control| {
+            control.wait("synthetic_ocr", Duration::from_secs(30))?;
+            panic!("helper ignored stdin cancellation");
+        })
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            serde_json::from_slice::<OcrHelperResponse>(&output).unwrap(),
+            OcrHelperResponse::Error { .. }
+        ));
     }
 }

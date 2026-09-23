@@ -12,6 +12,7 @@ mod permission;
 mod platform;
 mod report;
 mod security;
+mod stop;
 mod window;
 
 pub use capability::{Capability, CapabilityDescriptor, CapabilityState};
@@ -41,6 +42,7 @@ pub use platform::{
 };
 pub use report::CapabilityReport;
 pub use security::{IntegrityLevel, SecurityContext};
+pub use stop::{StopController, StopRegistration};
 pub use window::{
     CaptureWindowRequest, FocusWindowRequest, WaitForWindowRequest, WindowBounds,
     WindowFocusResult, WindowInfo, WindowScreenshot, WindowWaitResult,

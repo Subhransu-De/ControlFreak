@@ -11,6 +11,11 @@ use super::{
 /// Tool descriptions and schemas used by both `tools/list` and offline contract export.
 pub fn tools() -> Vec<Tool> {
     vec![
+        Tool::new(
+            "stop_desktop_work",
+            "Cancel active desktop work and close admission until the user restarts the server. Cleanup may still be draining. Cannot undo dispatched application operations.",
+            object_schema(JsonObject::new(), &[]),
+        ).with_annotations(ToolAnnotations::default().read_only(false).destructive(false).idempotent(true).open_world(false)),
         get_server_status_tool(),
         begin_control_session_tool(),
         end_control_session_tool(),
