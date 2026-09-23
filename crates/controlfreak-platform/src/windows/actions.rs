@@ -107,7 +107,10 @@ impl PointerBackend for Backend {
             },
             0,
             control,
-            |point| Self::ensure_point_input_target("drag_mouse", point),
+            |point| {
+                Self::ensure_point_input_target("drag_mouse", point)?;
+                super::input::ensure_pointer_idle("drag_mouse")
+            },
         )?;
         control.check("drag_mouse")?;
         send_drag_press(request.button, &request.modifiers, control, || {
@@ -321,7 +324,10 @@ impl Backend {
             },
             spec.duration_ms,
             control,
-            |point| Self::ensure_point_input_target(operation, point),
+            |point| {
+                Self::ensure_point_input_target(operation, point)?;
+                super::input::ensure_pointer_idle(operation)
+            },
         )?;
         // A move-only action is already dispatched. Its next cursor read is observation,
         // whereas clicks and scrolls still need this read to validate their input target.

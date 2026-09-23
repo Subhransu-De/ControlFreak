@@ -16,20 +16,41 @@ pub(super) fn move_cursor<F>(
     target: POINT,
     duration_ms: u32,
     control: &MutationControl,
-    mut validate_target: F,
+    validate_target: F,
 ) -> Result<(), PlatformError>
 where
     F: FnMut(POINT) -> Result<(), PlatformError>,
 {
+    move_cursor_with(
+        operation,
+        start,
+        target,
+        duration_ms,
+        control,
+        validate_target,
+        |point| {
+            // SAFETY: SetCursorPos takes signed screen coordinates and retains no references.
+            unsafe { SetCursorPos(point.x, point.y) }
+                .map_err(|error| win32_error("SetCursorPos", &error))
+        },
+    )
+}
+
+fn move_cursor_with(
+    operation: &str,
+    start: POINT,
+    target: POINT,
+    duration_ms: u32,
+    control: &MutationControl,
+    mut validate_target: impl FnMut(POINT) -> Result<(), PlatformError>,
+    mut set_position: impl FnMut(POINT) -> Result<(), PlatformError>,
+) -> Result<(), PlatformError> {
     control.check(operation)?;
     if duration_ms == 0 {
         validate_target(target)?;
         control.check(operation)?;
         control.dispatch_started();
-        // SAFETY: SetCursorPos accepts any pair of i32 virtual-screen coordinates and retains no
-        // pointers or references.
-        unsafe { SetCursorPos(target.x, target.y) }
-            .map_err(|error| win32_error("SetCursorPos", &error))?;
+        set_position(target)?;
         control.dispatch_accepted(0);
         return Ok(());
     }
@@ -47,9 +68,7 @@ where
         validate_target(POINT { x, y })?;
         control.check(operation)?;
         control.dispatch_started();
-        // SAFETY: SetCursorPos accepts any pair of i32 virtual-screen coordinates and retains no
-        // pointers or references.
-        unsafe { SetCursorPos(x, y) }.map_err(|error| win32_error("SetCursorPos", &error))?;
+        set_position(POINT { x, y })?;
         control.dispatch_accepted(0);
     }
     Ok(())
@@ -479,6 +498,27 @@ fn any_requested_input_held(inputs: &[INPUT], mut is_down: impl FnMut(i32) -> bo
     false
 }
 
+// Use only before ControlFreak presses a drag button. Recheck on every approach frame.
+pub(super) fn ensure_pointer_idle(operation: &str) -> Result<(), PlatformError> {
+    ensure_pointer_idle_with(operation, |key| {
+        // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
+        unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(key) < 0 }
+    })
+}
+
+fn ensure_pointer_idle_with(
+    operation: &str,
+    mut is_down: impl FnMut(i32) -> bool,
+) -> Result<(), PlatformError> {
+    if [1, 2, 4, 5, 6].into_iter().any(&mut is_down) {
+        return Err(PlatformError::OperationFailed {
+            operation: operation.to_owned(),
+            reason: "a mouse button is already held; refusing to move the user's drag".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn native_send_inputs(inputs: &[INPUT]) -> Result<usize, PlatformError> {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     if any_requested_input_held(inputs, |key| {
@@ -667,6 +707,32 @@ mod progress_tests {
             operation: "synthetic".into(),
             reason: "injected".into(),
         }
+    }
+
+    #[test]
+    fn held_buttons_refuse_cursor_dispatch_before_click_or_drag() {
+        for button in [1, 2, 4, 5, 6] {
+            for duration in [0, 20] {
+                let control = MutationControl::default();
+                let mut dispatched = false;
+                let result = move_cursor_with(
+                    "approach",
+                    POINT::default(),
+                    POINT { x: 100, y: 100 },
+                    duration,
+                    &control,
+                    |_| ensure_pointer_idle_with("approach", |key| key == button),
+                    |_| {
+                        dispatched = true;
+                        Ok(())
+                    },
+                );
+                assert!(result.is_err());
+                assert!(!dispatched);
+                assert_eq!(control.progress(), MutationControl::default().progress());
+            }
+        }
+        assert!(ensure_pointer_idle_with("approach", |_| false).is_ok());
     }
 
     #[test]
