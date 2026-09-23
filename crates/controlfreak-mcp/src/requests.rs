@@ -114,6 +114,10 @@ pub(super) struct FindTextInput {
     case_sensitive: bool,
     #[serde(default = "default_max_ocr_results")]
     max_results: u32,
+    #[serde(default)]
+    match_mode: controlfreak_core::TextMatchMode,
+    #[serde(default)]
+    ocr_confusions: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,6 +160,8 @@ impl FindTextInput {
             query: self.query,
             case_sensitive: self.case_sensitive,
             max_results: self.max_results,
+            match_mode: self.match_mode,
+            ocr_confusions: self.ocr_confusions,
         }
     }
 }

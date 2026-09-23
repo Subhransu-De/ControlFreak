@@ -528,8 +528,12 @@ fn assert_click_text_rejects_no_match(
     assert_eq!(rejected_click["result"]["isError"], true);
     assert_eq!(
         rejected_click["result"]["structuredContent"]["error"]["code"],
-        "platform_operation_failed"
+        "ocr_no_match"
     );
+    let content = &rejected_click["result"]["structuredContent"];
+    assert_eq!(content["input"]["input_outcome"], "not_started");
+    assert_eq!(content["input"]["sent_events"], 0);
+    assert_eq!(content["error"]["details"]["candidate_count"], 0);
 }
 
 #[cfg(target_os = "windows")]

@@ -22,7 +22,7 @@ use controlfreak_core::{
     MouseDragRequest, MouseMoveRequest, MousePosition, MouseScrollRequest, MutationControl,
     ObservationMode, ObservationOptions, OcrBackend, OcrLine, OcrRegionRequest, OcrResult, OcrWord,
     PermissionDescriptor, PermissionId, PermissionState, Platform, PlatformError,
-    PointerActionResult, PointerBackend, SecurityContext, TextInputRequest, TextMatch,
+    PointerActionResult, PointerBackend, SecurityContext, TextInputRequest,
     VirtualDesktopDirection, VirtualDesktopInfo, VirtualDesktopList, VirtualDesktopSwitchRequest,
     VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest, VisualChangeResult,
     WaitForChangeSinceRequest, WaitForVisualChangeRequest, WaitForWindowRequest, WindowBackend,
@@ -435,37 +435,23 @@ impl OcrBackend for Backend {
             });
         }
         let ocr = self.recognize_text(&request.region)?;
-        let needle = if request.case_sensitive {
-            request.query.clone()
-        } else {
-            request.query.to_lowercase()
-        };
-        let matches = ocr
-            .lines
-            .iter()
-            .filter(|line| {
-                let haystack = if request.case_sensitive {
-                    line.text.clone()
-                } else {
-                    line.text.to_lowercase()
-                };
-                haystack.contains(&needle)
-            })
-            .take(request.max_results as usize)
-            .map(|line| TextMatch {
-                text: line.text.clone(),
-                x: line.x,
-                y: line.y,
-                width: line.width,
-                height: line.height,
-            })
-            .collect();
+        let details = controlfreak_core::discover_text(
+            &ocr.lines,
+            &request.region,
+            &request.query,
+            request.case_sensitive,
+            request.match_mode,
+            request.ocr_confusions,
+            request.max_results,
+        )?;
+        let matches = details.candidates.clone();
         Ok(FindTextResult {
             query: request.query.clone(),
             display: ocr.display,
             source_bounds: ocr.source_bounds,
             language: ocr.language,
             matches,
+            details,
         })
     }
 
@@ -486,8 +472,9 @@ impl OcrBackend for Backend {
         }
         let ocr = self.recognize_text(&request.region)?;
         // Search result limits must not hide eligible lines from the uniqueness check.
-        let candidate = unique_text_candidate(
-            ocr.lines,
+        let candidate = controlfreak_core::select_text_candidate(
+            &ocr.lines,
+            &request.region,
             &request.query,
             request.case_sensitive,
             request.exact_match,
@@ -738,55 +725,6 @@ impl WindowBackend for Backend {
     }
 }
 
-fn unique_text_candidate(
-    lines: Vec<OcrLine>,
-    query: &str,
-    case_sensitive: bool,
-    exact_match: bool,
-) -> Result<TextMatch, PlatformError> {
-    let query = query.trim();
-    let normalized_query = if case_sensitive {
-        query.to_owned()
-    } else {
-        query.to_lowercase()
-    };
-    let mut candidates = lines.into_iter().filter(|line| {
-        let text = if case_sensitive {
-            line.text.trim().to_owned()
-        } else {
-            line.text.trim().to_lowercase()
-        };
-        if exact_match {
-            text == normalized_query
-        } else {
-            text.contains(&normalized_query)
-        }
-    });
-    let first = candidates
-        .next()
-        .ok_or_else(|| PlatformError::OperationFailed {
-            operation: "click_text".to_owned(),
-            reason: format!(
-                "no unique OCR match for {query:?}; refresh the region or relax exact_match"
-            ),
-        })?;
-    if candidates.next().is_some() {
-        return Err(PlatformError::InvalidArgument {
-            argument: "query".to_owned(),
-            reason: format!(
-                "matched more than one OCR line for {query:?}; narrow the region or use a more specific query"
-            ),
-        });
-    }
-    Ok(TextMatch {
-        text: first.text,
-        x: first.x,
-        y: first.y,
-        width: first.width,
-        height: first.height,
-    })
-}
-
 fn validate_duration(duration_ms: u32) -> Result<(), PlatformError> {
     if duration_ms > MAX_MOVE_DURATION_MS {
         return Err(PlatformError::InvalidArgument {
@@ -819,8 +757,8 @@ mod tests {
     use controlfreak_core::{
         CaptureDisplayRequest, CaptureRegionRequest, CaptureWindowRequest, DisplayBackend,
         DisplayBounds, DisplayInfo, Key, MouseButton, MouseMoveRequest, MouseScrollRequest,
-        ObservationOptions, OcrWord, PlatformError, PointerBackend, WaitForWindowRequest,
-        WindowBackend, WindowBounds, WindowInfo,
+        ObservationOptions, OcrLine, OcrRegionRequest, OcrWord, PlatformError, PointerBackend,
+        TextMatch, WaitForWindowRequest, WindowBackend, WindowBounds, WindowInfo,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MOUSE_EVENT_FLAGS, MOUSEEVENTF_HWHEEL,
@@ -833,7 +771,7 @@ mod tests {
         capture::{encode_png, image_difference, resize_rgba_box, scaled_dimensions, word_union},
         current_cursor_position, display_region_bounds, frame_fingerprint,
         input::{click_inputs, interpolate, key_chord_inputs, scroll_inputs},
-        unique_text_candidate, wait_for_ocr_helper, window_matches,
+        wait_for_ocr_helper, window_matches,
     };
 
     #[test]
@@ -1024,6 +962,28 @@ mod tests {
         assert_eq!(word_union(&words), Some((100, 48, 100, 24)));
     }
 
+    fn unique_text_candidate(
+        lines: &[OcrLine],
+        query: &str,
+        case_sensitive: bool,
+        exact: bool,
+    ) -> Result<TextMatch, PlatformError> {
+        controlfreak_core::select_text_candidate(
+            lines,
+            &OcrRegionRequest {
+                display_id: "synthetic".into(),
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: 1000,
+                language: None,
+            },
+            query,
+            case_sensitive,
+            exact,
+        )
+    }
+
     fn ocr_line(text: &str, x: u32) -> controlfreak_core::OcrLine {
         controlfreak_core::OcrLine {
             text: text.to_owned(),
@@ -1037,24 +997,24 @@ mod tests {
 
     #[test]
     fn semantic_click_selection_is_fail_closed_for_zero_or_ambiguous_matches() {
-        assert!(unique_text_candidate(Vec::new(), "Save", false, true).is_err());
+        assert!(unique_text_candidate(&[], "Save", false, true).is_err());
         assert!(matches!(
             unique_text_candidate(
-                vec![ocr_line("Save", 10), ocr_line("SAVE", 200)],
+                &[ocr_line("Save", 10), ocr_line("SAVE", 200)],
                 "save",
                 false,
                 true
             ),
-            Err(PlatformError::InvalidArgument { .. })
+            Err(PlatformError::OcrAmbiguousMatch { .. })
         ));
         assert_eq!(
-            unique_text_candidate(vec![ocr_line("Save", 10)], "save", false, true)
+            unique_text_candidate(&[ocr_line("Save", 10)], "save", false, true)
                 .unwrap()
                 .x,
             10
         );
         assert!(
-            unique_text_candidate(vec![ocr_line("Save changes", 10)], "Save", false, true).is_err()
+            unique_text_candidate(&[ocr_line("Save changes", 10)], "Save", false, true).is_err()
         );
     }
 
@@ -1065,12 +1025,12 @@ mod tests {
             lines.extend((1..super::MAX_OCR_RESULTS).map(|x| ocr_line("Save changes", x)));
             lines.push(ocr_line("Save", 200));
             assert!(matches!(
-                unique_text_candidate(lines.clone(), "Save", case_sensitive, true),
-                Err(PlatformError::InvalidArgument { .. })
+                unique_text_candidate(&lines, "Save", case_sensitive, true),
+                Err(PlatformError::OcrAmbiguousMatch { .. })
             ));
 
             lines[0] = ocr_line("Save as", 10);
-            let candidate = unique_text_candidate(lines, "Save", case_sensitive, true).unwrap();
+            let candidate = unique_text_candidate(&lines, "Save", case_sensitive, true).unwrap();
             assert_eq!(
                 candidate,
                 controlfreak_core::TextMatch {
@@ -1097,7 +1057,7 @@ mod tests {
             (" ÉDITER ", " éditer ", false, true, true),
         ] {
             let result =
-                unique_text_candidate(vec![ocr_line(text, 10)], query, case_sensitive, exact_match);
+                unique_text_candidate(&[ocr_line(text, 10)], query, case_sensitive, exact_match);
             assert_eq!(
                 result.is_ok(),
                 found,
@@ -1106,7 +1066,7 @@ mod tests {
         }
         assert!(matches!(
             unique_text_candidate(
-                vec![
+                &[
                     ocr_line("Cancel", 0),
                     ocr_line("Save as", 10),
                     ocr_line("SAVE changes", 200)
@@ -1115,7 +1075,7 @@ mod tests {
                 false,
                 false,
             ),
-            Err(PlatformError::InvalidArgument { .. })
+            Err(PlatformError::OcrAmbiguousMatch { .. })
         ));
     }
 
