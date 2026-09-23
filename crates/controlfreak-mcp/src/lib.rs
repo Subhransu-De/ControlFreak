@@ -235,7 +235,7 @@ impl ServerHandler for ControlFreakServer {
                         "desktop glow sessions are unavailable",
                     ));
                 }
-                if matches!(
+                let admission = if matches!(
                     request.name.as_ref(),
                     LIST_DISPLAYS
                         | LIST_WINDOWS
@@ -245,17 +245,12 @@ impl ServerHandler for ControlFreakServer {
                         | CAPTURE_WINDOW
                         | CAPTURE_VISUAL_BASELINE
                 ) {
-                    return dispatch_tool(
-                        backend,
-                        &diagnostics,
-                        &safety_indicator,
-                        indicator_runtime.as_ref(),
-                        request,
-                        None,
-                    )
-                    .await;
-                }
-                let work = match stop::Work::new(&stop) {
+                    // Observations remain available after stop, but retain request cancellation.
+                    Ok(stop::Work::default())
+                } else {
+                    stop::Work::new(&stop)
+                };
+                let work = match admission {
                     Ok(work) => work,
                     Err(error) => {
                         let response = tool_error(&error).into();

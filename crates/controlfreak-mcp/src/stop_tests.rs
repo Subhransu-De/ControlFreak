@@ -67,6 +67,10 @@ impl KeyboardBackend for WaitingBackend {
     }
 }
 impl DisplayBackend for WaitingBackend {
+    fn list_displays(&self) -> Result<Vec<controlfreak_core::DisplayInfo>, PlatformError> {
+        Ok(vec![])
+    }
+
     fn wait_for_visual_change_controlled(
         &self,
         _: &WaitForVisualChangeRequest,
@@ -187,7 +191,7 @@ async fn transport_stop_and_client_cancellation_reach_every_worker_kind() {
             })
             .await
             .unwrap();
-            assert_argument_errors(&mut client).await;
+            assert_observation_contract(&mut client).await;
             drop(client);
             tokio::time::timeout(Duration::from_secs(5), serving)
                 .await
@@ -197,7 +201,7 @@ async fn transport_stop_and_client_cancellation_reach_every_worker_kind() {
     }
 }
 
-async fn assert_argument_errors(client: &mut BufReader<tokio::io::DuplexStream>) {
+async fn assert_observation_contract(client: &mut BufReader<tokio::io::DuplexStream>) {
     // Every admission path preserves structured argument errors, including after stop.
     for tool in [
         CAPTURE_DISPLAY,
@@ -226,6 +230,44 @@ async fn assert_argument_errors(client: &mut BufReader<tokio::io::DuplexStream>)
         assert_eq!(
             response["result"]["structuredContent"]["error"]["code"],
             "invalid_arguments"
+        );
+    }
+    let listed = outcome_tests::exchange(
+        client,
+        json!({
+            "jsonrpc":"2.0", "id":6, "method":"tools/call",
+            "params":{"name":LIST_DISPLAYS,"arguments":{}}
+        }),
+    )
+    .await;
+    assert_eq!(listed["result"]["structuredContent"]["count"], 0);
+}
+
+#[tokio::test]
+async fn observation_cancellation_refuses_queued_work_and_discards_late_results() {
+    for queued in [true, false] {
+        let work = stop::Work::default();
+        let control = work.control.clone();
+        if queued {
+            control.cancel();
+        }
+        let result = stop::WORK
+            .scope(
+                work,
+                handlers::run_platform_operation(None, move || {
+                    assert!(
+                        !queued,
+                        "cancelled queued observation must not reach its provider"
+                    );
+                    control.cancel();
+                    Ok(())
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "cancelled observation must not return success"
         );
     }
 }

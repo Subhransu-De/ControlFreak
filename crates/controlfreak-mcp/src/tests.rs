@@ -699,6 +699,7 @@ async fn cancelling_a_request_keeps_the_glow_until_blocking_work_ends() {
     let request = tokio::spawn(run_platform_operation(Some(lease), move || {
         started_for_worker.notify_one();
         finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        Ok(())
     }));
     tokio::time::timeout(Duration::from_secs(5), started.notified())
         .await

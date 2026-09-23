@@ -20,16 +20,23 @@ use super::{
 pub(super) async fn run_platform_operation<T, F>(
     operation_lease: Option<OperationLease>,
     operation: F,
-) -> Result<T, ErrorData>
+) -> Result<Result<T, PlatformError>, ErrorData>
 where
     T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
+    F: FnOnce() -> Result<T, PlatformError> + Send + 'static,
 {
     let work = super::stop::current();
     tokio::task::spawn_blocking(move || {
-        let _work = work;
         let _operation_lease = operation_lease;
-        operation()
+        let control = work.as_ref().map(|work| &work.control);
+        if let Some(control) = control {
+            control.check("observation_worker")?;
+        }
+        let result = operation();
+        if let Some(control) = control {
+            control.check("observation_worker")?;
+        }
+        result
     })
     .await
     .map_err(|error| join_error(&error))

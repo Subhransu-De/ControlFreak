@@ -224,7 +224,8 @@ the stop button, shortcut and stop tool close admission for the server's lifetim
 
 `get_server_status.stop_state` reports `ready`, `draining`, `stopped`, or
 `cleanup_failed`. Read-only captures, lists, status and session cleanup remain available after stop. Queued
-mutations check cancellation before dispatch. Movement and visual waits use 10 ms cancellation polls between native calls; typing checks between bounded batches.
+mutations check cancellation before dispatch. Captures and lists also honor request cancellation
+before queued work starts and after an in-flight native call returns. Movement and visual waits use 10 ms cancellation polls between native calls; typing checks between bounded batches.
 Already-dispatched application operations cannot be undone. A blocked native call,
 including OCR, can still be draining. The private OCR helper forwards cancellation
 to WinRT recognition and retains its existing

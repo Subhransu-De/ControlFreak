@@ -6,17 +6,17 @@ tokio::task_local! {
     pub(super) static WORK: Work;
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(super) struct Work {
     pub(super) control: MutationControl,
-    registration: Arc<StopRegistration>,
+    registration: Option<Arc<StopRegistration>>,
 }
 
 impl Work {
     pub(super) fn new(stop: &StopController) -> Result<Self, PlatformError> {
         let control = MutationControl::default();
         Ok(Self {
-            registration: Arc::new(stop.register(control.clone())?),
+            registration: Some(Arc::new(stop.register(control.clone())?)),
             control,
         })
     }
@@ -38,8 +38,8 @@ pub(super) struct CleanupOnDrop(pub(super) Option<Work>);
 
 impl Drop for CleanupOnDrop {
     fn drop(&mut self) {
-        if let Some(work) = &self.0 {
-            work.registration.record_cleanup();
+        if let Some(registration) = self.0.as_ref().and_then(|work| work.registration.as_ref()) {
+            registration.record_cleanup();
         }
     }
 }
