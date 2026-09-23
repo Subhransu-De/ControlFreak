@@ -100,7 +100,10 @@ fn concurrent_cleanup_waits_for_every_mutation_and_preserves_the_reason() {
         });
         assert_eq!(runtime.status()["draining"], true);
         assert!(runtime.acquire_mutation_blocking().is_err());
-        assert_eq!(first.control.is_cancelled(), reason != "explicit_end");
+        assert_eq!(
+            first.mutation_control().is_cancelled(),
+            reason != "explicit_end"
+        );
         drop(first);
         assert!(fixture.owned.load(Ordering::SeqCst));
         // This guard represents backend work, including compensating releases.
@@ -129,10 +132,10 @@ fn desktop_changes_cancel_active_work_and_refuse_new_admission() {
         let lease = runtime.acquire_mutation_blocking().unwrap();
         *fixture.environment.lock().unwrap() = Some(reason);
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !lease.control.is_cancelled() && Instant::now() < deadline {
+        while !lease.mutation_control().is_cancelled() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(1));
         }
-        assert!(lease.control.is_cancelled());
+        assert!(lease.mutation_control().is_cancelled());
         assert!(runtime.begin_session(None).is_err());
         assert!(runtime.acquire_mutation_blocking().is_err());
         assert_eq!(runtime.status()["draining"], true);
@@ -188,7 +191,7 @@ fn dropping_server_cleanup_closes_admission_before_worker_completion() {
     let runtime = fixture.runtime();
     let lease = runtime.acquire_mutation_blocking().unwrap();
     drop(ServerCleanup(Some(Arc::clone(&runtime))));
-    assert!(lease.control.is_cancelled());
+    assert!(lease.mutation_control().is_cancelled());
     assert_eq!(runtime.status()["last_cleanup_reason"], "shutdown");
     assert!(runtime.acquire_mutation_blocking().is_err());
     drop(lease);
@@ -233,7 +236,7 @@ async fn eof_closes_admission_before_response_drain() {
     // Response draining can continue while the mutation retains ownership.
     assert!(fixture.owned.load(Ordering::SeqCst));
     runtime.close_session("disconnect", true).unwrap();
-    assert!(lease.control.is_cancelled());
+    assert!(lease.mutation_control().is_cancelled());
     drop(lease);
     assert_eq!(runtime.status()["last_cleanup_reason"], "disconnect");
     assert_eq!(fixture.releases.load(Ordering::SeqCst), 1);

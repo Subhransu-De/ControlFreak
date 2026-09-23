@@ -27,6 +27,20 @@ CI also validates generated documentation, dependency policy, workflow syntax, a
 
 Keep Windows API calls inside the platform crate. New unsafe operations belong in the smallest practical module, require a nearby `SAFETY` explanation, and must pass the Hawk and Clippy checks.
 
+For a new tool, keep its domain request, result, and validation in `controlfreak-core`.
+In `controlfreak-mcp`, `requests.rs` decodes arguments, `schema.rs` owns the published contract,
+`handlers.rs` runs backend operations on blocking workers, and `results.rs` translates outcomes.
+`lib.rs` owns transport and dispatch, `session.rs` owns control and indicator lifetimes, and
+`diagnostics.rs` records content-free operation summaries. The public indicator API is re-exported
+from the crate root. In the Windows backend, `actions.rs` owns pointer and keyboard execution
+and shared target checks; `ocr.rs` owns the isolated OCR process protocol and cleanup.
+
+Keep contract and handler tests in the MCP crate, native behavior tests beside their platform
+implementation, and lifecycle regressions in the session and cleanup tests. Extend
+`examples/recipes.json` and its synthetic transport test when a shipped contract changes a recipe.
+See [examples/README.md](examples/README.md) for the runner and generated contract export.
+The domain traits support test doubles; only Windows has a production desktop backend.
+
 ## Windows packaging
 
 `make release` builds both the server and the setup helper. The Windows target statically links

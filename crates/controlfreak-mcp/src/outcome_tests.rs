@@ -1,6 +1,7 @@
 use super::*;
 use controlfreak_core::{
-    BackendMetadata, DisplayBackend, KeyboardBackend, OcrBackend, PointerBackend, WindowBackend,
+    BackendMetadata, DisplayBackend, KeyboardBackend, OcrBackend, PointerBackend,
+    VirtualDesktopDirection, WindowBackend,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -181,7 +182,10 @@ impl WindowBackend for SyntheticBackend {
     }
 }
 
-async fn exchange(client: &mut BufReader<tokio::io::DuplexStream>, request: Value) -> Value {
+pub(super) async fn exchange(
+    client: &mut BufReader<tokio::io::DuplexStream>,
+    request: Value,
+) -> Value {
     client
         .get_mut()
         .write_all(format!("{request}\n").as_bytes())

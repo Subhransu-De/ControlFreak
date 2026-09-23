@@ -1,0 +1,331 @@
+[
+  {
+    "name": "observe-act-verify-and-crop-mapping",
+    "steps": [
+      {
+        "call": {
+          "name": "read_text_in_region",
+          "arguments": {
+            "display_id": "fixture",
+            "x": 100,
+            "y": 60,
+            "width": 400,
+            "height": 200
+          }
+        },
+        "expect": {
+          "/text": "Ready"
+        }
+      },
+      {
+        "call": {
+          "name": "capture_region",
+          "arguments": {
+            "display_id": "fixture",
+            "x": 100,
+            "y": 60,
+            "width": 400,
+            "height": 200,
+            "max_width": 200,
+            "include_cursor": false
+          }
+        },
+        "expect": {
+          "/source_bounds/left": -1820,
+          "/source_bounds/top": -140,
+          "/image_width": 200,
+          "/image_height": 100
+        }
+      },
+      {
+        "call": {
+          "name": "begin_control_session",
+          "arguments": {
+            "expected_seconds": 30
+          }
+        },
+        "expect": {
+          "/status": "armed"
+        }
+      },
+      {
+        "call": {
+          "name": "capture_visual_baseline",
+          "arguments": {
+            "display_id": "fixture",
+            "x": 100,
+            "y": 60,
+            "width": 400,
+            "height": 200
+          }
+        },
+        "expect": {
+          "/baseline_id": "vb-00000000000000000000000000000000-0000000000000001"
+        }
+      },
+      {
+        "call": {
+          "name": "click_mouse",
+          "arguments": {
+            "display_id": "fixture",
+            "x": 200,
+            "y": 110,
+            "button": "left",
+            "observation": {
+              "mode": "metadata"
+            }
+          }
+        },
+        "expect": {
+          "/status": "completed",
+          "/position/virtual_x": -1720,
+          "/position/virtual_y": -90,
+          "/effect_verification": "unverified",
+          "/retry_action": false
+        }
+      },
+      {
+        "call": {
+          "name": "wait_for_change_since",
+          "arguments": {
+            "baseline_id": "vb-00000000000000000000000000000000-0000000000000001",
+            "timeout_ms": 500,
+            "stable_ms": 100
+          }
+        },
+        "expect": {
+          "/changed": true,
+          "/timed_out": false
+        }
+      },
+      {
+        "call": {
+          "name": "read_text_in_region",
+          "arguments": {
+            "display_id": "fixture",
+            "x": 100,
+            "y": 60,
+            "width": 400,
+            "height": 200
+          }
+        },
+        "expect": {
+          "/text": "Saved"
+        }
+      },
+      {
+        "call": {
+          "name": "end_control_session",
+          "arguments": {}
+        },
+        "expect": {
+          "/status": "closing"
+        }
+      }
+    ]
+  },
+  {
+    "name": "bounded-wait-timeout",
+    "steps": [
+      {
+        "call": {
+          "name": "capture_visual_baseline",
+          "arguments": {
+            "display_id": "fixture",
+            "x": 100,
+            "y": 60,
+            "width": 400,
+            "height": 200
+          }
+        },
+        "expect": {
+          "/baseline_id": "vb-00000000000000000000000000000000-0000000000000001"
+        }
+      },
+      {
+        "call": {
+          "name": "wait_for_change_since",
+          "arguments": {
+            "baseline_id": "vb-00000000000000000000000000000000-0000000000000001",
+            "timeout_ms": 500,
+            "stable_ms": 100
+          }
+        },
+        "expect": {
+          "/changed": false,
+          "/timed_out": true
+        }
+      },
+      {
+        "call": {
+          "name": "read_text_in_region",
+          "arguments": {
+            "display_id": "fixture",
+            "x": 100,
+            "y": 60,
+            "width": 400,
+            "height": 200
+          }
+        },
+        "expect": {
+          "/text": "Ready"
+        }
+      }
+    ]
+  },
+  {
+    "name": "partial-input-recovery",
+    "steps": [
+      {
+        "call": {
+          "name": "read_text_in_region",
+          "arguments": {
+            "display_id": "fixture",
+            "x": 100,
+            "y": 60,
+            "width": 400,
+            "height": 200
+          }
+        },
+        "expect": {
+          "/text": "Ready"
+        }
+      },
+      {
+        "call": {
+          "name": "begin_control_session",
+          "arguments": {
+            "expected_seconds": 30
+          }
+        },
+        "expect": {
+          "/status": "armed"
+        }
+      },
+      {
+        "call": {
+          "name": "type_text",
+          "arguments": {
+            "text": "ab",
+            "observation": {
+              "mode": "none"
+            }
+          }
+        },
+        "expect": {
+          "/status": "partially_sent",
+          "/input/sent_events": 2,
+          "/retry_action": false,
+          "/effect_verification": "unverified"
+        }
+      },
+      {
+        "call": {
+          "name": "read_text_in_region",
+          "arguments": {
+            "display_id": "fixture",
+            "x": 100,
+            "y": 60,
+            "width": 400,
+            "height": 200
+          }
+        },
+        "expect": {
+          "/text": "a"
+        }
+      },
+      {
+        "call": {
+          "name": "end_control_session",
+          "arguments": {}
+        },
+        "expect": {
+          "/status": "closing"
+        }
+      }
+    ]
+  },
+  {
+    "name": "atomic-drag-lifecycle",
+    "steps": [
+      {
+        "call": {
+          "name": "capture_region",
+          "arguments": {
+            "display_id": "fixture",
+            "x": 100,
+            "y": 60,
+            "width": 400,
+            "height": 200,
+            "max_width": 200,
+            "include_cursor": false
+          }
+        },
+        "expect": {
+          "/source_bounds/left": -1820,
+          "/source_bounds/top": -140,
+          "/image_width": 200,
+          "/image_height": 100
+        }
+      },
+      {
+        "call": {
+          "name": "begin_control_session",
+          "arguments": {
+            "expected_seconds": 30
+          }
+        },
+        "expect": {
+          "/status": "armed"
+        }
+      },
+      {
+        "call": {
+          "name": "drag_mouse",
+          "arguments": {
+            "start_display_id": "fixture",
+            "start_x": 200,
+            "start_y": 110,
+            "end_display_id": "fixture",
+            "end_x": 300,
+            "end_y": 160,
+            "button": "left",
+            "duration_ms": 100,
+            "observation": {
+              "mode": "metadata"
+            }
+          }
+        },
+        "expect": {
+          "/status": "completed",
+          "/retry_action": false,
+          "/effect_verification": "unverified"
+        }
+      },
+      {
+        "call": {
+          "name": "read_text_in_region",
+          "arguments": {
+            "display_id": "fixture",
+            "x": 100,
+            "y": 60,
+            "width": 400,
+            "height": 200
+          }
+        },
+        "expect": {
+          "/text": "Dropped"
+        }
+      },
+      {
+        "call": {
+          "name": "end_control_session",
+          "arguments": {}
+        },
+        "expect": {
+          "/status": "closing"
+        }
+      }
+    ]
+  }
+]
