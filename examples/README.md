@@ -102,3 +102,10 @@ ControlFreak's implemented desktop backend is Windows only. Platform-neutral dom
 synthetic fixtures, and tool wording do not imply a Linux or macOS desktop backend. Application
 launch remains outside the tool contract; open the intended application through the user or a
 separately authorized launcher before discovering its window.
+
+## Tolerant OCR discovery
+
+The tolerant discovery recipe first tries exact text, then recovers a nonbreaking-space label
+using `match_mode=tolerant`. It checks the matching tier and full candidate count without
+acquiring a control session. Discovery does not authorize input. Inspect the returned text and
+bounds before choosing a fresh strict click query, and stop if the full count is ambiguous.

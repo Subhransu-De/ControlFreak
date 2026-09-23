@@ -121,6 +121,31 @@ impl OcrBackend for SyntheticBackend {
         _: &ClickTextRequest,
         control: &MutationControl,
     ) -> Result<ClickTextResult, PlatformError> {
+        let mode = self.0.load(Ordering::Relaxed);
+        if mode >= 5 {
+            let region = controlfreak_core::OcrRegionRequest {
+                display_id: "synthetic".into(),
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+                language: None,
+            };
+            let line = controlfreak_core::OcrLine {
+                text: "synthetic".into(),
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 2,
+                words: vec![],
+            };
+            let lines = if mode == 5 {
+                vec![]
+            } else {
+                vec![line.clone(), line]
+            };
+            controlfreak_core::select_text_candidate(&lines, &region, "synthetic", false, true)?;
+        }
         self.act(
             control,
             ClickTextResult {
@@ -255,6 +280,25 @@ async fn every_action_result_validates_against_tools_list_over_transport() {
             .unwrap();
         assert_eq!(recent.last().unwrap()["status"], status);
     }
+    for (mode, code, count) in [(5, "ocr_no_match", 0), (6, "ocr_ambiguous_match", 2)] {
+        backend.0.store(mode, Ordering::Relaxed);
+        let schema = &tools
+            .iter()
+            .find(|tool| tool["name"] == CLICK_TEXT)
+            .unwrap()["outputSchema"];
+        let validator = jsonschema::validator_for(schema).unwrap();
+        let arguments = &actions
+            .iter()
+            .find(|(name, _)| *name == CLICK_TEXT)
+            .unwrap()
+            .1;
+        let response = exchange(&mut client, json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":CLICK_TEXT,"arguments":arguments}})).await;
+        validate_action_response(&response, &validator, CLICK_TEXT, "not_started", 4);
+        let content = &response["result"]["structuredContent"];
+        assert_eq!(content["error"]["code"], code);
+        assert_eq!(content["error"]["details"]["candidate_count"], count);
+        assert_eq!(content["input"]["input_outcome"], "not_started");
+    }
     drop(client);
     tokio::time::timeout(Duration::from_secs(10), serving)
         .await
@@ -303,6 +347,11 @@ fn validate_action_response(
         "{name}: {content}: {:?}",
         validator.iter_errors(content).collect::<Vec<_>>()
     );
+    if mode == 0 && name == CLICK_TEXT {
+        assert_eq!(content["action"]["match_tier"], "exact");
+        assert_eq!(content["action"]["matched_text"]["width"], 1);
+        assert_eq!(content["action"]["matched_text"]["height"], 1);
+    }
     assert_eq!(content["retry_action"], false);
     assert_eq!(content["effect_verification"], "unverified");
     assert_eq!(

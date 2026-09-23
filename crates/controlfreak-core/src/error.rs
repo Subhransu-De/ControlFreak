@@ -6,6 +6,10 @@ use crate::IntegrityLevel;
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlatformError {
+    #[error("no OCR line matched; refine the query or change the match mode")]
+    OcrNoMatch { details: crate::OcrMatchDetails },
+    #[error("multiple OCR lines matched; narrow the region or refine the query")]
+    OcrAmbiguousMatch { details: crate::OcrMatchDetails },
     #[error("operation '{operation}' is unsupported: {reason}")]
     Unsupported { operation: String, reason: String },
     #[error("permission '{permission}' was denied")]

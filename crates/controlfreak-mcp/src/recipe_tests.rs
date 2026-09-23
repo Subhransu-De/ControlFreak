@@ -163,6 +163,36 @@ impl DisplayBackend for Fixture {
 }
 
 impl OcrBackend for Fixture {
+    fn find_text_on_screen(
+        &self,
+        request: &controlfreak_core::FindTextRequest,
+    ) -> Result<controlfreak_core::FindTextResult, PlatformError> {
+        let lines = vec![controlfreak_core::OcrLine {
+            text: "Save\u{a0}changes".into(),
+            x: 150,
+            y: 80,
+            width: 100,
+            height: 20,
+            words: vec![],
+        }];
+        let details = controlfreak_core::discover_text(
+            &lines,
+            &request.region,
+            &request.query,
+            request.case_sensitive,
+            request.match_mode,
+            request.ocr_confusions,
+            request.max_results,
+        )?;
+        Ok(controlfreak_core::FindTextResult {
+            query: request.query.clone(),
+            display: display(),
+            source_bounds: bounds(),
+            language: "en-US".into(),
+            matches: details.candidates.clone(),
+            details,
+        })
+    }
     fn read_text_in_region(&self, _: &OcrRegionRequest) -> Result<OcrResult, PlatformError> {
         Ok(OcrResult {
             display: display(),
@@ -319,7 +349,10 @@ async fn published_recipes_validate_and_run_on_a_synthetic_desktop() {
         }
         assert_eq!(
             backend.0.lock().unwrap().mutations,
-            usize::from(recipe["name"] != "bounded-wait-timeout")
+            usize::from(
+                recipe["name"] != "bounded-wait-timeout"
+                    && recipe["name"] != "tolerant-ocr-discovery"
+            )
         );
         assert_eq!(runtime.status()["state"], "dormant");
         assert_eq!(runtime.status()["owns_arbitration"], false);

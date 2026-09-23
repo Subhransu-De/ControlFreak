@@ -327,5 +327,54 @@
         }
       }
     ]
+  },
+  {
+    "name": "tolerant-ocr-discovery",
+    "steps": [
+      {
+        "call": {
+          "name": "find_text_on_screen",
+          "arguments": {
+            "display_id": "fixture",
+            "x": 100,
+            "y": 60,
+            "width": 400,
+            "height": 200,
+            "query": "Save changes",
+            "match_mode": "exact"
+          }
+        },
+        "expect": {
+          "/count": 0,
+          "/candidate_count": 0,
+          "/match_tier": null,
+          "/candidates_truncated": false,
+          "/text_truncated": false
+        }
+      },
+      {
+        "call": {
+          "name": "find_text_on_screen",
+          "arguments": {
+            "display_id": "fixture",
+            "x": 100,
+            "y": 60,
+            "width": 400,
+            "height": 200,
+            "query": "Save changes",
+            "match_mode": "tolerant"
+          }
+        },
+        "expect": {
+          "/count": 1,
+          "/candidate_count": 1,
+          "/match_tier": "normalized",
+          "/matches/0/x": 150,
+          "/matches/0/y": 80,
+          "/candidates_truncated": false,
+          "/text_truncated": false
+        }
+      }
+    ]
   }
 ]

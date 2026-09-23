@@ -49,6 +49,10 @@ pub struct FindTextRequest {
     pub query: String,
     pub case_sensitive: bool,
     pub max_results: u32,
+    #[serde(default)]
+    pub match_mode: TextMatchMode,
+    #[serde(default)]
+    pub ocr_confusions: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +71,36 @@ pub struct FindTextResult {
     pub source_bounds: DisplayBounds,
     pub language: String,
     pub matches: Vec<TextMatch>,
+    pub details: OcrMatchDetails,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextMatchMode {
+    Exact,
+    #[default]
+    Substring,
+    Tolerant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextMatchTier {
+    Exact,
+    Substring,
+    Normalized,
+    Joined,
+    OcrConfusion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OcrMatchDetails {
+    pub candidates: Vec<TextMatch>,
+    pub candidate_count: usize,
+    pub candidates_truncated: bool,
+    pub text_truncated: bool,
+    pub match_tier: Option<TextMatchTier>,
+    pub recovery: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

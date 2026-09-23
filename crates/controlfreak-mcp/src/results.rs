@@ -131,6 +131,11 @@ pub(super) fn pointer_result(result: &PointerActionResult, action: &Value) -> Ca
 pub(super) fn click_text_result(result: &ClickTextResult, action: &Value) -> CallToolResult {
     let mut action = action.clone();
     action["matched_text"] = json!(result.matched_text);
+    action["match_tier"] = json!(if action["exact_match"] == true {
+        "exact"
+    } else {
+        "substring"
+    });
     action_result(&result.observation, &action, Some(json!(result.position)))
 }
 
@@ -184,6 +189,8 @@ pub(super) fn tool_error(error: &PlatformError) -> CallToolResult {
         }));
     }
     let code = match error {
+        PlatformError::OcrNoMatch { .. } => "ocr_no_match",
+        PlatformError::OcrAmbiguousMatch { .. } => "ocr_ambiguous_match",
         PlatformError::Unsupported { .. } => "unsupported_platform_operation",
         PlatformError::PermissionDenied { .. } => "permission_denied",
         PlatformError::HigherIntegrityTarget { .. } => "higher_integrity_target",
@@ -194,12 +201,13 @@ pub(super) fn tool_error(error: &PlatformError) -> CallToolResult {
             "platform_operation_failed"
         }
     };
-    CallToolResult::structured_error(json!({
-        "error": {
-            "code": code,
-            "message": error.to_string(),
-        }
-    }))
+    let mut value = json!({"error": {"code": code, "message": error.to_string()}});
+    if let PlatformError::OcrNoMatch { details } | PlatformError::OcrAmbiguousMatch { details } =
+        error
+    {
+        value["error"]["details"] = json!(details);
+    }
+    CallToolResult::structured_error(value)
 }
 
 pub(super) fn with_progress(
