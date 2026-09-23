@@ -272,7 +272,7 @@ impl ServerHandler for ControlFreakServer {
                 let cancellation = stop::CancelOnDrop(work.control.clone());
                 let request_control = work.control.clone();
                 let operation = stop::WORK.scope(work, async move {
-                    let outcome = if tool_name == BEGIN_CONTROL_SESSION {
+                    if tool_name == BEGIN_CONTROL_SESSION {
                         match indicator_runtime.as_ref() {
                             Some(runtime) => {
                                 let input =
@@ -351,20 +351,6 @@ impl ServerHandler for ControlFreakServer {
                             None,
                         )
                         .await
-                    };
-                    match outcome {
-                        Ok(response) => Ok(response),
-                        Err(error) => {
-                            let response = tool_execution_error(&error).into();
-                            Ok(if is_mutating_tool(&tool_name) {
-                                results::with_progress(
-                                    response,
-                                    controlfreak_core::MutationProgress::default(),
-                                )
-                            } else {
-                                response
-                            })
-                        }
                     }
                 });
                 tokio::pin!(operation);
@@ -379,7 +365,20 @@ impl ServerHandler for ControlFreakServer {
                 drop(cancellation);
                 result
             };
-            let outcome = request_future.await;
+            let outcome = match request_future.await {
+                Ok(response) => Ok(response),
+                Err(error) => {
+                    let response = tool_execution_error(&error).into();
+                    Ok(if is_mutating_tool(&report_name) {
+                        results::with_progress(
+                            response,
+                            controlfreak_core::MutationProgress::default(),
+                        )
+                    } else {
+                        response
+                    })
+                }
+            };
             let elapsed_ms =
                 reporting.complete(&report_name, operation_id, started, gap_ms, &outcome);
             outcome.map(|mut response| {

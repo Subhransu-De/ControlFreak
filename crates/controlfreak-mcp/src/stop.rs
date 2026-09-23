@@ -9,7 +9,7 @@ tokio::task_local! {
 #[derive(Clone)]
 pub(super) struct Work {
     pub(super) control: MutationControl,
-    pub(super) registration: Arc<StopRegistration>,
+    registration: Arc<StopRegistration>,
 }
 
 impl Work {

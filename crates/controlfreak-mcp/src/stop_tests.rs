@@ -174,11 +174,45 @@ async fn transport_stop_and_client_cancellation_reach_every_worker_kind() {
             })
             .await
             .unwrap();
+            assert_argument_errors(&mut client).await;
             drop(client);
             tokio::time::timeout(Duration::from_secs(5), serving)
                 .await
                 .unwrap()
                 .unwrap();
         }
+    }
+}
+
+async fn assert_argument_errors(client: &mut BufReader<tokio::io::DuplexStream>) {
+    // Every admission path preserves structured argument errors, including after stop.
+    for tool in [
+        CAPTURE_DISPLAY,
+        GET_SERVER_STATUS,
+        END_CONTROL_SESSION,
+        "stop_desktop_work",
+    ] {
+        let mut response = outcome_tests::exchange(
+            client,
+            json!({
+                "jsonrpc":"2.0", "id":5, "method":"tools/call",
+                "params":{"name":tool,"arguments":{"unknown_option":true}}
+            }),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while response["id"] != 5 {
+                let mut line = String::new();
+                assert_ne!(client.read_line(&mut line).await.unwrap(), 0);
+                response = serde_json::from_str(&line).unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert_eq!(
+            response["result"]["structuredContent"]["error"]["code"],
+            "invalid_arguments"
+        );
     }
 }

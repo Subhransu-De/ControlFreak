@@ -27,7 +27,7 @@ impl StopController {
         }
     }
 
-    pub fn cleanup_failed(&self) {
+    fn cleanup_failed(&self) {
         self.stop();
         self.0
             .lock()
