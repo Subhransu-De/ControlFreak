@@ -214,13 +214,28 @@ server's elevation and Windows integrity level.
 
 ## Stop desktop work
 
-Click the native **STOP desktop work** window or press **Ctrl+Alt+Pause** to stop.
-The stop window and shortcut run independently of MCP requests, OCR and the glow helper.
-The shortcut samples only those three keys and does not record typed text.
+A navy blue bar with white text appears at the top center of the primary display,
+16 display-scaled pixels below its top edge, while ControlFreak owns a control session.
+It reads "ControlFreak is controlling your system (Use Esc to stop)". Press **Esc**
+to stop. The bar does not take focus and remains visible with cleanup status until
+ownership is released. It stays hidden during observation-only use.
+The bar and Esc monitor run independently of MCP requests, OCR and the glow helper.
+Only physical Esc stops the session; injected keys are ignored. The monitor does
+not retain typed text or keyboard history. The stop key press and release are
+consumed so they do not also dismiss a dialog in the controlled application.
 Clients can call `stop_desktop_work` or cancel an individual request with the MCP
 `notifications/cancelled` notification. Request cancellation affects that request;
-the stop button, shortcut and stop tool close admission for the server's lifetime.
+Esc and the stop tool close admission for the server's lifetime.
 `begin_control_session` and `end_control_session` cannot clear a stop.
+
+A user stop sends a custom MCP `notifications/controlfreak/session_stopped`
+notification with `params.event="user_stopped_session"`,
+`reason="user_stop"`, `stop_state`, and `retry_action=false`. The MCP connection
+stays open. The server advertises this as `experimental.controlfreak/user-stop`.
+Client support determines whether this notification is shown to the
+agent. Status also retains `stop_reason="user_stop"`, and subsequent action
+requests report that the user stopped control. Agents must not restart the server
+or resume desktop actions without the user's permission.
 
 `get_server_status.stop_state` reports `ready`, `draining`, `stopped`, or
 `cleanup_failed`. Read-only captures, lists, status and session cleanup remain available after stop. Queued

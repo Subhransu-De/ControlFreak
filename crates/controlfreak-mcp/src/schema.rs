@@ -85,7 +85,7 @@ fn end_control_session_tool() -> Tool {
 fn get_server_status_tool() -> Tool {
     Tool::new(
         GET_SERVER_STATUS,
-        "Return server identity, version, uptime, privileges, and operation diagnostics. Use after suspected server or transport failures.",
+        "Return server identity, version, uptime, privileges, operation diagnostics, stop_state and any user stop_reason. A user_stop requires the user's permission before restarting or resuming control.",
         object_schema(JsonObject::new(), &[]),
     )
     .with_annotations(

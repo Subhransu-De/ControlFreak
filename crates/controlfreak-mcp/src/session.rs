@@ -628,6 +628,7 @@ impl IndicatorRuntime {
         })?;
         state.session = ControlSession::dormant(self.short_hold);
         state.session.owns_arbitration = true;
+        self.stop.set_session_active(true);
         state.cancellation = cancellation;
         state.stop_registration = Some(stop_registration);
         Ok(())
@@ -730,6 +731,7 @@ impl IndicatorRuntime {
         }
         state.session = ControlSession::dormant(self.short_hold);
         state.stop_registration = None;
+        self.stop.set_session_active(false);
     }
 
     fn hold_for_session(&self, session: &ControlSession) -> Duration {
@@ -1016,17 +1018,20 @@ impl Drop for IndicatorRuntime {
             // A failed shutdown must not block Drop or surrender ownership.
             // Transfer both resources together; release only after safe cleanup.
             let arbitrator = Arc::clone(&self.arbitrator);
+            let stop = self.stop.clone();
             thread::spawn(move || {
                 while control.shutdown().is_err() {
                     thread::sleep(Duration::from_millis(50));
                 }
                 arbitrator.release();
+                stop.set_session_active(false);
             });
             return;
         }
         self.safety_indicator.mark_stopping();
         if state.session.owns_arbitration {
             self.arbitrator.release();
+            self.stop.set_session_active(false);
         }
     }
 }

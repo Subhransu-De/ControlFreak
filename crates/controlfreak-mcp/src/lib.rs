@@ -150,14 +150,50 @@ impl ControlFreakServer {
 
 impl ServerHandler for ControlFreakServer {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        let mut capabilities = ServerCapabilities::builder().enable_tools().build();
+        capabilities.experimental = Some(std::collections::BTreeMap::from([(
+            "controlfreak/user-stop".to_owned(),
+            serde_json::Map::from_iter([(
+                "notification".to_owned(),
+                json!("notifications/controlfreak/session_stopped"),
+            )]),
+        )]));
+        ServerConfig::new(capabilities)
             .with_server_info(Implementation::new(
                 "controlfreak",
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "ControlFreak is a computer-use MCP server. For tasks with multiple input actions, call begin_control_session first and end_control_session when finished. Actions return screenshots by default. Reuse them; capture again only when needed. Choose targets from current observations. Prefer click_text for unique visible labels. Check isError, status, and error text. Input dispatch and observation do not verify application effects. Observe again before recovering from partial or unknown delivery. Read structuredContent without serializing image data. Never repeat an action when retry_action=false.",
+                "ControlFreak is a computer-use MCP server. For tasks with multiple input actions, call begin_control_session first and end_control_session when finished. Actions return screenshots by default. Reuse them; capture again only when needed. Choose targets from current observations. Prefer click_text for unique visible labels. Check isError, status, and error text. Input dispatch and observation do not verify application effects. Observe again before recovering from partial or unknown delivery. Read structuredContent without serializing image data. Never repeat an action when retry_action=false. A notifications/controlfreak/session_stopped event or stop_reason=user_stop means the user ended control. Do not resume desktop actions or restart the server without the user's permission.",
             )
+    }
+
+    async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
+        let stop = self.stop.clone();
+        tokio::spawn(async move {
+            while !context.peer.is_transport_closed() {
+                if stop.user_stopped() {
+                    let notification = rmcp::model::CustomNotification::new(
+                        "notifications/controlfreak/session_stopped",
+                        Some(json!({
+                            "event": "user_stopped_session",
+                            "reason": "user_stop",
+                            "message": "The user stopped the ControlFreak session. Do not resume desktop actions or restart the server without the user's permission.",
+                            "stop_state": stop.status(),
+                            "retry_action": false,
+                        })),
+                    );
+                    let _ = context
+                        .peer
+                        .send_notification(rmcp::model::ServerNotification::CustomNotification(
+                            notification,
+                        ))
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        });
     }
 
     fn list_tools(
@@ -213,6 +249,9 @@ impl ServerHandler for ControlFreakServer {
                         && let Some(mut content) = result.structured_content
                     {
                         content["stop_state"] = json!(stop.status());
+                        if stop.user_stopped() {
+                            content["stop_reason"] = json!("user_stop");
+                        }
                         return Ok(CallToolResult::structured(content).into());
                     }
                     return Err(ErrorData::internal_error("missing server status", None));

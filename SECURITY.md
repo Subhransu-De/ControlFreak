@@ -65,9 +65,14 @@ indicator helper lifecycle, helper stderr, and error text. That log carries no d
 
 ## User stop and cancellation
 
-A native stop window and Ctrl+Alt+Pause shortcut latch stop independently of MCP
-transport and provider progress. The shortcut reads only the three chord keys;
-it retains no keyboard history. Clients may also stop all desktop work or cancel
+A native navy session bar and physical Esc latch stop independently of MCP
+transport and provider progress. The bar is visible only while this server owns
+the desktop, including cleanup. A dedicated keyboard hook examines key identity
+and injection flags only to recognize physical Esc. It retains no typed values
+or keyboard history, ignores injected Esc, and consumes the stop key's press and
+release. Esc outside an owned session is passed through. A user-stop notification
+is sent over MCP and its reason remains available in status and refused actions.
+Clients may also stop all desktop work or cancel
 one request. No MCP call clears the stop latch. User-controlled server restart is
 the re-arming procedure, after draining and resolving any cleanup failure.
 

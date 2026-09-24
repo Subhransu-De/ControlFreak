@@ -114,7 +114,8 @@ async fn stop_keeps_blocked_worker_ownership_until_cleanup_finishes() {
             .await
         }));
         ready.await.unwrap();
-        runtime.stop.stop();
+        assert!(runtime.stop.session_active());
+        assert!(runtime.stop.stop_by_user());
         assert_eq!(runtime.stop.status(), "draining");
         assert!(runtime.acquire_mutation_blocking().is_err());
         assert!(fixture.owned.load(Ordering::SeqCst));
@@ -140,6 +141,8 @@ async fn stop_keeps_blocked_worker_ownership_until_cleanup_finishes() {
             }
         );
         assert_eq!(fixture.owned.load(Ordering::SeqCst), cleanup_failed);
+        assert_eq!(runtime.stop.session_active(), cleanup_failed);
+        assert!(runtime.stop.user_stopped());
         assert!(runtime.begin_session(None).is_err());
     }
 }

@@ -99,8 +99,100 @@ impl OcrBackend for WaitingBackend {
 impl WindowBackend for WaitingBackend {}
 
 #[tokio::test]
+async fn human_stop_notifies_idle_client_once_and_retains_reason() {
+    let backend = Arc::new(WaitingBackend {
+        started: Mutex::new(None),
+        cancelled: Mutex::new(None),
+    });
+    let server = ControlFreakServer::with_indicator(backend, SafetyIndicator::dormant(), None);
+    let stop = server.stop.clone();
+    let (client_io, server_io) = tokio::io::duplex(65536);
+    let serving = tokio::spawn(async move {
+        server
+            .serve(server_io)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap()
+    });
+    let mut client = BufReader::new(client_io);
+    let initialized = outcome_tests::exchange(
+        &mut client,
+        json!({
+            "jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+                "protocolVersion":"2025-11-25", "capabilities":{},
+                "clientInfo":{"name":"human-stop-test","version":"1"}
+            }
+        }),
+    )
+    .await;
+    assert!(
+        initialized["result"]["capabilities"]["experimental"]["controlfreak/user-stop"].is_object()
+    );
+    client
+        .get_mut()
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .unwrap();
+    stop.set_session_active(true);
+    assert!(stop.stop_by_user());
+    assert!(!stop.stop_by_user());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    let notification: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(
+        notification["method"],
+        "notifications/controlfreak/session_stopped"
+    );
+
+    assert_eq!(notification["params"]["event"], "user_stopped_session");
+    assert_eq!(notification["params"]["reason"], "user_stop");
+    assert_eq!(notification["params"]["retry_action"], false);
+    stop.set_session_active(false);
+    let status = outcome_tests::exchange(
+        &mut client,
+        json!({
+            "jsonrpc":"2.0", "id":2, "method":"tools/call",
+            "params":{"name":GET_SERVER_STATUS,"arguments":{}}
+        }),
+    )
+    .await;
+    assert_eq!(
+        status["id"], 2,
+        "a repeated stop must not emit a second notification"
+    );
+    assert_eq!(
+        status["result"]["structuredContent"]["stop_reason"],
+        "user_stop"
+    );
+    let refused = outcome_tests::exchange(
+        &mut client,
+        json!({
+            "jsonrpc":"2.0", "id":3, "method":"tools/call",
+            "params":{"name":TYPE_TEXT,"arguments":{"text":"synthetic"}}
+        }),
+    )
+    .await;
+    assert_eq!(
+        refused["result"]["structuredContent"]["retry_action"],
+        false
+    );
+    assert!(refused.to_string().contains("the user stopped"));
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(5), serving)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn transport_stop_and_client_cancellation_reach_every_worker_kind() {
-    for user_stop in [false, true] {
+    for cancellation_mode in ["request", "tool", "human"] {
+        let user_stop = cancellation_mode != "request";
         for (name, arguments) in [
             (MOVE_MOUSE, json!({"display_id":"fixture","x":0,"y":0})),
             (TYPE_TEXT, json!({"text":"synthetic"})),
@@ -161,11 +253,16 @@ async fn transport_stop_and_client_cancellation_reach_every_worker_kind() {
             } else {
                 json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}})
             };
-            client
-                .get_mut()
-                .write_all(format!("{cancellation}\n").as_bytes())
-                .await
-                .unwrap();
+            if cancellation_mode == "human" {
+                stop.set_session_active(true);
+                assert!(stop.stop_by_user());
+            } else {
+                client
+                    .get_mut()
+                    .write_all(format!("{cancellation}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
             tokio::time::timeout(Duration::from_secs(2), finished)
                 .await
                 .unwrap()
@@ -178,17 +275,10 @@ async fn transport_stop_and_client_cancellation_reach_every_worker_kind() {
                 .write_all(format!("{status}\n").as_bytes())
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let mut line = String::new();
-                    assert_ne!(client.read_line(&mut line).await.unwrap(), 0);
-                    let value: Value = serde_json::from_str(&line).unwrap();
-                    if value["id"] == 4 {
-                        assert!(value["result"]["structuredContent"]["stop_state"].is_string());
-                        break;
-                    }
-                }
-            })
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                receive_stop_status(&mut client, cancellation_mode == "human"),
+            )
             .await
             .unwrap();
             assert_observation_contract(&mut client).await;
@@ -197,6 +287,24 @@ async fn transport_stop_and_client_cancellation_reach_every_worker_kind() {
                 .await
                 .unwrap()
                 .unwrap();
+        }
+    }
+}
+
+async fn receive_stop_status(client: &mut BufReader<tokio::io::DuplexStream>, expect_event: bool) {
+    let mut status_received = false;
+    let mut event_received = !expect_event;
+    while !status_received || !event_received {
+        let mut line = String::new();
+        assert_ne!(client.read_line(&mut line).await.unwrap(), 0);
+        let value: Value = serde_json::from_str(&line).unwrap();
+        if value["id"] == 4 {
+            assert!(value["result"]["structuredContent"]["stop_state"].is_string());
+            status_received = true;
+        }
+        if value["method"] == "notifications/controlfreak/session_stopped" {
+            assert_eq!(value["params"]["event"], "user_stopped_session");
+            event_received = true;
         }
     }
 }

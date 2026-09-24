@@ -9,7 +9,7 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
-- Add an independent stop window, Ctrl+Alt+Pause shortcut, client stop tool and request cancellation. Keep ownership through draining and uncertain cleanup; require a user restart to re-arm.
+- Add a navy bar centered near the top of the primary display with white control-session text and physical Esc to stop. Notify the MCP client when the user stops control. Keep the client stop tool, request cancellation and ownership through cleanup; require a user restart to re-arm.
 - Cancel queued input and visual waits, track OCR draining, and release only acknowledged held inputs after partial dispatch.
 
 ### Added
