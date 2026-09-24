@@ -114,7 +114,7 @@ fn concurrent_cleanup_waits_for_every_mutation_and_preserves_the_reason() {
         runtime.end_session().unwrap();
         assert_eq!(fixture.releases.load(Ordering::SeqCst), 1);
         if reason != "explicit_end" {
-            assert!(runtime.begin_session(None).is_err());
+            assert!(runtime.begin_session(None, "synthetic").is_err());
         }
     }
 }
@@ -136,7 +136,7 @@ fn desktop_changes_cancel_active_work_and_refuse_new_admission() {
             thread::sleep(Duration::from_millis(1));
         }
         assert!(lease.mutation_control().is_cancelled());
-        assert!(runtime.begin_session(None).is_err());
+        assert!(runtime.begin_session(None, "synthetic").is_err());
         assert!(runtime.acquire_mutation_blocking().is_err());
         assert_eq!(runtime.status()["draining"], true);
         drop(lease);
@@ -148,7 +148,7 @@ fn desktop_changes_cancel_active_work_and_refuse_new_admission() {
                 .contains(reason)
         );
         *fixture.environment.lock().unwrap() = None;
-        runtime.begin_session(None).unwrap();
+        runtime.begin_session(None, "synthetic").unwrap();
         runtime.close_session("shutdown", true).unwrap();
     }
 }
@@ -157,9 +157,9 @@ fn desktop_changes_cancel_active_work_and_refuse_new_admission() {
 fn stale_timeout_cannot_close_a_new_session() {
     let fixture = Arc::new(Fixture::default());
     let runtime = fixture.runtime();
-    runtime.begin_session(None).unwrap();
+    runtime.begin_session(None, "synthetic").unwrap();
     let generation = runtime.state.lock().unwrap().generation;
-    runtime.begin_session(None).unwrap();
+    runtime.begin_session(None, "synthetic").unwrap();
     runtime.close_if_idle(generation);
     assert!(fixture.owned.load(Ordering::SeqCst));
     let generation = runtime.state.lock().unwrap().generation;
@@ -172,7 +172,7 @@ fn stale_timeout_cannot_close_a_new_session() {
 fn failed_shutdown_keeps_arbitration_until_retry_is_safe() {
     let fixture = Arc::new(Fixture::default());
     let runtime = fixture.runtime();
-    runtime.begin_session(None).unwrap();
+    runtime.begin_session(None, "synthetic").unwrap();
     fixture.shutdown_failed.store(true, Ordering::SeqCst);
     assert!(runtime.close_session("shutdown", true).is_err());
     assert_eq!(runtime.status()["draining"], true);
@@ -209,7 +209,7 @@ fn desktop_is_revalidated_after_indicator_startup() {
             Ok(Box::new(Indicator(Arc::clone(&fixture_for_start))))
         });
         if explicit {
-            assert!(runtime.begin_session(None).is_err());
+            assert!(runtime.begin_session(None, "synthetic").is_err());
         } else {
             assert!(runtime.acquire_mutation_blocking().is_err());
         }
@@ -246,7 +246,7 @@ async fn eof_closes_admission_before_response_drain() {
 async fn persistent_shutdown_failure_has_a_bounded_wait_without_releasing_ownership() {
     let fixture = Arc::new(Fixture::default());
     let runtime = fixture.runtime();
-    runtime.begin_session(None).unwrap();
+    runtime.begin_session(None, "synthetic").unwrap();
     fixture.shutdown_failed.store(true, Ordering::SeqCst);
     assert!(runtime.close_session("shutdown", true).is_err());
     let error = wait_for_cleanup(&runtime, Duration::from_millis(1))

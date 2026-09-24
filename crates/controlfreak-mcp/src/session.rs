@@ -1,6 +1,6 @@
 use super::{
-    Arc, AtomicBool, AtomicU8, Duration, ErrorData, Instant, MutationControl, Mutex, Ordering,
-    PlatformBackend, Value, VecDeque, json, mpsc, thread,
+    Arc, AtomicBool, AtomicU8, BeginSessionError, Duration, ErrorData, Instant, MutationControl,
+    Mutex, Ordering, PlatformBackend, Value, VecDeque, json, mpsc, thread,
 };
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -366,19 +366,43 @@ impl IndicatorRuntime {
         })
     }
 
+    fn bind_target(&self, target: &str) -> Result<(), controlfreak_core::PlatformError> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancellation
+            .bind_target(target)
+    }
+
     pub(super) fn begin_session(
         self: &Arc<Self>,
         expected_seconds: Option<u64>,
-    ) -> Result<(), String> {
+        target: &str,
+    ) -> Result<(), BeginSessionError> {
         let _lifecycle = self
             .lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.check_environment()?;
-        self.ensure_session_owned()?;
+        self.check_environment()
+            .map_err(BeginSessionError::Indicator)?;
+        let already_owned = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .session
+            .owns_arbitration;
+        self.ensure_session_owned()
+            .map_err(BeginSessionError::Indicator)?;
+        // Bind under the lifecycle lock before changing an existing hold or indicator.
+        if let Err(error) = self.bind_target(target) {
+            if !already_owned {
+                let _ = self.close_session_locked("admission_failure", false);
+            }
+            return Err(BeginSessionError::Target(error));
+        }
         if let Err(reason) = self.schedule_close(0, self.max_hold) {
             let _ = self.close_session_locked("admission_failure", false);
-            return Err(reason);
+            return Err(BeginSessionError::Indicator(reason));
         }
         let active = self
             .state
@@ -391,8 +415,10 @@ impl IndicatorRuntime {
         } else {
             IndicatorLevel::Armed
         };
-        self.ensure_indicator_level(level)?;
-        self.check_environment()?;
+        self.ensure_indicator_level(level)
+            .map_err(BeginSessionError::Indicator)?;
+        self.check_environment()
+            .map_err(BeginSessionError::Indicator)?;
         let mut state = self
             .state
             .lock()
@@ -414,9 +440,11 @@ impl IndicatorRuntime {
         if active {
             Ok(())
         } else {
-            self.schedule_close(generation, delay).inspect_err(|_| {
-                let _ = self.close_session_locked("admission_failure", false);
-            })
+            self.schedule_close(generation, delay)
+                .inspect_err(|_| {
+                    let _ = self.close_session_locked("admission_failure", false);
+                })
+                .map_err(BeginSessionError::Indicator)
         }
     }
 
@@ -835,6 +863,7 @@ impl IndicatorRuntime {
             "last_cleanup_reason": state.last_cleanup_reason,
             "draining": state.session.state == ControlSessionState::Closing,
             "call_count": state.session.call_count,
+            "approved_target_ref": state.cancellation.approved_target(),
             "active_mutations": state.active_mutations,
             "hold_ms": u64::try_from(state.session.hold.as_millis()).unwrap_or(u64::MAX),
             "time_until_close_ms": remaining_ms,

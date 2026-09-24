@@ -3,6 +3,7 @@ use super::*;
 fn screenshot_metadata(screenshot: &DisplayScreenshot) -> Value {
     json!({
         "display": screenshot.display,
+        "target_ref": screenshot.target_ref,
         "source_bounds": screenshot.source_bounds,
         "mime_type": "image/png",
         "byte_length": screenshot.png.len(),
@@ -140,7 +141,7 @@ pub(super) fn click_text_result(result: &ClickTextResult, action: &Value) -> Cal
 }
 
 pub(super) fn window_focus_result(result: &WindowFocusResult) -> CallToolResult {
-    let action = json!({ "kind": "focus_window", "window": result.window });
+    let action = json!({ "kind": "focus_window", "window": result.window, "attempts": result.attempts, "elapsed_ms": result.elapsed_ms });
     action_result(&result.observation, &action, None)
 }
 
@@ -189,6 +190,8 @@ pub(super) fn tool_error(error: &PlatformError) -> CallToolResult {
         }));
     }
     let code = match error {
+        PlatformError::TargetInvalidated { .. } => "target_invalidated",
+        PlatformError::ActivationFailed { reason, .. } => reason.as_str(),
         PlatformError::OcrNoMatch { .. } => "ocr_no_match",
         PlatformError::OcrAmbiguousMatch { .. } => "ocr_ambiguous_match",
         PlatformError::Unsupported { .. } => "unsupported_platform_operation",
@@ -202,6 +205,14 @@ pub(super) fn tool_error(error: &PlatformError) -> CallToolResult {
         }
     };
     let mut value = json!({"error": {"code": code, "message": error.to_string()}});
+    if let PlatformError::ActivationFailed {
+        attempts,
+        elapsed_ms,
+        ..
+    } = error
+    {
+        value["error"]["details"] = json!({"attempts": attempts, "elapsed_ms": elapsed_ms});
+    }
     if let PlatformError::OcrNoMatch { details } | PlatformError::OcrAmbiguousMatch { details } =
         error
     {

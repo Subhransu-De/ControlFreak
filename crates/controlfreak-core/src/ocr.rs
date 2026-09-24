@@ -36,6 +36,8 @@ pub struct OcrLine {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OcrResult {
+    #[serde(default)]
+    pub target_ref: Option<String>,
     pub display: DisplayInfo,
     pub source_bounds: DisplayBounds,
     pub language: String,
@@ -66,6 +68,7 @@ pub struct TextMatch {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FindTextResult {
+    pub target_ref: Option<String>,
     pub query: String,
     pub display: DisplayInfo,
     pub source_bounds: DisplayBounds,

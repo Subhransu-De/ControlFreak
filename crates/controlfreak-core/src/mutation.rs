@@ -15,6 +15,8 @@ pub struct MutationControl {
     cancelled: Arc<AtomicBool>,
     parent: Option<Arc<Self>>,
     progress: Arc<Mutex<MutationProgress>>,
+    target: Arc<Mutex<Option<String>>>,
+    target_invalidated: Arc<AtomicBool>,
 }
 
 impl MutationControl {
@@ -22,9 +24,69 @@ impl MutationControl {
     #[must_use]
     pub fn with_cancellation(&self, parent: Self) -> Self {
         Self {
+            target: Arc::clone(&parent.target),
+            target_invalidated: Arc::clone(&parent.target_invalidated),
             cancelled: Arc::clone(&self.cancelled),
             parent: Some(Arc::new(parent)),
             progress: Arc::default(),
+        }
+    }
+
+    /// Bind once for the entire session, including concurrent operations.
+    pub fn bind_target(&self, target: &str) -> Result<(), PlatformError> {
+        self.check_target()?;
+        let mut approved = self
+            .target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match approved.as_deref() {
+            Some(current) if current != target => Err(PlatformError::TargetInvalidated {
+                reason: "end the control session before approving a different target".into(),
+            }),
+            _ if target.is_empty() => Err(PlatformError::TargetInvalidated {
+                reason: "an approved target reference is required".into(),
+            }),
+            _ => {
+                *approved = Some(target.to_owned());
+                Ok(())
+            }
+        }
+    }
+
+    pub fn approved_target(&self) -> Option<String> {
+        self.target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn target_foreground(&self, remained: bool) {
+        self.update_progress(|progress| {
+            if progress.target_remained_foreground != Some(false) {
+                progress.target_remained_foreground = Some(remained);
+            }
+        });
+    }
+
+    pub fn activation_progress(&self, attempts: u32, elapsed_ms: u64) {
+        self.update_progress(|progress| {
+            progress.activation_attempts = attempts;
+            progress.activation_elapsed_ms = elapsed_ms;
+        });
+    }
+
+    pub fn invalidate_target(&self) {
+        self.target_invalidated.store(true, Ordering::Release);
+    }
+
+    pub fn check_target(&self) -> Result<(), PlatformError> {
+        if self.target_invalidated.load(Ordering::Acquire) {
+            Err(PlatformError::TargetInvalidated {
+                reason: "the session target was invalidated; end the session and observe again"
+                    .into(),
+            })
+        } else {
+            Ok(())
         }
     }
 
@@ -125,6 +187,39 @@ impl fmt::Debug for MutationControl {
 #[cfg(test)]
 mod tests {
     use super::MutationControl;
+
+    #[test]
+    fn session_binding_survives_operations_and_refuses_retargeting() {
+        let session = MutationControl::default();
+        let indicator = MutationControl::default();
+        let first = indicator.with_cancellation(session.clone()).for_operation();
+        first.bind_target("approved").unwrap();
+        let next = indicator.with_cancellation(session.clone()).for_operation();
+        assert_eq!(next.approved_target().as_deref(), Some("approved"));
+        assert!(next.bind_target("different").is_err());
+        next.invalidate_target();
+        assert!(first.check_target().is_err());
+        assert!(session.bind_target("approved").is_err());
+        assert!(!indicator.is_cancelled());
+        let fresh = indicator.with_cancellation(MutationControl::default());
+        fresh.bind_target("different").unwrap();
+        fresh.check_target().unwrap();
+    }
+
+    #[test]
+    fn lost_foreground_evidence_cannot_be_overwritten_by_later_focus() {
+        let control = MutationControl::default();
+        control.target_foreground(false);
+        control.target_foreground(true);
+        assert_eq!(control.progress().target_remained_foreground, Some(false));
+        assert_eq!(
+            control
+                .for_operation()
+                .progress()
+                .target_remained_foreground,
+            None
+        );
+    }
 
     #[test]
     fn session_cancellation_does_not_poison_indicator_reuse() {

@@ -9,6 +9,15 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Changed
+
+- Input actions and control sessions now require an opaque `target_ref`; `focus_window` uses
+  `window_id`. Sessions refuse target changes, stale window/process identities, incompatible
+  observation geometry, desktop changes, focus theft, and pointer hits on other windows.
+- Foreground activation now retries within a configurable 100 to 5000 ms budget, reports attempts
+  and elapsed time, and distinguishes refusal, settle timeout, invalidation, and integrity errors.
+
+
 ### Added
 
 - Structured OCR no-match and ambiguity errors with bounded candidate metadata and recovery

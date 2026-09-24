@@ -35,6 +35,8 @@ where
 
 async fn run_mutation_operation<T, F>(
     operation_lease: Option<OperationLease>,
+    target_ref: String,
+    backend: Arc<dyn PlatformBackend>,
     operation: F,
 ) -> (Result<T, PlatformError>, MutationProgress)
 where
@@ -48,7 +50,11 @@ where
     let worker_control = control.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _operation_lease = operation_lease;
-        operation(&worker_control)
+        backend.validate_target_reference(&target_ref)?;
+        worker_control.bind_target(&target_ref)?;
+        let result = operation(&worker_control);
+        backend.record_target_evidence(&worker_control);
+        result
     })
     .await;
     let result = result.unwrap_or_else(|_| {
@@ -272,6 +278,7 @@ pub(super) async fn call_find_text_on_screen(
     match result {
         Ok(result) => Ok(CallToolResult::structured(json!({
             "count": result.matches.len(),
+            "target_ref": result.target_ref,
             "query": result.query,
             "display": result.display,
             "source_bounds": result.source_bounds,
@@ -320,9 +327,12 @@ pub(super) async fn call_click_text(
         duration_ms: input.duration_ms,
         observation: input.observation.into(),
     };
-    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
-        backend.click_text_controlled(&request, control)
-    })
+    let (result, progress) = run_mutation_operation(
+        operation_lease,
+        input.target_ref,
+        Arc::clone(&backend),
+        move |control| backend.click_text_controlled(&request, control),
+    )
     .await;
     match result {
         Ok(result) => Ok(click_text_result(&result, &action).into()),
@@ -344,9 +354,12 @@ pub(super) async fn call_move_mouse(
         duration_ms: input.duration_ms,
         observation: input.observation.into(),
     };
-    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
-        backend.move_mouse_controlled(&request, control)
-    })
+    let (result, progress) = run_mutation_operation(
+        operation_lease,
+        input.target_ref,
+        Arc::clone(&backend),
+        move |control| backend.move_mouse_controlled(&request, control),
+    )
     .await;
     match result {
         Ok(result) => Ok(pointer_result(&result, &json!({ "kind": "move" })).into()),
@@ -372,9 +385,12 @@ pub(super) async fn call_click_mouse(
         duration_ms: input.duration_ms,
         observation: input.observation.into(),
     };
-    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
-        backend.click_mouse_controlled(&click_request, control)
-    })
+    let (result, progress) = run_mutation_operation(
+        operation_lease,
+        input.target_ref,
+        Arc::clone(&backend),
+        move |control| backend.click_mouse_controlled(&click_request, control),
+    )
     .await;
     match result {
         Ok(result) => Ok(pointer_result(
@@ -425,9 +441,12 @@ pub(super) async fn call_drag_mouse(
         duration_ms: input.duration_ms,
         observation: input.observation.into(),
     };
-    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
-        backend.drag_mouse_controlled(&request, control)
-    })
+    let (result, progress) = run_mutation_operation(
+        operation_lease,
+        input.target_ref,
+        Arc::clone(&backend),
+        move |control| backend.drag_mouse_controlled(&request, control),
+    )
     .await;
     match result {
         Ok(result) => Ok(pointer_result(&result, &action).into()),
@@ -478,9 +497,12 @@ pub(super) async fn call_switch_virtual_desktop(
         steps: input.steps,
         observation: input.observation.into(),
     };
-    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
-        backend.switch_virtual_desktop_controlled(&request, control)
-    })
+    let (result, progress) = run_mutation_operation(
+        operation_lease,
+        input.target_ref,
+        Arc::clone(&backend),
+        move |control| backend.switch_virtual_desktop_controlled(&request, control),
+    )
     .await;
     match result {
         Ok(result) => Ok(virtual_desktop_switch_result(&result).into()),
@@ -496,12 +518,16 @@ pub(super) async fn call_focus_window(
 ) -> Result<CallToolResponse, ErrorData> {
     let input = parse_arguments::<FocusWindowInput>(arguments)?;
     let request = FocusWindowRequest {
+        timeout_ms: input.timeout_ms,
         window_id: input.window_id,
         observation: input.observation.into(),
     };
-    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
-        backend.focus_window_controlled(&request, control)
-    })
+    let (result, progress) = run_mutation_operation(
+        operation_lease,
+        request.window_id.clone(),
+        Arc::clone(&backend),
+        move |control| backend.focus_window_controlled(&request, control),
+    )
     .await;
     match result {
         Ok(result) => Ok(window_focus_result(&result).into()),
@@ -562,9 +588,12 @@ pub(super) async fn call_press_keys(
         keys: input.keys,
         observation: input.observation.into(),
     };
-    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
-        backend.press_keys_controlled(&request, control)
-    })
+    let (result, progress) = run_mutation_operation(
+        operation_lease,
+        input.target_ref,
+        Arc::clone(&backend),
+        move |control| backend.press_keys_controlled(&request, control),
+    )
     .await;
     match result {
         Ok(result) => Ok(keyboard_result(
@@ -588,9 +617,12 @@ pub(super) async fn call_type_text(
         text: input.text,
         observation: input.observation.into(),
     };
-    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
-        backend.type_text_controlled(&request, control)
-    })
+    let (result, progress) = run_mutation_operation(
+        operation_lease,
+        input.target_ref,
+        Arc::clone(&backend),
+        move |control| backend.type_text_controlled(&request, control),
+    )
     .await;
     match result {
         Ok(result) => Ok(keyboard_result(
@@ -620,9 +652,12 @@ pub(super) async fn call_scroll_mouse(
         duration_ms: input.duration_ms,
         observation: input.observation.into(),
     };
-    let (result, progress) = run_mutation_operation(operation_lease, move |control| {
-        backend.scroll_mouse_controlled(&scroll_request, control)
-    })
+    let (result, progress) = run_mutation_operation(
+        operation_lease,
+        input.target_ref,
+        Arc::clone(&backend),
+        move |control| backend.scroll_mouse_controlled(&scroll_request, control),
+    )
     .await;
     match result {
         Ok(result) => Ok(pointer_result(

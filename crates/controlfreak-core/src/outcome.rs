@@ -27,4 +27,7 @@ pub struct MutationProgress {
     pub input_outcome: InputOutcome,
     pub sent_events: u64,
     pub cleanup: CleanupStatus,
+    pub(crate) target_remained_foreground: Option<bool>,
+    pub(crate) activation_attempts: u32,
+    pub(crate) activation_elapsed_ms: u64,
 }

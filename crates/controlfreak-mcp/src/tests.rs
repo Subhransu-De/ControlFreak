@@ -9,15 +9,15 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use controlfreak_core::{
-    ActionObservation, DisplayBounds, DisplayInfo, DisplayScreenshot, MousePosition,
+    ActionObservation, DisplayBounds, DisplayInfo, DisplayScreenshot, MousePosition, PlatformError,
     PointerActionResult,
 };
 
 use super::{
-    ActivityArbitrator, ActivityIndicator, ArbitrationBusy, CaptureDisplayInput, FocusWindowInput,
-    GlowTiming, IndicatorHealth, IndicatorRuntime, PressKeysInput, SafetyIndicator,
-    handlers::run_platform_operation, parse_arguments, pointer_result, schema::json_object,
-    tool_error, tool_execution_error, tools,
+    ActivityArbitrator, ActivityIndicator, ArbitrationBusy, BeginSessionError, CaptureDisplayInput,
+    FocusWindowInput, GlowTiming, IndicatorHealth, IndicatorRuntime, PressKeysInput,
+    SafetyIndicator, handlers::run_platform_operation, parse_arguments, pointer_result,
+    schema::json_object, tool_error, tool_execution_error, tools,
 };
 
 pub(super) async fn wait_until(expected: &str, timeout: Duration, mut ready: impl FnMut() -> bool) {
@@ -422,12 +422,44 @@ fn begin_clamps_expected_seconds_and_end_hides_immediately() {
         },
     ));
 
-    runtime.begin_session(Some(99)).unwrap();
+    assert!(runtime.begin_session(Some(99), "").is_err());
+    assert_eq!(runtime.status()["owns_arbitration"], false);
+    assert!(events.lock().unwrap().is_empty());
+    runtime.begin_session(Some(99), "synthetic").unwrap();
     assert_eq!(runtime.status()["hold_ms"], 2_000);
     assert_eq!(runtime.status()["state"], "armed");
+    let snapshot = || {
+        let state = runtime.state.lock().unwrap();
+        (
+            state.session.hold,
+            state.session.close_deadline,
+            state.generation,
+        )
+    };
+    let before = snapshot();
+    std::thread::scope(|scope| {
+        let callers: Vec<_> = (0..4)
+            .map(|_| {
+                scope.spawn(|| {
+                    assert!(matches!(
+                        runtime.begin_session(Some(1), "different"),
+                        Err(BeginSessionError::Target(
+                            PlatformError::TargetInvalidated { .. }
+                        ))
+                    ));
+                })
+            })
+            .collect();
+        for caller in callers {
+            caller.join().unwrap();
+        }
+    });
+    assert_eq!(snapshot(), before);
+    assert_eq!(runtime.status()["approved_target_ref"], "synthetic");
+    assert_eq!(*events.lock().unwrap(), ["armed"]);
     runtime.end_session().unwrap();
 
-    runtime.begin_session(Some(1)).unwrap();
+    runtime.begin_session(Some(1), "synthetic").unwrap();
     assert_eq!(runtime.status()["hold_ms"], 1_000);
     runtime.end_session().unwrap();
     assert_eq!(*events.lock().unwrap(), ["armed", "hide", "armed", "hide"]);
@@ -449,7 +481,7 @@ async fn begin_keeps_acting_while_a_mutation_is_in_flight() {
     ));
 
     let lease = runtime.acquire().await.unwrap();
-    runtime.begin_session(None).unwrap();
+    runtime.begin_session(None, "synthetic").unwrap();
 
     assert_eq!(runtime.status()["state"], "acting");
     assert_eq!(runtime.status()["active_mutations"], 1);
@@ -481,7 +513,7 @@ async fn explicit_session_hold_survives_the_first_mutation() {
     ));
     let _timeouts = manual_timeouts(&runtime);
 
-    runtime.begin_session(Some(2)).unwrap();
+    runtime.begin_session(Some(2), "synthetic").unwrap();
     drop(runtime.acquire().await.unwrap());
 
     assert_eq!(runtime.status()["state"], "armed");
@@ -545,13 +577,13 @@ fn refused_server_stays_dark_until_the_owner_ends() {
         },
     ));
 
-    first.begin_session(None).unwrap();
-    assert!(second.begin_session(None).is_err());
+    first.begin_session(None, "synthetic").unwrap();
+    assert!(second.begin_session(None, "synthetic").is_err());
     assert_eq!(second_starts.load(Ordering::Relaxed), 0);
     assert!(second_events.lock().unwrap().is_empty());
 
     first.end_session().unwrap();
-    second.begin_session(None).unwrap();
+    second.begin_session(None, "synthetic").unwrap();
     assert_eq!(*second_events.lock().unwrap(), ["armed"]);
     second.end_session().unwrap();
 }
@@ -600,15 +632,15 @@ fn failed_helper_start_releases_arbitration_for_the_next_server() {
         },
     ));
 
-    assert_eq!(
-        first.begin_session(None).unwrap_err(),
-        "native indicator initialization failed"
-    );
+    assert!(matches!(
+        first.begin_session(None, "synthetic").unwrap_err(),
+        BeginSessionError::Indicator(reason) if reason == "native indicator initialization failed"
+    ));
     assert_eq!(failed_starts.load(Ordering::Relaxed), 3);
     assert_eq!(first.status()["owns_arbitration"], false);
     assert_eq!(first.status()["last_cleanup_reason"], "admission_failure");
 
-    second.begin_session(None).unwrap();
+    second.begin_session(None, "synthetic").unwrap();
     second.end_session().unwrap();
     assert_eq!(*events.lock().unwrap(), ["armed", "hide"]);
 }
@@ -628,7 +660,7 @@ async fn end_waits_for_the_outstanding_mutation_guard() {
         Duration::from_secs(1),
     ));
 
-    runtime.begin_session(None).unwrap();
+    runtime.begin_session(None, "synthetic").unwrap();
     let lease = runtime.acquire().await.unwrap();
     runtime.end_session().unwrap();
     assert_eq!(*events.lock().unwrap(), ["armed", "acting"]);
@@ -768,7 +800,7 @@ fn improved_arguments_accept_bounded_capture_focus_observation_and_uppercase_key
     assert!(!capture.include_cursor);
 
     let focus = parse_arguments::<FocusWindowInput>(Some(json_object(serde_json::json!({
-        "window_id": "0X10:20",
+        "window_id": "target-12345678-1234-1234-1234-123456789ABC",
         "observation": {
             "mode": "screenshot",
             "region": {
@@ -784,6 +816,7 @@ fn improved_arguments_accept_bounded_capture_focus_observation_and_uppercase_key
     assert_eq!(focus.observation.region.unwrap().width, 300);
 
     let chord = parse_arguments::<PressKeysInput>(Some(json_object(serde_json::json!({
+        "target_ref": "synthetic",
         "keys": ["CTRL", "L"]
     }))))
     .unwrap();
@@ -831,6 +864,7 @@ fn pointer_result_contains_post_action_png() {
         observation: ActionObservation {
             foreground_window: None,
             screenshot: Some(DisplayScreenshot {
+                target_ref: None,
                 source_bounds: display.bounds,
                 display,
                 png: b"\x89PNG\r\n\x1a\n".to_vec(),
