@@ -20,20 +20,29 @@ use super::{
 pub(super) async fn run_platform_operation<T, F>(
     operation_lease: Option<OperationLease>,
     operation: F,
-) -> Result<T, ErrorData>
+) -> Result<Result<T, PlatformError>, ErrorData>
 where
     T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
+    F: FnOnce() -> Result<T, PlatformError> + Send + 'static,
 {
+    let work = super::stop::current();
     tokio::task::spawn_blocking(move || {
         let _operation_lease = operation_lease;
-        operation()
+        let control = work.as_ref().map(|work| &work.control);
+        if let Some(control) = control {
+            control.check("observation_worker")?;
+        }
+        let result = operation();
+        if let Some(control) = control {
+            control.check("observation_worker")?;
+        }
+        result
     })
     .await
     .map_err(|error| join_error(&error))
 }
 
-async fn run_mutation_operation<T, F>(
+pub(super) async fn run_mutation_operation<T, F>(
     operation_lease: Option<OperationLease>,
     target_ref: String,
     backend: Arc<dyn PlatformBackend>,
@@ -43,13 +52,21 @@ where
     T: Send + 'static,
     F: FnOnce(&MutationControl) -> Result<T, PlatformError> + Send + 'static,
 {
-    let control = operation_lease
+    let work = super::stop::current();
+    let request_control = work
         .as_ref()
-        .map_or_else(MutationControl::default, OperationLease::mutation_control)
-        .for_operation();
+        .map_or_else(MutationControl::default, |work| work.control.clone());
+    let control = request_control.with_cancellation(
+        operation_lease
+            .as_ref()
+            .map_or_else(MutationControl::default, OperationLease::mutation_control),
+    );
     let worker_control = control.clone();
     let result = tokio::task::spawn_blocking(move || {
+        let registered_work = work;
         let _operation_lease = operation_lease;
+        let _cleanup = super::stop::CleanupOnDrop(registered_work.clone());
+        worker_control.check("mutation_worker")?;
         backend.validate_target_reference(&target_ref)?;
         worker_control.bind_target(&target_ref)?;
         let result = operation(&worker_control);
@@ -100,7 +117,7 @@ pub(super) fn call_get_server_status(
             "status": safety_indicator.status(),
             "reason": safety_indicator.failure_reason(),
         },
-        "session": indicator_runtime.map(|runtime| runtime.status()),
+        "session": indicator_runtime.map(|runtime| runtime.try_status()),
         "version": env!("CARGO_PKG_VERSION"),
         "instance_id": diagnostics.instance_id,
         "process_id": std::process::id(),
@@ -192,8 +209,10 @@ pub(super) async fn call_wait_for_visual_change(
         stable_ms: input.stable_ms,
         difference_threshold: input.difference_threshold,
     };
+    let control =
+        super::stop::current().map_or_else(MutationControl::default, |work| work.control.clone());
     let result = run_platform_operation(operation_lease, move || {
-        backend.wait_for_visual_change(&request)
+        backend.wait_for_visual_change_controlled(&request, &control)
     })
     .await?;
     match result {
@@ -237,8 +256,10 @@ pub(super) async fn call_wait_for_change_since(
         stable_ms: input.stable_ms,
         difference_threshold: input.difference_threshold,
     };
+    let control =
+        super::stop::current().map_or_else(MutationControl::default, |work| work.control.clone());
     let result = run_platform_operation(operation_lease, move || {
-        backend.wait_for_change_since(&request)
+        backend.wait_for_change_since_controlled(&request, &control)
     })
     .await?;
     match result {
@@ -254,8 +275,10 @@ pub(super) async fn call_read_text_in_region(
 ) -> Result<CallToolResponse, ErrorData> {
     let input = parse_arguments::<OcrRegionInput>(arguments)?;
     let request = input.into_request();
+    let control =
+        super::stop::current().map_or_else(MutationControl::default, |work| work.control.clone());
     let result = run_platform_operation(operation_lease, move || {
-        backend.read_text_in_region(&request)
+        backend.read_text_in_region_controlled(&request, &control)
     })
     .await?;
     match result {
@@ -271,8 +294,10 @@ pub(super) async fn call_find_text_on_screen(
 ) -> Result<CallToolResponse, ErrorData> {
     let input = parse_arguments::<FindTextInput>(arguments)?;
     let request = input.into_request();
+    let control =
+        super::stop::current().map_or_else(MutationControl::default, |work| work.control.clone());
     let result = run_platform_operation(operation_lease, move || {
-        backend.find_text_on_screen(&request)
+        backend.find_text_on_screen_controlled(&request, &control)
     })
     .await?;
     match result {
@@ -569,8 +594,12 @@ pub(super) async fn call_wait_for_window(
         is_foreground: input.is_foreground,
         timeout_ms: input.timeout_ms,
     };
-    let result =
-        run_platform_operation(operation_lease, move || backend.wait_for_window(&request)).await?;
+    let control =
+        super::stop::current().map_or_else(MutationControl::default, |work| work.control.clone());
+    let result = run_platform_operation(operation_lease, move || {
+        backend.wait_for_window_controlled(&request, &control)
+    })
+    .await?;
     match result {
         Ok(result) => Ok(window_wait_result(&result).into()),
         Err(error) => Ok(tool_error(&error).into()),

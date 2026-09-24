@@ -101,6 +101,17 @@ pub trait DisplayBackend {
         ))
     }
 
+    fn wait_for_visual_change_controlled(
+        &self,
+        request: &WaitForVisualChangeRequest,
+        control: &MutationControl,
+    ) -> Result<VisualChangeResult, PlatformError> {
+        control.check("wait_for_visual_change")?;
+        let result = self.wait_for_visual_change(request)?;
+        control.check("wait_for_visual_change")?;
+        Ok(result)
+    }
+
     fn wait_for_visual_change(
         &self,
         _request: &WaitForVisualChangeRequest,
@@ -121,6 +132,17 @@ pub trait DisplayBackend {
         ))
     }
 
+    fn wait_for_change_since_controlled(
+        &self,
+        request: &WaitForChangeSinceRequest,
+        control: &MutationControl,
+    ) -> Result<VisualChangeResult, PlatformError> {
+        control.check("wait_for_change_since")?;
+        let result = self.wait_for_change_since(request)?;
+        control.check("wait_for_change_since")?;
+        Ok(result)
+    }
+
     fn wait_for_change_since(
         &self,
         _request: &WaitForChangeSinceRequest,
@@ -134,11 +156,33 @@ pub trait DisplayBackend {
 
 /// Performs local OCR and semantic text interaction.
 pub trait OcrBackend {
+    fn read_text_in_region_controlled(
+        &self,
+        request: &OcrRegionRequest,
+        control: &MutationControl,
+    ) -> Result<OcrResult, PlatformError> {
+        control.check("read_text_in_region")?;
+        let result = self.read_text_in_region(request)?;
+        control.check("read_text_in_region")?;
+        Ok(result)
+    }
+
     fn read_text_in_region(&self, _request: &OcrRegionRequest) -> Result<OcrResult, PlatformError> {
         Err(PlatformError::unsupported(
             "read_text_in_region",
             "the active platform backend has no OCR implementation",
         ))
+    }
+
+    fn find_text_on_screen_controlled(
+        &self,
+        request: &FindTextRequest,
+        control: &MutationControl,
+    ) -> Result<FindTextResult, PlatformError> {
+        control.check("find_text_on_screen")?;
+        let result = self.find_text_on_screen(request)?;
+        control.check("find_text_on_screen")?;
+        Ok(result)
     }
 
     fn find_text_on_screen(
@@ -309,6 +353,17 @@ pub trait WindowBackend {
             "capture_window",
             "the active platform backend has no window-capture implementation",
         ))
+    }
+
+    fn wait_for_window_controlled(
+        &self,
+        request: &WaitForWindowRequest,
+        control: &MutationControl,
+    ) -> Result<WindowWaitResult, PlatformError> {
+        control.check("wait_for_window")?;
+        let result = self.wait_for_window(request)?;
+        control.check("wait_for_window")?;
+        Ok(result)
     }
 
     fn wait_for_window(

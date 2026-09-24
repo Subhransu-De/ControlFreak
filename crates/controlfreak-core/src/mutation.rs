@@ -13,22 +13,43 @@ use crate::{CleanupStatus, InputOutcome, MutationProgress, PlatformError};
 #[derive(Clone, Default)]
 pub struct MutationControl {
     cancelled: Arc<AtomicBool>,
-    parent: Option<Arc<Self>>,
+    parents: Vec<Arc<Self>>,
     progress: Arc<Mutex<MutationProgress>>,
     target: Arc<Mutex<Option<String>>>,
     target_invalidated: Arc<AtomicBool>,
 }
 
 impl MutationControl {
+    /// Bounded cooperative wait, also used by providers between native calls.
+    pub fn wait(
+        &self,
+        operation: &str,
+        duration: std::time::Duration,
+    ) -> Result<(), PlatformError> {
+        let deadline = std::time::Instant::now() + duration;
+        loop {
+            self.check(operation)?;
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+        }
+    }
+
     /// Combine indicator cancellation with the owning session cancellation.
     #[must_use]
     pub fn with_cancellation(&self, parent: Self) -> Self {
+        let mut parents = self.parents.clone();
+        let target = Arc::clone(&parent.target);
+        let target_invalidated = Arc::clone(&parent.target_invalidated);
+        parents.push(Arc::new(parent));
         Self {
-            target: Arc::clone(&parent.target),
-            target_invalidated: Arc::clone(&parent.target_invalidated),
+            target,
+            target_invalidated,
             cancelled: Arc::clone(&self.cancelled),
-            parent: Some(Arc::new(parent)),
-            progress: Arc::default(),
+            parents,
+            progress: Arc::clone(&self.progress),
         }
     }
 
@@ -156,17 +177,14 @@ impl MutationControl {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
-            || self
-                .parent
-                .as_ref()
-                .is_some_and(|parent| parent.is_cancelled())
+            || self.parents.iter().any(|parent| parent.is_cancelled())
     }
 
     pub fn check(&self, operation: &str) -> Result<(), PlatformError> {
         if self.is_cancelled() {
             Err(PlatformError::OperationFailed {
                 operation: operation.to_owned(),
-                reason: "the desktop mutation was cancelled because the control session closed or the safety indicator became unhealthy"
+                reason: "the desktop operation was cancelled by a user/client stop, request cancellation, a closing control session, or because the safety indicator became unhealthy"
                     .to_owned(),
             })
         } else {
@@ -187,6 +205,52 @@ impl fmt::Debug for MutationControl {
 #[cfg(test)]
 mod tests {
     use super::MutationControl;
+
+    #[test]
+    fn cancellation_interrupts_provider_waits_without_waiting_for_the_deadline() {
+        use std::{sync::mpsc, time::Duration};
+        for operation in [
+            "move_mouse",
+            "type_text",
+            "wait_for_change",
+            "windows_ocr_helper",
+        ] {
+            let control = MutationControl::default();
+            let worker = control.clone();
+            let (sender, receiver) = mpsc::channel();
+            let task = std::thread::spawn(move || {
+                sender
+                    .send(worker.wait(operation, Duration::from_secs(30)))
+                    .unwrap();
+            });
+            control.cancel();
+            assert!(
+                receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .is_err()
+            );
+            task.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn linking_request_cancellation_preserves_session_and_indicator_cancellation() {
+        for source in 0..3 {
+            let indicator = MutationControl::default();
+            let session = MutationControl::default();
+            let request = MutationControl::default();
+            session.bind_target("approved").unwrap();
+            let lease = indicator.with_cancellation(session.clone()).for_operation();
+            let operation = request.with_cancellation(lease);
+            assert_eq!(operation.approved_target().as_deref(), Some("approved"));
+            assert!(operation.bind_target("other").is_err());
+            operation.invalidate_target();
+            assert!(session.check_target().is_err());
+            [&indicator, &session, &request][source].cancel();
+            assert!(operation.is_cancelled());
+        }
+    }
 
     #[test]
     fn session_binding_survives_operations_and_refuses_retargeting() {

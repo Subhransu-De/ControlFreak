@@ -95,7 +95,7 @@ impl PointerBackend for Backend {
         let (end_x, end_y) = end_display
             .bounds
             .to_virtual(request.end_x, request.end_y)?;
-        let _guard = self.lock_input();
+        let _guard = self.lock_input(control)?;
         let foreground_before = foreground_window_handle();
         ensure_interactive_input_desktop("drag_mouse")?;
         control.check("drag_mouse")?;
@@ -108,7 +108,10 @@ impl PointerBackend for Backend {
             },
             0,
             control,
-            |point| super::target::validate(control, "drag_mouse", Some(point)),
+            |point| {
+                super::target::validate(control, "drag_mouse", Some(point))?;
+                super::input::ensure_pointer_idle("drag_mouse")
+            },
         )?;
         control.check("drag_mouse")?;
         send_drag_press(request.button, &request.modifiers, control, || {
@@ -205,7 +208,7 @@ impl KeyboardBackend for Backend {
         ensure_dpi_awareness()?;
         validate_key_chord(request)?;
         validate_observation(&request.observation)?;
-        let _guard = self.lock_input();
+        let _guard = self.lock_input(control)?;
         super::target::validate(control, "press_keys", None)?;
         send_key_chord("press_keys", &request.keys, control, || {
             super::target::validate(control, "press_keys", None)
@@ -244,7 +247,7 @@ impl KeyboardBackend for Backend {
             });
         }
 
-        let _guard = self.lock_input();
+        let _guard = self.lock_input(control)?;
         super::target::validate(control, "type_text", None)?;
         send_unicode_text(&utf16, control, || {
             super::target::validate(control, "type_text", None)
@@ -260,10 +263,20 @@ impl KeyboardBackend for Backend {
 }
 
 impl Backend {
-    pub(super) fn lock_input(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.input_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    pub(super) fn lock_input(
+        &self,
+        control: &MutationControl,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, PlatformError> {
+        loop {
+            control.check("input_queue")?;
+            match self.input_lock.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    control.wait("input_queue", Duration::from_millis(10))?;
+                }
+            }
+        }
     }
 
     pub(super) fn ensure_window_input_target(
@@ -291,7 +304,7 @@ impl Backend {
         super::target::validate(control, operation, None)?;
         let display = super::target::display(control, spec.display_id)?;
         let (target_x, target_y) = display.bounds.to_virtual(spec.x, spec.y)?;
-        let _guard = self.lock_input();
+        let _guard = self.lock_input(control)?;
         ensure_interactive_input_desktop(operation)?;
         control.check(operation)?;
         let foreground_before = foreground_window_handle();
@@ -307,7 +320,10 @@ impl Backend {
             },
             spec.duration_ms,
             control,
-            |point| super::target::validate(control, operation, Some(point)),
+            |point| {
+                super::target::validate(control, operation, Some(point))?;
+                super::input::ensure_pointer_idle(operation)
+            },
         )?;
         // A move-only action is already dispatched. Its next cursor read is observation,
         // whereas clicks and scrolls still need this read to validate their input target.

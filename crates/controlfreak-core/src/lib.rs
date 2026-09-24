@@ -12,6 +12,7 @@ mod permission;
 mod platform;
 mod report;
 mod security;
+mod stop;
 mod text_matching;
 mod window;
 
@@ -42,6 +43,7 @@ pub use platform::{
 };
 pub use report::CapabilityReport;
 pub use security::{IntegrityLevel, SecurityContext};
+pub use stop::{StopController, StopRegistration};
 pub use text_matching::{discover_text, select_text_candidate, validate_text_discovery};
 pub use window::{
     CaptureWindowRequest, FocusWindowRequest, WaitForWindowRequest, WindowBounds,

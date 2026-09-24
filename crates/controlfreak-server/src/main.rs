@@ -178,11 +178,14 @@ async fn run_server(allow_elevated: bool) -> Result<(), Box<dyn Error + Send + S
         let arbitrator = Arc::new(PlatformArbitrator(
             controlfreak_platform::desktop_arbitrator()?,
         ));
+        let stop = controlfreak_core::StopController::default();
+        let _user_stop = controlfreak_platform::UserStop::start(stop.clone())?;
         controlfreak_mcp::serve_stdio_with_indicator_and_arbitrator(
             platform_backend(security_context)?,
             safety_indicator,
             move || desktop_glow::DesktopGlow::start(elevated),
             arbitrator,
+            stop,
         )
         .await
     }
@@ -192,7 +195,7 @@ async fn run_server(allow_elevated: bool) -> Result<(), Box<dyn Error + Send + S
 }
 
 fn run_ocr_helper() -> Result<(), Box<dyn Error + Send + Sync>> {
-    controlfreak_platform::serve_ocr_helper(io::stdin().lock(), io::stdout().lock())
+    controlfreak_platform::serve_ocr_helper(io::stdin(), io::stdout().lock())
 }
 
 fn platform_backend(

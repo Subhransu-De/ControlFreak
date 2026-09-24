@@ -731,6 +731,7 @@ async fn cancelling_a_request_keeps_the_glow_until_blocking_work_ends() {
     let request = tokio::spawn(run_platform_operation(Some(lease), move || {
         started_for_worker.notify_one();
         finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        Ok(())
     }));
     tokio::time::timeout(Duration::from_secs(5), started.notified())
         .await
@@ -760,6 +761,7 @@ fn tool_surface_includes_windows_and_keyboard() {
     assert_eq!(
         names,
         [
+            "stop_desktop_work",
             "get_server_status",
             "begin_control_session",
             "end_control_session",

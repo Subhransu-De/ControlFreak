@@ -76,3 +76,25 @@ and duration to stderr. These events deliberately exclude tool arguments, typed 
 window titles, screenshots, and image data. ControlFreak writes no diagnostics to disk by default.
 Setting `CONTROLFREAK_GLOW_ERROR_LOG` opts into an append-only log at the given path, recording
 indicator helper lifecycle, helper stderr, and error text. That log carries no desktop content.
+
+## User stop and cancellation
+
+A native navy session bar and physical Esc latch stop independently of MCP
+transport and provider progress. The bar is visible only while this server owns
+the desktop, including cleanup. A dedicated keyboard hook examines key identity
+and injection flags only to recognize physical Esc. It retains no typed values
+or keyboard history, ignores injected Esc, and consumes the stop key's press and
+release. Esc outside an owned session is passed through. A user-stop notification
+is sent over MCP and its reason remains available in status and refused actions.
+Clients may also stop all desktop work or cancel
+one request. No MCP call clears the stop latch. User-controlled server restart is
+the re-arming procedure, after draining and resolving any cleanup failure.
+
+Cancellation is cooperative. An in-flight native call may finish after stop.
+Cleanup bypasses ordinary mutation admission but releases only acknowledged,
+unmatched owned inputs. It does not release every key named by a failed request.
+An existing held key or button is refused before new input dispatch. Unknown
+cleanup closes admission and retains the ownership lease and indicator. Status
+reports draining or cleanup failure without claiming to undo application effects.
+Stopping does not kill applications, lock Windows, or shut it down. The private
+OCR helper retains its pre-existing timeout and owned-process cleanup policy.

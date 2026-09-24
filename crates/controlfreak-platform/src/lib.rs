@@ -35,7 +35,7 @@ pub mod packaging_tests;
 use windows as implementation;
 
 #[cfg(target_os = "windows")]
-pub use implementation::{DesktopArbitrator, ManagedChild};
+pub use implementation::{DesktopArbitrator, ManagedChild, UserStop};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OcrHelperCommand {
@@ -114,7 +114,7 @@ pub fn serve_desktop_glow_helper(arguments: &[String]) -> std::io::Result<Option
 
 #[cfg(target_os = "windows")]
 pub fn serve_ocr_helper(
-    input: impl std::io::Read,
+    input: impl std::io::Read + Send + 'static,
     output: impl std::io::Write,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     implementation::serve_ocr_helper(input, output)
