@@ -55,6 +55,20 @@ struct Reference {
 }
 
 impl Reference {
+    fn refresh_if_unchanged(
+        &mut self,
+        identity: &Identity,
+        bounds: [i32; 4],
+        displays: &[DisplayInfo],
+        now: Instant,
+    ) -> Option<String> {
+        if &self.identity != identity || self.bounds != bounds || self.displays != displays {
+            return None;
+        }
+        self.issued = now;
+        Some(self.id.clone())
+    }
+
     fn validate_snapshot(
         &self,
         current: &Identity,
@@ -305,12 +319,10 @@ pub(super) fn issue(hwnd: HWND) -> Result<String, PlatformError> {
         return Err(invalid("window state changed during observation"));
     }
     references.retain(|reference| reference.issued.elapsed() < REFERENCE_TTL);
-    if let Some(reference) = references.iter().find(|reference| {
-        reference.identity == identity
-            && reference.bounds == bounds
-            && reference.displays == displays
+    if let Some(id) = references.iter_mut().find_map(|reference| {
+        reference.refresh_if_unchanged(&identity, bounds, &displays, Instant::now())
     }) {
-        return Ok(reference.id.clone());
+        return Ok(id);
     }
     // SAFETY: CoCreateGuid takes no borrowed input and the generated value is returned by value.
     let guid =
@@ -603,6 +615,33 @@ mod tests {
                 "change {change}"
             );
         }
+    }
+
+    #[test]
+    fn fresh_observations_refresh_only_compatible_references() {
+        let mut cached = reference();
+        let observed = cached.clone();
+        let fresh = (cached.issued + REFERENCE_TTL)
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(
+            cached.refresh_if_unchanged(&observed.identity, observed.bounds, &[], fresh),
+            Some(observed.id)
+        );
+        assert_eq!(cached.issued, fresh);
+        let mut moved = observed.bounds;
+        moved[0] += 1;
+        assert!(
+            cached
+                .refresh_if_unchanged(
+                    &observed.identity,
+                    moved,
+                    &[],
+                    fresh + Duration::from_secs(1)
+                )
+                .is_none()
+        );
+        assert_eq!(cached.issued, fresh);
     }
 
     #[test]

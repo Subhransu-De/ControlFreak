@@ -265,6 +265,7 @@ async fn every_action_result_validates_against_tools_list_over_transport() {
     )
     .await;
     let tools = listed["result"]["tools"].as_array().unwrap();
+    assert_window_input_schemas(tools);
     let actions = action_requests();
     for (mode, status) in [
         "completed",
@@ -317,6 +318,19 @@ async fn every_action_result_validates_against_tools_list_over_transport() {
         .await
         .unwrap()
         .unwrap();
+}
+
+fn assert_window_input_schemas(tools: &[Value]) {
+    let reference = "target-12345678-1234-1234-1234-123456789ABC";
+    for name in [FOCUS_WINDOW, CAPTURE_WINDOW, WAIT_FOR_WINDOW] {
+        let schema = &tools.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"];
+        let validator = jsonschema::validator_for(schema).unwrap();
+        assert!(
+            validator.is_valid(&json!({"window_id": reference})),
+            "{name}"
+        );
+        assert!(!validator.is_valid(&json!({"window_id": ""})), "{name}");
+    }
 }
 
 async fn assert_unapproved_actions_rejected(

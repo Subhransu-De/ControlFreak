@@ -768,7 +768,7 @@ fn improved_arguments_accept_bounded_capture_focus_observation_and_uppercase_key
     assert!(!capture.include_cursor);
 
     let focus = parse_arguments::<FocusWindowInput>(Some(json_object(serde_json::json!({
-        "window_id": "0X10:20",
+        "window_id": "target-12345678-1234-1234-1234-123456789ABC",
         "observation": {
             "mode": "screenshot",
             "region": {

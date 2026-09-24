@@ -455,14 +455,7 @@ fn list_windows_tool() -> Tool {
 fn focus_window_tool() -> Tool {
     let mut properties = JsonObject::new();
     properties.insert("timeout_ms".into(), json!({ "type": "integer", "minimum": 100, "maximum": 5000, "default": 1000, "description": "Total activation retry and settle budget in milliseconds." }));
-    properties.insert(
-        "window_id".to_owned(),
-        json!({
-            "type": "string",
-            "pattern": "^0[xX][0-9A-Fa-f]+:[0-9A-Fa-f]+$",
-            "description": "Fresh ephemeral window ID returned by list_windows."
-        }),
-    );
+    add_window_id(&mut properties);
     add_observation(&mut properties);
     Tool::new(
         FOCUS_WINDOW,
@@ -694,8 +687,8 @@ fn add_window_id(properties: &mut JsonObject) {
         "window_id".to_owned(),
         json!({
             "type": "string",
-            "pattern": "^0[xX][0-9A-Fa-f]+:[0-9A-Fa-f]+$",
-            "description": "Fresh ephemeral window ID returned by list_windows."
+            "minLength": 1,
+            "description": "Opaque server-issued target reference returned by list_windows or an observation."
         }),
     );
 }

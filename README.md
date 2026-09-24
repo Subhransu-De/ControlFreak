@@ -25,7 +25,7 @@ approved reference. A session permits one reference; end it before approving a d
 
 Screenshot and OCR results include `target_ref` when the foreground target and observation
 state remained compatible across capture. A null reference does not authorize input. References
-retain their source window bounds and display layout, expire after five minutes, and use a
+retain their source window bounds and display layout, expire five minutes after the latest compatible observation, and use a
 bounded server cache. Their opaque IDs identify the stored observation generation. Input checks
 process creation time, window identity and ownership, desktop, foreground, integrity, bounds,
 and display layout before every batch, including later text batches and drag movement.
