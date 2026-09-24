@@ -278,7 +278,26 @@ pub(super) fn find_display_at_point(point: POINT) -> Option<DisplayInfo> {
 #[derive(Default)]
 struct WindowEnumeration {
     windows: Vec<WindowInfo>,
-    error: Option<String>,
+    error: Option<PlatformError>,
+}
+
+impl WindowEnumeration {
+    fn accept(&mut self, outcome: Result<WindowInfo, PlatformError>) -> BOOL {
+        match outcome {
+            Ok(window) => {
+                if self.windows.len() < MAX_WINDOWS {
+                    self.windows.push(window);
+                }
+                BOOL(1)
+            }
+            Err(error @ PlatformError::Unavailable { .. }) => {
+                self.error = Some(error);
+                BOOL(0)
+            }
+            // Windows can disappear or become inaccessible during enumeration.
+            Err(_) => BOOL(1),
+        }
+    }
 }
 
 unsafe extern "system" fn window_callback(hwnd: HWND, data: LPARAM) -> BOOL {
@@ -286,35 +305,32 @@ unsafe extern "system" fn window_callback(hwnd: HWND, data: LPARAM) -> BOOL {
     // synchronous EnumWindows and remains valid for the complete callback invocation.
     let enumeration = unsafe { &mut *(data.0 as *mut WindowEnumeration) };
     let outcome = catch_unwind(AssertUnwindSafe(|| window_info(hwnd)));
-    match outcome {
-        Ok(Ok(window)) => {
-            if enumeration.windows.len() < MAX_WINDOWS {
-                enumeration.windows.push(window);
-            }
-            BOOL(1)
-        }
-        Ok(Err(_)) => BOOL(1),
-        Err(_) => {
-            enumeration.error = Some("window callback panicked".to_owned());
-            BOOL(0)
-        }
+    if let Ok(result) = outcome {
+        enumeration.accept(result)
+    } else {
+        enumeration.error = Some(PlatformError::OperationFailed {
+            operation: "EnumWindows".into(),
+            reason: "window callback panicked".into(),
+        });
+        BOOL(0)
     }
 }
 
 pub(super) fn enumerate_windows() -> Result<Vec<WindowInfo>, PlatformError> {
+    super::target::ensure_available()?;
     let mut enumeration = WindowEnumeration::default();
     // SAFETY: The LPARAM points to `enumeration`, which remains uniquely borrowed for this
     // synchronous enumeration. The callback catches panics before returning across the FFI edge.
-    unsafe {
+    let result = unsafe {
         EnumWindows(
             Some(window_callback),
             LPARAM((&raw mut enumeration).cast::<c_void>() as isize),
         )
+    };
+    if let Some(error) = enumeration.error {
+        return Err(error);
     }
-    .map_err(|error| PlatformError::OperationFailed {
-        operation: "EnumWindows".to_owned(),
-        reason: enumeration.error.unwrap_or_else(|| error.to_string()),
-    })?;
+    result.map_err(|error| win32_error("EnumWindows", &error))?;
 
     enumeration.windows.sort_by(|left, right| {
         right
@@ -550,5 +566,32 @@ fn window_not_available(reason: &str) -> PlatformError {
     PlatformError::InvalidArgument {
         argument: "window".to_owned(),
         reason: reason.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod enumeration_tests {
+    use super::*;
+
+    #[test]
+    fn shared_reference_failures_abort_instead_of_reporting_an_empty_desktop() {
+        let mut enumeration = WindowEnumeration::default();
+        assert!(
+            enumeration
+                .accept(Err(window_not_available("window disappeared")))
+                .as_bool()
+        );
+        assert!(enumeration.error.is_none());
+        assert!(
+            enumeration
+                .accept(Err(super::super::target::invalid("process exited")))
+                .as_bool()
+        );
+        assert!(enumeration.error.is_none());
+        let failure = PlatformError::Unavailable {
+            reason: "target reference initialization failed".into(),
+        };
+        assert!(!enumeration.accept(Err(failure.clone())).as_bool());
+        assert_eq!(enumeration.error, Some(failure));
     }
 }

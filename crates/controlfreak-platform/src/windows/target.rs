@@ -95,6 +95,12 @@ pub(super) fn invalid(reason: &str) -> PlatformError {
     }
 }
 
+fn unavailable(reason: impl std::fmt::Display) -> PlatformError {
+    PlatformError::Unavailable {
+        reason: format!("target references unavailable: {reason}"),
+    }
+}
+
 fn identity(hwnd: HWND) -> Result<Identity, PlatformError> {
     let mut pid = 0;
     // SAFETY: These queries retain no pointers; pid is writable for the synchronous call.
@@ -135,8 +141,8 @@ fn identity(hwnd: HWND) -> Result<Identity, PlatformError> {
         .filter(|length| *length > 0)
         .ok_or_else(|| invalid("window class cannot be verified"))?;
     let owner = window_owner(hwnd)?;
-    let _apartment = desktop::ComApartment::initialize()?;
-    let manager = desktop::virtual_desktop_manager()?;
+    let _apartment = desktop::ComApartment::initialize().map_err(unavailable)?;
+    let manager = desktop::virtual_desktop_manager().map_err(unavailable)?;
     let desktop = desktop::window_desktop_id(&manager, hwnd)
         .map_err(|_| invalid("window desktop cannot be verified"))?;
     Ok(Identity {
@@ -222,7 +228,7 @@ fn retire_foreground(references: &mut VecDeque<Reference>, foreground: usize) {
     references.retain(|reference| !reference.armed || reference.identity.hwnd == foreground);
 }
 
-fn watch_lifetimes() -> Result<(), PlatformError> {
+pub(super) fn ensure_available() -> Result<(), PlatformError> {
     static WATCHER: OnceLock<Result<(), String>> = OnceLock::new();
     WATCHER
         .get_or_init(|| {
@@ -287,21 +293,27 @@ fn watch_lifetimes() -> Result<(), PlatformError> {
                 .map_err(|error| error.to_string())?
         })
         .clone()
-        .map_err(|reason| invalid(&reason))
+        .map_err(unavailable)?;
+    if WATCHING.load(Ordering::Acquire) {
+        Ok(())
+    } else {
+        Err(unavailable("window lifetime watcher stopped"))
+    }
 }
 
 pub(super) fn issue(hwnd: HWND) -> Result<String, PlatformError> {
-    watch_lifetimes()?;
+    ensure_available()?;
     let generation = OBSERVATION_GENERATION.load(Ordering::Acquire);
     let identity = identity(hwnd)?;
     let bounds = bounds(hwnd)?;
-    let displays = desktop::enumerate_displays()?;
+    let displays = desktop::enumerate_displays().map_err(unavailable)?;
     let mut references = REFERENCES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !WATCHING.load(Ordering::Acquire)
-        || OBSERVATION_GENERATION.load(Ordering::Acquire) != generation
-    {
+    if !WATCHING.load(Ordering::Acquire) {
+        return Err(unavailable("window lifetime watcher stopped"));
+    }
+    if OBSERVATION_GENERATION.load(Ordering::Acquire) != generation {
         return Err(invalid("window state changed during observation"));
     }
     references.retain(|reference| reference.issued.elapsed() < REFERENCE_TTL);
@@ -315,8 +327,7 @@ pub(super) fn issue(hwnd: HWND) -> Result<String, PlatformError> {
         return Ok(id);
     }
     // SAFETY: CoCreateGuid takes no borrowed input and the generated value is returned by value.
-    let guid =
-        unsafe { CoCreateGuid() }.map_err(|_| invalid("could not issue a target reference"))?;
+    let guid = unsafe { CoCreateGuid() }.map_err(unavailable)?;
     let id = format!("target-{guid:?}");
     if references.len() >= MAX_REFERENCES {
         references.pop_front();
