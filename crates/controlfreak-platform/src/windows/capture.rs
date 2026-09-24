@@ -273,7 +273,7 @@ fn capture_observation_screenshot(
     }
 }
 
-pub(super) fn foreground_window_info() -> Option<WindowInfo> {
+fn foreground_window_info() -> Option<WindowInfo> {
     let hwnd = foreground_window_handle();
     (!hwnd.is_invalid())
         .then(|| window_info(hwnd).ok())
