@@ -46,6 +46,20 @@ the current target process integrity. A target above the server's integrity is r
 UAC secure desktop, the lock screen, disconnected sessions, and non-default input desktops remain
 blocked even when `--allow-elevated` is present.
 
+Mutating sessions bind one server-issued opaque target reference. Each input batch validates
+that window's process creation time, ownership, desktop, foreground and integrity. Pointer
+batches also check the effective top-level window under the mapped point. References retain
+window bounds and display layout from observation; incompatible changes invalidate input.
+A bounded five-minute cache and Windows destroy-event watcher prevent raw HWND/PID reconstruction
+and retire destroyed-window references, including same-process handle reuse. Watcher failure
+refuses target resolution. Desktop-switch events retire existing references.
+
+Focus acquisition uses only documented restoration and foreground APIs with a bounded retry
+budget. It validates on every poll and stops on competing foreground ownership. A mismatch
+invalidates session approval. Release-only cleanup remains permitted after earlier dispatch.
+These checks reduce OS races; out-of-context event notifications and input delivery are not
+atomic with validation. Post-action foreground evidence is a sample, not a continuous guarantee.
+
 `get_server_status` and `--print-capabilities` report `server_elevated`, the Windows integrity level,
 and whether elevated operation was explicitly allowed. Elevated mutation sessions replace the
 standard blue glow and its bright core with red counterparts; all other indicator behavior and

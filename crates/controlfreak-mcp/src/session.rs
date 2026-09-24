@@ -366,6 +366,14 @@ impl IndicatorRuntime {
         })
     }
 
+    pub(super) fn bind_target(&self, target: &str) -> Result<(), controlfreak_core::PlatformError> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancellation
+            .bind_target(target)
+    }
+
     pub(super) fn begin_session(
         self: &Arc<Self>,
         expected_seconds: Option<u64>,
@@ -835,6 +843,7 @@ impl IndicatorRuntime {
             "last_cleanup_reason": state.last_cleanup_reason,
             "draining": state.session.state == ControlSessionState::Closing,
             "call_count": state.session.call_count,
+            "approved_target_ref": state.cancellation.approved_target(),
             "active_mutations": state.active_mutations,
             "hold_ms": u64::try_from(state.session.hold.as_millis()).unwrap_or(u64::MAX),
             "time_until_close_ms": remaining_ms,

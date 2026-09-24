@@ -38,6 +38,15 @@ impl SyntheticBackend {
 }
 
 impl BackendMetadata for SyntheticBackend {
+    fn validate_target_reference(&self, target: &str) -> Result<(), PlatformError> {
+        if target == "synthetic" {
+            Ok(())
+        } else {
+            Err(PlatformError::TargetInvalidated {
+                reason: "synthetic stale target".into(),
+            })
+        }
+    }
     fn identity(&self) -> controlfreak_core::BackendIdentity {
         controlfreak_core::BackendIdentity {
             platform: controlfreak_core::Platform::Windows,
@@ -171,6 +180,8 @@ impl WindowBackend for SyntheticBackend {
         self.act(
             control,
             WindowFocusResult {
+                attempts: 1,
+                elapsed_ms: 0,
                 window: controlfreak_core::WindowInfo {
                     id: "synthetic".into(),
                     title: "synthetic".into(),
@@ -299,11 +310,41 @@ async fn every_action_result_validates_against_tools_list_over_transport() {
         assert_eq!(content["error"]["details"]["candidate_count"], count);
         assert_eq!(content["input"]["input_outcome"], "not_started");
     }
+    backend.0.store(0, Ordering::Relaxed);
+    assert_unapproved_actions_rejected(&mut client, &actions).await;
     drop(client);
     tokio::time::timeout(Duration::from_secs(10), serving)
         .await
         .unwrap()
         .unwrap();
+}
+
+async fn assert_unapproved_actions_rejected(
+    client: &mut BufReader<tokio::io::DuplexStream>,
+    actions: &[(&str, Value)],
+) {
+    for (name, arguments) in actions {
+        for supplied in [None, Some("0X10:20"), Some("expired-target")] {
+            let mut arguments = arguments.clone();
+            let field = if *name == FOCUS_WINDOW {
+                "window_id"
+            } else {
+                "target_ref"
+            };
+            arguments.as_object_mut().unwrap().remove(field);
+            if let Some(target) = supplied {
+                arguments[field] = json!(target);
+            }
+            let response = exchange(client, json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":name,"arguments":arguments}})).await;
+            let content = &response["result"]["structuredContent"];
+            assert_eq!(
+                content["input"]["input_outcome"], "not_started",
+                "{name}: {response}"
+            );
+            assert_eq!(content["input"]["sent_events"], 0, "{name}: {response}");
+            assert_eq!(response["result"]["isError"], true);
+        }
+    }
 }
 
 fn action_requests() -> [(&'static str, Value); 9] {
@@ -329,7 +370,10 @@ fn action_requests() -> [(&'static str, Value); 9] {
         (TYPE_TEXT, json!({"text":"synthetic"})),
         (FOCUS_WINDOW, json!({"window_id":"synthetic"})),
         (SWITCH_VIRTUAL_DESKTOP, json!({"direction":"right"})),
-    ]
+    ].map(|(name, mut arguments)| {
+        if name != FOCUS_WINDOW { arguments["target_ref"] = json!("synthetic"); }
+        (name, arguments)
+    })
 }
 
 fn validate_action_response(

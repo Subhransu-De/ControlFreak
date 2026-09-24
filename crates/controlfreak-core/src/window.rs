@@ -26,12 +26,15 @@ pub struct WindowInfo {
 pub struct WindowFocusResult {
     pub window: WindowInfo,
     pub observation: ActionObservation,
+    pub attempts: u32,
+    pub elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FocusWindowRequest {
     pub window_id: String,
     pub observation: ObservationOptions,
+    pub timeout_ms: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

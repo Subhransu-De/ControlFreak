@@ -51,17 +51,19 @@ use windows::Win32::{
         },
         Shell::{IVirtualDesktopManager, VirtualDesktopManager},
         WindowsAndMessaging::{
-            BringWindowToTop, EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetCursorPos,
-            GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
-            GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-            MONITORINFOF_PRIMARY, SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindowAsync,
-            WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+            EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetCursorPos, GetForegroundWindow,
+            GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+            GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, MONITORINFOF_PRIMARY,
+            SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindowAsync, WS_EX_APPWINDOW,
+            WS_EX_TOOLWINDOW,
         },
     },
 };
 use windows::core::BOOL;
 mod actions;
+mod activation;
 mod ocr;
+mod target;
 use ocr::recognize_text_with_helper;
 pub(crate) use ocr::serve_ocr_helper;
 #[cfg(test)]
@@ -100,16 +102,15 @@ pub(crate) fn server_security_context(
 }
 use capture::{
     baseline_process_nonce, capture_bounds, capture_comparison_frame, capture_display_bounds,
-    capture_display_image, display_bounds_from_window, display_region_bounds,
-    foreground_window_info, frame_fingerprint, observe_display, observe_foreground,
-    recognize_text as recognize_text_in_process, validate_max_width, validate_visual_wait,
-    validate_wait_values, wait_for_change,
+    capture_display_image, display_bounds_from_window, display_region_bounds, frame_fingerprint,
+    observe_display, observe_foreground, recognize_text as recognize_text_in_process,
+    validate_max_width, validate_visual_wait, validate_wait_values, wait_for_change,
 };
 use desktop::{
-    ComApartment, activate_window, bring_window_to_top, current_cursor_position,
-    current_virtual_desktop_id, ensure_dpi_awareness, enumerate_displays, enumerate_windows,
-    find_display, find_display_at_point, find_window, foreground_window_handle, parse_window_id,
-    restore_window, validate_window_wait, virtual_desktop_manager, window_desktop_id, window_info,
+    ComApartment, activate_window, current_cursor_position, current_virtual_desktop_id,
+    ensure_dpi_awareness, enumerate_displays, enumerate_windows, find_display,
+    find_display_at_point, find_window, foreground_window_handle, parse_window_id, restore_window,
+    validate_window_wait, virtual_desktop_manager, window_desktop_id, window_info,
     window_is_on_current_desktop, window_matches,
 };
 use environment::ensure_interactive_input_desktop;
@@ -175,6 +176,76 @@ pub struct Backend {
     security_context: SecurityContext,
 }
 
+struct NativeActivation<'a> {
+    window_id: &'a str,
+    hwnd: HWND,
+    initial_foreground: String,
+    minimized: bool,
+    control: &'a MutationControl,
+    started: Instant,
+    attempts: u32,
+}
+
+impl activation::Activation for NativeActivation<'_> {
+    fn validate(&mut self) -> Result<bool, PlatformError> {
+        self.control
+            .activation_progress(self.attempts, self.elapsed_ms());
+        self.control.check_target()?;
+        self.control.check("focus_window")?;
+        find_window(self.window_id).map_err(|_| PlatformError::TargetInvalidated {
+            reason: "the approved window no longer exists".into(),
+        })?;
+        Backend::ensure_window_input_target("focus_window", self.hwnd)?;
+        let foreground = foreground_window_handle();
+        Backend::ensure_window_input_target("focus_window", foreground)?;
+        if foreground != self.hwnd && foreground != target::resolve(&self.initial_foreground)?.0 {
+            return Err(PlatformError::TargetInvalidated {
+                reason: "foreground ownership changed during activation".into(),
+            });
+        }
+        Ok(foreground == self.hwnd)
+    }
+
+    fn activate(&mut self) -> Result<bool, PlatformError> {
+        if self.validate()? {
+            return Ok(true);
+        }
+        self.attempts += 1;
+        self.control
+            .activation_progress(self.attempts, self.elapsed_ms());
+        if self.minimized {
+            let previous = self.control.dispatch_started();
+            if !restore_window(self.hwnd) {
+                self.control.dispatch_rejected(previous);
+                return Ok(false);
+            }
+            self.control.dispatch_accepted(0);
+            self.minimized = false;
+        }
+        // Revalidate after restoration, which can itself change foreground ownership.
+        if self.validate()? {
+            return Ok(true);
+        }
+        let previous = self.control.dispatch_started();
+        let accepted = activate_window(self.hwnd);
+        if accepted {
+            self.control.dispatch_accepted(0);
+            target::arm_if_foreground(self.window_id)?;
+        } else {
+            self.control.dispatch_rejected(previous);
+        }
+        Ok(accepted)
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn wait(&mut self, milliseconds: u64) {
+        thread::sleep(Duration::from_millis(milliseconds));
+    }
+}
+
 impl Backend {
     pub fn new() -> Self {
         let security_context = privilege::current_security_context(false).unwrap_or_default();
@@ -211,14 +282,26 @@ impl Backend {
     }
 
     fn recognize_text(&self, request: &OcrRegionRequest) -> Result<OcrResult, PlatformError> {
-        self.ocr_helper.as_ref().map_or_else(
+        let target_before = target::observe();
+        let mut result = self.ocr_helper.as_ref().map_or_else(
             || recognize_text_in_process(request),
             |command| recognize_text_with_helper(command, request),
-        )
+        )?;
+        result.target_ref = target::finish_observation(target_before);
+        Ok(result)
     }
 }
 
 impl BackendMetadata for Backend {
+    fn validate_target_reference(&self, target: &str) -> Result<(), PlatformError> {
+        let (hwnd, _) = target::resolve(target)?;
+        Self::ensure_window_input_target("approve_target", hwnd)?;
+        target::arm_if_foreground(target)
+    }
+    fn record_target_evidence(&self, control: &MutationControl) {
+        target::evidence(control);
+    }
+
     fn check_control_environment(&self) -> Result<(), PlatformError> {
         ensure_interactive_input_desktop("control_session")
     }
@@ -441,6 +524,7 @@ impl OcrBackend for Backend {
         )?;
         let matches = details.candidates.clone();
         Ok(FindTextResult {
+            target_ref: ocr.target_ref,
             query: request.query.clone(),
             display: ocr.display,
             source_bounds: ocr.source_bounds,
@@ -465,7 +549,15 @@ impl OcrBackend for Backend {
                 reason: "must not be empty".to_owned(),
             });
         }
+        target::validate(control, "click_text", None)?;
         let ocr = self.recognize_text(&request.region)?;
+        target::validate(control, "click_text", None)?;
+        if ocr.target_ref != control.approved_target() {
+            control.invalidate_target();
+            return Err(target::invalid(
+                "OCR observation no longer belongs to the approved target generation",
+            ));
+        }
         // Search result limits must not hide eligible lines from the uniqueness check.
         let candidate = controlfreak_core::select_text_candidate(
             &ocr.lines,
@@ -584,11 +676,12 @@ impl WindowBackend for Backend {
                 "switch_virtual_desktop",
                 &[Key::Ctrl, Key::Win, arrow],
                 control,
-                || Self::ensure_foreground_input_target("switch_virtual_desktop"),
+                || target::validate(control, "switch_virtual_desktop", None),
             )?;
             thread::sleep(Duration::from_millis(DESKTOP_SWITCH_SETTLE_MS));
         }
         control.input_complete();
+        target::evidence(control);
         let after = current_virtual_desktop_id(&manager);
         let observation = observe_foreground(&request.observation)
             .map_err(|error| post_action_error("switch_virtual_desktop", error.to_string()))?;
@@ -617,41 +710,42 @@ impl WindowBackend for Backend {
         let _guard = self.lock_input();
         ensure_interactive_input_desktop("focus_window")?;
         control.check("focus_window")?;
+        if control.approved_target().as_deref() != Some(request.window_id.as_str()) {
+            return Err(target::invalid(
+                "focus target differs from the approved session target",
+            ));
+        }
         let window = find_window(&request.window_id)?;
         let (hwnd, _) = parse_window_id(&request.window_id)?;
         Self::ensure_window_input_target("focus_window", hwnd)?;
 
-        control.dispatch_started();
-        if window.is_minimized {
-            restore_window(hwnd);
+        let mut driver = NativeActivation {
+            attempts: 0,
+            window_id: &request.window_id,
+            hwnd,
+            initial_foreground: target::issue(foreground_window_handle())?,
+            minimized: window.is_minimized,
+            control,
+            started: Instant::now(),
+        };
+        let activation = activation::focus(&mut driver, request.timeout_ms);
+        if activation.is_err() {
+            control.invalidate_target();
         }
-        bring_window_to_top(hwnd)?;
-        if !activate_window(hwnd) {
-            return Err(PlatformError::OperationFailed {
-                operation: "focus_window".to_owned(),
-                reason: "Windows denied foreground activation; refresh list_windows and retry only if user activity did not change the target".to_owned(),
-            });
-        }
+        let (_, elapsed_ms) = activation?;
+        let attempts = driver.attempts;
+        control.activation_progress(attempts, elapsed_ms);
+        target::arm_if_foreground(&request.window_id)?;
         control.input_complete();
-        let deadline = Instant::now() + Duration::from_millis(300);
-        while foreground_window_handle() != hwnd && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        if foreground_window_handle() != hwnd {
-            let actual = foreground_window_info();
-            return Err(PlatformError::OperationFailed {
-                operation: "focus_window".to_owned(),
-                reason: format!(
-                    "the requested window did not remain foreground after activation; actual foreground: {actual:?}"
-                ),
-            });
-        }
+        target::evidence(control);
 
         let focused = window_info(hwnd)
             .map_err(|error| post_action_error("focus_window", error.to_string()))?;
         let observation = observe_display(&focused.display_id, &request.observation)
             .map_err(|error| post_action_error("focus_window", error.to_string()))?;
         Ok(WindowFocusResult {
+            attempts,
+            elapsed_ms,
             window: focused,
             observation,
         })
@@ -675,6 +769,12 @@ impl WindowBackend for Backend {
         let bounds = display_bounds_from_window(window.bounds);
         let (png, image_width, image_height, downscale_factor, cursor_marker) =
             capture_bounds(bounds, request.max_width, request.include_cursor)?;
+        let (hwnd, _) = parse_window_id(&request.window_id)?;
+        if target::issue(hwnd)? != window.id {
+            return Err(target::invalid(
+                "window geometry changed during capture; observe again",
+            ));
+        }
         Ok(WindowScreenshot {
             source_bounds: window.bounds,
             window,
@@ -764,7 +864,7 @@ mod tests {
     use super::{
         Backend,
         capture::{encode_png, image_difference, resize_rgba_box, scaled_dimensions, word_union},
-        current_cursor_position, display_region_bounds, frame_fingerprint,
+        display_region_bounds, frame_fingerprint,
         input::{click_inputs, interpolate, key_chord_inputs, scroll_inputs},
         wait_for_ocr_helper, window_matches,
     };
@@ -1209,6 +1309,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an explicitly approved disposable desktop"]
     fn live_backend_enumerates_and_captures_primary_display() {
         let backend = Backend::new();
         let displays = backend.list_displays().expect("enumerate Windows displays");
@@ -1245,6 +1346,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an explicitly approved disposable desktop"]
     fn live_backend_enumerates_visible_windows() {
         let backend = Backend::new();
         let windows = backend
@@ -1255,7 +1357,7 @@ mod tests {
         assert!(
             windows
                 .iter()
-                .all(|window| window.id.starts_with("0X") && window.id.contains(':'))
+                .all(|window| window.id.starts_with("target-"))
         );
         let desktops = backend
             .list_virtual_desktops()
@@ -1296,45 +1398,81 @@ mod tests {
     }
 
     #[test]
-    fn live_backend_can_set_the_existing_cursor_position() {
+    fn every_input_family_refuses_an_unapproved_target() {
+        use controlfreak_core::{
+            KeyChordRequest, KeyboardBackend, MouseClickRequest, MouseDragRequest, ObservationMode,
+            TextInputRequest,
+        };
         let backend = Backend::new();
-        let displays = backend.list_displays().expect("enumerate Windows displays");
-        let point = current_cursor_position().expect("read current cursor position");
-        let display = displays
-            .iter()
-            .find(|display| {
-                let right = i64::from(display.bounds.left) + i64::from(display.bounds.width);
-                let bottom = i64::from(display.bounds.top) + i64::from(display.bounds.height);
-                i64::from(point.x) >= i64::from(display.bounds.left)
-                    && i64::from(point.x) < right
-                    && i64::from(point.y) >= i64::from(display.bounds.top)
-                    && i64::from(point.y) < bottom
-            })
-            .expect("cursor is located on an active display");
-        let local_x = u32::try_from(point.x - display.bounds.left).expect("local cursor x");
-        let local_y = u32::try_from(point.y - display.bounds.top).expect("local cursor y");
-        let result = backend
-            .move_mouse(&MouseMoveRequest {
-                display_id: display.id.clone(),
-                x: local_x,
-                y: local_y,
-                duration_ms: 0,
-                observation: ObservationOptions::default(),
-            })
-            .expect("set current cursor position");
-
-        assert_eq!(
-            (result.position.virtual_x, result.position.virtual_y),
-            (point.x, point.y)
-        );
-        assert_eq!(
-            &result
-                .observation
-                .screenshot
-                .as_ref()
-                .expect("screenshot")
-                .png[..8],
-            b"\x89PNG\r\n\x1a\n"
-        );
+        let observation = ObservationOptions {
+            mode: ObservationMode::None,
+            ..ObservationOptions::default()
+        };
+        let requests = [
+            backend
+                .move_mouse(&MouseMoveRequest {
+                    display_id: "synthetic".into(),
+                    x: 0,
+                    y: 0,
+                    duration_ms: 0,
+                    observation: observation.clone(),
+                })
+                .map(|_| ()),
+            backend
+                .click_mouse(&MouseClickRequest {
+                    display_id: "synthetic".into(),
+                    x: 0,
+                    y: 0,
+                    duration_ms: 0,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: vec![],
+                    observation: observation.clone(),
+                })
+                .map(|_| ()),
+            backend
+                .scroll_mouse(&MouseScrollRequest {
+                    display_id: "synthetic".into(),
+                    x: 0,
+                    y: 0,
+                    duration_ms: 0,
+                    delta_x: 0,
+                    delta_y: 120,
+                    observation: observation.clone(),
+                })
+                .map(|_| ()),
+            backend
+                .drag_mouse(&MouseDragRequest {
+                    start_display_id: "synthetic".into(),
+                    end_display_id: "synthetic".into(),
+                    start_x: 0,
+                    start_y: 0,
+                    end_x: 1,
+                    end_y: 1,
+                    duration_ms: 0,
+                    button: MouseButton::Left,
+                    modifiers: vec![],
+                    observation: observation.clone(),
+                })
+                .map(|_| ()),
+            backend
+                .press_keys(&KeyChordRequest {
+                    keys: vec![Key::Enter],
+                    observation: observation.clone(),
+                })
+                .map(|_| ()),
+            backend
+                .type_text(&TextInputRequest {
+                    text: "synthetic".into(),
+                    observation,
+                })
+                .map(|_| ()),
+        ];
+        for result in requests {
+            assert!(
+                matches!(result, Err(PlatformError::TargetInvalidated { .. })),
+                "{result:?}"
+            );
+        }
     }
 }

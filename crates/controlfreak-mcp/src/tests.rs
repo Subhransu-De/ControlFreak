@@ -784,6 +784,7 @@ fn improved_arguments_accept_bounded_capture_focus_observation_and_uppercase_key
     assert_eq!(focus.observation.region.unwrap().width, 300);
 
     let chord = parse_arguments::<PressKeysInput>(Some(json_object(serde_json::json!({
+        "target_ref": "synthetic",
         "keys": ["CTRL", "L"]
     }))))
     .unwrap();
@@ -831,6 +832,7 @@ fn pointer_result_contains_post_action_png() {
         observation: ActionObservation {
             foreground_window: None,
             screenshot: Some(DisplayScreenshot {
+                target_ref: None,
                 source_bounds: display.bounds,
                 display,
                 png: b"\x89PNG\r\n\x1a\n".to_vec(),

@@ -13,6 +13,7 @@ pub(super) struct NoArguments {}
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct BeginControlSessionInput {
+    pub(super) target_ref: String,
     pub(super) expected_seconds: Option<u64>,
 }
 
@@ -123,6 +124,7 @@ pub(super) struct FindTextInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ClickTextInput {
+    pub(super) target_ref: String,
     pub(super) display_id: String,
     pub(super) x: u32,
     pub(super) y: u32,
@@ -218,6 +220,7 @@ impl From<ObservationInput> for ObservationOptions {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct MoveMouseInput {
+    pub(super) target_ref: String,
     pub(super) display_id: String,
     pub(super) x: u32,
     pub(super) y: u32,
@@ -230,6 +233,7 @@ pub(super) struct MoveMouseInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ClickMouseInput {
+    pub(super) target_ref: String,
     pub(super) display_id: String,
     pub(super) x: u32,
     pub(super) y: u32,
@@ -247,6 +251,7 @@ pub(super) struct ClickMouseInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DragMouseInput {
+    pub(super) target_ref: String,
     pub(super) start_display_id: String,
     pub(super) start_x: u32,
     pub(super) start_y: u32,
@@ -265,6 +270,7 @@ pub(super) struct DragMouseInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ScrollMouseInput {
+    pub(super) target_ref: String,
     pub(super) display_id: String,
     pub(super) x: u32,
     pub(super) y: u32,
@@ -280,6 +286,8 @@ pub(super) struct ScrollMouseInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct FocusWindowInput {
+    #[serde(default = "default_focus_timeout_ms")]
+    pub(super) timeout_ms: u32,
     pub(super) window_id: String,
     #[serde(default)]
     pub(super) observation: ObservationInput,
@@ -288,6 +296,7 @@ pub(super) struct FocusWindowInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SwitchVirtualDesktopInput {
+    pub(super) target_ref: String,
     pub(super) direction: VirtualDesktopDirection,
     #[serde(default = "default_desktop_steps")]
     pub(super) steps: u8,
@@ -319,6 +328,7 @@ pub(super) struct WaitForWindowInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct PressKeysInput {
+    pub(super) target_ref: String,
     pub(super) keys: Vec<Key>,
     #[serde(default)]
     pub(super) observation: ObservationInput,
@@ -327,6 +337,7 @@ pub(super) struct PressKeysInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct TypeTextInput {
+    pub(super) target_ref: String,
     pub(super) text: String,
     #[serde(default)]
     pub(super) observation: ObservationInput,
@@ -374,4 +385,8 @@ where
             Some(json!({ "reason": error.to_string() })),
         )
     })
+}
+
+const fn default_focus_timeout_ms() -> u32 {
+    1_000
 }

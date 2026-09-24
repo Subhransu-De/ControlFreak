@@ -41,6 +41,7 @@ fn bounds() -> DisplayBounds {
 
 fn screenshot() -> DisplayScreenshot {
     DisplayScreenshot {
+        target_ref: Some("fixture-target".into()),
         display: display(),
         source_bounds: bounds(),
         png: include_bytes!("../../../examples/fixture.png").to_vec(),
@@ -92,6 +93,9 @@ impl Fixture {
 }
 
 impl BackendMetadata for Fixture {
+    fn validate_target_reference(&self, _target: &str) -> Result<(), PlatformError> {
+        Ok(())
+    }
     fn identity(&self) -> BackendIdentity {
         BackendIdentity {
             platform: Platform::Windows,
@@ -185,6 +189,7 @@ impl OcrBackend for Fixture {
             request.max_results,
         )?;
         Ok(controlfreak_core::FindTextResult {
+            target_ref: Some("fixture-target".into()),
             query: request.query.clone(),
             display: display(),
             source_bounds: bounds(),
@@ -195,6 +200,7 @@ impl OcrBackend for Fixture {
     }
     fn read_text_in_region(&self, _: &OcrRegionRequest) -> Result<OcrResult, PlatformError> {
         Ok(OcrResult {
+            target_ref: Some("fixture-target".into()),
             display: display(),
             source_bounds: bounds(),
             language: "en-US".into(),

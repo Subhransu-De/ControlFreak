@@ -1,8 +1,8 @@
 #![allow(unsafe_code)]
 
 use super::{
-    AssertUnwindSafe, BOOL, BringWindowToTop, CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance,
-    CoInitializeEx, CoUninitialize, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DWMWA_CLOAKED,
+    AssertUnwindSafe, BOOL, CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+    CoUninitialize, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DWMWA_CLOAKED,
     DWMWA_EXTENDED_FRAME_BOUNDS, DisplayBounds, DisplayInfo, DwmGetWindowAttribute, E_ACCESSDENIED,
     EnumDisplayMonitors, EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetCursorPos,
     GetForegroundWindow, GetMonitorInfoW, GetWindow, GetWindowLongPtrW, GetWindowRect,
@@ -37,14 +37,9 @@ pub(super) fn window_is_on_current_desktop(manager: &IVirtualDesktopManager, hwn
     unsafe { manager.IsWindowOnCurrentVirtualDesktop(hwnd) }.is_ok_and(BOOL::as_bool)
 }
 
-pub(super) fn restore_window(hwnd: HWND) {
+pub(super) fn restore_window(hwnd: HWND) -> bool {
     // SAFETY: `hwnd` was validated by `find_window`; this asynchronous call does not borrow data.
-    let _ = unsafe { ShowWindowAsync(hwnd, SW_RESTORE) };
-}
-
-pub(super) fn bring_window_to_top(hwnd: HWND) -> Result<(), PlatformError> {
-    // SAFETY: `hwnd` was validated by `find_window` and remains owned by Windows.
-    unsafe { BringWindowToTop(hwnd) }.map_err(|error| win32_error("BringWindowToTop", &error))
+    unsafe { ShowWindowAsync(hwnd, SW_RESTORE) }.as_bool()
 }
 
 pub(super) fn activate_window(hwnd: HWND) -> bool {
@@ -363,7 +358,7 @@ pub(super) fn window_info(hwnd: HWND) -> Result<WindowInfo, PlatformError> {
     }
 
     Ok(WindowInfo {
-        id: format_window_id(hwnd, process_id),
+        id: super::target::issue(hwnd)?,
         title,
         class_name,
         process_id,
@@ -481,13 +476,16 @@ pub(super) fn find_window(window_id: &str) -> Result<WindowInfo, PlatformError> 
         argument: "window_id".to_owned(),
         reason: format!("visible window '{window_id}' was not found; call list_windows again"),
     })?;
-    if window.process_id != expected_process_id || window.id != window_id.to_ascii_uppercase() {
+    if window.process_id != expected_process_id {
         return Err(PlatformError::InvalidArgument {
             argument: "window_id".to_owned(),
             reason: "stale or recycled window ID; call list_windows again".to_owned(),
         });
     }
-    Ok(window)
+    Ok(WindowInfo {
+        id: window_id.to_owned(),
+        ..window
+    })
 }
 
 pub(super) fn validate_window_wait(request: &WaitForWindowRequest) -> Result<(), PlatformError> {
@@ -544,34 +542,8 @@ pub(super) fn window_matches(window: &WindowInfo, request: &WaitForWindowRequest
             .is_none_or(|foreground| window.is_foreground == foreground)
 }
 
-fn format_window_id(hwnd: HWND, process_id: u32) -> String {
-    format!("0X{:X}:{process_id:X}", hwnd.0 as usize)
-}
-
 pub(super) fn parse_window_id(window_id: &str) -> Result<(HWND, u32), PlatformError> {
-    let (handle, process_id) = window_id
-        .strip_prefix("0x")
-        .or_else(|| window_id.strip_prefix("0X"))
-        .and_then(|value| value.split_once(':'))
-        .ok_or_else(|| PlatformError::InvalidArgument {
-            argument: "window_id".to_owned(),
-            reason: "must be an ID returned by list_windows".to_owned(),
-        })?;
-    let handle = usize::from_str_radix(handle, 16)
-        .ok()
-        .filter(|value| *value != 0)
-        .ok_or_else(|| PlatformError::InvalidArgument {
-            argument: "window_id".to_owned(),
-            reason: "window handle is invalid".to_owned(),
-        })?;
-    let process_id = u32::from_str_radix(process_id, 16)
-        .ok()
-        .filter(|value| *value != 0)
-        .ok_or_else(|| PlatformError::InvalidArgument {
-            argument: "window_id".to_owned(),
-            reason: "window process ID is invalid".to_owned(),
-        })?;
-    Ok((HWND(handle as *mut c_void), process_id))
+    super::target::resolve(window_id)
 }
 
 fn window_not_available(reason: &str) -> PlatformError {

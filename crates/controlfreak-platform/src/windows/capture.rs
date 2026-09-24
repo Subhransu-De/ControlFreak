@@ -124,9 +124,11 @@ pub(super) fn capture_display_bounds(
     max_width: Option<u32>,
     include_cursor_marker: bool,
 ) -> Result<DisplayScreenshot, PlatformError> {
+    let target_before = super::target::observe();
     let (png, image_width, image_height, downscale_factor, cursor_marker) =
         capture_bounds(source_bounds, max_width, include_cursor_marker)?;
     Ok(DisplayScreenshot {
+        target_ref: super::target::finish_observation(target_before),
         display,
         source_bounds,
         png,
@@ -597,6 +599,7 @@ pub(super) fn recognize_text(request: &OcrRegionRequest) -> Result<OcrResult, Pl
         });
     }
     Ok(OcrResult {
+        target_ref: None,
         display,
         source_bounds,
         language,
