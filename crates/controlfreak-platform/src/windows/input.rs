@@ -188,7 +188,7 @@ where
     control.check(operation)?;
     let inputs = key_chord_inputs(keys);
     validate_target()?;
-    send_releasing(operation, &inputs, control, native_send_inputs)
+    send_releasing_native(operation, &inputs, control)
 }
 
 pub(super) fn key_chord_inputs(keys: &[Key]) -> Vec<INPUT> {
@@ -396,7 +396,7 @@ where
 {
     let inputs = click_inputs(button, click_count, modifiers);
     validate_target()?;
-    send_releasing("click_mouse", &inputs, control, native_send_inputs)
+    send_releasing_native("click_mouse", &inputs, control)
 }
 
 pub(super) fn send_drag_press<F>(
@@ -418,7 +418,7 @@ where
     );
     inputs.push(mouse_input(down, 0));
     validate_target()?;
-    send_releasing("drag_mouse", &inputs, control, native_send_inputs)
+    send_releasing_native("drag_mouse", &inputs, control)
 }
 
 pub(super) fn send_drag_release<F>(
@@ -519,14 +519,43 @@ fn ensure_pointer_idle_with(
     Ok(())
 }
 
-fn native_send_inputs(inputs: &[INPUT]) -> Result<usize, PlatformError> {
+fn send_releasing_native(
+    operation: &str,
+    inputs: &[INPUT],
+    control: &MutationControl,
+) -> Result<(), PlatformError> {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-    if any_requested_input_held(inputs, |key| {
-        // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
-        unsafe { GetAsyncKeyState(key) < 0 }
-    }) {
-        return Ok(0);
+    send_releasing_if_idle(
+        operation,
+        inputs,
+        control,
+        |key| {
+            // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
+            unsafe { GetAsyncKeyState(key) < 0 }
+        },
+        native_send_inputs,
+    )
+}
+
+fn send_releasing_if_idle(
+    operation: &str,
+    inputs: &[INPUT],
+    control: &MutationControl,
+    is_down: impl FnMut(i32) -> bool,
+    send: impl FnMut(&[INPUT]) -> Result<usize, PlatformError>,
+) -> Result<(), PlatformError> {
+    control.check(operation)?;
+    if any_requested_input_held(inputs, is_down) {
+        return Err(PlatformError::OperationFailed {
+            operation: operation.to_owned(),
+            reason: "a requested key or mouse button is already held; release it before retrying"
+                .to_owned(),
+        });
     }
+    send_releasing(operation, inputs, control, send)
+}
+
+fn native_send_inputs(inputs: &[INPUT]) -> Result<usize, PlatformError> {
     let input_size =
         i32::try_from(size_of::<INPUT>()).map_err(|_| PlatformError::OperationFailed {
             operation: "SendInput".to_owned(),
@@ -764,6 +793,27 @@ mod progress_tests {
             assert!(releases.len() <= 2);
         }
         assert!(owned_releases(&clicks).is_empty());
+    }
+
+    #[test]
+    fn held_input_refusal_reports_no_dispatch_or_cleanup() {
+        for inputs in [
+            key_chord_inputs(&[Key::Ctrl, Key::C]),
+            click_inputs(MouseButton::Left, 1, &[]),
+        ] {
+            let control = MutationControl::default();
+            let error = send_releasing_if_idle(
+                "test",
+                &inputs,
+                &control,
+                |_| true,
+                |_| panic!("held input must not dispatch or release user input"),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("release it before retrying"));
+            assert!(!error.to_string().contains("integrity"));
+            assert_eq!(control.progress(), MutationControl::default().progress());
+        }
     }
 
     #[test]

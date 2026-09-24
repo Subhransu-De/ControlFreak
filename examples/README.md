@@ -25,7 +25,8 @@ The first recipe observes `Ready`, captures the target, begins a bounded control
 captures a visual baseline, clicks, waits for a change, and reads `Saved` before ending control.
 On a real desktop, discover display and window IDs first and choose targets from current
 observations. Replace the fixture IDs, coordinates, baseline ID, and expected text with the
-values observed during that run. Reuse action screenshots when they answer the next question.
+values observed during that run. Replace `fixture-target` with the returned `target_ref` and
+use that same approved reference throughout the session. End the session before changing targets. Reuse action screenshots when they answer the next question.
 
 A completed action reports accepted input. Its `effect_verification` remains `unverified`.
 A visual change also does not prove success. The final observation must establish the intended

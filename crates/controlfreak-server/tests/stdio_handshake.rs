@@ -64,42 +64,8 @@ fn stdio_handshake_reports_complete_windows_tool_surface() {
         .iter()
         .find(|response| response["id"] == 2)
         .expect("tools/list response");
-    let tool_names: Vec<&str> = tools["result"]["tools"]
-        .as_array()
-        .expect("tools array")
-        .iter()
-        .map(|tool| tool["name"].as_str().expect("tool name"))
-        .collect();
-    assert_eq!(
-        tool_names,
-        [
-            "stop_desktop_work",
-            "get_server_status",
-            "begin_control_session",
-            "end_control_session",
-            "list_displays",
-            "capture_display",
-            "capture_region",
-            "wait_for_visual_change",
-            "capture_visual_baseline",
-            "wait_for_change_since",
-            "read_text_in_region",
-            "find_text_on_screen",
-            "click_text",
-            "list_virtual_desktops",
-            "switch_virtual_desktop",
-            "list_windows",
-            "focus_window",
-            "capture_window",
-            "wait_for_window",
-            "move_mouse",
-            "click_mouse",
-            "drag_mouse",
-            "scroll_mouse",
-            "press_keys",
-            "type_text"
-        ]
-    );
+    assert_tool_names(tools);
+    assert_target_arguments(tools);
 
     let display_result = responses
         .iter()
@@ -122,6 +88,33 @@ fn stdio_handshake_reports_complete_windows_tool_surface() {
         .find(|response| response["id"] == 4)
         .expect("server status response");
     assert_server_status(status);
+}
+
+fn assert_target_arguments(tools: &Value) {
+    for tool in tools["result"]["tools"].as_array().unwrap() {
+        if matches!(
+            tool["name"].as_str(),
+            Some(
+                "begin_control_session"
+                    | "click_text"
+                    | "move_mouse"
+                    | "click_mouse"
+                    | "drag_mouse"
+                    | "scroll_mouse"
+                    | "press_keys"
+                    | "type_text"
+                    | "switch_virtual_desktop"
+            )
+        ) {
+            assert!(
+                tool["inputSchema"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|field| field == "target_ref")
+            );
+        }
+    }
 }
 
 fn assert_server_status(status: &Value) {
@@ -160,6 +153,7 @@ fn capability_report_matches_the_target_platform() {
 
 #[cfg(target_os = "windows")]
 #[test]
+#[ignore = "requires an explicitly approved disposable desktop"]
 fn stdio_capture_display_returns_png_image_content() {
     let mut child = spawn_server();
     let stdout = child.stdout.take().expect("open server stdout");
@@ -229,7 +223,7 @@ fn stdio_capture_display_returns_png_image_content() {
         &mut child,
         &serde_json::json!({
             "jsonrpc": "2.0", "id": 16, "method": "tools/call",
-            "params": { "name": "begin_control_session", "arguments": { "expected_seconds": 120 } }
+            "params": { "name": "begin_control_session", "arguments": { "expected_seconds": 120, "target_ref": metadata["target_ref"] } }
         }),
     );
     assert_eq!(read_response(&mut reader)["result"]["isError"], false);
@@ -506,7 +500,10 @@ fn assert_region_tools(child: &mut Child, reader: &mut impl BufRead, display_id:
     assert_eq!(text_match["result"]["isError"], false);
     assert_eq!(text_match["result"]["structuredContent"]["count"], 0);
 
-    assert_click_text_rejects_no_match(child, reader, display_id);
+    let target_ref = ocr["result"]["structuredContent"]["target_ref"]
+        .as_str()
+        .expect("stable disposable target reference");
+    assert_click_text_rejects_no_match(child, reader, display_id, target_ref);
 }
 
 #[cfg(target_os = "windows")]
@@ -514,12 +511,14 @@ fn assert_click_text_rejects_no_match(
     child: &mut Child,
     reader: &mut impl BufRead,
     display_id: &str,
+    target_ref: &str,
 ) {
     send_request(
         child,
         &serde_json::json!({
             "jsonrpc": "2.0", "id": 10, "method": "tools/call",
             "params": { "name": "click_text", "arguments": {
+                "target_ref": target_ref,
                 "display_id": display_id, "x": 0, "y": 0, "width": 1, "height": 1,
                 "query": "controlfreak-ocr-no-match", "observation": { "mode": "none" }
             }}
@@ -566,4 +565,43 @@ fn read_response(reader: &mut impl BufRead) -> Value {
     let mut line = String::new();
     reader.read_line(&mut line).expect("read MCP response");
     serde_json::from_str(line.trim_end()).expect("valid JSON-RPC response")
+}
+
+fn assert_tool_names(tools: &Value) {
+    let tool_names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect();
+    assert_eq!(
+        tool_names,
+        [
+            "stop_desktop_work",
+            "get_server_status",
+            "begin_control_session",
+            "end_control_session",
+            "list_displays",
+            "capture_display",
+            "capture_region",
+            "wait_for_visual_change",
+            "capture_visual_baseline",
+            "wait_for_change_since",
+            "read_text_in_region",
+            "find_text_on_screen",
+            "click_text",
+            "list_virtual_desktops",
+            "switch_virtual_desktop",
+            "list_windows",
+            "focus_window",
+            "capture_window",
+            "wait_for_window",
+            "move_mouse",
+            "click_mouse",
+            "drag_mouse",
+            "scroll_mouse",
+            "press_keys",
+            "type_text"
+        ]
+    );
 }

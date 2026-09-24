@@ -64,6 +64,7 @@ pub struct DisplayInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisplayScreenshot {
+    pub target_ref: Option<String>,
     pub display: DisplayInfo,
     pub source_bounds: DisplayBounds,
     pub png: Vec<u8>,

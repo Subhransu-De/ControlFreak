@@ -4,12 +4,19 @@ use controlfreak_core::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-struct WaitingBackend {
+pub(super) struct WaitingBackend {
     started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     cancelled: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl WaitingBackend {
+    pub(super) fn idle() -> Self {
+        Self {
+            started: Mutex::new(None),
+            cancelled: Mutex::new(None),
+        }
+    }
+
     fn wait<T>(&self, control: &MutationControl) -> Result<T, PlatformError> {
         self.started
             .lock()
@@ -33,6 +40,11 @@ impl WaitingBackend {
 }
 
 impl BackendMetadata for WaitingBackend {
+    fn validate_target_reference(&self, target: &str) -> Result<(), PlatformError> {
+        assert_eq!(target, "fixture");
+        Ok(())
+    }
+
     fn identity(&self) -> controlfreak_core::BackendIdentity {
         controlfreak_core::BackendIdentity {
             platform: controlfreak_core::Platform::Windows,
@@ -193,23 +205,7 @@ async fn human_stop_notifies_idle_client_once_and_retains_reason() {
 async fn transport_stop_and_client_cancellation_reach_every_worker_kind() {
     for cancellation_mode in ["request", "tool", "human"] {
         let user_stop = cancellation_mode != "request";
-        for (name, arguments) in [
-            (MOVE_MOUSE, json!({"display_id":"fixture","x":0,"y":0})),
-            (TYPE_TEXT, json!({"text":"synthetic"})),
-            (
-                WAIT_FOR_VISUAL_CHANGE,
-                json!({"display_id":"fixture","x":0,"y":0,"width":1,"height":1}),
-            ),
-            (
-                FIND_TEXT_ON_SCREEN,
-                json!({"display_id":"fixture","x":0,"y":0,"width":1,"height":1,
-                    "query":"synthetic", "match_mode":"tolerant", "ocr_confusions":true}),
-            ),
-            (
-                READ_TEXT_IN_REGION,
-                json!({"display_id":"fixture","x":0,"y":0,"width":1,"height":1}),
-            ),
-        ] {
+        for (name, arguments) in worker_requests() {
             let (started, ready) = tokio::sync::oneshot::channel();
             let (cancelled, finished) = tokio::sync::oneshot::channel();
             let backend = Arc::new(WaitingBackend {
@@ -378,4 +374,30 @@ async fn observation_cancellation_refuses_queued_work_and_discards_late_results(
             "cancelled observation must not return success"
         );
     }
+}
+
+fn worker_requests() -> [(&'static str, Value); 5] {
+    [
+        (
+            MOVE_MOUSE,
+            json!({"target_ref":"fixture","display_id":"fixture","x":0,"y":0}),
+        ),
+        (
+            TYPE_TEXT,
+            json!({"target_ref":"fixture","text":"synthetic"}),
+        ),
+        (
+            WAIT_FOR_VISUAL_CHANGE,
+            json!({"display_id":"fixture","x":0,"y":0,"width":1,"height":1}),
+        ),
+        (
+            FIND_TEXT_ON_SCREEN,
+            json!({"display_id":"fixture","x":0,"y":0,"width":1,"height":1,
+                    "query":"synthetic", "match_mode":"tolerant", "ocr_confusions":true}),
+        ),
+        (
+            READ_TEXT_IN_REGION,
+            json!({"display_id":"fixture","x":0,"y":0,"width":1,"height":1}),
+        ),
+    ]
 }

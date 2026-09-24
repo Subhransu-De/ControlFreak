@@ -4,7 +4,7 @@ use super::{
     MousePosition, MouseScrollRequest, MutationControl, ObservationOptions, POINT,
     POST_FOCUS_SETTLE_MS, POST_INPUT_SETTLE_MS, PlatformError, PointerActionResult,
     PointerActionSpec, PointerBackend, TextInputRequest, current_cursor_position,
-    ensure_dpi_awareness, ensure_interactive_input_desktop, find_display, find_display_at_point,
+    ensure_dpi_awareness, ensure_interactive_input_desktop, find_display_at_point,
     foreground_window_handle, move_cursor, observe_display, observe_foreground, post_action_error,
     privilege, send_click, send_drag_press, send_drag_release, send_key_chord, send_scroll,
     send_unicode_text, thread, validate_click_request, validate_duration, validate_key_chord,
@@ -65,7 +65,7 @@ impl PointerBackend for Backend {
                     request.click_count,
                     &request.modifiers,
                     control,
-                    || Self::ensure_point_input_target("click_mouse", target),
+                    || super::target::validate(control, "click_mouse", Some(target)),
                 )?;
                 thread::sleep(Duration::from_millis(POST_INPUT_SETTLE_MS));
                 Ok(())
@@ -86,8 +86,9 @@ impl PointerBackend for Backend {
         validate_duration(request.duration_ms)?;
         validate_observation(&request.observation)?;
         validate_modifiers(&request.modifiers)?;
-        let start_display = find_display(&request.start_display_id)?;
-        let end_display = find_display(&request.end_display_id)?;
+        super::target::validate(control, "drag_mouse", None)?;
+        let start_display = super::target::display(control, &request.start_display_id)?;
+        let end_display = super::target::display(control, &request.end_display_id)?;
         let (start_x, start_y) = start_display
             .bounds
             .to_virtual(request.start_x, request.start_y)?;
@@ -108,13 +109,13 @@ impl PointerBackend for Backend {
             0,
             control,
             |point| {
-                Self::ensure_point_input_target("drag_mouse", point)?;
+                super::target::validate(control, "drag_mouse", Some(point))?;
                 super::input::ensure_pointer_idle("drag_mouse")
             },
         )?;
         control.check("drag_mouse")?;
         send_drag_press(request.button, &request.modifiers, control, || {
-            Self::ensure_point_input_target("drag_mouse", current_cursor_position()?)
+            super::target::validate(control, "drag_mouse", Some(current_cursor_position()?))
         })?;
         control.cleanup_status(controlfreak_core::CleanupStatus::Unknown);
         let movement = move_cursor(
@@ -126,19 +127,20 @@ impl PointerBackend for Backend {
             POINT { x: end_x, y: end_y },
             request.duration_ms,
             control,
-            |point| Self::ensure_point_input_target("drag_mouse", point),
+            |point| super::target::validate(control, "drag_mouse", Some(point)),
         );
         let release = send_drag_release(
             request.button,
             &request.modifiers,
             control,
             movement.is_err(),
-            || Self::ensure_point_input_target("drag_mouse", current_cursor_position()?),
+            || super::target::validate(control, "drag_mouse", Some(current_cursor_position()?)),
         );
         movement?;
         release?;
         thread::sleep(Duration::from_millis(POST_INPUT_SETTLE_MS));
         control.input_complete();
+        super::target::evidence(control);
         Self::pointer_action_result("drag_mouse", foreground_before, &request.observation)
     }
 
@@ -184,7 +186,7 @@ impl PointerBackend for Backend {
             |control, target| {
                 control.check("scroll_mouse")?;
                 send_scroll(request.delta_x, request.delta_y, control, || {
-                    Self::ensure_point_input_target("scroll_mouse", target)
+                    super::target::validate(control, "scroll_mouse", Some(target))
                 })?;
                 thread::sleep(Duration::from_millis(POST_INPUT_SETTLE_MS));
                 Ok(())
@@ -207,12 +209,13 @@ impl KeyboardBackend for Backend {
         validate_key_chord(request)?;
         validate_observation(&request.observation)?;
         let _guard = self.lock_input(control)?;
-        ensure_interactive_input_desktop("press_keys")?;
+        super::target::validate(control, "press_keys", None)?;
         send_key_chord("press_keys", &request.keys, control, || {
-            Self::ensure_foreground_input_target("press_keys")
+            super::target::validate(control, "press_keys", None)
         })?;
         thread::sleep(Duration::from_millis(POST_FOCUS_SETTLE_MS));
         control.input_complete();
+        super::target::evidence(control);
         Ok(KeyboardActionResult {
             observation: observe_foreground(&request.observation)
                 .map_err(|error| post_action_error("press_keys", error.to_string()))?,
@@ -245,12 +248,13 @@ impl KeyboardBackend for Backend {
         }
 
         let _guard = self.lock_input(control)?;
-        ensure_interactive_input_desktop("type_text")?;
+        super::target::validate(control, "type_text", None)?;
         send_unicode_text(&utf16, control, || {
-            Self::ensure_foreground_input_target("type_text")
+            super::target::validate(control, "type_text", None)
         })?;
         thread::sleep(Duration::from_millis(POST_FOCUS_SETTLE_MS));
         control.input_complete();
+        super::target::evidence(control);
         Ok(KeyboardActionResult {
             observation: observe_foreground(&request.observation)
                 .map_err(|error| post_action_error("type_text", error.to_string()))?,
@@ -283,15 +287,6 @@ impl Backend {
         privilege::ensure_window_integrity(operation, hwnd)
     }
 
-    pub(super) fn ensure_foreground_input_target(operation: &str) -> Result<(), PlatformError> {
-        Self::ensure_window_input_target(operation, foreground_window_handle())
-    }
-
-    fn ensure_point_input_target(operation: &str, point: POINT) -> Result<(), PlatformError> {
-        ensure_interactive_input_desktop(operation)?;
-        privilege::ensure_point_integrity(operation, point)
-    }
-
     fn perform_pointer_action<F>(
         &self,
         operation: &str,
@@ -306,7 +301,8 @@ impl Backend {
         validate_duration(spec.duration_ms)?;
         validate_observation(spec.observation)?;
 
-        let display = find_display(spec.display_id)?;
+        super::target::validate(control, operation, None)?;
+        let display = super::target::display(control, spec.display_id)?;
         let (target_x, target_y) = display.bounds.to_virtual(spec.x, spec.y)?;
         let _guard = self.lock_input(control)?;
         ensure_interactive_input_desktop(operation)?;
@@ -325,7 +321,7 @@ impl Backend {
             spec.duration_ms,
             control,
             |point| {
-                Self::ensure_point_input_target(operation, point)?;
+                super::target::validate(control, operation, Some(point))?;
                 super::input::ensure_pointer_idle(operation)
             },
         )?;
@@ -333,12 +329,14 @@ impl Backend {
         // whereas clicks and scrolls still need this read to validate their input target.
         if operation == "move_mouse" {
             control.input_complete();
+            super::target::evidence(control);
             return Self::pointer_action_result(operation, foreground_before, spec.observation);
         }
         let actual_target = current_cursor_position()?;
         action(control, actual_target)?;
 
         control.input_complete();
+        super::target::evidence(control);
         Self::pointer_action_result(operation, foreground_before, spec.observation)
     }
 

@@ -9,10 +9,18 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
-- Add a navy bar centered near the top of the primary display with white control-session text and physical Esc to stop. Notify the MCP client when the user stops control. Keep the client stop tool, request cancellation and ownership through cleanup; require a user restart to re-arm.
-- Cancel queued input and visual waits, track OCR draining, and release only acknowledged held inputs after partial dispatch.
+### Changed
+
+- Input actions and control sessions now require an opaque `target_ref`; `focus_window` uses
+  `window_id`. Sessions refuse target changes, stale window/process identities, incompatible
+  observation geometry, desktop changes, focus theft, and pointer hits on other windows.
+- Foreground activation now retries within a configurable 100 to 5000 ms budget, reports attempts
+  and elapsed time, and distinguishes refusal, settle timeout, invalidation, and integrity errors.
 
 ### Added
+
+- Add a navy bar centered near the top of the primary display with white control-session text and physical Esc to stop. Notify the MCP client when the user stops control. Keep the client stop tool, request cancellation and ownership through cleanup; require a user restart to re-arm.
+- Cancel queued input and visual waits, track OCR draining, and release only acknowledged held inputs after partial dispatch.
 
 - Structured OCR no-match and ambiguity errors with bounded candidate metadata and recovery
   guidance. Successful text clicks report the matching tier and selected bounds.
@@ -26,6 +34,7 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ### Fixed
 
+- Report held keys and buttons as input refusals with release guidance, without implying Windows blocked a dispatch.
 - Check text-click uniqueness across all recognized lines before clicking, so search result
   limits cannot hide duplicate or unique exact matches. Apply case and surrounding-whitespace
   handling consistently when selecting click targets.

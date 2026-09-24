@@ -16,6 +16,41 @@ MCP clients over STDIO.
 Text clicks require exactly one matching OCR line across the requested region, regardless of
 text-search result limits. Matching ignores surrounding whitespace and, by default, letter case.
 
+## Approved targets
+
+Window IDs are opaque references issued by this server. Do not construct IDs from HWNDs or PIDs.
+Choose an ID from `list_windows` or a current observation. Pass it as `target_ref` to
+`begin_control_session` and every input action. `focus_window` uses its `window_id` as the
+approved reference. A session permits one reference; end it before approving a different one.
+
+Screenshot and OCR results include `target_ref` when the foreground target and observation
+state remained compatible across capture. A null reference does not authorize input. References
+retain their source window bounds and display layout, expire five minutes after the latest compatible observation, and use a
+bounded server cache. Their opaque IDs identify the stored observation generation. Input checks
+process creation time, window identity and ownership, desktop, foreground, integrity, bounds,
+and display layout before every batch, including later text batches and drag movement.
+Pointer destinations must belong to the approved top-level window. Owned popups are not implicitly
+approved. A mismatch invalidates the session target and sends no further action input.
+Release-only cleanup still runs when an earlier batch left keys or buttons held.
+
+Use `focus_window` to acquire the chosen target. Its `timeout_ms` defaults to 1000 and accepts
+100 through 5000. Refused activation retries after 50 ms, then 100 ms, then at most every 200 ms.
+The server polls at 10 ms intervals and waits without retrying once Windows accepts activation.
+It restores minimized windows using `ShowWindowAsync` and activates with `SetForegroundWindow`.
+It never generates keyboard or mouse input to acquire focus. A third foreground window stops
+activation. Errors distinguish `activation_refused`, `settle_timeout`, `target_invalidated`,
+and the existing integrity refusals. Results include attempt count and elapsed milliseconds.
+
+Restoring or moving a window can invalidate its old bounds. End that session, capture the restored
+window, and approve its new reference before coordinate input. Desktop switching also invalidates
+the previous target; multi-step switching stops when the next batch cannot validate it.
+
+`input.target_remained_foreground` reports the post-action identity/foreground check, or null
+when unavailable. It is sampled evidence, not proof of uninterrupted ownership or application
+success. Validation narrows Windows event-delivery races; it cannot make external input atomic.
+After refusal or uncertain delivery, end the session and observe again. Do not replay input or
+silently refocus after a mismatch.
+
 ## OCR matching and recovery
 
 `click_text` keeps strict trimmed equality by default, with optional Unicode lowercase comparison.

@@ -49,6 +49,15 @@ pub trait BackendMetadata: Send + Sync + 'static {
         Ok(())
     }
 
+    fn validate_target_reference(&self, _target: &str) -> Result<(), PlatformError> {
+        Err(PlatformError::unsupported(
+            "approve_target",
+            "the backend cannot validate target identities",
+        ))
+    }
+
+    fn record_target_evidence(&self, _control: &MutationControl) {}
+
     fn security_context(&self) -> SecurityContext {
         SecurityContext::default()
     }

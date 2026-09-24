@@ -14,6 +14,11 @@ The root `Makefile` runs formatting verification, workspace Clippy with warnings
 
 CI also validates generated documentation, dependency policy, workflow syntax, and unsafe-code boundaries.
 
+Tests that capture the live desktop are ignored by default. Run the named `live_backend_*`
+capture tests and `stdio_capture_display_returns_png_image_content` with `--ignored` only
+in an explicitly approved disposable desktop. The default suite uses synthetic data and hidden
+fixture windows for target-policy coverage and never needs a personal application as a fixture.
+
 ## Architecture
 
 - `controlfreak-core` owns domain types and focused backend traits.

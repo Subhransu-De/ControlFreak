@@ -63,10 +63,15 @@ async fn cancelled_response_stays_draining_until_indicator_cleanup_returns() {
     let work = stop::Work::new(&runtime.stop).unwrap();
     let stopping = runtime.stop.clone();
     let task = tokio::spawn(stop::WORK.scope(work, async move {
-        handlers::run_mutation_operation(Some(lease), move |_| {
-            stopping.stop();
-            Ok(())
-        })
+        handlers::run_mutation_operation(
+            Some(lease),
+            "fixture".into(),
+            Arc::new(stop_tests::WaitingBackend::idle()),
+            move |_| {
+                stopping.stop();
+                Ok(())
+            },
+        )
         .await
     }));
     tokio::time::timeout(Duration::from_secs(5), hiding)
@@ -100,17 +105,22 @@ async fn stop_keeps_blocked_worker_ownership_until_cleanup_finishes() {
         let (finish, drain) = mpsc::channel();
         let task = tokio::spawn(stop::WORK.scope(work, async move {
             let _cancel = stop::CancelOnDrop(control);
-            handlers::run_mutation_operation(Some(lease), move |control| {
-                control.dispatch_accepted(1);
-                control.cleanup_status(controlfreak_core::CleanupStatus::Unknown);
-                started.send(()).unwrap();
-                drain.recv_timeout(Duration::from_secs(5)).unwrap();
-                assert!(control.is_cancelled());
-                if !cleanup_failed {
-                    control.cleanup_status(controlfreak_core::CleanupStatus::Succeeded);
-                }
-                control.check("synthetic_drag")
-            })
+            handlers::run_mutation_operation(
+                Some(lease),
+                "fixture".into(),
+                Arc::new(stop_tests::WaitingBackend::idle()),
+                move |control| {
+                    control.dispatch_accepted(1);
+                    control.cleanup_status(controlfreak_core::CleanupStatus::Unknown);
+                    started.send(()).unwrap();
+                    drain.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert!(control.is_cancelled());
+                    if !cleanup_failed {
+                        control.cleanup_status(controlfreak_core::CleanupStatus::Succeeded);
+                    }
+                    control.check("synthetic_drag")
+                },
+            )
             .await
         }));
         ready.await.unwrap();
@@ -143,7 +153,7 @@ async fn stop_keeps_blocked_worker_ownership_until_cleanup_finishes() {
         assert_eq!(fixture.owned.load(Ordering::SeqCst), cleanup_failed);
         assert_eq!(runtime.stop.session_active(), cleanup_failed);
         assert!(runtime.stop.user_stopped());
-        assert!(runtime.begin_session(None).is_err());
+        assert!(runtime.begin_session(None, "fixture").is_err());
     }
 }
 
@@ -276,7 +286,7 @@ fn concurrent_cleanup_waits_for_every_mutation_and_preserves_the_reason() {
         runtime.end_session().unwrap();
         assert_eq!(fixture.releases.load(Ordering::SeqCst), 1);
         if reason != "explicit_end" {
-            assert!(runtime.begin_session(None).is_err());
+            assert!(runtime.begin_session(None, "synthetic").is_err());
         }
     }
 }
@@ -298,7 +308,7 @@ fn desktop_changes_cancel_active_work_and_refuse_new_admission() {
             thread::sleep(Duration::from_millis(1));
         }
         assert!(lease.mutation_control().is_cancelled());
-        assert!(runtime.begin_session(None).is_err());
+        assert!(runtime.begin_session(None, "synthetic").is_err());
         assert!(runtime.acquire_mutation_blocking().is_err());
         assert_eq!(runtime.status()["draining"], true);
         drop(lease);
@@ -310,7 +320,7 @@ fn desktop_changes_cancel_active_work_and_refuse_new_admission() {
                 .contains(reason)
         );
         *fixture.environment.lock().unwrap() = None;
-        runtime.begin_session(None).unwrap();
+        runtime.begin_session(None, "synthetic").unwrap();
         runtime.close_session("shutdown", true).unwrap();
     }
 }
@@ -319,9 +329,9 @@ fn desktop_changes_cancel_active_work_and_refuse_new_admission() {
 fn stale_timeout_cannot_close_a_new_session() {
     let fixture = Arc::new(Fixture::default());
     let runtime = fixture.runtime();
-    runtime.begin_session(None).unwrap();
+    runtime.begin_session(None, "synthetic").unwrap();
     let generation = runtime.state.lock().unwrap().generation;
-    runtime.begin_session(None).unwrap();
+    runtime.begin_session(None, "synthetic").unwrap();
     runtime.close_if_idle(generation);
     assert!(fixture.owned.load(Ordering::SeqCst));
     let generation = runtime.state.lock().unwrap().generation;
@@ -334,7 +344,7 @@ fn stale_timeout_cannot_close_a_new_session() {
 fn failed_shutdown_keeps_arbitration_until_retry_is_safe() {
     let fixture = Arc::new(Fixture::default());
     let runtime = fixture.runtime();
-    runtime.begin_session(None).unwrap();
+    runtime.begin_session(None, "synthetic").unwrap();
     fixture.shutdown_failed.store(true, Ordering::SeqCst);
     assert!(runtime.close_session("shutdown", true).is_err());
     assert_eq!(runtime.status()["draining"], true);
@@ -371,7 +381,7 @@ fn desktop_is_revalidated_after_indicator_startup() {
             Ok(Box::new(Indicator(Arc::clone(&fixture_for_start))))
         });
         if explicit {
-            assert!(runtime.begin_session(None).is_err());
+            assert!(runtime.begin_session(None, "synthetic").is_err());
         } else {
             assert!(runtime.acquire_mutation_blocking().is_err());
         }
@@ -408,7 +418,7 @@ async fn eof_closes_admission_before_response_drain() {
 async fn persistent_shutdown_failure_has_a_bounded_wait_without_releasing_ownership() {
     let fixture = Arc::new(Fixture::default());
     let runtime = fixture.runtime();
-    runtime.begin_session(None).unwrap();
+    runtime.begin_session(None, "synthetic").unwrap();
     fixture.shutdown_failed.store(true, Ordering::SeqCst);
     assert!(runtime.close_session("shutdown", true).is_err());
     let error = wait_for_cleanup(&runtime, Duration::from_millis(1))

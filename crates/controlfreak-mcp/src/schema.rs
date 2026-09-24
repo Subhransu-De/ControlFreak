@@ -10,7 +10,7 @@ use super::{
 
 /// Tool descriptions and schemas used by both `tools/list` and offline contract export.
 pub fn tools() -> Vec<Tool> {
-    vec![
+    let mut tools = vec![
         Tool::new(
             "stop_desktop_work",
             "Cancel active desktop work and close admission until the user restarts the server. Cleanup may still be draining. Cannot undo dispatched application operations.",
@@ -40,7 +40,23 @@ pub fn tools() -> Vec<Tool> {
         scroll_mouse_tool(),
         press_keys_tool(),
         type_text_tool(),
-    ]
+    ];
+    for tool in &mut tools {
+        if super::is_mutating_tool(&tool.name) && tool.name != FOCUS_WINDOW
+            || tool.name == BEGIN_CONTROL_SESSION
+        {
+            let schema = Arc::make_mut(&mut tool.input_schema);
+            schema.get_mut("properties").and_then(Value::as_object_mut).unwrap().insert(
+                "target_ref".into(), json!({"type": "string", "minLength": 1,
+                "description": "Server-issued target reference from a current window or screenshot observation. Must match the session's approved target. End the session before approving another target."}));
+            schema
+                .get_mut("required")
+                .and_then(Value::as_array_mut)
+                .unwrap()
+                .push(json!("target_ref"));
+        }
+    }
+    tools
 }
 
 fn begin_control_session_tool() -> Tool {
@@ -443,14 +459,8 @@ fn list_windows_tool() -> Tool {
 
 fn focus_window_tool() -> Tool {
     let mut properties = JsonObject::new();
-    properties.insert(
-        "window_id".to_owned(),
-        json!({
-            "type": "string",
-            "pattern": "^0[xX][0-9A-Fa-f]+:[0-9A-Fa-f]+$",
-            "description": "Fresh ephemeral window ID returned by list_windows."
-        }),
-    );
+    properties.insert("timeout_ms".into(), json!({ "type": "integer", "minimum": 100, "maximum": 5000, "default": 1000, "description": "Total activation retry and settle budget in milliseconds." }));
+    add_window_id(&mut properties);
     add_observation(&mut properties);
     Tool::new(
         FOCUS_WINDOW,
@@ -637,7 +647,7 @@ fn press_keys_tool() -> Tool {
     add_observation(&mut properties);
     Tool::new(
         PRESS_KEYS,
-        "Send a key or chord to the foreground window. Call focus_window first if the target is uncertain.",
+        "Send a key or chord only while the approved target remains foreground. Observe and explicitly approve a target before input.",
         object_schema(properties, &["keys"]),
     )
     .with_raw_output_schema(action_output_schema(false))
@@ -664,7 +674,7 @@ fn type_text_tool() -> Tool {
     add_observation(&mut properties);
     Tool::new(
         TYPE_TEXT,
-        "Type Unicode text into the foreground window without using the clipboard. Call focus_window first if the target is uncertain.",
+        "Type Unicode text into the approved foreground target without using the clipboard. Each text batch revalidates target ownership.",
         object_schema(properties, &["text"]),
     )
     .with_raw_output_schema(action_output_schema(false))
@@ -682,8 +692,8 @@ fn add_window_id(properties: &mut JsonObject) {
         "window_id".to_owned(),
         json!({
             "type": "string",
-            "pattern": "^0[xX][0-9A-Fa-f]+:[0-9A-Fa-f]+$",
-            "description": "Fresh ephemeral window ID returned by list_windows."
+            "minLength": 1,
+            "description": "Opaque server-issued target reference returned by list_windows or an observation."
         }),
     );
 }
@@ -913,7 +923,10 @@ fn mutation_progress_properties() -> Value {
             "properties": {
                 "input_outcome": {"enum": ["not_started", "input_sent", "partially_sent", "unknown"]},
                 "sent_events": {"type": "integer", "minimum": 0},
-                "cleanup": {"enum": ["not_needed", "succeeded", "unknown"]}
+                "target_remained_foreground": { "type": ["boolean", "null"] },
+                "activation_attempts": { "type": "integer", "minimum": 0 },
+                "activation_elapsed_ms": { "type": "integer", "minimum": 0 },
+                    "cleanup": {"enum": ["not_needed", "succeeded", "unknown"]}
             },
             "required": ["input_outcome", "sent_events", "cleanup"],
             "additionalProperties": false
@@ -928,6 +941,7 @@ fn screenshot_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "target_ref": {"type": ["string", "null"]},
             "display": display_schema(),
             "source_bounds": bounds_schema(),
             "mime_type": { "const": "image/png" },

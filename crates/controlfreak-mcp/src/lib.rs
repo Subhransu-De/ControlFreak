@@ -91,6 +91,11 @@ use serde_json::{Value, json};
 const LIST_DISPLAYS: &str = "list_displays";
 const GET_SERVER_STATUS: &str = "get_server_status";
 const BEGIN_CONTROL_SESSION: &str = "begin_control_session";
+#[derive(Debug)]
+enum BeginSessionError {
+    Target(PlatformError),
+    Indicator(String),
+}
 const END_CONTROL_SESSION: &str = "end_control_session";
 const CAPTURE_DISPLAY: &str = "capture_display";
 const CAPTURE_REGION: &str = "capture_region";
@@ -164,7 +169,7 @@ impl ServerHandler for ControlFreakServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "ControlFreak is a computer-use MCP server. For tasks with multiple input actions, call begin_control_session first and end_control_session when finished. Actions return screenshots by default. Reuse them; capture again only when needed. Choose targets from current observations. Prefer click_text for unique visible labels. Check isError, status, and error text. Input dispatch and observation do not verify application effects. Observe again before recovering from partial or unknown delivery. Read structuredContent without serializing image data. Never repeat an action when retry_action=false. A notifications/controlfreak/session_stopped event or stop_reason=user_stop means the user ended control. Do not resume desktop actions or restart the server without the user's permission.",
+                "ControlFreak is a computer-use MCP server. For tasks with multiple input actions, call begin_control_session first and end_control_session when finished. Actions return screenshots by default. Reuse them; capture again only when needed. Choose a server-issued target_ref from current window or screenshot observations. Pass it to begin_control_session and every input action; focus_window uses window_id. End the session before changing targets. Prefer click_text for unique visible labels. Check isError, status, and error text. Input dispatch and observation do not verify application effects. Observe again before recovering from partial or unknown delivery. Read structuredContent without serializing image data. Never repeat an action when retry_action=false. A notifications/controlfreak/session_stopped event or stop_reason=user_stop means the user ended control. Do not resume desktop actions or restart the server without the user's permission.",
             )
     }
 
@@ -313,19 +318,28 @@ impl ServerHandler for ControlFreakServer {
                                     parse_arguments::<BeginControlSessionInput>(request.arguments)?;
                                 let runtime_for_worker = Arc::clone(runtime);
                                 let work = stop::current();
+                                let backend = Arc::clone(&backend);
                                 match tokio::task::spawn_blocking(move || {
                                     if let Some(work) = &work {
                                         work.control
                                             .check("begin_control_session")
-                                            .map_err(|error| error.to_string())?;
+                                            .map_err(BeginSessionError::Target)?;
                                     }
-                                    runtime_for_worker.begin_session(input.expected_seconds)?;
+                                    backend
+                                        .validate_target_reference(&input.target_ref)
+                                        .map_err(BeginSessionError::Target)?;
+                                    runtime_for_worker
+                                        .begin_session(input.expected_seconds, &input.target_ref)?;
                                     if work
                                         .as_ref()
                                         .is_some_and(|work| work.control.is_cancelled())
                                     {
-                                        runtime_for_worker.end_session()?;
-                                        return Err("session request was cancelled".to_owned());
+                                        runtime_for_worker
+                                            .end_session()
+                                            .map_err(BeginSessionError::Indicator)?;
+                                        return Err(BeginSessionError::Indicator(
+                                            "session request was cancelled".to_owned(),
+                                        ));
                                     }
                                     Ok(())
                                 })
@@ -336,7 +350,10 @@ impl ServerHandler for ControlFreakServer {
                                         "session": runtime.status(),
                                     }))
                                     .into()),
-                                    Ok(Err(reason)) => {
+                                    Ok(Err(BeginSessionError::Target(error))) => {
+                                        Ok(tool_error(&error).into())
+                                    }
+                                    Ok(Err(BeginSessionError::Indicator(reason))) => {
                                         Err(indicator_unavailable(&safety_indicator, &reason))
                                     }
                                     Err(error) => Err(join_error(&error)),
