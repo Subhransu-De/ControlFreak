@@ -55,20 +55,6 @@ struct Reference {
 }
 
 impl Reference {
-    fn refresh_if_unchanged(
-        &mut self,
-        identity: &Identity,
-        bounds: [i32; 4],
-        displays: &[DisplayInfo],
-        now: Instant,
-    ) -> Option<String> {
-        if &self.identity != identity || self.bounds != bounds || self.displays != displays {
-            return None;
-        }
-        self.issued = now;
-        Some(self.id.clone())
-    }
-
     fn validate_snapshot(
         &self,
         current: &Identity,
@@ -319,9 +305,13 @@ pub(super) fn issue(hwnd: HWND) -> Result<String, PlatformError> {
         return Err(invalid("window state changed during observation"));
     }
     references.retain(|reference| reference.issued.elapsed() < REFERENCE_TTL);
-    if let Some(id) = references.iter_mut().find_map(|reference| {
-        reference.refresh_if_unchanged(&identity, bounds, &displays, Instant::now())
-    }) {
+    if let Some(id) = refresh_reference(
+        &mut references,
+        &identity,
+        bounds,
+        &displays,
+        Instant::now(),
+    ) {
         return Ok(id);
     }
     // SAFETY: CoCreateGuid takes no borrowed input and the generated value is returned by value.
@@ -340,6 +330,25 @@ pub(super) fn issue(hwnd: HWND) -> Result<String, PlatformError> {
         armed: false,
     });
     Ok(id)
+}
+
+fn refresh_reference(
+    references: &mut VecDeque<Reference>,
+    identity: &Identity,
+    bounds: [i32; 4],
+    displays: &[DisplayInfo],
+    now: Instant,
+) -> Option<String> {
+    let index = references.iter().position(|reference| {
+        &reference.identity == identity
+            && reference.bounds == bounds
+            && reference.displays == displays
+    })?;
+    let mut reference = references.remove(index)?;
+    reference.issued = now;
+    let id = reference.id.clone();
+    references.push_back(reference);
+    Some(id)
 }
 
 fn lookup(id: &str) -> Result<Reference, PlatformError> {
@@ -618,30 +627,39 @@ mod tests {
     }
 
     #[test]
-    fn fresh_observations_refresh_only_compatible_references() {
-        let mut cached = reference();
-        let observed = cached.clone();
-        let fresh = (cached.issued + REFERENCE_TTL)
+    fn fresh_observations_renew_and_promote_only_compatible_references() {
+        let observed = reference();
+        let fresh = (observed.issued + REFERENCE_TTL)
             .checked_sub(Duration::from_millis(1))
             .unwrap();
+        let mut cached = VecDeque::from([observed.clone()]);
+        for index in 1..MAX_REFERENCES {
+            let mut other = reference();
+            other.id = format!("other-{index}");
+            other.identity.hwnd = index + 1;
+            cached.push_back(other);
+        }
         assert_eq!(
-            cached.refresh_if_unchanged(&observed.identity, observed.bounds, &[], fresh),
-            Some(observed.id)
+            refresh_reference(&mut cached, &observed.identity, observed.bounds, &[], fresh),
+            Some(observed.id.clone())
         );
-        assert_eq!(cached.issued, fresh);
+        // The next capacity eviction must discard an older observation, not the renewed one.
+        cached.pop_front();
+        assert_eq!(cached.back().unwrap().id, observed.id);
+        assert_eq!(cached.back().unwrap().issued, fresh);
         let mut moved = observed.bounds;
         moved[0] += 1;
         assert!(
-            cached
-                .refresh_if_unchanged(
-                    &observed.identity,
-                    moved,
-                    &[],
-                    fresh + Duration::from_secs(1)
-                )
-                .is_none()
+            refresh_reference(
+                &mut cached,
+                &observed.identity,
+                moved,
+                &[],
+                fresh + Duration::from_secs(1)
+            )
+            .is_none()
         );
-        assert_eq!(cached.issued, fresh);
+        assert_eq!(cached.back().unwrap().issued, fresh);
     }
 
     #[test]

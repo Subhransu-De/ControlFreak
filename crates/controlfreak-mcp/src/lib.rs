@@ -88,6 +88,7 @@ use serde_json::{Value, json};
 const LIST_DISPLAYS: &str = "list_displays";
 const GET_SERVER_STATUS: &str = "get_server_status";
 const BEGIN_CONTROL_SESSION: &str = "begin_control_session";
+#[derive(Debug)]
 enum BeginSessionError {
     Target(PlatformError),
     Indicator(String),
@@ -197,11 +198,7 @@ impl ServerHandler for ControlFreakServer {
                                 .validate_target_reference(&input.target_ref)
                                 .map_err(BeginSessionError::Target)?;
                             runtime_for_worker
-                                .begin_session(input.expected_seconds)
-                                .map_err(BeginSessionError::Indicator)?;
-                            runtime_for_worker
-                                .bind_target(&input.target_ref)
-                                .map_err(BeginSessionError::Target)?;
+                                .begin_session(input.expected_seconds, &input.target_ref)?;
                             Ok::<(), BeginSessionError>(())
                         })
                         .await
