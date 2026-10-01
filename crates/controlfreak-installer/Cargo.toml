@@ -8,7 +8,7 @@ version.workspace = true
 
 [dependencies]
 controlfreak-platform.workspace = true
-jsonc-parser = { version = "0.33.2", features = ["cst", "serde", "serde_json"], default-features = false }
+jsonc-parser = { version = "0.34.0", features = ["cst", "serde", "serde_json"], default-features = false }
 semver = "1.0.28"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
