@@ -144,24 +144,42 @@ fn toml_comments_and_other_tables_survive() {
 
 #[test]
 fn jsonc_comments_trailing_commas_and_other_settings_survive() {
-    let f = Fixture::new();
-    let path = "user/.config/opencode/opencode.jsonc";
-    f.write(path, "{\n  // preserve\n  \"theme\": \"dark\",\n  \"mcp\": {\"other\": {\"type\":\"local\",\"command\":[\"fixture.exe\"],},},\n}\n");
-    assert!(
-        f.configure("opencode", "keep").status.success(),
-        "{}",
-        f.report()
-    );
-    let text = fs::read_to_string(f.path(path)).unwrap();
-    assert!(text.contains("// preserve"));
-    assert!(text.contains("\"theme\": \"dark\""));
-    assert!(!f.path("user/.config/opencode/opencode.json").exists());
-    assert!(f.remove().status.success());
-    assert!(
-        fs::read_to_string(f.path(path))
+    for newline in ["\n", "\r\n", "\r"] {
+        let f = Fixture::new();
+        let path = "user/.config/opencode/opencode.jsonc";
+        let original = "{\n  // preserve\n  \"theme\": \"dark\",\n  \"mcp\": {\"other\": {\"type\":\"local\",\"command\":[\"fixture.exe\"],},},\n}\n"
+            .replace('\n', newline);
+        f.write(path, &original);
+        assert!(
+            f.configure("opencode", "keep").status.success(),
+            "{}",
+            f.report()
+        );
+        for installed in [true, false] {
+            if !installed {
+                assert!(f.remove().status.success(), "{}", f.report());
+            }
+            let text = fs::read_to_string(f.path(path)).unwrap();
+            assert!(text.contains(&format!("// preserve{newline}")));
+            assert!(text.contains("\"theme\": \"dark\""));
+            let without_newlines = text.replace(newline, "");
+            assert!(!without_newlines.contains(['\r', '\n']));
+            let value = jsonc_parser::cst::CstRootNode::parse(
+                &text,
+                &jsonc_parser::ParseOptions::default(),
+            )
             .unwrap()
-            .contains("// preserve")
-    );
+            .to_serde_value()
+            .unwrap();
+            assert_eq!(value["theme"], "dark");
+            assert_eq!(
+                value["mcp"]["other"],
+                serde_json::json!({"type":"local","command":["fixture.exe"]})
+            );
+            assert_eq!(value["mcp"].get("controlfreak").is_some(), installed);
+            assert!(!f.path("user/.config/opencode/opencode.json").exists());
+        }
+    }
 }
 
 #[test]

@@ -34,6 +34,9 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ### Fixed
 
+- Preserve JSONC line comments and line endings during setup and cleanup,
+  including lone carriage returns, with jsonc-parser 0.34.0. Keep JSON5
+  extensions disabled.
 - Report held keys and buttons as input refusals with release guidance, without implying Windows blocked a dispatch.
 - Check text-click uniqueness across all recognized lines before clicking, so search result
   limits cannot hide duplicate or unique exact matches. Apply case and surrounding-whitespace

@@ -2,6 +2,7 @@ use super::*;
 use controlfreak_core::{
     BackendMetadata, DisplayBackend, KeyboardBackend, OcrBackend, PointerBackend, WindowBackend,
 };
+use rmcp::model::ProtocolVersion;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 pub(super) struct WaitingBackend {
@@ -112,6 +113,20 @@ impl WindowBackend for WaitingBackend {}
 
 #[tokio::test]
 async fn human_stop_notifies_idle_client_once_and_retains_reason() {
+    for requested in [
+        ProtocolVersion::LATEST_WITH_INITIALIZE,
+        ProtocolVersion::LATEST,
+    ] {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            assert_human_stop_lifecycle(requested),
+        )
+        .await
+        .expect("protocol negotiation and user-stop lifecycle finish within the deadline");
+    }
+}
+
+async fn assert_human_stop_lifecycle(requested: ProtocolVersion) {
     let backend = Arc::new(WaitingBackend {
         started: Mutex::new(None),
         cancelled: Mutex::new(None),
@@ -133,12 +148,16 @@ async fn human_stop_notifies_idle_client_once_and_retains_reason() {
         &mut client,
         json!({
             "jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
-                "protocolVersion":"2025-11-25", "capabilities":{},
+                "protocolVersion":requested.as_str(), "capabilities":{},
                 "clientInfo":{"name":"human-stop-test","version":"1"}
             }
         }),
     )
     .await;
+    assert_eq!(
+        initialized["result"]["protocolVersion"],
+        ProtocolVersion::LATEST_WITH_INITIALIZE.as_str()
+    );
     assert!(
         initialized["result"]["capabilities"]["experimental"]["controlfreak/user-stop"].is_object()
     );
