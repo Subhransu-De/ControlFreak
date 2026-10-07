@@ -219,6 +219,38 @@ fn malformed_ambiguous_or_wrong_type_configs_are_not_overwritten_or_logged() {
 }
 
 #[test]
+fn json5_extensions_are_refused_without_changing_json_or_jsonc_configs() {
+    for value in [
+        ".5",
+        "5.",
+        "5.e3",
+        "Infinity",
+        "-Infinity",
+        "NaN",
+        r#""synthetic\x41""#,
+        r#""synthetic\v""#,
+        r#""synthetic\0""#,
+        r#""synthetic\'""#,
+        "\"synthetic\\\ncontinued\"",
+    ] {
+        for (id, path) in [
+            ("claude-code", "user/.claude.json"),
+            ("opencode", "user/.config/opencode/opencode.jsonc"),
+        ] {
+            let f = Fixture::new();
+            let original = format!(r#"{{"synthetic-secret":{value}}}"#);
+            f.write(path, &original);
+            let result = f.configure(id, "replace");
+            assert!(!result.status.success(), "accepted {value} in {path}");
+            assert_eq!(fs::read_to_string(f.path(path)).unwrap(), original);
+            assert!(!f.path(&format!("state/{id}.json")).exists());
+            assert!(!String::from_utf8_lossy(&result.stderr).contains("synthetic-secret"));
+            assert!(!f.report().contains("synthetic-secret"));
+        }
+    }
+}
+
+#[test]
 fn ambiguous_opencode_files_are_refused() {
     let f = Fixture::new();
     f.write("user/.config/opencode/opencode.json", "{}");
