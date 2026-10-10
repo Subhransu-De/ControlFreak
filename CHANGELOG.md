@@ -11,6 +11,9 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ### Changed
 
+- MCP discovery probes preserve subsequent classic initialization. Modern inline clients receive
+  conservative tool-list cache hints through rmcp 3.5.1.
+
 - Input actions and control sessions now require an opaque `target_ref`; `focus_window` uses
   `window_id`. Sessions refuse target changes, stale window/process identities, incompatible
   observation geometry, desktop changes, focus theft, and pointer hits on other windows.

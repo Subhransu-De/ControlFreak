@@ -119,7 +119,7 @@ fn list_displays_tool() -> Tool {
         "List active displays with IDs, primary status, and bounds in physical pixels.",
         object_schema(JsonObject::new(), &[]),
     )
-    .with_raw_output_schema(Arc::new(json_object(json!({
+    .with_raw_output_schema(Arc::new(rmcp::object!({
         "type": "object",
         "properties": {
             "count": { "type": "integer", "minimum": 0 },
@@ -130,7 +130,7 @@ fn list_displays_tool() -> Tool {
         },
         "required": ["count", "displays"],
         "additionalProperties": false
-    }))))
+    })))
     .with_annotations(
         ToolAnnotations::default()
             .read_only(true)
@@ -367,7 +367,7 @@ fn list_virtual_desktops_tool() -> Tool {
         "Group discoverable titled windows by desktop ID and identify the current group. Empty desktops, names, and desktop order are unavailable.",
         object_schema(JsonObject::new(), &[]),
     )
-    .with_raw_output_schema(Arc::new(json_object(json!({
+    .with_raw_output_schema(Arc::new(rmcp::object!({
         "type": "object",
         "properties": {
             "count": { "type": "integer", "minimum": 0 },
@@ -391,7 +391,7 @@ fn list_virtual_desktops_tool() -> Tool {
         },
         "required": ["count", "desktops", "includes_empty_desktops", "order_available", "names_available"],
         "additionalProperties": false
-    }))))
+    })))
     .with_annotations(
         ToolAnnotations::default()
             .read_only(true)
@@ -439,7 +439,7 @@ fn list_windows_tool() -> Tool {
         "List visible titled top-level windows. Refresh IDs after windows open, close, or change ownership.",
         object_schema(JsonObject::new(), &[]),
     )
-    .with_raw_output_schema(Arc::new(json_object(json!({
+    .with_raw_output_schema(Arc::new(rmcp::object!({
         "type": "object",
         "properties": {
             "count": { "type": "integer", "minimum": 0 },
@@ -447,7 +447,7 @@ fn list_windows_tool() -> Tool {
         },
         "required": ["count", "windows"],
         "additionalProperties": false
-    }))))
+    })))
     .with_annotations(
         ToolAnnotations::default()
             .read_only(true)
@@ -910,9 +910,7 @@ fn action_output_schema(include_position: bool) -> Arc<JsonObject> {
             "observation_status": {"const": observation}
         }}))
     );
-    Arc::new(json_object(
-        json!({"type": "object", "oneOf": [schema, incomplete]}),
-    ))
+    Arc::new(rmcp::object!({"type": "object", "oneOf": [schema, incomplete]}))
 }
 
 fn mutation_progress_properties() -> Value {
@@ -1126,11 +1124,4 @@ fn key_names() -> Vec<&'static str> {
         "f11",
         "f12",
     ]
-}
-
-pub(super) fn json_object(value: Value) -> JsonObject {
-    match value {
-        Value::Object(object) => object,
-        _ => unreachable!("tool schemas are always JSON objects"),
-    }
 }
