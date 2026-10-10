@@ -16,8 +16,8 @@ use controlfreak_core::{
 use super::{
     ActivityArbitrator, ActivityIndicator, ArbitrationBusy, BeginSessionError, CaptureDisplayInput,
     FocusWindowInput, GlowTiming, IndicatorHealth, IndicatorRuntime, PressKeysInput,
-    SafetyIndicator, handlers::run_platform_operation, parse_arguments, pointer_result,
-    schema::json_object, tool_error, tool_execution_error, tools,
+    SafetyIndicator, handlers::run_platform_operation, parse_arguments, pointer_result, tool_error,
+    tool_execution_error, tools,
 };
 
 pub(super) async fn wait_until(expected: &str, timeout: Duration, mut ready: impl FnMut() -> bool) {
@@ -792,16 +792,16 @@ fn tool_surface_includes_windows_and_keyboard() {
 
 #[test]
 fn improved_arguments_accept_bounded_capture_focus_observation_and_uppercase_keys() {
-    let capture = parse_arguments::<CaptureDisplayInput>(Some(json_object(serde_json::json!({
+    let capture = parse_arguments::<CaptureDisplayInput>(Some(rmcp::object!({
         "display_id": "display",
         "max_width": 1600,
         "include_cursor": false
-    }))))
+    })))
     .unwrap();
     assert_eq!(capture.max_width, Some(1600));
     assert!(!capture.include_cursor);
 
-    let focus = parse_arguments::<FocusWindowInput>(Some(json_object(serde_json::json!({
+    let focus = parse_arguments::<FocusWindowInput>(Some(rmcp::object!({
         "window_id": "target-12345678-1234-1234-1234-123456789ABC",
         "observation": {
             "mode": "screenshot",
@@ -813,14 +813,14 @@ fn improved_arguments_accept_bounded_capture_focus_observation_and_uppercase_key
                 "height": 200
             }
         }
-    }))))
+    })))
     .unwrap();
     assert_eq!(focus.observation.region.unwrap().width, 300);
 
-    let chord = parse_arguments::<PressKeysInput>(Some(json_object(serde_json::json!({
+    let chord = parse_arguments::<PressKeysInput>(Some(rmcp::object!({
         "target_ref": "synthetic",
         "keys": ["CTRL", "L"]
-    }))))
+    })))
     .unwrap();
     assert_eq!(
         chord.keys,

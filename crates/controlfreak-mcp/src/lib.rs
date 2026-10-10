@@ -31,6 +31,8 @@ use session::{
 #[cfg(test)]
 mod outcome_tests;
 #[cfg(test)]
+mod protocol_tests;
+#[cfg(test)]
 mod recipe_tests;
 mod results;
 mod schema;
