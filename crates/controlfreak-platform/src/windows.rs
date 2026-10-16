@@ -511,15 +511,38 @@ impl DisplayBackend for Backend {
             argument: "baseline_id".to_owned(),
             reason: "baseline was not found or has expired; capture a new baseline".to_owned(),
         })?;
-        wait_for_change(
-            baseline.display,
+        ensure_dpi_awareness()?;
+        ensure_baseline_display(&baseline.display, enumerate_displays()?.as_slice())?;
+        let result = wait_for_change(
+            baseline.display.clone(),
             baseline.bounds,
             &baseline.frame,
             request.timeout_ms,
             request.stable_ms,
             request.difference_threshold,
             control,
-        )
+        )?;
+        // A layout change during the wait would make the comparison meaningless.
+        ensure_baseline_display(&baseline.display, enumerate_displays()?.as_slice())?;
+        Ok(result)
+    }
+}
+
+/// Refuses a stored baseline whose display moved, resized, or disappeared since capture.
+fn ensure_baseline_display(
+    captured: &DisplayInfo,
+    current: &[DisplayInfo],
+) -> Result<(), PlatformError> {
+    if current
+        .iter()
+        .any(|display| display.id == captured.id && display.bounds == captured.bounds)
+    {
+        Ok(())
+    } else {
+        Err(PlatformError::InvalidArgument {
+            argument: "baseline_id".to_owned(),
+            reason: "the display layout changed since this baseline was captured; capture a new baseline".to_owned(),
+        })
     }
 }
 
@@ -1143,6 +1166,32 @@ mod tests {
         );
         assert!(display_region_bounds(&display, 1900, 0, 100, 100).is_err());
         assert!(display_region_bounds(&display, u32::MAX, 0, 2, 1).is_err());
+    }
+
+    #[test]
+    fn baselines_are_refused_after_their_display_moves_resizes_or_disappears() {
+        let captured = DisplayInfo {
+            id: "display".to_owned(),
+            name: "display".to_owned(),
+            bounds: DisplayBounds {
+                left: -1920,
+                top: 0,
+                width: 1920,
+                height: 1080,
+            },
+            is_primary: false,
+        };
+        assert!(super::ensure_baseline_display(&captured, std::slice::from_ref(&captured)).is_ok());
+        let mut moved = captured.clone();
+        moved.bounds.left = 0;
+        let mut resized = captured.clone();
+        resized.bounds.width = 2560;
+        for current in [vec![], vec![moved], vec![resized]] {
+            assert!(matches!(
+                super::ensure_baseline_display(&captured, &current),
+                Err(PlatformError::InvalidArgument { argument, .. }) if argument == "baseline_id"
+            ));
+        }
     }
 
     #[test]
