@@ -450,9 +450,11 @@ const SETTLE_MIN_CHANGED_PIXELS: usize = 48;
 /// each read of them costs about as much as the wait itself.
 const SETTLE_MAX_PIXELS: u64 = 2_560 * 1_600;
 const SETTLE_POLL: Duration = Duration::from_millis(4);
-/// Identical reads must span more than one 60 Hz display refresh to count as settled; two reads
-/// within one refresh can match while the window is still animating.
-const SETTLE_STABLE: Duration = Duration::from_millis(20);
+/// How long the window must stay identical to count as settled. Applications often repaint in
+/// phases, for example a busy state and then the result; a short window returns between phases
+/// and the evidence shows the intermediate state. Live tests saw a second phase 65 ms after the
+/// first, so the window covers gaps up to 60 ms while still returning well under the 150 ms cap.
+const SETTLE_STABLE: Duration = Duration::from_millis(60);
 
 /// Watches the approved window across an input action, so the action returns as soon as the
 /// window has visibly responded and stopped changing, instead of always sleeping the full cap.

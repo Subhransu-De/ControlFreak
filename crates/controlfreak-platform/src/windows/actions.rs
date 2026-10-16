@@ -165,12 +165,13 @@ impl PointerBackend for Backend {
             control,
             |control, target| {
                 control.check("scroll_mouse")?;
-                let watch = settle_watch(control);
                 send_scroll(request.delta_x, request.delta_y, control, || {
                     super::target::validate(control, "scroll_mouse", Some(target))?;
                     ensure_cursor_at("scroll_mouse", target, current_cursor_position()?)
                 })?;
-                settle(watch, POST_INPUT_SETTLE_MS);
+                // A window-settle check needs the same stillness window as keyboard
+                // actions, which would save almost nothing within this short cap.
+                settle(None, POST_INPUT_SETTLE_MS);
                 Ok(())
             },
         )
@@ -280,7 +281,6 @@ impl Backend {
             control,
             |control, target| {
                 control.check("click_mouse")?;
-                let watch = settle_watch(control);
                 send_click(
                     request.button,
                     request.click_count,
@@ -291,7 +291,9 @@ impl Backend {
                         ensure_cursor_at("click_mouse", target, current_cursor_position()?)
                     },
                 )?;
-                settle(watch, POST_INPUT_SETTLE_MS);
+                // A window-settle check needs the same stillness window as keyboard
+                // actions, which would save almost nothing within this short cap.
+                settle(None, POST_INPUT_SETTLE_MS);
                 Ok(())
             },
         )

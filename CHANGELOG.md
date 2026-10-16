@@ -24,9 +24,10 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ### Changed
 
-- Input actions return as soon as the approved window has visibly responded and stopped changing,
-  instead of always waiting 75 ms (pointer) or 150 ms (keyboard). Windows that never visibly
-  respond keep the previous wait.
+- Key and text actions return once the approved window has visibly responded and then stayed
+  unchanged for 60 ms, instead of always waiting 150 ms. Windows that never visibly respond keep
+  the previous wait. Pointer actions keep their fixed 75 ms wait, which a safe stillness window
+  could not shorten.
 - One OCR helper process is kept warm between requests and recycled after errors, timeouts,
   cancellation, 100 requests, or a minute idle. `read_text_in_region` takes about half as long.
 - Target checks share one virtual-desktop manager instead of activating one per check, and glow

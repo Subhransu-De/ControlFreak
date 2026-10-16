@@ -126,7 +126,9 @@ pub(super) fn recognize_text_with_helper(
         Err(failure) => return Err(failure.error),
     };
     helper.served += 1;
-    if helper.served < MAX_REQUESTS_PER_HELPER {
+    // Only a helper that just succeeded is kept; an error reply may reflect helper-side state.
+    let succeeded = matches!(reply.response, OcrHelperResponse::Success { .. });
+    if succeeded && helper.served < MAX_REQUESTS_PER_HELPER {
         let mut slot = pool
             .idle
             .lock()
@@ -690,6 +692,37 @@ mod tests {
             Duration::from_secs(20),
         )
         .unwrap();
+    }
+
+    /// Answers every request with a recognition error.
+    #[test]
+    #[ignore = "spawned only by warm helper tests"]
+    fn warm_error_test_helper() {
+        serve_ocr_helper_with(
+            std::io::stdin(),
+            std::io::stdout().lock(),
+            |_, _| {
+                Err(PlatformError::Unavailable {
+                    reason: "OCR language 'xx' is not installed".into(),
+                })
+            },
+            Duration::from_secs(20),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn helpers_that_report_an_error_are_not_reused() {
+        let pool = OcrHelperPool::default();
+        let command = test_helper("warm_error_test_helper");
+        let request = serde_json::from_slice::<OcrHelperRequest>(&request_line(0))
+            .unwrap()
+            .request;
+        let error =
+            recognize_text_with_helper(&command, &pool, &request, &MutationControl::default())
+                .unwrap_err();
+        assert!(error.to_string().contains("not installed"));
+        assert!(pool.idle.lock().unwrap().is_none());
     }
 
     /// Never finishes a request unless cancelled.
