@@ -1029,6 +1029,9 @@ pub(super) fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>
     let mut encoder = png::Encoder::new(&mut output, width, height);
     encoder.set_color(png::ColorType::Rgb);
     encoder.set_depth(png::BitDepth::Eight);
+    // On real 1280-pixel screenshots, zlib level 2 encodes about four times faster than the
+    // default level for roughly 8% more bytes. Images do not cost more model tokens by size.
+    encoder.set_deflate_compression(png::DeflateCompression::Level(2));
     let mut writer = encoder
         .write_header()
         .map_err(|error| PlatformError::OperationFailed {
@@ -1250,5 +1253,64 @@ mod settle_tests {
                 .is_none()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod live_encode_benchmarks {
+    use super::*;
+
+    /// Times the shipped encoder against the previous default on the live primary display.
+    /// Only sizes and times are printed; no pixels are kept.
+    #[test]
+    #[ignore = "reads the live desktop; run only on an approved disposable desktop"]
+    fn live_png_encode_cost() {
+        ensure_dpi_awareness().unwrap();
+        let display = enumerate_displays()
+            .unwrap()
+            .into_iter()
+            .find(|display| display.is_primary)
+            .unwrap();
+        let frame = capture_rgba(display.bounds).unwrap();
+        let (width, height, _) =
+            scaled_dimensions(display.bounds.width, display.bounds.height, Some(1280));
+        let resized = resize_rgba_area(
+            &frame,
+            display.bounds.width,
+            display.bounds.height,
+            width,
+            height,
+        );
+        let median = |encode: &dyn Fn() -> usize| {
+            let mut size = 0;
+            let mut samples: Vec<f64> = (0..7)
+                .map(|_| {
+                    let started = Instant::now();
+                    size = encode();
+                    started.elapsed().as_secs_f64() * 1_000.0
+                })
+                .collect();
+            samples.sort_by(f64::total_cmp);
+            (samples[samples.len() / 2], size)
+        };
+        let shipped = median(&|| encode_png(width, height, &resized).unwrap().len());
+        let previous = median(&|| {
+            let rgb: Vec<u8> = resized
+                .chunks_exact(4)
+                .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+                .collect();
+            let mut output = Vec::new();
+            let mut encoder = png::Encoder::new(&mut output, width, height);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&rgb).unwrap();
+            writer.finish().unwrap();
+            output.len()
+        });
+        eprintln!(
+            "{width}x{height}: shipped {:.1}ms {} bytes; balanced default {:.1}ms {} bytes",
+            shipped.0, shipped.1, previous.0, previous.1
+        );
     }
 }
