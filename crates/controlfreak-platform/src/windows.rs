@@ -168,10 +168,14 @@ struct PointerActionSpec<'a> {
     y: u32,
     duration_ms: u32,
     observation: &'a ObservationOptions,
+    /// Refuse dispatch if any other input action completed since this generation was read.
+    input_generation: Option<u64>,
 }
 
 pub struct Backend {
     input_lock: Mutex<()>,
+    /// Counts completed input-lock holders, so slow observations can detect intervening input.
+    input_generation: AtomicU64,
     visual_baselines: Mutex<Vec<StoredVisualBaseline>>,
     next_baseline_id: AtomicU64,
     ocr_helper: Option<OcrHelperCommand>,
@@ -253,6 +257,7 @@ impl Backend {
         let security_context = privilege::current_security_context(false).unwrap_or_default();
         Self {
             input_lock: Mutex::new(()),
+            input_generation: AtomicU64::new(0),
             visual_baselines: Mutex::new(Vec::new()),
             next_baseline_id: AtomicU64::new(1),
             ocr_helper: None,
@@ -263,6 +268,7 @@ impl Backend {
     pub fn with_security(security_context: SecurityContext) -> Self {
         Self {
             input_lock: Mutex::new(()),
+            input_generation: AtomicU64::new(0),
             visual_baselines: Mutex::new(Vec::new()),
             next_baseline_id: AtomicU64::new(1),
             ocr_helper: None,
@@ -276,6 +282,7 @@ impl Backend {
     ) -> Self {
         Self {
             input_lock: Mutex::new(()),
+            input_generation: AtomicU64::new(0),
             visual_baselines: Mutex::new(Vec::new()),
             next_baseline_id: AtomicU64::new(1),
             ocr_helper: Some(command),
@@ -617,6 +624,8 @@ impl OcrBackend for Backend {
             });
         }
         target::validate(control, "click_text", None)?;
+        // OCR runs outside the input lock; input that lands meanwhile can move the matched text.
+        let input_generation = self.input_generation.load(Ordering::Acquire);
         let ocr = self.recognize_text(&request.region, control)?;
         target::validate(control, "click_text", None)?;
         if ocr.target_ref != control.approved_target() {
@@ -636,7 +645,7 @@ impl OcrBackend for Backend {
         let x = candidate.x.saturating_add(candidate.width / 2);
         let y = candidate.y.saturating_add(candidate.height / 2);
         control.check("click_text")?;
-        let result = self.click_mouse_controlled(
+        let result = self.click_mouse_at_generation(
             &MouseClickRequest {
                 display_id: request.region.display_id.clone(),
                 x,
@@ -648,6 +657,7 @@ impl OcrBackend for Backend {
                 observation: request.observation.clone(),
             },
             control,
+            Some(input_generation),
         )?;
         Ok(ClickTextResult {
             matched_text: candidate,
