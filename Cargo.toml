@@ -14,12 +14,12 @@ edition = "2024"
 license = "MIT"
 publish = false
 rust-version = "1.97"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 
 [workspace.dependencies]
-controlfreak-core = { version = "=0.1.0-alpha.1", path = "crates/controlfreak-core" }
-controlfreak-mcp = { version = "=0.1.0-alpha.1", path = "crates/controlfreak-mcp" }
-controlfreak-platform = { version = "=0.1.0-alpha.1", path = "crates/controlfreak-platform" }
+controlfreak-core = { version = "=0.1.0-alpha.2", path = "crates/controlfreak-core" }
+controlfreak-mcp = { version = "=0.1.0-alpha.2", path = "crates/controlfreak-mcp" }
+controlfreak-platform = { version = "=0.1.0-alpha.2", path = "crates/controlfreak-platform" }
 rmcp = { version = "=3.5.1", default-features = false, features = ["server", "transport-io"] }
 base64 = "0.23"
 png = "0.18"

@@ -9,6 +9,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+## [0.1.0-alpha.2] - 2026-10-16
+
 ### Added
 
 - `run_actions` runs up to 16 click, scroll, `type_text`, and `press_keys` steps on one approved
