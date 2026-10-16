@@ -4,8 +4,8 @@ use super::{
     FOCUS_WINDOW, GET_SERVER_STATUS, JsonObject, LIST_DISPLAYS, LIST_VIRTUAL_DESKTOPS,
     LIST_WINDOWS, MAX_CAPTURE_WIDTH, MAX_MOVE_DURATION_MS, MAX_SCROLL_DELTA, MAX_TEXT_UTF16_UNITS,
     MAX_WAIT_MS, MOVE_MOUSE, PRESS_KEYS, READ_TEXT_IN_REGION, SCROLL_MOUSE, SWITCH_VIRTUAL_DESKTOP,
-    TYPE_TEXT, Tool, ToolAnnotations, Value, WAIT_FOR_CHANGE_SINCE, WAIT_FOR_VISUAL_CHANGE,
-    WAIT_FOR_WINDOW, json,
+    TYPE_TEXT, Tool, ToolAnnotations, Value, WAIT_FOR_CHANGE_SINCE, WAIT_FOR_TEXT,
+    WAIT_FOR_VISUAL_CHANGE, WAIT_FOR_WINDOW, json,
 };
 
 /// Tool descriptions and schemas used by both `tools/list` and offline contract export.
@@ -27,6 +27,7 @@ pub fn tools() -> Vec<Tool> {
         wait_for_change_since_tool(),
         read_text_in_region_tool(),
         find_text_on_screen_tool(),
+        wait_for_text_tool(),
         click_text_tool(),
         list_virtual_desktops_tool(),
         switch_virtual_desktop_tool(),
@@ -297,6 +298,42 @@ fn find_text_on_screen_tool() -> Tool {
     Tool::new(
         FIND_TEXT_ON_SCREEN,
         "Discover OCR text within a region without authorizing input. Returns display-local bounds, match_tier, full candidate_count, and truncation flags. At most max_results candidates and 256 Unicode characters per candidate; ambiguity is never hidden by the limit.",
+        object_schema(properties, &["display_id", "x", "y", "width", "height", "query"]),
+    )
+    .with_annotations(
+        ToolAnnotations::default()
+            .read_only(true)
+            .destructive(false)
+            .idempotent(false)
+            .open_world(false),
+    )
+}
+
+fn wait_for_text_tool() -> Tool {
+    let mut properties = region_properties();
+    add_ocr_language(&mut properties);
+    properties.insert("query".to_owned(), json!({ "type": "string", "minLength": 1, "description": "Text to wait for, matched as in find_text_on_screen." }));
+    properties.insert("condition".to_owned(), json!({ "type": "string", "enum": ["appears", "disappears"], "default": "appears", "description": "appears: wait until at least one match is visible. disappears: wait until none is." }));
+    properties.insert(
+        "timeout_ms".to_owned(),
+        json!({ "type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS, "default": 5000 }),
+    );
+    properties.insert(
+        "case_sensitive".to_owned(),
+        json!({ "type": "boolean", "default": false }),
+    );
+    properties.insert(
+        "max_results".to_owned(),
+        json!({ "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }),
+    );
+    properties.insert("match_mode".into(), json!({"type": "string", "enum": ["exact", "substring", "tolerant"], "default": "substring"}));
+    properties.insert(
+        "ocr_confusions".into(),
+        json!({"type": "boolean", "default": false, "description": "Tolerant matching only."}),
+    );
+    Tool::new(
+        WAIT_FOR_TEXT,
+        "Repeat OCR discovery in a region until query appears or disappears, or timeout_ms elapses. Returns satisfied, timed_out, attempts, and the final pass's matches with display-local bounds. Each pass is a full recognition; prefer a small region. Discovery only: it never authorizes input.",
         object_schema(properties, &["display_id", "x", "y", "width", "height", "query"]),
     )
     .with_annotations(

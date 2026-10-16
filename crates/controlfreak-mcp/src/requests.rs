@@ -148,6 +148,57 @@ pub(super) struct ClickTextInput {
     pub(super) observation: ObservationInput,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WaitForTextInput {
+    display_id: String,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    language: Option<String>,
+    query: String,
+    #[serde(default)]
+    case_sensitive: bool,
+    #[serde(default = "default_max_ocr_results")]
+    max_results: u32,
+    #[serde(default)]
+    match_mode: controlfreak_core::TextMatchMode,
+    #[serde(default)]
+    ocr_confusions: bool,
+    #[serde(default)]
+    condition: controlfreak_core::TextCondition,
+    #[serde(default = "default_text_wait_ms")]
+    timeout_ms: u32,
+}
+
+const fn default_text_wait_ms() -> u32 {
+    5_000
+}
+
+impl WaitForTextInput {
+    pub(super) fn into_request(self) -> controlfreak_core::WaitForTextRequest {
+        controlfreak_core::WaitForTextRequest {
+            find: FindTextInput {
+                display_id: self.display_id,
+                x: self.x,
+                y: self.y,
+                width: self.width,
+                height: self.height,
+                language: self.language,
+                query: self.query,
+                case_sensitive: self.case_sensitive,
+                max_results: self.max_results,
+                match_mode: self.match_mode,
+                ocr_confusions: self.ocr_confusions,
+            }
+            .into_request(),
+            condition: self.condition,
+            timeout_ms: self.timeout_ms,
+        }
+    }
+}
+
 impl FindTextInput {
     pub(super) fn into_request(self) -> FindTextRequest {
         FindTextRequest {

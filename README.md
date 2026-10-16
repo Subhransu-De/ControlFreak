@@ -9,7 +9,7 @@ MCP clients over STDIO.
 - Move, click, drag, and scroll the mouse across multiple displays.
 - Send keyboard shortcuts and type Unicode text without using the clipboard.
 - List, focus, capture, and wait for application windows.
-- Read and click on-screen text using the local Windows OCR engine.
+- Read, find, wait for, and click on-screen text using the local Windows OCR engine.
 - Inspect and switch between discoverable Windows virtual desktops.
 - Show a click-through animated desktop-edge glow while a client owns a mutating control session.
 
@@ -72,6 +72,13 @@ default, `exact`, and `tolerant`. Exact and substring ignore surrounding query w
 `case_sensitive` consistently. Discovery returns `match_tier`, the full `candidate_count`,
 truncation flags, and up to `max_results` matches, each limited to 256 Unicode scalar values.
 A limited response containing one candidate does not establish uniqueness.
+
+`wait_for_text` repeats the same discovery in a region until the query `appears` (the default)
+or `disappears`, or until `timeout_ms` (default 5000, at most 30000) elapses. It returns
+`satisfied`, `timed_out`, `attempts`, `elapsed_ms`, and the final pass's matches, so a client
+can wait for a status message or a closing dialog in one call instead of a capture-and-read
+loop. Each pass is a full recognition, so a small region is faster. Like discovery, it never
+authorizes input.
 
 Tolerant discovery tries these tiers in order and stops at the first nonempty tier, even when
 that tier is ambiguous:

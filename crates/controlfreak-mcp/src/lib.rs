@@ -16,7 +16,7 @@ use requests::{
     ClickMouseInput, ClickTextInput, DragMouseInput, FindTextInput, FocusWindowInput,
     MoveMouseInput, NoArguments, OcrRegionInput, PressKeysInput, ScrollMouseInput,
     SwitchVirtualDesktopInput, TypeTextInput, VisualBaselineInput, WaitForChangeSinceInput,
-    WaitForVisualChangeInput, WaitForWindowInput, parse_arguments,
+    WaitForTextInput, WaitForVisualChangeInput, WaitForWindowInput, parse_arguments,
 };
 pub use session::{
     ActivityArbitrator, ActivityIndicator, ArbitrationBusy, ArbitrationError, IndicatorHealth,
@@ -43,7 +43,7 @@ use handlers::{
     call_focus_window, call_get_server_status, call_list_displays, call_list_virtual_desktops,
     call_list_windows, call_move_mouse, call_press_keys, call_read_text_in_region,
     call_scroll_mouse, call_switch_virtual_desktop, call_type_text, call_wait_for_change_since,
-    call_wait_for_visual_change, call_wait_for_window,
+    call_wait_for_text, call_wait_for_visual_change, call_wait_for_window,
 };
 use results::{
     click_text_result, keyboard_result, pointer_result, screenshot_result, tool_error,
@@ -106,6 +106,7 @@ const CAPTURE_VISUAL_BASELINE: &str = "capture_visual_baseline";
 const WAIT_FOR_CHANGE_SINCE: &str = "wait_for_change_since";
 const READ_TEXT_IN_REGION: &str = "read_text_in_region";
 const FIND_TEXT_ON_SCREEN: &str = "find_text_on_screen";
+const WAIT_FOR_TEXT: &str = "wait_for_text";
 const CLICK_TEXT: &str = "click_text";
 const MOVE_MOUSE: &str = "move_mouse";
 const CLICK_MOUSE: &str = "click_mouse";
@@ -502,6 +503,7 @@ async fn dispatch_tool(
         FIND_TEXT_ON_SCREEN => {
             call_find_text_on_screen(backend, request.arguments, operation_lease).await
         }
+        WAIT_FOR_TEXT => call_wait_for_text(backend, request.arguments, operation_lease).await,
         CLICK_TEXT => call_click_text(backend, request.arguments, operation_lease).await,
         MOVE_MOUSE => call_move_mouse(backend, request.arguments, operation_lease).await,
         CLICK_MOUSE => call_click_mouse(backend, request.arguments, operation_lease).await,

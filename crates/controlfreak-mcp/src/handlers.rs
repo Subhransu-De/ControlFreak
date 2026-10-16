@@ -9,7 +9,7 @@ use super::{
     MoveMouseInput, NoArguments, OcrRegionInput, OcrRegionRequest, OperationLease, Ordering,
     PlatformBackend, PressKeysInput, SafetyIndicator, ScrollMouseInput, SwitchVirtualDesktopInput,
     TextInputRequest, TypeTextInput, Value, VirtualDesktopSwitchRequest, VisualBaselineInput,
-    VisualBaselineRequest, WaitForChangeSinceInput, WaitForChangeSinceRequest,
+    VisualBaselineRequest, WaitForChangeSinceInput, WaitForChangeSinceRequest, WaitForTextInput,
     WaitForVisualChangeInput, WaitForVisualChangeRequest, WaitForWindowInput, WaitForWindowRequest,
     click_text_result, join_error, json, keyboard_result, parse_arguments, pointer_result,
     screenshot_result, tool_error, virtual_desktop_list_result, virtual_desktop_switch_result,
@@ -327,6 +327,43 @@ pub(super) async fn call_find_text_on_screen(
             "candidates_truncated": result.details.candidates_truncated,
             "text_truncated": result.details.text_truncated,
             "recovery": result.details.recovery,
+        }))
+        .into()),
+        Err(error) => Ok(tool_error(&error).into()),
+    }
+}
+
+pub(super) async fn call_wait_for_text(
+    backend: Arc<dyn PlatformBackend>,
+    arguments: Option<JsonObject>,
+    operation_lease: Option<OperationLease>,
+) -> Result<CallToolResponse, ErrorData> {
+    let input = parse_arguments::<WaitForTextInput>(arguments)?;
+    let request = input.into_request();
+    let control =
+        super::stop::current().map_or_else(MutationControl::default, |work| work.control.clone());
+    let result = run_platform_operation(operation_lease, move || {
+        backend.wait_for_text_controlled(&request, &control)
+    })
+    .await?;
+    match result {
+        Ok(result) => Ok(CallToolResult::structured(json!({
+            "condition": result.condition,
+            "satisfied": result.satisfied,
+            "timed_out": result.timed_out,
+            "elapsed_ms": result.elapsed_ms,
+            "attempts": result.attempts,
+            "count": result.last.matches.len(),
+            "target_ref": result.last.target_ref,
+            "query": result.last.query,
+            "display": result.last.display,
+            "source_bounds": result.last.source_bounds,
+            "language": result.last.language,
+            "matches": result.last.matches,
+            "match_tier": result.last.details.match_tier,
+            "candidate_count": result.last.details.candidate_count,
+            "candidates_truncated": result.last.details.candidates_truncated,
+            "text_truncated": result.last.details.text_truncated,
         }))
         .into()),
         Err(error) => Ok(tool_error(&error).into()),

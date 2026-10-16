@@ -395,7 +395,7 @@ async fn observation_cancellation_refuses_queued_work_and_discards_late_results(
     }
 }
 
-fn worker_requests() -> [(&'static str, Value); 5] {
+fn worker_requests() -> [(&'static str, Value); 6] {
     [
         (
             MOVE_MOUSE,
@@ -413,6 +413,11 @@ fn worker_requests() -> [(&'static str, Value); 5] {
             FIND_TEXT_ON_SCREEN,
             json!({"display_id":"fixture","x":0,"y":0,"width":1,"height":1,
                     "query":"synthetic", "match_mode":"tolerant", "ocr_confusions":true}),
+        ),
+        (
+            WAIT_FOR_TEXT,
+            json!({"display_id":"fixture","x":0,"y":0,"width":1,"height":1,
+                    "query":"synthetic", "timeout_ms":10000}),
         ),
         (
             READ_TEXT_IN_REGION,

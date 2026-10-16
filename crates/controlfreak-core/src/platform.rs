@@ -8,8 +8,8 @@ use crate::{
     OcrRegionRequest, OcrResult, PermissionDescriptor, PlatformError, PointerActionResult,
     SecurityContext, TextInputRequest, VirtualDesktopList, VirtualDesktopSwitchRequest,
     VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest, VisualChangeResult,
-    WaitForChangeSinceRequest, WaitForVisualChangeRequest, WaitForWindowRequest, WindowFocusResult,
-    WindowList, WindowScreenshot, WindowWaitResult,
+    WaitForChangeSinceRequest, WaitForTextRequest, WaitForTextResult, WaitForVisualChangeRequest,
+    WaitForWindowRequest, WindowFocusResult, WindowList, WindowScreenshot, WindowWaitResult,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +183,49 @@ pub trait OcrBackend {
         let result = self.find_text_on_screen(request)?;
         control.check("find_text_on_screen")?;
         Ok(result)
+    }
+
+    /// Repeats discovery until a match appears or disappears, or the timeout elapses. Each pass is
+    /// a full recognition; the final pass is returned so callers act on current text.
+    fn wait_for_text_controlled(
+        &self,
+        request: &WaitForTextRequest,
+        control: &MutationControl,
+    ) -> Result<WaitForTextResult, PlatformError> {
+        const POLL_GAP: std::time::Duration = std::time::Duration::from_millis(100);
+        if request.timeout_ms > crate::MAX_TEXT_WAIT_MS {
+            return Err(PlatformError::InvalidArgument {
+                argument: "timeout_ms".to_owned(),
+                reason: format!("must be at most {}", crate::MAX_TEXT_WAIT_MS),
+            });
+        }
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(u64::from(request.timeout_ms));
+        let mut attempts = 0_u32;
+        loop {
+            let last = self.find_text_on_screen_controlled(&request.find, control)?;
+            attempts = attempts.saturating_add(1);
+            let visible = !last.matches.is_empty();
+            let satisfied = match request.condition {
+                crate::TextCondition::Appears => visible,
+                crate::TextCondition::Disappears => !visible,
+            };
+            let now = std::time::Instant::now();
+            if satisfied || now >= deadline {
+                return Ok(WaitForTextResult {
+                    condition: request.condition,
+                    satisfied,
+                    timed_out: !satisfied,
+                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    attempts,
+                    last,
+                });
+            }
+            control.wait(
+                "wait_for_text",
+                POLL_GAP.min(deadline.saturating_duration_since(now)),
+            )?;
+        }
     }
 
     fn find_text_on_screen(
@@ -494,5 +537,145 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(control.progress().input_outcome, InputOutcome::Unknown);
         assert_eq!(control.progress().cleanup, CleanupStatus::Unknown);
+    }
+
+    /// Reports the query as visible on passes `visible_from..visible_until`.
+    struct ScriptedText {
+        passes: std::sync::atomic::AtomicU32,
+        visible: std::ops::Range<u32>,
+    }
+
+    impl OcrBackend for ScriptedText {
+        fn find_text_on_screen_controlled(
+            &self,
+            request: &crate::FindTextRequest,
+            _: &MutationControl,
+        ) -> Result<crate::FindTextResult, PlatformError> {
+            let pass = self
+                .passes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let bounds = crate::DisplayBounds {
+                left: 0,
+                top: 0,
+                width: 10,
+                height: 10,
+            };
+            let matches = if self.visible.contains(&pass) {
+                vec![crate::TextMatch {
+                    text: request.query.clone(),
+                    x: 1,
+                    y: 2,
+                    width: 3,
+                    height: 4,
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(crate::FindTextResult {
+                target_ref: None,
+                query: request.query.clone(),
+                display: crate::DisplayInfo {
+                    id: "fixture".into(),
+                    name: "fixture".into(),
+                    bounds,
+                    is_primary: true,
+                },
+                source_bounds: bounds,
+                language: "en-US".into(),
+                details: crate::OcrMatchDetails {
+                    candidates: matches.clone(),
+                    candidate_count: matches.len(),
+                    candidates_truncated: false,
+                    text_truncated: false,
+                    match_tier: None,
+                    recovery: String::new(),
+                },
+                matches,
+            })
+        }
+    }
+
+    fn wait_request(condition: crate::TextCondition, timeout_ms: u32) -> crate::WaitForTextRequest {
+        crate::WaitForTextRequest {
+            find: crate::FindTextRequest {
+                region: OcrRegionRequest {
+                    display_id: "fixture".into(),
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 10,
+                    language: None,
+                },
+                query: "Saved".into(),
+                case_sensitive: false,
+                max_results: 20,
+                match_mode: crate::TextMatchMode::default(),
+                ocr_confusions: false,
+            },
+            condition,
+            timeout_ms,
+        }
+    }
+
+    #[test]
+    fn text_waits_repeat_recognition_until_the_condition_holds() {
+        let control = MutationControl::default();
+        let appearing = ScriptedText {
+            passes: 0.into(),
+            visible: 2..u32::MAX,
+        };
+        let result = appearing
+            .wait_for_text_controlled(
+                &wait_request(crate::TextCondition::Appears, 5_000),
+                &control,
+            )
+            .unwrap();
+        assert!(result.satisfied && !result.timed_out);
+        assert_eq!(result.attempts, 3);
+        assert_eq!(result.last.matches.len(), 1);
+
+        let disappearing = ScriptedText {
+            passes: 0.into(),
+            visible: 0..2,
+        };
+        let result = disappearing
+            .wait_for_text_controlled(
+                &wait_request(crate::TextCondition::Disappears, 5_000),
+                &control,
+            )
+            .unwrap();
+        assert!(result.satisfied);
+        assert_eq!(result.attempts, 3);
+        assert!(result.last.matches.is_empty());
+    }
+
+    #[test]
+    fn text_waits_time_out_with_the_final_pass_and_reject_long_timeouts() {
+        let control = MutationControl::default();
+        let never = ScriptedText {
+            passes: 0.into(),
+            visible: 0..0,
+        };
+        let result = never
+            .wait_for_text_controlled(&wait_request(crate::TextCondition::Appears, 0), &control)
+            .unwrap();
+        assert!(!result.satisfied && result.timed_out);
+        assert_eq!(result.attempts, 1);
+        assert!(matches!(
+            never.wait_for_text_controlled(
+                &wait_request(crate::TextCondition::Appears, crate::MAX_TEXT_WAIT_MS + 1),
+                &control,
+            ),
+            Err(PlatformError::InvalidArgument { .. })
+        ));
+        control.cancel();
+        assert!(
+            never
+                .wait_for_text_controlled(
+                    &wait_request(crate::TextCondition::Appears, 5_000),
+                    &control
+                )
+                .is_err()
+        );
     }
 }
