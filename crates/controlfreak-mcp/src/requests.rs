@@ -1,6 +1,7 @@
+use super::observations::PointerTarget;
 use controlfreak_core::{
     FindTextRequest, Key, MouseButton, ObservationMode, ObservationOptions, ObservationRegion,
-    OcrRegionRequest, VirtualDesktopDirection,
+    OcrRegionRequest, PlatformError, VirtualDesktopDirection,
 };
 use rmcp::{ErrorData, model::JsonObject};
 use serde::Deserialize;
@@ -272,9 +273,18 @@ impl From<ObservationInput> for ObservationOptions {
 #[serde(deny_unknown_fields)]
 pub(super) struct MoveMouseInput {
     pub(super) target_ref: String,
-    pub(super) display_id: String,
-    pub(super) x: u32,
-    pub(super) y: u32,
+    #[serde(default)]
+    pub(super) display_id: Option<String>,
+    #[serde(default)]
+    pub(super) x: Option<u32>,
+    #[serde(default)]
+    pub(super) y: Option<u32>,
+    #[serde(default)]
+    pub(super) observation_id: Option<String>,
+    #[serde(default)]
+    pub(super) image_x: Option<u32>,
+    #[serde(default)]
+    pub(super) image_y: Option<u32>,
     #[serde(default)]
     pub(super) duration_ms: u32,
     #[serde(default)]
@@ -285,9 +295,18 @@ pub(super) struct MoveMouseInput {
 #[serde(deny_unknown_fields)]
 pub(super) struct ClickMouseInput {
     pub(super) target_ref: String,
-    pub(super) display_id: String,
-    pub(super) x: u32,
-    pub(super) y: u32,
+    #[serde(default)]
+    pub(super) display_id: Option<String>,
+    #[serde(default)]
+    pub(super) x: Option<u32>,
+    #[serde(default)]
+    pub(super) y: Option<u32>,
+    #[serde(default)]
+    pub(super) observation_id: Option<String>,
+    #[serde(default)]
+    pub(super) image_x: Option<u32>,
+    #[serde(default)]
+    pub(super) image_y: Option<u32>,
     pub(super) button: MouseButton,
     #[serde(default = "default_click_count")]
     pub(super) click_count: u8,
@@ -303,12 +322,28 @@ pub(super) struct ClickMouseInput {
 #[serde(deny_unknown_fields)]
 pub(super) struct DragMouseInput {
     pub(super) target_ref: String,
-    pub(super) start_display_id: String,
-    pub(super) start_x: u32,
-    pub(super) start_y: u32,
-    pub(super) end_display_id: String,
-    pub(super) end_x: u32,
-    pub(super) end_y: u32,
+    #[serde(default)]
+    pub(super) start_display_id: Option<String>,
+    #[serde(default)]
+    pub(super) start_x: Option<u32>,
+    #[serde(default)]
+    pub(super) start_y: Option<u32>,
+    #[serde(default)]
+    pub(super) end_display_id: Option<String>,
+    #[serde(default)]
+    pub(super) end_x: Option<u32>,
+    #[serde(default)]
+    pub(super) end_y: Option<u32>,
+    #[serde(default)]
+    pub(super) observation_id: Option<String>,
+    #[serde(default)]
+    pub(super) start_image_x: Option<u32>,
+    #[serde(default)]
+    pub(super) start_image_y: Option<u32>,
+    #[serde(default)]
+    pub(super) end_image_x: Option<u32>,
+    #[serde(default)]
+    pub(super) end_image_y: Option<u32>,
     pub(super) button: MouseButton,
     #[serde(default)]
     pub(super) modifiers: Vec<Key>,
@@ -322,9 +357,18 @@ pub(super) struct DragMouseInput {
 #[serde(deny_unknown_fields)]
 pub(super) struct ScrollMouseInput {
     pub(super) target_ref: String,
-    pub(super) display_id: String,
-    pub(super) x: u32,
-    pub(super) y: u32,
+    #[serde(default)]
+    pub(super) display_id: Option<String>,
+    #[serde(default)]
+    pub(super) x: Option<u32>,
+    #[serde(default)]
+    pub(super) y: Option<u32>,
+    #[serde(default)]
+    pub(super) observation_id: Option<String>,
+    #[serde(default)]
+    pub(super) image_x: Option<u32>,
+    #[serde(default)]
+    pub(super) image_y: Option<u32>,
     #[serde(default)]
     pub(super) delta_x: i32,
     pub(super) delta_y: i32,
@@ -440,4 +484,56 @@ where
 
 const fn default_focus_timeout_ms() -> u32 {
     1_000
+}
+
+macro_rules! pointer_target {
+    ($input:ty) => {
+        impl $input {
+            /// The requested position, given either in display pixels or as an image point.
+            pub(super) fn pointer_target(&self) -> Result<PointerTarget, PlatformError> {
+                PointerTarget::from_arguments(
+                    (self.display_id.clone(), self.x, self.y),
+                    (self.observation_id.as_deref(), self.image_x, self.image_y),
+                    "display_id/x/y or observation_id/image_x/image_y",
+                )
+            }
+        }
+    };
+}
+
+pointer_target!(MoveMouseInput);
+pointer_target!(ClickMouseInput);
+pointer_target!(ScrollMouseInput);
+
+impl DragMouseInput {
+    /// Start and end positions, each in display pixels or as points in one observation.
+    pub(super) fn pointer_targets(&self) -> Result<(PointerTarget, PointerTarget), PlatformError> {
+        let uses_image = |x: Option<u32>, y: Option<u32>| x.is_some() || y.is_some();
+        let start_image = uses_image(self.start_image_x, self.start_image_y);
+        let end_image = uses_image(self.end_image_x, self.end_image_y);
+        if self.observation_id.is_some() && !start_image && !end_image {
+            return Err(PlatformError::InvalidArgument {
+                argument: "observation_id".to_owned(),
+                reason: "give start_image_x/start_image_y or end_image_x/end_image_y with it"
+                    .to_owned(),
+            });
+        }
+        let observation = |used: bool| used.then_some(self.observation_id.as_deref()).flatten();
+        Ok((
+            PointerTarget::from_arguments(
+                (self.start_display_id.clone(), self.start_x, self.start_y),
+                (
+                    observation(start_image),
+                    self.start_image_x,
+                    self.start_image_y,
+                ),
+                "start_display_id/start_x/start_y or observation_id/start_image_x/start_image_y",
+            )?,
+            PointerTarget::from_arguments(
+                (self.end_display_id.clone(), self.end_x, self.end_y),
+                (observation(end_image), self.end_image_x, self.end_image_y),
+                "end_display_id/end_x/end_y or observation_id/end_image_x/end_image_y",
+            )?,
+        ))
+    }
 }

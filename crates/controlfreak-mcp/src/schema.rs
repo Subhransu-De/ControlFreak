@@ -564,8 +564,8 @@ fn wait_for_window_tool() -> Tool {
 fn move_mouse_tool() -> Tool {
     Tool::new(
         MOVE_MOUSE,
-        "Move the pointer within or between displays using display-local physical pixels.",
-        object_schema(pointer_properties(), &["display_id", "x", "y"]),
+        "Move the pointer within or between displays. Give display_id with display-local physical x/y, or observation_id with image_x/image_y from a returned screenshot.",
+        object_schema(pointer_properties(), &[]),
     )
     .with_raw_output_schema(pointer_action_output_schema())
     .with_annotations(
@@ -591,8 +591,8 @@ fn click_mouse_tool() -> Tool {
     properties.insert("modifiers".to_owned(), modifier_schema());
     Tool::new(
         CLICK_MOUSE,
-        "Click at display-local physical-pixel coordinates. Clicks and modifiers execute as one input sequence.",
-        object_schema(properties, &["display_id", "x", "y", "button"]),
+        "Click at display_id with display-local physical x/y, or at observation_id with image_x/image_y from a returned screenshot. Clicks and modifiers execute as one input sequence.",
+        object_schema(properties, &["button"]),
     )
     .with_raw_output_schema(pointer_action_output_schema())
     .with_annotations(
@@ -611,6 +611,12 @@ fn drag_mouse_tool() -> Tool {
         properties.insert(format!("{prefix}_x"), json!({ "type": "integer", "minimum": 0, "description": format!("{prefix} physical-pixel X coordinate local to its display.") }));
         properties.insert(format!("{prefix}_y"), json!({ "type": "integer", "minimum": 0, "description": format!("{prefix} physical-pixel Y coordinate local to its display.") }));
     }
+    properties.insert("observation_id".to_owned(), json!({ "type": "string", "minLength": 1, "description": "Screenshot observation_id for start/end image points." }));
+    for prefix in ["start", "end"] {
+        for axis in ["x", "y"] {
+            properties.insert(format!("{prefix}_image_{axis}"), json!({ "type": "integer", "minimum": 0, "description": format!("{prefix} {axis} in the observation_id image's own pixels; replaces {prefix}_display_id/{prefix}_x/{prefix}_y.") }));
+        }
+    }
     properties.insert(
         "button".to_owned(),
         json!({ "type": "string", "enum": ["left", "right", "middle"] }),
@@ -620,8 +626,8 @@ fn drag_mouse_tool() -> Tool {
     add_observation(&mut properties);
     Tool::new(
         DRAG_MOUSE,
-        "Drag within or between displays. Hold the button and modifiers for the drag, then release all held inputs.",
-        object_schema(properties, &["start_display_id", "start_x", "start_y", "end_display_id", "end_x", "end_y", "button"]),
+        "Drag within or between displays. Give each end as display_id with display-local x/y, or as image points in one observation_id. Hold the button and modifiers for the drag, then release all held inputs.",
+        object_schema(properties, &["button"]),
     )
     .with_raw_output_schema(pointer_action_output_schema())
     .with_annotations(
@@ -656,8 +662,8 @@ fn scroll_mouse_tool() -> Tool {
     );
     Tool::new(
         SCROLL_MOUSE,
-        "Move to display-local physical-pixel coordinates and scroll vertically or horizontally.",
-        object_schema(properties, &["display_id", "x", "y", "delta_y"]),
+        "Move to display_id with display-local physical x/y, or observation_id with image_x/image_y, then scroll vertically or horizontally.",
+        object_schema(properties, &["delta_y"]),
     )
     .with_raw_output_schema(pointer_action_output_schema())
     .with_annotations(
@@ -833,6 +839,30 @@ fn modifier_schema() -> Value {
 fn pointer_properties() -> JsonObject {
     let mut properties = JsonObject::new();
     properties.insert(
+        "observation_id".to_owned(),
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "description": "observation_id of a returned screenshot. Use with image_x/image_y instead of display_id/x/y."
+        }),
+    );
+    properties.insert(
+        "image_x".to_owned(),
+        json!({
+            "type": "integer",
+            "minimum": 0,
+            "description": "X in that screenshot's own pixels; the server maps it through the crop and scale."
+        }),
+    );
+    properties.insert(
+        "image_y".to_owned(),
+        json!({
+            "type": "integer",
+            "minimum": 0,
+            "description": "Y in that screenshot's own pixels."
+        }),
+    );
+    properties.insert(
         "display_id".to_owned(),
         json!({
             "type": "string",
@@ -986,8 +1016,9 @@ fn screenshot_schema() -> Value {
             "image_width": { "type": "integer", "minimum": 1 },
             "image_height": { "type": "integer", "minimum": 1 },
             "downscale_factor": { "type": "integer", "minimum": 1, "description": "Backward-compatible ceiling ratio. For exact mapping use source_bounds and image dimensions." },
-            "resize_method": { "type": "string", "enum": ["native", "bilinear"] },
-            "cursor_marker": { "type": "boolean" }
+            "resize_method": { "type": "string", "enum": ["native", "area_average"] },
+            "cursor_marker": { "type": "boolean" },
+            "observation_id": { "type": "string", "description": "Pass with image_x/image_y to pointer tools to act on a point in this image." }
         },
         "required": ["display", "source_bounds", "mime_type", "byte_length", "capture_method", "image_width", "image_height", "downscale_factor", "resize_method", "cursor_marker"],
         "additionalProperties": false

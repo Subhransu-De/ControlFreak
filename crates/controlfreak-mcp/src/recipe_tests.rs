@@ -112,6 +112,10 @@ impl BackendMetadata for Fixture {
 }
 
 impl DisplayBackend for Fixture {
+    fn list_displays(&self) -> Result<Vec<DisplayInfo>, PlatformError> {
+        Ok(vec![display()])
+    }
+
     fn capture_region(
         &self,
         request: &CaptureRegionRequest,
@@ -368,4 +372,107 @@ async fn published_recipes_validate_and_run_on_a_synthetic_desktop() {
             .unwrap()
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn image_points_from_a_cropped_screenshot_reach_the_same_display_pixel() {
+    let backend = Arc::new(Fixture::default());
+    let indicator = SafetyIndicator::dormant();
+    let runtime = Arc::new(IndicatorRuntime::new_with_timing(
+        indicator.clone(),
+        || Ok(FixtureIndicator),
+        Arc::new(LocalArbitrator),
+        GlowTiming {
+            short_hold: Duration::from_secs(30),
+            session_hold: Duration::from_secs(30),
+            max_hold: Duration::from_secs(30),
+        },
+    ));
+    let server = ControlFreakServer::with_indicator(backend.clone(), indicator, Some(runtime));
+    let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+    let serving = tokio::spawn(async move {
+        server
+            .serve(server_io)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap()
+    });
+    let mut client = BufReader::new(client_io);
+    let exchange = super::outcome_tests::exchange;
+    exchange(&mut client, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"image-points","version":"1"}}})).await;
+    client
+        .get_mut()
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}
+",
+        )
+        .await
+        .unwrap();
+    let call = |id: u64, name: &str, arguments: Value| json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}});
+    let captured = exchange(
+        &mut client,
+        call(
+            2,
+            CAPTURE_REGION,
+            json!({"display_id":"fixture","x":100,"y":60,"width":400,"height":200,"max_width":200,"include_cursor":false}),
+        ),
+    )
+    .await;
+    let observation_id = captured["result"]["structuredContent"]["observation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The fixture asserts that image pixel (50, 25) arrives as display-local (200, 110).
+    let clicked = exchange(
+        &mut client,
+        call(
+            3,
+            CLICK_MOUSE,
+            json!({"target_ref":"fixture-target","observation_id":observation_id,
+                   "image_x":50,"image_y":25,"button":"left","observation":{"mode":"none"}}),
+        ),
+    )
+    .await;
+    assert_ne!(clicked["result"]["isError"], true, "{clicked}");
+    assert_eq!(
+        clicked["result"]["structuredContent"]["position"]["local_x"],
+        200
+    );
+    for (id, arguments, reason) in [
+        (
+            4,
+            json!({"target_ref":"fixture-target","observation_id":observation_id,
+                   "image_x":200,"image_y":25,"button":"left"}),
+            "inside the 200x100 image",
+        ),
+        (
+            5,
+            json!({"target_ref":"fixture-target","observation_id":"obs-unknown",
+                   "image_x":1,"image_y":1,"button":"left"}),
+            "not found or has expired",
+        ),
+        (
+            6,
+            json!({"target_ref":"fixture-target","display_id":"fixture","x":1,"y":1,
+                   "observation_id":observation_id,"image_x":1,"image_y":1,"button":"left"}),
+            "provide either",
+        ),
+    ] {
+        let refused = exchange(&mut client, call(id, CLICK_MOUSE, arguments)).await;
+        let content = &refused["result"]["structuredContent"];
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        assert_eq!(
+            content["input"]["input_outcome"], "not_started",
+            "{refused}"
+        );
+        assert!(content.to_string().contains(reason), "{refused}");
+    }
+    assert_eq!(backend.0.lock().unwrap().mutations, 1);
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(10), serving)
+        .await
+        .unwrap()
+        .unwrap();
 }

@@ -104,6 +104,16 @@ Prefer capability-supported UI Automation patterns for checkbox, selection, and 
 when available through a client or another tool. OCR text and checkbox glyphs do not prove control
 state. ControlFreak does not currently implement UI Automation.
 
+## Image-space points
+
+Every returned screenshot includes an `observation_id`. Pointer tools accept that ID with
+`image_x` and `image_y` in the screenshot's own pixels, instead of `display_id` with display-local
+`x` and `y`, and the server maps the point through the screenshot's crop and resize. This avoids
+DPI and resize arithmetic in the client. Give exactly one form per point. IDs keep only geometry,
+expire after five minutes, and at most 64 are retained. Mapped points pass the same target checks
+as direct coordinates. Screenshots are downscaled by area averaging (`resize_method:
+area_average`), which preserves thin text strokes better than sampling.
+
 ## Action results
 
 Mouse, keyboard, OCR-click, window-focus, and desktop-switch results report input dispatch

@@ -4,6 +4,7 @@
 mod cleanup_tests;
 mod diagnostics;
 mod handlers;
+mod observations;
 mod requests;
 mod session;
 mod stop;

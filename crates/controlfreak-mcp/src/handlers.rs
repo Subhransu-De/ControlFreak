@@ -422,18 +422,27 @@ pub(super) async fn call_move_mouse(
     operation_lease: Option<OperationLease>,
 ) -> Result<CallToolResponse, ErrorData> {
     let input = parse_arguments::<MoveMouseInput>(arguments)?;
-    let request = MouseMoveRequest {
-        display_id: input.display_id,
-        x: input.x,
-        y: input.y,
-        duration_ms: input.duration_ms,
-        observation: input.observation.into(),
+    let target = match input.pointer_target() {
+        Ok(target) => target,
+        Err(error) => return Ok(not_started(&error)),
     };
+    let duration_ms = input.duration_ms;
+    let observation = input.observation.into();
     let (result, progress) = run_mutation_operation(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
-        move |control| backend.move_mouse_controlled(&request, control),
+        move |control| {
+            let (display_id, x, y) = target.resolve(backend.as_ref())?;
+            let request = MouseMoveRequest {
+                display_id,
+                x,
+                y,
+                duration_ms,
+                observation,
+            };
+            backend.move_mouse_controlled(&request, control)
+        },
     )
     .await;
     match result {
@@ -449,22 +458,33 @@ pub(super) async fn call_click_mouse(
     operation_lease: Option<OperationLease>,
 ) -> Result<CallToolResponse, ErrorData> {
     let input = parse_arguments::<ClickMouseInput>(arguments)?;
-    let button = input.button;
-    let click_request = MouseClickRequest {
-        display_id: input.display_id,
-        x: input.x,
-        y: input.y,
-        button,
-        click_count: input.click_count,
-        modifiers: input.modifiers.clone(),
-        duration_ms: input.duration_ms,
-        observation: input.observation.into(),
+    let target = match input.pointer_target() {
+        Ok(target) => target,
+        Err(error) => return Ok(not_started(&error)),
     };
+    let button = input.button;
+    let click_count = input.click_count;
+    let modifiers = input.modifiers.clone();
+    let duration_ms = input.duration_ms;
+    let observation = input.observation.into();
     let (result, progress) = run_mutation_operation(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
-        move |control| backend.click_mouse_controlled(&click_request, control),
+        move |control| {
+            let (display_id, x, y) = target.resolve(backend.as_ref())?;
+            let click_request = MouseClickRequest {
+                display_id,
+                x,
+                y,
+                button,
+                click_count,
+                modifiers,
+                duration_ms,
+                observation,
+            };
+            backend.click_mouse_controlled(&click_request, control)
+        },
     )
     .await;
     match result {
@@ -489,38 +509,42 @@ pub(super) async fn call_drag_mouse(
     operation_lease: Option<OperationLease>,
 ) -> Result<CallToolResponse, ErrorData> {
     let input = parse_arguments::<DragMouseInput>(arguments)?;
+    let (start, end) = match input.pointer_targets() {
+        Ok(targets) => targets,
+        Err(error) => return Ok(not_started(&error)),
+    };
     let action = json!({
         "kind": "drag",
         "button": input.button,
         "modifiers": input.modifiers,
-        "start": {
-            "display_id": input.start_display_id,
-            "x": input.start_x,
-            "y": input.start_y,
-        },
-        "end": {
-            "display_id": input.end_display_id,
-            "x": input.end_x,
-            "y": input.end_y,
-        },
+        "start": start.to_json(),
+        "end": end.to_json(),
     });
-    let request = MouseDragRequest {
-        start_display_id: input.start_display_id,
-        start_x: input.start_x,
-        start_y: input.start_y,
-        end_display_id: input.end_display_id,
-        end_x: input.end_x,
-        end_y: input.end_y,
-        button: input.button,
-        modifiers: input.modifiers,
-        duration_ms: input.duration_ms,
-        observation: input.observation.into(),
-    };
+    let button = input.button;
+    let modifiers = input.modifiers;
+    let duration_ms = input.duration_ms;
+    let observation = input.observation.into();
     let (result, progress) = run_mutation_operation(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
-        move |control| backend.drag_mouse_controlled(&request, control),
+        move |control| {
+            let (start_display_id, start_x, start_y) = start.resolve(backend.as_ref())?;
+            let (end_display_id, end_x, end_y) = end.resolve(backend.as_ref())?;
+            let request = MouseDragRequest {
+                start_display_id,
+                start_x,
+                start_y,
+                end_display_id,
+                end_x,
+                end_y,
+                button,
+                modifiers,
+                duration_ms,
+                observation,
+            };
+            backend.drag_mouse_controlled(&request, control)
+        },
     )
     .await;
     match result {
@@ -721,22 +745,31 @@ pub(super) async fn call_scroll_mouse(
     operation_lease: Option<OperationLease>,
 ) -> Result<CallToolResponse, ErrorData> {
     let input = parse_arguments::<ScrollMouseInput>(arguments)?;
+    let target = match input.pointer_target() {
+        Ok(target) => target,
+        Err(error) => return Ok(not_started(&error)),
+    };
     let delta_x = input.delta_x;
     let delta_y = input.delta_y;
-    let scroll_request = MouseScrollRequest {
-        display_id: input.display_id,
-        x: input.x,
-        y: input.y,
-        delta_x,
-        delta_y,
-        duration_ms: input.duration_ms,
-        observation: input.observation.into(),
-    };
+    let duration_ms = input.duration_ms;
+    let observation = input.observation.into();
     let (result, progress) = run_mutation_operation(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
-        move |control| backend.scroll_mouse_controlled(&scroll_request, control),
+        move |control| {
+            let (display_id, x, y) = target.resolve(backend.as_ref())?;
+            let scroll_request = MouseScrollRequest {
+                display_id,
+                x,
+                y,
+                delta_x,
+                delta_y,
+                duration_ms,
+                observation,
+            };
+            backend.scroll_mouse_controlled(&scroll_request, control)
+        },
     )
     .await;
     match result {
@@ -752,4 +785,9 @@ pub(super) async fn call_scroll_mouse(
         Err(error) => Ok(tool_error(&error).into()),
     }
     .map(|response| super::results::with_progress(response, progress))
+}
+
+/// A tool error for a request rejected before any desktop work, with not-started progress.
+fn not_started(error: &PlatformError) -> CallToolResponse {
+    super::results::with_progress(tool_error(error).into(), MutationProgress::default())
 }

@@ -11,14 +11,27 @@ fn screenshot_metadata(screenshot: &DisplayScreenshot) -> Value {
         "image_width": screenshot.image_width,
         "image_height": screenshot.image_height,
         "downscale_factor": screenshot.downscale_factor,
-        "resize_method": if screenshot.image_width == screenshot.source_bounds.width
-            && screenshot.image_height == screenshot.source_bounds.height {
-            "native"
-        } else {
-            "bilinear"
-        },
+        "resize_method": resize_method(
+            screenshot.source_bounds.width,
+            screenshot.source_bounds.height,
+            screenshot.image_width,
+            screenshot.image_height,
+        ),
         "cursor_marker": screenshot.cursor_marker,
+        "observation_id": super::observations::register(
+            screenshot.source_bounds,
+            screenshot.image_width,
+            screenshot.image_height,
+        ),
     })
+}
+
+fn resize_method(source_width: u32, source_height: u32, width: u32, height: u32) -> &'static str {
+    if width == source_width && height == source_height {
+        "native"
+    } else {
+        "area_average"
+    }
 }
 
 pub(super) fn visual_change_result(result: &VisualChangeResult) -> CallToolResult {
@@ -58,13 +71,23 @@ pub(super) fn window_screenshot_result(screenshot: &WindowScreenshot) -> CallToo
             "image_width": screenshot.image_width,
             "image_height": screenshot.image_height,
             "downscale_factor": screenshot.downscale_factor,
-            "resize_method": if screenshot.image_width == screenshot.source_bounds.width
-                && screenshot.image_height == screenshot.source_bounds.height {
-                "native"
-            } else {
-                "bilinear"
-            },
+            "resize_method": resize_method(
+                screenshot.source_bounds.width,
+                screenshot.source_bounds.height,
+                screenshot.image_width,
+                screenshot.image_height,
+            ),
             "cursor_marker": screenshot.cursor_marker,
+            "observation_id": super::observations::register(
+                controlfreak_core::DisplayBounds {
+                    left: screenshot.source_bounds.left,
+                    top: screenshot.source_bounds.top,
+                    width: screenshot.source_bounds.width,
+                    height: screenshot.source_bounds.height,
+                },
+                screenshot.image_width,
+                screenshot.image_height,
+            ),
         }),
     )
 }
