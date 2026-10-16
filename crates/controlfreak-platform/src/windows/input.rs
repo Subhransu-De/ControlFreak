@@ -224,8 +224,7 @@ where
     F: FnMut() -> Result<(), PlatformError>,
     S: FnMut(&[INPUT]) -> Result<usize, PlatformError>,
 {
-    const UNITS_PER_BATCH: usize = 50;
-    for batch in utf16.chunks(UNITS_PER_BATCH) {
+    for batch in unicode_batches(utf16) {
         control.check("type_text")?;
         let mut inputs = Vec::with_capacity(batch.len() * 2);
         for unit in batch {
@@ -234,11 +233,30 @@ where
         }
         validate_target()?;
         send_releasing("type_text", &inputs, control, &mut send)?;
-        if batch.len() == UNITS_PER_BATCH {
+        if batch.len() + 1 >= UNITS_PER_TEXT_BATCH {
             thread::sleep(Duration::from_millis(2));
         }
     }
     Ok(())
+}
+
+const UNITS_PER_TEXT_BATCH: usize = 50;
+
+// Batches end before a high surrogate so a refusal between batches cannot leave half a character.
+fn unicode_batches(utf16: &[u16]) -> impl Iterator<Item = &[u16]> {
+    let mut rest = utf16;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let mut end = rest.len().min(UNITS_PER_TEXT_BATCH);
+        if end < rest.len() && (0xD800..=0xDBFF).contains(&rest[end - 1]) {
+            end -= 1;
+        }
+        let (batch, remaining) = rest.split_at(end);
+        rest = remaining;
+        Some(batch)
+    })
 }
 
 fn virtual_key(key: Key) -> (VIRTUAL_KEY, bool) {
@@ -857,7 +875,9 @@ mod progress_tests {
                     );
                     assert!(result.is_err());
                     let progress = control.progress();
-                    assert_eq!(progress.sent_events, failed_batch * 100 + accepted as u64);
+                    // The first batch stops one unit early instead of ending on a high surrogate.
+                    let earlier_events = [0, 98, 198][usize::try_from(failed_batch).unwrap()];
+                    assert_eq!(progress.sent_events, earlier_events + accepted as u64);
                     assert_eq!(
                         progress.input_outcome,
                         if failed_batch == 0 && accepted == 0 {
@@ -878,6 +898,22 @@ mod progress_tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn text_batches_never_split_a_surrogate_pair() {
+        for prefix in 0..60 {
+            let text: Vec<u16> = format!("{}\u{1f980}\u{1f980}", "a".repeat(prefix))
+                .encode_utf16()
+                .collect();
+            let batches: Vec<&[u16]> = unicode_batches(&text).collect();
+            assert_eq!(batches.concat(), text);
+            assert!(batches.iter().all(|batch| {
+                !batch.is_empty()
+                    && batch.len() <= UNITS_PER_TEXT_BATCH
+                    && !(0xD800..=0xDBFF).contains(batch.last().unwrap())
+            }));
         }
     }
 
