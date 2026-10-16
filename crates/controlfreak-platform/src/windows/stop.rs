@@ -9,7 +9,6 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
 };
 use windows::{
     Win32::{
@@ -28,12 +27,12 @@ use windows::{
             WindowsAndMessaging::{
                 CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
                 GetClientRect, HHOOK, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG,
-                PM_REMOVE, PeekMessageW, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
-                SWP_NOACTIVATE, SetWindowDisplayAffinity, SetWindowPos, SetWindowsHookExW,
-                ShowWindow, UnhookWindowsHookEx, UnregisterClassW, WDA_EXCLUDEFROMCAPTURE,
-                WH_KEYBOARD_LL, WM_CLOSE, WM_KEYDOWN, WM_KEYUP, WM_PAINT, WM_SYSKEYDOWN,
-                WM_SYSKEYUP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-                WS_POPUP,
+                MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassW,
+                SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetWindowDisplayAffinity, SetWindowPos,
+                SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, UnregisterClassW,
+                WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WM_CLOSE, WM_KEYDOWN, WM_KEYUP, WM_PAINT,
+                WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+                WS_EX_TOPMOST, WS_POPUP,
             },
         },
     },
@@ -290,7 +289,12 @@ fn run(
             }
             visible = active;
         }
-        thread::sleep(Duration::from_millis(10));
+        // Low-level keyboard hook calls arrive as sent messages on this thread. Wake for them at
+        // once: sleeping here would delay every keystroke on the system, injected or physical.
+        // SAFETY: No handles are passed; the call only waits on this thread's message queue.
+        unsafe {
+            let _ = MsgWaitForMultipleObjects(None, false, 10, QS_ALLINPUT);
+        }
     }
     Ok(())
 }
