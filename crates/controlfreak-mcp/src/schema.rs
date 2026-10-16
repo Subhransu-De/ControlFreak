@@ -987,6 +987,7 @@ fn action_output_schema(include_position: bool) -> Arc<JsonObject> {
         "properties": {
             "operation": {"type": "string"},
             "warning": {"type": "string"},
+            "details": {"type": "object", "description": "run_actions: per-step reports when the final observation failed."},
             "error": {
                 "type": "object",
                 "properties": {"code": {"type": "string"}, "message": {"type": "string"}, "details": {}},

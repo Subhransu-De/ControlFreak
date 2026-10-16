@@ -9,6 +9,8 @@ use tokio::io::{AsyncWriteExt, BufReader};
 /// Records each dispatched step and fails the step whose zero-based number is `fail_at`.
 struct Scripted {
     fail_at: Option<usize>,
+    /// Step whose input is delivered but whose post-action observation then fails.
+    observation_fails_at: Option<usize>,
     calls: Mutex<Vec<String>>,
 }
 
@@ -26,6 +28,12 @@ impl Scripted {
         control.dispatch_started();
         control.dispatch_accepted(2);
         control.input_complete();
+        if self.observation_fails_at == Some(index) {
+            return Err(PlatformError::PostActionObservationFailed {
+                operation: "synthetic".into(),
+                reason: "display topology changed".into(),
+            });
+        }
         Ok(())
     }
 }
@@ -140,8 +148,17 @@ impl OcrBackend for Scripted {}
 impl WindowBackend for Scripted {}
 
 async fn run(fail_at: Option<usize>, arguments: Value) -> (Value, Vec<String>) {
+    run_scripted(fail_at, None, arguments).await
+}
+
+async fn run_scripted(
+    fail_at: Option<usize>,
+    observation_fails_at: Option<usize>,
+    arguments: Value,
+) -> (Value, Vec<String>) {
     let backend = Arc::new(Scripted {
         fail_at,
+        observation_fails_at,
         calls: Mutex::new(Vec::new()),
     });
     let server =
@@ -266,4 +283,42 @@ async fn invalid_later_steps_are_refused_before_any_input() {
         assert_eq!(content["status"], "not_started", "{bad}: {content}");
         assert!(calls.is_empty(), "{bad}: {calls:?}");
     }
+}
+
+#[tokio::test]
+async fn observation_failures_report_steps_and_true_delivery() {
+    let statuses = |steps: &Value| -> Vec<String> {
+        steps
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["status"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    // A middle step sent its input, then its check failed: later steps never ran.
+    let (content, calls) = run_scripted(
+        None,
+        Some(1),
+        json!({"target_ref": "fixture", "steps": steps()}),
+    )
+    .await;
+    assert_eq!(content["status"], "partially_sent", "{content}");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        statuses(&content["error"]["details"]["steps"]),
+        ["completed", "failed", "skipped", "skipped"]
+    );
+    // Only the final evidence failed: every step was delivered.
+    let (content, calls) = run_scripted(
+        None,
+        Some(3),
+        json!({"target_ref": "fixture", "steps": steps()}),
+    )
+    .await;
+    assert_eq!(content["status"], "completed_unverified", "{content}");
+    assert_eq!(calls.len(), 4);
+    assert_eq!(
+        statuses(&content["details"]["steps"]),
+        ["completed", "completed", "completed", "completed"]
+    );
 }

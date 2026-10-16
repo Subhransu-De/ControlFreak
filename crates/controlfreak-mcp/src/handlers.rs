@@ -840,10 +840,13 @@ pub(super) async fn call_run_actions(
         }
         Err(error) => {
             let mut response = tool_error(&error);
-            if let Some(content) = response.structured_content.as_mut()
-                && content.get("error").is_some()
-            {
-                content["error"]["details"]["steps"] = action["steps"].clone();
+            if let Some(content) = response.structured_content.as_mut() {
+                if content.get("error").is_some() {
+                    content["error"]["details"]["steps"] = action["steps"].clone();
+                } else {
+                    // The completed-but-unverified variant carries a warning, not an error.
+                    content["details"] = json!({ "steps": action["steps"] });
+                }
             }
             Ok(response.into())
         }
@@ -922,6 +925,15 @@ fn run_steps(
                 observation = Some(step_observation);
             }
             Err(error) => {
+                let observation_failed =
+                    matches!(error, PlatformError::PostActionObservationFailed { .. });
+                if observation_failed && index + 1 == steps.len() {
+                    // Every step's input was sent; only the final evidence is missing.
+                    report(
+                        json!({ "index": index, "action": step.kind(), "status": "completed", "sent_events": sent_events, "error": error.to_string() }),
+                    );
+                    return Err(error);
+                }
                 report(
                     json!({ "index": index, "action": step.kind(), "status": "failed", "sent_events": sent_events, "error": error.to_string() }),
                 );
@@ -930,11 +942,22 @@ fn run_steps(
                         json!({ "index": skipped, "action": step.kind(), "status": "skipped", "sent_events": 0 }),
                     );
                 }
-                if index > 0 && !matches!(error, PlatformError::PostActionObservationFailed { .. })
-                {
+                if index > 0 || observation_failed {
                     control.steps_incomplete();
                 }
-                return Err(error);
+                // A non-final step that sent input but failed its post-action check still
+                // stopped the batch, so report it as a failure, not as unverified completion.
+                return Err(match error {
+                    PlatformError::PostActionObservationFailed { operation, reason } => {
+                        PlatformError::OperationFailed {
+                            operation: "run_actions".to_owned(),
+                            reason: format!(
+                                "step {index} ({operation}) sent its input but its post-action check failed: {reason}; later steps were skipped"
+                            ),
+                        }
+                    }
+                    other => other,
+                });
             }
         }
     }

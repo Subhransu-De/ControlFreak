@@ -905,10 +905,11 @@ impl WindowBackend for Backend {
                     .0
                     .into_iter()
                     .filter(|candidate| target.is_none_or(|hwnd| hwnd == candidate.hwnd))
-                    .find(|candidate| window_matches(&candidate.window, request))
+                    .filter(|candidate| window_matches(&candidate.window, request))
+                    // A match can vanish before its reference is issued; try the next one.
                     .map(issue_candidate)
+                    .find_map(Result::transpose)
                     .transpose()?
-                    .flatten()
             };
             if let Some(window) = matched {
                 return Ok(WindowWaitResult {
