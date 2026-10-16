@@ -122,7 +122,8 @@ points and whether each point lies on an active display, are checked before the 
 so a malformed later step refuses the whole batch without input. Live checks that depend on
 desktop state, such as foreground ownership and the window under a point, run per step. Each step uses the same target checks, settle wait, and release cleanup as its
 single-action tool, and only the last step captures the requested observation. The batch stops at
-the first failure: `action.steps` (or `error.details.steps` on failure) reports each step as
+the first failure: `action.steps` (`error.details.steps` on failure, or `details.steps` when every
+step was sent but the final observation failed) reports each step as
 `completed`, `failed`, or `skipped` with its accepted event count, and `status` is
 `partially_sent` when earlier steps already ran. Use it for a known sequence such as filling a
 form; observe between calls when a later step depends on what an earlier one shows.
