@@ -244,7 +244,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "controlfreak-core"
-version = "0.1.0-alpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -254,7 +254,7 @@ dependencies = [
 
 [[package]]
 name = "controlfreak-installer"
-version = "0.1.0-alpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "controlfreak-platform",
  "jsonc-parser",
@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "controlfreak-mcp"
-version = "0.1.0-alpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "base64",
  "controlfreak-core",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "controlfreak-platform"
-version = "0.1.0-alpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "controlfreak-core",
  "png",
@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "controlfreak-server"
-version = "0.1.0-alpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "base64",
  "controlfreak-core",
@@ -1691,7 +1691,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xtask"
-version = "0.1.0-alpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "clap",
  "controlfreak-platform",
