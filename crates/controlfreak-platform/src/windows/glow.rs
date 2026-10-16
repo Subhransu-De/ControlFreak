@@ -116,12 +116,13 @@ pub(crate) fn run(config: HelperConfig) -> io::Result<()> {
     let started = Instant::now();
     let mut next_frame = Instant::now();
     let mut next_topology = Instant::now() + TOPOLOGY_INTERVAL;
+    let mut early = None;
     loop {
         if !pump_messages() {
             return Ok(());
         }
 
-        while let Ok(event) = receiver.try_recv() {
+        while let Some(event) = early.take().or_else(|| receiver.try_recv().ok()) {
             match event {
                 InputEvent::Line(line) => {
                     let Some(command) = parse_command(&line, config.generation)? else {
@@ -178,7 +179,11 @@ pub(crate) fn run(config: HelperConfig) -> io::Result<()> {
         } else {
             Duration::from_millis(20)
         };
-        thread::sleep(sleep.min(Duration::from_millis(20)));
+        // Wake for the next command instead of sleeping through it; the server waits for its
+        // acknowledgement before each input action.
+        early = receiver
+            .recv_timeout(sleep.min(Duration::from_millis(20)))
+            .ok();
     }
 }
 
