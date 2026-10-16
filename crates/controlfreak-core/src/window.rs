@@ -72,3 +72,11 @@ pub struct WindowWaitResult {
     pub elapsed_ms: u64,
     pub window: Option<WindowInfo>,
 }
+
+/// Visible windows in foreground-then-title order, capped by the backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowList {
+    pub windows: Vec<WindowInfo>,
+    /// More eligible windows existed than the backend returned.
+    pub truncated: bool,
+}

@@ -172,6 +172,12 @@ impl OcrBackend for SyntheticBackend {
     }
 }
 impl WindowBackend for SyntheticBackend {
+    fn list_windows(&self) -> Result<controlfreak_core::WindowList, PlatformError> {
+        Ok(controlfreak_core::WindowList {
+            windows: vec![synthetic_window()],
+            truncated: true,
+        })
+    }
     fn focus_window_controlled(
         &self,
         _: &FocusWindowRequest,
@@ -182,21 +188,7 @@ impl WindowBackend for SyntheticBackend {
             WindowFocusResult {
                 attempts: 1,
                 elapsed_ms: 0,
-                window: controlfreak_core::WindowInfo {
-                    id: "synthetic".into(),
-                    title: "synthetic".into(),
-                    class_name: "synthetic".into(),
-                    process_id: 1,
-                    bounds: controlfreak_core::WindowBounds {
-                        left: -100,
-                        top: 0,
-                        width: 10,
-                        height: 10,
-                    },
-                    display_id: "synthetic".into(),
-                    is_foreground: true,
-                    is_minimized: false,
-                },
+                window: synthetic_window(),
                 observation: observation(),
             },
         )
@@ -215,6 +207,24 @@ impl WindowBackend for SyntheticBackend {
                 observation: observation(),
             },
         )
+    }
+}
+
+fn synthetic_window() -> controlfreak_core::WindowInfo {
+    controlfreak_core::WindowInfo {
+        id: "synthetic".into(),
+        title: "synthetic".into(),
+        class_name: "synthetic".into(),
+        process_id: 1,
+        bounds: controlfreak_core::WindowBounds {
+            left: -100,
+            top: 0,
+            width: 10,
+            height: 10,
+        },
+        display_id: "synthetic".into(),
+        is_foreground: true,
+        is_minimized: false,
     }
 }
 
@@ -266,6 +276,18 @@ async fn every_action_result_validates_against_tools_list_over_transport() {
     .await;
     let tools = listed["result"]["tools"].as_array().unwrap();
     assert_window_input_schemas(tools);
+    let schema = &tools
+        .iter()
+        .find(|tool| tool["name"] == LIST_WINDOWS)
+        .unwrap()["outputSchema"];
+    let listed_windows = exchange(&mut client, json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":LIST_WINDOWS,"arguments":{}}})).await;
+    let content = &listed_windows["result"]["structuredContent"];
+    assert!(
+        jsonschema::validator_for(schema).unwrap().is_valid(content),
+        "{content}"
+    );
+    assert_eq!(content["truncated"], true);
+    assert_eq!(content["count"], 1);
     let actions = action_requests();
     for (mode, status) in [
         "completed",

@@ -26,7 +26,7 @@ use controlfreak_core::{
     VirtualDesktopDirection, VirtualDesktopInfo, VirtualDesktopList, VirtualDesktopSwitchRequest,
     VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest, VisualChangeResult,
     WaitForChangeSinceRequest, WaitForVisualChangeRequest, WaitForWindowRequest, WindowBackend,
-    WindowBounds, WindowFocusResult, WindowInfo, WindowScreenshot, WindowWaitResult,
+    WindowBounds, WindowFocusResult, WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
 };
 use windows::Win32::{
     Foundation::{E_ACCESSDENIED, HWND, LPARAM, POINT, RECT, RPC_E_CHANGED_MODE},
@@ -110,10 +110,10 @@ use capture::{
 };
 use desktop::{
     ComApartment, activate_window, current_cursor_position, current_virtual_desktop_id,
-    ensure_dpi_awareness, enumerate_displays, enumerate_windows, find_display,
-    find_display_at_point, find_window, foreground_window_handle, parse_window_id, restore_window,
-    validate_window_wait, virtual_desktop_manager, window_desktop_id, window_info,
-    window_is_on_current_desktop, window_matches,
+    ensure_dpi_awareness, enumerate_displays, enumerate_window_candidates, enumerate_windows,
+    find_display, find_display_at_point, find_window, foreground_window_handle, issue_candidate,
+    parse_window_id, restore_window, validate_window_wait, virtual_desktop_manager,
+    window_desktop_id, window_info, window_is_on_current_desktop, window_matches,
 };
 use environment::ensure_interactive_input_desktop;
 use input::{
@@ -635,9 +635,10 @@ impl OcrBackend for Backend {
 }
 
 impl WindowBackend for Backend {
-    fn list_windows(&self) -> Result<Vec<WindowInfo>, PlatformError> {
+    fn list_windows(&self) -> Result<WindowList, PlatformError> {
         ensure_dpi_awareness()?;
-        enumerate_windows()
+        let (windows, truncated) = enumerate_windows()?;
+        Ok(WindowList { windows, truncated })
     }
 
     fn list_virtual_desktops(&self) -> Result<VirtualDesktopList, PlatformError> {
@@ -647,7 +648,7 @@ impl WindowBackend for Backend {
         let current_id = current_virtual_desktop_id(&manager);
         let mut current_ids = std::collections::BTreeSet::<String>::new();
         let mut grouped = std::collections::BTreeMap::<String, Vec<WindowInfo>>::new();
-        for window in enumerate_windows()? {
+        for window in enumerate_windows()?.0 {
             let Ok((hwnd, _)) = parse_window_id(&window.id) else {
                 continue;
             };
@@ -848,10 +849,27 @@ impl WindowBackend for Backend {
         let started = Instant::now();
         let deadline = started + Duration::from_millis(u64::from(request.timeout_ms));
         loop {
-            if let Some(window) = enumerate_windows()?
-                .into_iter()
-                .find(|window| window_matches(window, request))
-            {
+            // A window_id names one handle; matching it never depends on the list_windows cap.
+            let target = match &request.window_id {
+                Some(id) => match parse_window_id(id) {
+                    Ok((hwnd, _)) => Some(hwnd),
+                    Err(_) => None,
+                },
+                None => None,
+            };
+            let matched = if request.window_id.is_some() && target.is_none() {
+                None
+            } else {
+                enumerate_window_candidates()?
+                    .0
+                    .into_iter()
+                    .filter(|candidate| target.is_none_or(|hwnd| hwnd == candidate.hwnd))
+                    .find(|candidate| window_matches(&candidate.window, request))
+                    .map(issue_candidate)
+                    .transpose()?
+                    .flatten()
+            };
+            if let Some(window) = matched {
                 return Ok(WindowWaitResult {
                     matched: true,
                     timed_out: false,
@@ -1457,7 +1475,8 @@ mod tests {
         let backend = Backend::new();
         let windows = backend
             .list_windows()
-            .expect("enumerate visible Windows windows");
+            .expect("enumerate visible Windows windows")
+            .windows;
 
         assert!(windows.iter().all(|window| !window.title.is_empty()));
         assert!(

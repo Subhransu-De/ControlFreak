@@ -488,9 +488,10 @@ pub(super) async fn call_list_windows(
     parse_arguments::<NoArguments>(arguments)?;
     let result = run_platform_operation(operation_lease, move || backend.list_windows()).await?;
     match result {
-        Ok(windows) => Ok(CallToolResult::structured(json!({
-            "count": windows.len(),
-            "windows": windows,
+        Ok(list) => Ok(CallToolResult::structured(json!({
+            "count": list.windows.len(),
+            "truncated": list.truncated,
+            "windows": list.windows,
         }))
         .into()),
         Err(error) => Ok(tool_error(&error).into()),

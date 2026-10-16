@@ -47,5 +47,5 @@ pub use stop::{StopController, StopRegistration};
 pub use text_matching::{discover_text, select_text_candidate, validate_text_discovery};
 pub use window::{
     CaptureWindowRequest, FocusWindowRequest, WaitForWindowRequest, WindowBounds,
-    WindowFocusResult, WindowInfo, WindowScreenshot, WindowWaitResult,
+    WindowFocusResult, WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
 };

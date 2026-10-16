@@ -436,16 +436,17 @@ fn switch_virtual_desktop_tool() -> Tool {
 fn list_windows_tool() -> Tool {
     Tool::new(
         LIST_WINDOWS,
-        "List visible titled top-level windows. Refresh IDs after windows open, close, or change ownership.",
+        "List visible titled top-level windows, foreground first, then by title. Returns at most 200; truncated=true means more exist, so use wait_for_window with title_contains, class_name, or process_id to reach them. Refresh IDs after windows open, close, or change ownership.",
         object_schema(JsonObject::new(), &[]),
     )
     .with_raw_output_schema(Arc::new(rmcp::object!({
         "type": "object",
         "properties": {
             "count": { "type": "integer", "minimum": 0 },
+            "truncated": { "type": "boolean", "description": "More eligible windows existed than were returned." },
             "windows": { "type": "array", "items": window_schema() }
         },
-        "required": ["count", "windows"],
+        "required": ["count", "truncated", "windows"],
         "additionalProperties": false
     })))
     .with_annotations(

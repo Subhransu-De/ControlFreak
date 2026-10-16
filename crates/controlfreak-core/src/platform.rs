@@ -9,7 +9,7 @@ use crate::{
     SecurityContext, TextInputRequest, VirtualDesktopList, VirtualDesktopSwitchRequest,
     VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest, VisualChangeResult,
     WaitForChangeSinceRequest, WaitForVisualChangeRequest, WaitForWindowRequest, WindowFocusResult,
-    WindowInfo, WindowScreenshot, WindowWaitResult,
+    WindowList, WindowScreenshot, WindowWaitResult,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,7 +293,7 @@ pub trait PointerBackend {
 
 /// Enumerates, observes, and focuses windows and virtual desktops.
 pub trait WindowBackend {
-    fn list_windows(&self) -> Result<Vec<WindowInfo>, PlatformError> {
+    fn list_windows(&self) -> Result<WindowList, PlatformError> {
         Err(PlatformError::unsupported(
             "list_windows",
             "the active platform backend has no window-enumeration implementation",
