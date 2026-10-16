@@ -673,7 +673,7 @@ pub(super) fn recognize_text(
             let _ = operation.Cancel();
             break;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(2));
     }
     let recognized = operation.join().map_err(ocr_error)?;
     control.check("windows_ocr")?;

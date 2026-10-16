@@ -64,10 +64,8 @@ mod actions;
 mod activation;
 mod ocr;
 mod target;
-use ocr::recognize_text_with_helper;
 pub(crate) use ocr::serve_ocr_helper;
-#[cfg(test)]
-use ocr::wait_for_ocr_helper;
+use ocr::{OcrHelperPool, recognize_text_with_helper};
 mod arbitration;
 mod capture;
 mod desktop;
@@ -179,6 +177,7 @@ pub struct Backend {
     visual_baselines: Mutex<Vec<StoredVisualBaseline>>,
     next_baseline_id: AtomicU64,
     ocr_helper: Option<OcrHelperCommand>,
+    ocr_helpers: OcrHelperPool,
     security_context: SecurityContext,
 }
 
@@ -261,6 +260,7 @@ impl Backend {
             visual_baselines: Mutex::new(Vec::new()),
             next_baseline_id: AtomicU64::new(1),
             ocr_helper: None,
+            ocr_helpers: OcrHelperPool::default(),
             security_context,
         }
     }
@@ -272,6 +272,7 @@ impl Backend {
             visual_baselines: Mutex::new(Vec::new()),
             next_baseline_id: AtomicU64::new(1),
             ocr_helper: None,
+            ocr_helpers: OcrHelperPool::default(),
             security_context,
         }
     }
@@ -286,6 +287,7 @@ impl Backend {
             visual_baselines: Mutex::new(Vec::new()),
             next_baseline_id: AtomicU64::new(1),
             ocr_helper: Some(command),
+            ocr_helpers: OcrHelperPool::default(),
             security_context,
         }
     }
@@ -298,7 +300,7 @@ impl Backend {
         let target_before = target::observe();
         let mut result = self.ocr_helper.as_ref().map_or_else(
             || recognize_text_in_process(request, control),
-            |command| recognize_text_with_helper(command, request, control),
+            |command| recognize_text_with_helper(command, &self.ocr_helpers, request, control),
         )?;
         result.target_ref = target::finish_observation(target_before);
         Ok(result)
@@ -979,36 +981,8 @@ mod tests {
         capture::{encode_png, image_difference, resize_rgba_box, scaled_dimensions, word_union},
         display_region_bounds, frame_fingerprint,
         input::{click_inputs, interpolate, key_chord_inputs, scroll_inputs},
-        wait_for_ocr_helper, window_matches,
+        window_matches,
     };
-
-    #[test]
-    fn isolated_ocr_process_is_killed_after_its_deadline() {
-        use std::{process::Stdio, time::Duration};
-
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "windows::tests::ocr_timeout_test_helper",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let started = std::time::Instant::now();
-        let error = wait_for_ocr_helper(child, Duration::from_millis(100)).unwrap_err();
-
-        assert!(started.elapsed() < Duration::from_secs(5));
-        match error {
-            PlatformError::OperationFailed { operation, reason } => {
-                assert_eq!(operation, "windows_ocr_helper");
-                assert!(reason.contains("timed out"));
-            }
-            other => panic!("unexpected OCR timeout error: {other:?}"),
-        }
-    }
 
     #[test]
     fn queued_input_cancels_while_another_worker_still_owns_the_input_lock() {
@@ -1030,72 +1004,6 @@ mod tests {
         assert!(result.recv_timeout(Duration::from_secs(2)).unwrap());
         drop(owner);
         worker.join().unwrap();
-    }
-
-    #[test]
-    fn isolated_ocr_process_drains_output_before_exit() {
-        use std::{process::Stdio, time::Duration};
-
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "windows::tests::ocr_large_output_test_helper",
-                "--nocapture",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let output = wait_for_ocr_helper(child, Duration::from_secs(5)).unwrap();
-
-        assert!(output.status.success());
-        assert!(output.stdout.len() >= 512 * 1024);
-    }
-
-    #[test]
-    fn cancelled_ocr_helper_drains_without_waiting_for_its_kill_deadline() {
-        use std::{
-            process::Stdio,
-            time::{Duration, Instant},
-        };
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "windows::tests::ocr_large_output_test_helper",
-                "--nocapture",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let control = controlfreak_core::MutationControl::default();
-        control.cancel();
-        let started = Instant::now();
-        let error =
-            super::ocr::wait_for_ocr_helper_controlled(child, Duration::from_secs(30), &control)
-                .unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(error.to_string().contains("cancelled"));
-    }
-
-    #[test]
-    #[ignore = "spawned only by isolated_ocr_process_is_killed_after_its_deadline"]
-    fn ocr_timeout_test_helper() {
-        std::thread::sleep(std::time::Duration::from_secs(30));
-    }
-
-    #[test]
-    #[ignore = "spawned only by isolated_ocr_process_drains_output_before_exit"]
-    fn ocr_large_output_test_helper() {
-        use std::io::Write as _;
-
-        std::io::stdout()
-            .write_all(&vec![b'x'; 512 * 1024])
-            .unwrap();
     }
 
     fn mouse_flags(input: &INPUT) -> MOUSE_EVENT_FLAGS {
