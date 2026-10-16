@@ -102,6 +102,7 @@ fn unavailable(reason: impl std::fmt::Display) -> PlatformError {
 }
 
 fn identity(hwnd: HWND) -> Result<Identity, PlatformError> {
+    let _timer = controlfreak_core::timing::start("identity");
     let mut pid = 0;
     // SAFETY: These queries retain no pointers; pid is writable for the synchronous call.
     let thread = unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
@@ -141,10 +142,11 @@ fn identity(hwnd: HWND) -> Result<Identity, PlatformError> {
         .filter(|length| *length > 0)
         .ok_or_else(|| invalid("window class cannot be verified"))?;
     let owner = window_owner(hwnd)?;
-    let _apartment = desktop::ComApartment::initialize().map_err(unavailable)?;
-    let manager = desktop::virtual_desktop_manager().map_err(unavailable)?;
-    let desktop = desktop::window_desktop_id(&manager, hwnd)
-        .map_err(|_| invalid("window desktop cannot be verified"))?;
+    let desktop = controlfreak_core::timing::time("identity_desktop", || {
+        desktop::with_virtual_desktop_manager(|manager| desktop::window_desktop_id(manager, hwnd))
+    })
+    .map_err(unavailable)?
+    .map_err(|_| invalid("window desktop cannot be verified"))?;
     Ok(Identity {
         hwnd: hwnd.0 as usize,
         pid,
@@ -459,19 +461,28 @@ fn validate_reference(
     operation: &str,
     point: Option<windows::Win32::Foundation::POINT>,
 ) -> Result<(), PlatformError> {
-    ensure_interactive_input_desktop(operation)?;
+    controlfreak_core::timing::time("check_input_desktop", || {
+        ensure_interactive_input_desktop(operation)
+    })?;
     let (hwnd, _) = resolve(id)?;
     let foreground = desktop::foreground_window_handle();
-    privilege::ensure_window_integrity(operation, foreground)?;
-    privilege::ensure_window_integrity(operation, hwnd)?;
-    let _apartment = desktop::ComApartment::initialize()?;
-    let manager = desktop::virtual_desktop_manager()?;
-    if !desktop::window_is_on_current_desktop(&manager, hwnd) {
+    controlfreak_core::timing::time("check_integrity", || {
+        privilege::ensure_window_integrity(operation, foreground)?;
+        privilege::ensure_window_integrity(operation, hwnd)
+    })?;
+    let on_current = controlfreak_core::timing::time("check_virtual_desktop", || {
+        desktop::with_virtual_desktop_manager(|manager| {
+            desktop::window_on_current_desktop(manager, hwnd)
+        })
+    })?
+    .unwrap_or(false);
+    if !on_current {
         return Err(invalid("approved target left the current desktop"));
     }
     let reference = lookup(id)?;
     let current_bounds = bounds(hwnd)?;
-    let displays = desktop::enumerate_displays()?;
+    let displays =
+        controlfreak_core::timing::time("enumerate_displays", desktop::enumerate_displays)?;
     let current_identity = identity(hwnd)?;
     let hit = if let Some(point) = point {
         // SAFETY: These APIs inspect value coordinates and return borrowed window handles.

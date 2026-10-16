@@ -307,11 +307,13 @@ impl Backend {
 
 impl BackendMetadata for Backend {
     fn validate_target_reference(&self, target: &str) -> Result<(), PlatformError> {
+        let _timer = controlfreak_core::timing::start("approve_target");
         let (hwnd, _) = target::resolve(target)?;
         Self::ensure_window_input_target("approve_target", hwnd)?;
         target::arm_if_foreground(target)
     }
     fn record_target_evidence(&self, control: &MutationControl) {
+        let _timer = controlfreak_core::timing::start("target_evidence");
         target::evidence(control);
     }
 

@@ -31,6 +31,15 @@ pub(super) fn window_desktop_id(
     unsafe { manager.GetWindowDesktopId(hwnd) }
 }
 
+pub(super) fn window_on_current_desktop(
+    manager: &IVirtualDesktopManager,
+    hwnd: HWND,
+) -> windows::core::Result<bool> {
+    // SAFETY: `manager` is an initialized COM interface and `hwnd` is a borrowed window handle.
+    // The windows crate owns the result storage.
+    unsafe { manager.IsWindowOnCurrentVirtualDesktop(hwnd) }.map(BOOL::as_bool)
+}
+
 pub(super) fn window_is_on_current_desktop(manager: &IVirtualDesktopManager, hwnd: HWND) -> bool {
     // SAFETY: `manager` is an initialized COM interface and `hwnd` comes from the current Windows
     // enumeration. The windows crate owns the result storage.
@@ -79,6 +88,13 @@ impl ComApartment {
     }
 }
 
+impl ComApartment {
+    /// Whether this thread is in the multithreaded apartment rather than a host-owned STA.
+    pub(super) const fn is_multithreaded(&self) -> bool {
+        self.uninitialize
+    }
+}
+
 impl Drop for ComApartment {
     fn drop(&mut self) {
         if self.uninitialize {
@@ -94,6 +110,73 @@ pub(super) fn virtual_desktop_manager() -> Result<IVirtualDesktopManager, Platfo
     // the windows crate for IVirtualDesktopManager.
     unsafe { CoCreateInstance(&VirtualDesktopManager, None, CLSCTX_ALL) }
         .map_err(|error| win32_error("CoCreateInstance(VirtualDesktopManager)", &error))
+}
+
+/// A virtual-desktop manager proxy created in the process multithreaded apartment.
+struct SharedVirtualDesktopManager(IVirtualDesktopManager);
+
+// SAFETY: The proxy is created on an MTA thread and is only used by callers that have joined the
+// MTA (checked through `ComApartment::is_multithreaded`). COM permits any MTA thread to call an
+// MTA proxy without marshaling, and the windows crate reference-counts it with atomic AddRef.
+unsafe impl Send for SharedVirtualDesktopManager {}
+// SAFETY: See `Send`; the shared slot only hands out AddRef'd clones under its mutex.
+unsafe impl Sync for SharedVirtualDesktopManager {}
+
+static SHARED_VIRTUAL_DESKTOP_MANAGER: std::sync::Mutex<Option<SharedVirtualDesktopManager>> =
+    std::sync::Mutex::new(None);
+
+/// Keeps the process MTA alive between worker threads, so the shared proxy and its connection to
+/// the shell are not torn down whenever a short-lived worker thread uninitializes COM.
+fn keep_multithreaded_apartment() -> Result<(), PlatformError> {
+    static USAGE: OnceLock<Result<(), String>> = OnceLock::new();
+    USAGE
+        .get_or_init(|| {
+            // SAFETY: The call has no inputs. The returned cookie is intentionally never passed to
+            // CoDecrementMTAUsage, so MTA support stays active for the life of the process.
+            unsafe { windows::Win32::System::Com::CoIncrementMTAUsage() }
+                .map(|_cookie| ())
+                .map_err(|error| error.to_string())
+        })
+        .clone()
+        .map_err(|reason| PlatformError::OperationFailed {
+            operation: "CoIncrementMTAUsage".to_owned(),
+            reason,
+        })
+}
+
+fn shared_virtual_desktop_manager(fresh: bool) -> Result<IVirtualDesktopManager, PlatformError> {
+    let mut slot = SHARED_VIRTUAL_DESKTOP_MANAGER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if fresh {
+        *slot = None;
+    }
+    if let Some(shared) = slot.as_ref() {
+        return Ok(shared.0.clone());
+    }
+    let manager = virtual_desktop_manager()?;
+    *slot = Some(SharedVirtualDesktopManager(manager.clone()));
+    Ok(manager)
+}
+
+/// Runs a virtual-desktop query through a process-wide manager. Creating a manager is a
+/// cross-process activation in the shell that costs milliseconds, and target checks need several
+/// per action. A failed query is retried once with a new manager, for example after the shell
+/// restarts. The outer error reports COM setup failure; the inner result is the query's own.
+pub(super) fn with_virtual_desktop_manager<T>(
+    query: impl Fn(&IVirtualDesktopManager) -> windows::core::Result<T>,
+) -> Result<windows::core::Result<T>, PlatformError> {
+    let apartment = ComApartment::initialize()?;
+    if !apartment.is_multithreaded() {
+        // A host-initialized single-threaded apartment cannot call an MTA proxy directly.
+        return Ok(query(&virtual_desktop_manager()?));
+    }
+    keep_multithreaded_apartment()?;
+    let manager = shared_virtual_desktop_manager(false)?;
+    match query(&manager) {
+        Ok(value) => Ok(Ok(value)),
+        Err(_) => Ok(query(&shared_virtual_desktop_manager(true)?)),
+    }
 }
 
 pub(super) fn current_virtual_desktop_id(manager: &IVirtualDesktopManager) -> Option<String> {

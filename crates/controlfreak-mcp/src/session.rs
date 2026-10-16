@@ -355,9 +355,14 @@ impl IndicatorRuntime {
                     .check("admission")
                     .map_err(|error| error.to_string())?;
             }
-            runtime
-                .acquire_mutation_blocking()
-                .map(|lease| (lease, work))
+            controlfreak_core::timing::reset();
+            let lease = controlfreak_core::timing::time("session_admission", || {
+                runtime.acquire_mutation_blocking()
+            });
+            if let Some(work) = &work {
+                work.record_stages(controlfreak_core::timing::take());
+            }
+            lease.map(|lease| (lease, work))
         })
         .await
         .map_err(|error| {
