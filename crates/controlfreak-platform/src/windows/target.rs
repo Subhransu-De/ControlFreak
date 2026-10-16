@@ -530,6 +530,20 @@ fn validate_reference(
     arm_if_foreground(id)
 }
 
+/// Screen bounds of the approved window as observed when its reference was issued.
+pub(super) fn approved_window_bounds(
+    control: &MutationControl,
+) -> Option<controlfreak_core::DisplayBounds> {
+    let reference = lookup(&control.approved_target()?).ok()?;
+    let [left, top, right, bottom] = reference.bounds;
+    Some(controlfreak_core::DisplayBounds {
+        left,
+        top,
+        width: u32::try_from(right.checked_sub(left)?).ok()?,
+        height: u32::try_from(bottom.checked_sub(top)?).ok()?,
+    })
+}
+
 pub(super) fn evidence(control: &MutationControl) {
     let remained = control.approved_target().is_some_and(|id| {
         resolve(&id).is_ok_and(|(hwnd, _)| desktop::foreground_window_handle() == hwnd)

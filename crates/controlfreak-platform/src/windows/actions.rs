@@ -1,3 +1,4 @@
+use super::capture::{SettleOutcome, SettleWatch};
 use super::{
     Backend, Duration, HWND, KeyChordRequest, KeyboardActionResult, KeyboardBackend,
     MAX_SCROLL_DELTA, MAX_TEXT_UTF16_UNITS, MouseClickRequest, MouseDragRequest, MouseMoveRequest,
@@ -116,7 +117,7 @@ impl PointerBackend for Backend {
         );
         movement?;
         release?;
-        settle(POST_INPUT_SETTLE_MS);
+        settle(None, POST_INPUT_SETTLE_MS);
         control.input_complete();
         super::target::evidence(control);
         Self::pointer_action_result("drag_mouse", foreground_before, &request.observation)
@@ -164,11 +165,12 @@ impl PointerBackend for Backend {
             control,
             |control, target| {
                 control.check("scroll_mouse")?;
+                let watch = settle_watch(control);
                 send_scroll(request.delta_x, request.delta_y, control, || {
                     super::target::validate(control, "scroll_mouse", Some(target))?;
                     ensure_cursor_at("scroll_mouse", target, current_cursor_position()?)
                 })?;
-                settle(POST_INPUT_SETTLE_MS);
+                settle(watch, POST_INPUT_SETTLE_MS);
                 Ok(())
             },
         )
@@ -190,10 +192,11 @@ impl KeyboardBackend for Backend {
         validate_observation(&request.observation)?;
         let _guard = self.lock_input(control)?;
         super::target::validate(control, "press_keys", None)?;
+        let watch = settle_watch(control);
         send_key_chord("press_keys", &request.keys, control, || {
             super::target::validate(control, "press_keys", None)
         })?;
-        settle(POST_FOCUS_SETTLE_MS);
+        settle(watch, POST_FOCUS_SETTLE_MS);
         control.input_complete();
         super::target::evidence(control);
         Ok(KeyboardActionResult {
@@ -229,10 +232,11 @@ impl KeyboardBackend for Backend {
 
         let _guard = self.lock_input(control)?;
         super::target::validate(control, "type_text", None)?;
+        let watch = settle_watch(control);
         send_unicode_text(&utf16, control, || {
             super::target::validate(control, "type_text", None)
         })?;
-        settle(POST_FOCUS_SETTLE_MS);
+        settle(watch, POST_FOCUS_SETTLE_MS);
         control.input_complete();
         super::target::evidence(control);
         Ok(KeyboardActionResult {
@@ -276,6 +280,7 @@ impl Backend {
             control,
             |control, target| {
                 control.check("click_mouse")?;
+                let watch = settle_watch(control);
                 send_click(
                     request.button,
                     request.click_count,
@@ -286,7 +291,7 @@ impl Backend {
                         ensure_cursor_at("click_mouse", target, current_cursor_position()?)
                     },
                 )?;
-                settle(POST_INPUT_SETTLE_MS);
+                settle(watch, POST_INPUT_SETTLE_MS);
                 Ok(())
             },
         )
@@ -424,11 +429,27 @@ impl Backend {
     }
 }
 
-/// Gives the target application time to process input before evidence is captured.
-fn settle(milliseconds: u64) {
-    controlfreak_core::timing::time("settle", || {
-        thread::sleep(Duration::from_millis(milliseconds));
-    });
+/// Gives the target application time to process input before evidence is captured. With a
+/// watch, returns once the approved window has responded and stopped changing; otherwise, or if
+/// it never visibly responds, waits the full cap as before.
+fn settle(watch: Option<SettleWatch>, cap_milliseconds: u64) {
+    let cap = Duration::from_millis(cap_milliseconds);
+    let started = std::time::Instant::now();
+    let outcome = watch.map(|watch| watch.wait(cap));
+    if outcome.is_none() {
+        thread::sleep(cap);
+    }
+    let stage = match outcome {
+        Some(SettleOutcome::Settled) => "settle_responded",
+        Some(SettleOutcome::Capped) => "settle_capped",
+        None => "settle_fixed",
+    };
+    controlfreak_core::timing::record(stage, started.elapsed());
+    controlfreak_core::timing::record("settle", started.elapsed());
+}
+
+fn settle_watch(control: &MutationControl) -> Option<SettleWatch> {
+    SettleWatch::begin(super::target::approved_window_bounds(control))
 }
 
 /// Button and wheel events fire at the live cursor, so refuse if it left the validated point.

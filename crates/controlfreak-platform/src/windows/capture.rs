@@ -443,6 +443,94 @@ pub(super) fn scaled_dimensions(
     (image_width, image_height, legacy_downscale_factor)
 }
 
+/// Changed pixels needed before a repaint counts as the application's response. A blinking
+/// caret changes fewer pixels than this; one typed glyph or a pressed button changes more.
+const SETTLE_MIN_CHANGED_PIXELS: usize = 48;
+/// Largest window area watched for settling; bigger windows fall back to the fixed wait because
+/// each read of them costs about as much as the wait itself.
+const SETTLE_MAX_PIXELS: u64 = 2_560 * 1_600;
+const SETTLE_POLL: Duration = Duration::from_millis(4);
+/// Identical reads must span more than one 60 Hz display refresh to count as settled; two reads
+/// within one refresh can match while the window is still animating.
+const SETTLE_STABLE: Duration = Duration::from_millis(20);
+
+/// Watches the approved window across an input action, so the action returns as soon as the
+/// window has visibly responded and stopped changing, instead of always sleeping the full cap.
+pub(super) struct SettleWatch {
+    bounds: DisplayBounds,
+    before: Vec<u8>,
+}
+
+/// How a settle wait ended; recorded as a timing stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SettleOutcome {
+    /// The window changed and then held still for one read.
+    Settled,
+    /// The cap elapsed first; the result is the same as the previous fixed wait.
+    Capped,
+}
+
+impl SettleWatch {
+    /// Reads the window before input. Returns `None` when it is unknown, too large, or unreadable,
+    /// in which case the caller keeps the fixed wait.
+    pub(super) fn begin(bounds: Option<DisplayBounds>) -> Option<Self> {
+        let bounds = bounds?;
+        if bounds.width == 0
+            || bounds.height == 0
+            || u64::from(bounds.width) * u64::from(bounds.height) > SETTLE_MAX_PIXELS
+        {
+            return None;
+        }
+        let before = timing::time("settle_capture", || capture_rgba(bounds)).ok()?;
+        Some(Self { bounds, before })
+    }
+
+    /// Waits until the window changed and then stayed identical for at least `SETTLE_STABLE`,
+    /// or until `cap`.
+    pub(super) fn wait(self, cap: Duration) -> SettleOutcome {
+        let started = Instant::now();
+        let mut changed: Option<(Vec<u8>, Instant)> = None;
+        loop {
+            let remaining = cap.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return SettleOutcome::Capped;
+            }
+            std::thread::sleep(SETTLE_POLL.min(remaining));
+            let read_at = Instant::now();
+            let Ok(frame) = timing::time("settle_capture", || capture_rgba(self.bounds)) else {
+                std::thread::sleep(cap.saturating_sub(started.elapsed()));
+                return SettleOutcome::Capped;
+            };
+            match &changed {
+                Some((last, since)) if changed_pixels(last, &frame, 1) == 0 => {
+                    if read_at.saturating_duration_since(*since) >= SETTLE_STABLE {
+                        return SettleOutcome::Settled;
+                    }
+                }
+                Some(_) => changed = Some((frame, read_at)),
+                None if changed_pixels(&self.before, &frame, SETTLE_MIN_CHANGED_PIXELS)
+                    >= SETTLE_MIN_CHANGED_PIXELS =>
+                {
+                    changed = Some((frame, read_at));
+                }
+                None => {}
+            }
+        }
+    }
+}
+
+/// Counts RGBA pixels that differ between two equally sized frames, stopping at `limit`.
+fn changed_pixels(left: &[u8], right: &[u8], limit: usize) -> usize {
+    if left.len() != right.len() {
+        return limit;
+    }
+    left.chunks_exact(4)
+        .zip(right.chunks_exact(4))
+        .filter(|(left, right)| left != right)
+        .take(limit)
+        .count()
+}
+
 pub(super) fn capture_comparison_frame(bounds: DisplayBounds) -> Result<Vec<u8>, PlatformError> {
     let rgba = timing::time("capture_gdi", || capture_rgba(bounds))?;
     let factor = bounds.width.div_ceil(VISUAL_COMPARE_WIDTH).max(1);
@@ -1088,5 +1176,79 @@ mod resize_tests {
         let darkest = resized.chunks_exact(4).map(|pixel| pixel[0]).min().unwrap();
         // Area averaging keeps a third of the stroke's contrast instead of skipping it.
         assert!((165..=175).contains(&darkest), "{darkest}");
+    }
+}
+
+#[cfg(test)]
+mod live_capture_benchmarks {
+    use super::*;
+
+    /// Times screen reads only; no pixels are stored or written anywhere.
+    #[test]
+    #[ignore = "reads the live desktop; run only on an approved disposable desktop"]
+    fn live_gdi_capture_latency() {
+        ensure_dpi_awareness().unwrap();
+        for (width, height) in [(64_u32, 64_u32), (400, 300), (760, 560), (1920, 1080)] {
+            let bounds = DisplayBounds {
+                left: 0,
+                top: 0,
+                width,
+                height,
+            };
+            let mut samples: Vec<f64> = (0..15)
+                .map(|_| {
+                    let started = Instant::now();
+                    capture_rgba(bounds).unwrap();
+                    started.elapsed().as_secs_f64() * 1_000.0
+                })
+                .collect();
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "{width}x{height}: median={:.1}ms min={:.1}ms",
+                samples[samples.len() / 2],
+                samples[0]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod settle_tests {
+    use super::*;
+
+    #[test]
+    fn changed_pixel_counts_stop_at_the_limit_and_ignore_identical_pixels() {
+        let base = vec![10_u8; 4 * 100];
+        let mut caret = base.clone();
+        for pixel in caret
+            .chunks_exact_mut(4)
+            .take(SETTLE_MIN_CHANGED_PIXELS - 1)
+        {
+            pixel[0] = 0;
+        }
+        assert_eq!(changed_pixels(&base, &base, 1), 0);
+        assert_eq!(
+            changed_pixels(&base, &caret, SETTLE_MIN_CHANGED_PIXELS),
+            SETTLE_MIN_CHANGED_PIXELS - 1
+        );
+        let glyph = vec![0_u8; 4 * 100];
+        assert_eq!(changed_pixels(&base, &glyph, 7), 7);
+        assert_eq!(changed_pixels(&base, &base[..4], 5), 5);
+    }
+
+    #[test]
+    fn settle_watch_skips_unknown_empty_and_oversized_windows() {
+        assert!(SettleWatch::begin(None).is_none());
+        for (width, height) in [(0, 10), (10, 0), (7_680, 4_320)] {
+            assert!(
+                SettleWatch::begin(Some(DisplayBounds {
+                    left: 0,
+                    top: 0,
+                    width,
+                    height,
+                }))
+                .is_none()
+            );
+        }
     }
 }
