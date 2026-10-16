@@ -193,10 +193,10 @@ pub trait OcrBackend {
         control: &MutationControl,
     ) -> Result<WaitForTextResult, PlatformError> {
         const POLL_GAP: std::time::Duration = std::time::Duration::from_millis(100);
-        if request.timeout_ms > crate::MAX_TEXT_WAIT_MS {
+        if request.timeout_ms > crate::ocr::MAX_TEXT_WAIT_MS {
             return Err(PlatformError::InvalidArgument {
                 argument: "timeout_ms".to_owned(),
-                reason: format!("must be at most {}", crate::MAX_TEXT_WAIT_MS),
+                reason: format!("must be at most {}", crate::ocr::MAX_TEXT_WAIT_MS),
             });
         }
         let started = std::time::Instant::now();
@@ -210,8 +210,13 @@ pub trait OcrBackend {
                 crate::TextCondition::Appears => visible,
                 crate::TextCondition::Disappears => !visible,
             };
-            let now = std::time::Instant::now();
-            if satisfied || now >= deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            // Never start a pass after the deadline: a recognition pass can take far longer
+            // than the gap, so finish the wait on the last pass instead.
+            if !satisfied && remaining <= POLL_GAP {
+                control.wait("wait_for_text", remaining)?;
+            }
+            if satisfied || remaining <= POLL_GAP {
                 return Ok(WaitForTextResult {
                     condition: request.condition,
                     satisfied,
@@ -221,10 +226,7 @@ pub trait OcrBackend {
                     last,
                 });
             }
-            control.wait(
-                "wait_for_text",
-                POLL_GAP.min(deadline.saturating_duration_since(now)),
-            )?;
+            control.wait("wait_for_text", POLL_GAP)?;
         }
     }
 
@@ -663,7 +665,10 @@ mod tests {
         assert_eq!(result.attempts, 1);
         assert!(matches!(
             never.wait_for_text_controlled(
-                &wait_request(crate::TextCondition::Appears, crate::MAX_TEXT_WAIT_MS + 1),
+                &wait_request(
+                    crate::TextCondition::Appears,
+                    crate::ocr::MAX_TEXT_WAIT_MS + 1
+                ),
                 &control,
             ),
             Err(PlatformError::InvalidArgument { .. })

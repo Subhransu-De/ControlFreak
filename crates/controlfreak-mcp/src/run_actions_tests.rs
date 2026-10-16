@@ -257,6 +257,8 @@ async fn invalid_later_steps_are_refused_before_any_input() {
         json!({"action": "scroll", "display_id": "fixture", "x": 1, "y": 1}),
         json!({"action": "click", "display_id": "fixture", "x": 1}),
         json!({"action": "click", "observation_id": "obs-unknown", "image_x": 1, "image_y": 1}),
+        json!({"action": "click", "display_id": "fixture", "x": 1920, "y": 1}),
+        json!({"action": "scroll", "display_id": "missing", "x": 1, "y": 1, "delta_y": 120}),
     ] {
         let mut all = steps();
         all.as_array_mut().unwrap().push(bad.clone());

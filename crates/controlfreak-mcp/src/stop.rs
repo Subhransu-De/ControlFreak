@@ -13,7 +13,7 @@ pub(super) struct Work {
     pub(super) control: MutationControl,
     registration: Option<Arc<StopRegistration>>,
     /// Stage timings reported by blocking workers that ran for this request.
-    pub(super) stages: Arc<Mutex<Vec<StageTiming>>>,
+    stages: Arc<Mutex<Vec<StageTiming>>>,
 }
 
 impl Work {

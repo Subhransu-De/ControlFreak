@@ -118,8 +118,9 @@ area_average`), which preserves thin text strokes better than sampling.
 
 `run_actions` runs up to 16 `click`, `scroll`, `type_text`, and `press_keys` steps in order on one
 approved target and returns one final observation. Every step's arguments, including image
-points, are checked before the first step runs, so a malformed later step refuses the whole batch
-without input. Each step uses the same target checks, settle wait, and release cleanup as its
+points and whether each point lies on an active display, are checked before the first step runs,
+so a malformed later step refuses the whole batch without input. Live checks that depend on
+desktop state, such as foreground ownership and the window under a point, run per step. Each step uses the same target checks, settle wait, and release cleanup as its
 single-action tool, and only the last step captures the requested observation. The batch stops at
 the first failure: `action.steps` (or `error.details.steps` on failure) reports each step as
 `completed`, `failed`, or `skipped` with its accepted event count, and `status` is

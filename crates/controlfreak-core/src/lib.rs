@@ -33,9 +33,9 @@ pub use error::PlatformError;
 pub use keyboard::{Key, KeyChordRequest, KeyboardActionResult, TextInputRequest};
 pub use mutation::MutationControl;
 pub use ocr::{
-    ClickTextRequest, ClickTextResult, FindTextRequest, FindTextResult, MAX_TEXT_WAIT_MS, OcrLine,
-    OcrMatchDetails, OcrRegionRequest, OcrResult, OcrWord, TextCondition, TextMatch, TextMatchMode,
-    TextMatchTier, WaitForTextRequest, WaitForTextResult,
+    ClickTextRequest, ClickTextResult, FindTextRequest, FindTextResult, OcrLine, OcrMatchDetails,
+    OcrRegionRequest, OcrResult, OcrWord, TextCondition, TextMatch, TextMatchMode, TextMatchTier,
+    WaitForTextRequest, WaitForTextResult,
 };
 pub use outcome::{CleanupStatus, InputOutcome, MutationProgress};
 pub use permission::{PermissionDescriptor, PermissionId, PermissionState};

@@ -274,17 +274,17 @@ impl From<ObservationInput> for ObservationOptions {
 pub(super) struct MoveMouseInput {
     pub(super) target_ref: String,
     #[serde(default)]
-    pub(super) display_id: Option<String>,
+    display_id: Option<String>,
     #[serde(default)]
-    pub(super) x: Option<u32>,
+    x: Option<u32>,
     #[serde(default)]
-    pub(super) y: Option<u32>,
+    y: Option<u32>,
     #[serde(default)]
-    pub(super) observation_id: Option<String>,
+    observation_id: Option<String>,
     #[serde(default)]
-    pub(super) image_x: Option<u32>,
+    image_x: Option<u32>,
     #[serde(default)]
-    pub(super) image_y: Option<u32>,
+    image_y: Option<u32>,
     #[serde(default)]
     pub(super) duration_ms: u32,
     #[serde(default)]
@@ -296,17 +296,17 @@ pub(super) struct MoveMouseInput {
 pub(super) struct ClickMouseInput {
     pub(super) target_ref: String,
     #[serde(default)]
-    pub(super) display_id: Option<String>,
+    display_id: Option<String>,
     #[serde(default)]
-    pub(super) x: Option<u32>,
+    x: Option<u32>,
     #[serde(default)]
-    pub(super) y: Option<u32>,
+    y: Option<u32>,
     #[serde(default)]
-    pub(super) observation_id: Option<String>,
+    observation_id: Option<String>,
     #[serde(default)]
-    pub(super) image_x: Option<u32>,
+    image_x: Option<u32>,
     #[serde(default)]
-    pub(super) image_y: Option<u32>,
+    image_y: Option<u32>,
     pub(super) button: MouseButton,
     #[serde(default = "default_click_count")]
     pub(super) click_count: u8,
@@ -323,27 +323,27 @@ pub(super) struct ClickMouseInput {
 pub(super) struct DragMouseInput {
     pub(super) target_ref: String,
     #[serde(default)]
-    pub(super) start_display_id: Option<String>,
+    start_display_id: Option<String>,
     #[serde(default)]
-    pub(super) start_x: Option<u32>,
+    start_x: Option<u32>,
     #[serde(default)]
-    pub(super) start_y: Option<u32>,
+    start_y: Option<u32>,
     #[serde(default)]
-    pub(super) end_display_id: Option<String>,
+    end_display_id: Option<String>,
     #[serde(default)]
-    pub(super) end_x: Option<u32>,
+    end_x: Option<u32>,
     #[serde(default)]
-    pub(super) end_y: Option<u32>,
+    end_y: Option<u32>,
     #[serde(default)]
-    pub(super) observation_id: Option<String>,
+    observation_id: Option<String>,
     #[serde(default)]
-    pub(super) start_image_x: Option<u32>,
+    start_image_x: Option<u32>,
     #[serde(default)]
-    pub(super) start_image_y: Option<u32>,
+    start_image_y: Option<u32>,
     #[serde(default)]
-    pub(super) end_image_x: Option<u32>,
+    end_image_x: Option<u32>,
     #[serde(default)]
-    pub(super) end_image_y: Option<u32>,
+    end_image_y: Option<u32>,
     pub(super) button: MouseButton,
     #[serde(default)]
     pub(super) modifiers: Vec<Key>,
@@ -358,17 +358,17 @@ pub(super) struct DragMouseInput {
 pub(super) struct ScrollMouseInput {
     pub(super) target_ref: String,
     #[serde(default)]
-    pub(super) display_id: Option<String>,
+    display_id: Option<String>,
     #[serde(default)]
-    pub(super) x: Option<u32>,
+    x: Option<u32>,
     #[serde(default)]
-    pub(super) y: Option<u32>,
+    y: Option<u32>,
     #[serde(default)]
-    pub(super) observation_id: Option<String>,
+    observation_id: Option<String>,
     #[serde(default)]
-    pub(super) image_x: Option<u32>,
+    image_x: Option<u32>,
     #[serde(default)]
-    pub(super) image_y: Option<u32>,
+    image_y: Option<u32>,
     #[serde(default)]
     pub(super) delta_x: i32,
     pub(super) delta_y: i32,
@@ -545,7 +545,7 @@ pub(super) const MAX_RUN_ACTION_STEPS: usize = 16;
 #[serde(deny_unknown_fields)]
 pub(super) struct RunActionsInput {
     pub(super) target_ref: String,
-    pub(super) steps: Vec<ActionStepInput>,
+    steps: Vec<ActionStepInput>,
     #[serde(default)]
     pub(super) observation: ObservationInput,
 }

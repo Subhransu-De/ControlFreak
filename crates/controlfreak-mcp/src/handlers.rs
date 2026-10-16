@@ -874,6 +874,30 @@ fn run_steps(
             ActionStep::TypeText { .. } | ActionStep::PressKeys { .. } => Ok(None),
         })
         .collect::<Result<Vec<_>, _>>()?;
+    // Direct coordinates are only echoed by resolution, so check every point against the
+    // current displays now; a bad later point must not strand input from earlier steps.
+    let displays = backend.list_displays()?;
+    for (index, point) in resolved.iter().enumerate() {
+        let Some((display_id, x, y)) = point else {
+            continue;
+        };
+        let display = displays
+            .iter()
+            .find(|display| display.id.eq_ignore_ascii_case(display_id))
+            .ok_or_else(|| PlatformError::InvalidArgument {
+                argument: format!("steps[{index}]"),
+                reason: format!("display '{display_id}' is not active; call list_displays again"),
+            })?;
+        if *x >= display.bounds.width || *y >= display.bounds.height {
+            return Err(PlatformError::InvalidArgument {
+                argument: format!("steps[{index}]"),
+                reason: format!(
+                    "point ({x}, {y}) lies outside the {}x{} display",
+                    display.bounds.width, display.bounds.height
+                ),
+            });
+        }
+    }
     let quiet = ObservationOptions {
         mode: ObservationMode::None,
         ..ObservationOptions::default()

@@ -69,7 +69,7 @@ pub enum TextCondition {
 }
 
 /// Longest wait accepted by `wait_for_text`, matching the other bounded waits.
-pub const MAX_TEXT_WAIT_MS: u32 = 30_000;
+pub(crate) const MAX_TEXT_WAIT_MS: u32 = 30_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitForTextRequest {

@@ -90,7 +90,7 @@ impl ComApartment {
 
 impl ComApartment {
     /// Whether this thread is in the multithreaded apartment rather than a host-owned STA.
-    pub(super) const fn is_multithreaded(&self) -> bool {
+    const fn is_multithreaded(&self) -> bool {
         self.uninitialize
     }
 }
