@@ -32,7 +32,12 @@ where
         if let Some(control) = control {
             control.check("observation_worker")?;
         }
+        controlfreak_core::timing::reset();
         let result = operation();
+        let taken = controlfreak_core::timing::take();
+        if let Some(work) = &work {
+            work.record_stages(taken);
+        }
         if let Some(control) = control {
             control.check("observation_worker")?;
         }
@@ -67,10 +72,17 @@ where
         let _operation_lease = operation_lease;
         let _cleanup = super::stop::CleanupOnDrop(registered_work.clone());
         worker_control.check("mutation_worker")?;
-        backend.validate_target_reference(&target_ref)?;
-        worker_control.bind_target(&target_ref)?;
-        let result = operation(&worker_control);
-        backend.record_target_evidence(&worker_control);
+        controlfreak_core::timing::reset();
+        let result = (|| {
+            backend.validate_target_reference(&target_ref)?;
+            worker_control.bind_target(&target_ref)?;
+            let result = operation(&worker_control);
+            backend.record_target_evidence(&worker_control);
+            result
+        })();
+        if let Some(work) = &registered_work {
+            work.record_stages(controlfreak_core::timing::take());
+        }
         result
     })
     .await;
@@ -107,6 +119,7 @@ pub(super) fn call_get_server_status(
                 "status": operation.status,
                 "elapsed_ms": operation.elapsed_ms,
                 "gap_ms": operation.gap_ms,
+                "stages_ms": operation.stages_ms,
             })
         })
         .collect();

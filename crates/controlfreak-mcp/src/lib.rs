@@ -238,6 +238,8 @@ impl ServerHandler for ControlFreakServer {
                 });
             let reporting = Arc::clone(&diagnostics);
             let report_name = tool_name.clone();
+            let request_stages = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let worker_stages = Arc::clone(&request_stages);
             let request_future = async move {
                 if request.name == "stop_desktop_work" {
                     parse_arguments::<NoArguments>(request.arguments)?;
@@ -297,7 +299,7 @@ impl ServerHandler for ControlFreakServer {
                     stop::Work::new(&stop)
                 };
                 let work = match admission {
-                    Ok(work) => work,
+                    Ok(work) => work.with_stages(worker_stages),
                     Err(error) => {
                         let response = tool_error(&error).into();
                         return Ok(if is_mutating_tool(&request.name) {
@@ -432,8 +434,20 @@ impl ServerHandler for ControlFreakServer {
                     })
                 }
             };
-            let elapsed_ms =
-                reporting.complete(&report_name, operation_id, started, gap_ms, &outcome);
+            let stages = std::mem::take(
+                &mut *request_stages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            let stages_ms = diagnostics::stages_json(&stages);
+            let elapsed_ms = reporting.complete(
+                &report_name,
+                operation_id,
+                started,
+                gap_ms,
+                &outcome,
+                stages_ms.clone(),
+            );
             outcome.map(|mut response| {
                 if let CallToolResponse::Complete(result) = &mut response {
                     let mut meta = result.meta.take().unwrap_or_default();
@@ -443,6 +457,7 @@ impl ServerHandler for ControlFreakServer {
                             "instance_id": reporting.instance_id,
                             "operation_id": operation_id,
                             "elapsed_ms": elapsed_ms,
+                            "stages_ms": stages_ms,
                         }),
                     );
                     result.meta = Some(meta);

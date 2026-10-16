@@ -18,6 +18,28 @@ enum OcrHelperResponse {
     Error { error: PlatformError },
 }
 
+/// One helper reply: the response plus content-free stage timings measured inside the helper.
+#[derive(Debug, Serialize, Deserialize)]
+struct OcrHelperReply {
+    #[serde(flatten)]
+    response: OcrHelperResponse,
+    #[serde(default)]
+    stages_micros: Vec<(String, u64)>,
+}
+
+/// Re-records helper stages under server-side names so they are not confused with in-process work.
+fn record_helper_stages(stages: &[(String, u64)]) {
+    for (stage, micros) in stages {
+        let name = match stage.as_str() {
+            "ocr_recognize" => "ocr_helper_recognize",
+            "ocr_engine_create" => "ocr_helper_engine_create",
+            "capture_gdi" => "ocr_helper_capture",
+            _ => continue,
+        };
+        controlfreak_core::timing::record(name, Duration::from_micros(*micros));
+    }
+}
+
 pub(super) fn recognize_text_with_helper(
     command: &OcrHelperCommand,
     request: &OcrRegionRequest,
@@ -35,6 +57,7 @@ pub(super) fn recognize_text_with_helper(
             operation: "windows_ocr_helper".to_owned(),
             reason: format!("could not encode the OCR request: {error}"),
         })?;
+    let spawn_timer = controlfreak_core::timing::start("ocr_helper_spawn");
     let mut child = Command::new(command.program())
         .args(command.arguments())
         .stdin(Stdio::piped())
@@ -63,7 +86,10 @@ pub(super) fn recognize_text_with_helper(
         });
     }
 
-    let output = wait_for_ocr_helper_controlled(child, OCR_HELPER_TIMEOUT, control)?;
+    drop(spawn_timer);
+    let output = controlfreak_core::timing::time("ocr_helper_wait", || {
+        wait_for_ocr_helper_controlled(child, OCR_HELPER_TIMEOUT, control)
+    })?;
     if !output.status.success() {
         return Err(PlatformError::OperationFailed {
             operation: "windows_ocr_helper".to_owned(),
@@ -71,12 +97,13 @@ pub(super) fn recognize_text_with_helper(
         });
     }
 
-    let response: OcrHelperResponse =
+    let reply: OcrHelperReply =
         serde_json::from_slice(&output.stdout).map_err(|error| PlatformError::OperationFailed {
             operation: "windows_ocr_helper".to_owned(),
             reason: format!("the isolated OCR process returned invalid output: {error}"),
         })?;
-    match response {
+    record_helper_stages(&reply.stages_micros);
+    match reply.response {
         OcrHelperResponse::Success { result } => Ok(result),
         OcrHelperResponse::Error { error } => Err(error),
     }
@@ -254,11 +281,22 @@ fn serve_ocr_helper_with(
             let _ = input.read(&mut [0_u8; 1]);
             cancellation.cancel();
         })?;
+    controlfreak_core::timing::reset();
     let response = match recognize(&request, &control) {
         Ok(result) => OcrHelperResponse::Success { result },
         Err(error) => OcrHelperResponse::Error { error },
     };
-    serde_json::to_writer(output, &response)?;
+    let stages_micros = controlfreak_core::timing::take()
+        .into_iter()
+        .map(|stage| (stage.stage.to_owned(), stage.micros))
+        .collect();
+    serde_json::to_writer(
+        output,
+        &OcrHelperReply {
+            response,
+            stages_micros,
+        },
+    )?;
     Ok(())
 }
 
@@ -313,7 +351,9 @@ mod cancellation_tests {
         .unwrap();
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(matches!(
-            serde_json::from_slice::<OcrHelperResponse>(&output).unwrap(),
+            serde_json::from_slice::<OcrHelperReply>(&output)
+                .unwrap()
+                .response,
             OcrHelperResponse::Error { .. }
         ));
     }

@@ -173,6 +173,7 @@ impl OcrBackend for SyntheticBackend {
 }
 impl WindowBackend for SyntheticBackend {
     fn list_windows(&self) -> Result<controlfreak_core::WindowList, PlatformError> {
+        controlfreak_core::timing::record("synthetic_enumerate", Duration::from_micros(1_500));
         Ok(controlfreak_core::WindowList {
             windows: vec![synthetic_window()],
             truncated: true,
@@ -287,6 +288,11 @@ async fn every_action_result_validates_against_tools_list_over_transport() {
         "{content}"
     );
     assert_eq!(content["truncated"], true);
+    // Worker stage timings reach the response metadata without entering structured content.
+    assert_eq!(
+        listed_windows["result"]["_meta"]["controlfreak"]["stages_ms"]["synthetic_enumerate"],
+        1.5
+    );
     assert_eq!(content["count"], 1);
     let actions = action_requests();
     for (mode, status) in [

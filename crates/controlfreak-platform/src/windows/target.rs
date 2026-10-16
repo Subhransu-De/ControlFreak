@@ -302,6 +302,7 @@ pub(super) fn ensure_available() -> Result<(), PlatformError> {
 }
 
 pub(super) fn issue(hwnd: HWND) -> Result<String, PlatformError> {
+    let _timer = controlfreak_core::timing::start("issue_reference");
     ensure_available()?;
     let generation = OBSERVATION_GENERATION.load(Ordering::Acquire);
     let identity = identity(hwnd)?;
@@ -440,6 +441,7 @@ pub(super) fn validate(
     operation: &str,
     point: Option<windows::Win32::Foundation::POINT>,
 ) -> Result<(), PlatformError> {
+    let _timer = controlfreak_core::timing::start("validate_target");
     control.check(operation)?;
     control.check_target()?;
     let id = control

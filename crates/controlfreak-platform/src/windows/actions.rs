@@ -116,7 +116,7 @@ impl PointerBackend for Backend {
         );
         movement?;
         release?;
-        thread::sleep(Duration::from_millis(POST_INPUT_SETTLE_MS));
+        settle(POST_INPUT_SETTLE_MS);
         control.input_complete();
         super::target::evidence(control);
         Self::pointer_action_result("drag_mouse", foreground_before, &request.observation)
@@ -168,7 +168,7 @@ impl PointerBackend for Backend {
                     super::target::validate(control, "scroll_mouse", Some(target))?;
                     ensure_cursor_at("scroll_mouse", target, current_cursor_position()?)
                 })?;
-                thread::sleep(Duration::from_millis(POST_INPUT_SETTLE_MS));
+                settle(POST_INPUT_SETTLE_MS);
                 Ok(())
             },
         )
@@ -193,7 +193,7 @@ impl KeyboardBackend for Backend {
         send_key_chord("press_keys", &request.keys, control, || {
             super::target::validate(control, "press_keys", None)
         })?;
-        thread::sleep(Duration::from_millis(POST_FOCUS_SETTLE_MS));
+        settle(POST_FOCUS_SETTLE_MS);
         control.input_complete();
         super::target::evidence(control);
         Ok(KeyboardActionResult {
@@ -232,7 +232,7 @@ impl KeyboardBackend for Backend {
         send_unicode_text(&utf16, control, || {
             super::target::validate(control, "type_text", None)
         })?;
-        thread::sleep(Duration::from_millis(POST_FOCUS_SETTLE_MS));
+        settle(POST_FOCUS_SETTLE_MS);
         control.input_complete();
         super::target::evidence(control);
         Ok(KeyboardActionResult {
@@ -286,7 +286,7 @@ impl Backend {
                         ensure_cursor_at("click_mouse", target, current_cursor_position()?)
                     },
                 )?;
-                thread::sleep(Duration::from_millis(POST_INPUT_SETTLE_MS));
+                settle(POST_INPUT_SETTLE_MS);
                 Ok(())
             },
         )
@@ -296,6 +296,7 @@ impl Backend {
         &self,
         control: &MutationControl,
     ) -> Result<InputGuard<'_>, PlatformError> {
+        let _timer = controlfreak_core::timing::start("input_queue");
         loop {
             control.check("input_queue")?;
             let lock = match self.input_lock.try_lock() {
@@ -421,6 +422,13 @@ impl Backend {
             observation,
         })
     }
+}
+
+/// Gives the target application time to process input before evidence is captured.
+fn settle(milliseconds: u64) {
+    controlfreak_core::timing::time("settle", || {
+        thread::sleep(Duration::from_millis(milliseconds));
+    });
 }
 
 /// Button and wheel events fire at the live cursor, so refuse if it left the validated point.

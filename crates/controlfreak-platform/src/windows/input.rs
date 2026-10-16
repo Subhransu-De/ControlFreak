@@ -21,6 +21,7 @@ pub(super) fn move_cursor<F>(
 where
     F: FnMut(POINT) -> Result<(), PlatformError>,
 {
+    let _timer = controlfreak_core::timing::start("move_cursor");
     move_cursor_with(
         operation,
         start,
@@ -574,6 +575,7 @@ fn send_releasing_if_idle(
 }
 
 fn native_send_inputs(inputs: &[INPUT]) -> Result<usize, PlatformError> {
+    let _timer = controlfreak_core::timing::start("send_input");
     let input_size =
         i32::try_from(size_of::<INPUT>()).map_err(|_| PlatformError::OperationFailed {
             operation: "SendInput".to_owned(),

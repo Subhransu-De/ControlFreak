@@ -331,6 +331,7 @@ unsafe extern "system" fn window_callback(hwnd: HWND, data: LPARAM) -> BOOL {
 
 /// Describes eligible windows in foreground-then-title order without issuing references.
 pub(super) fn enumerate_window_candidates() -> Result<(Vec<WindowCandidate>, bool), PlatformError> {
+    let _timer = controlfreak_core::timing::start("enumerate_windows");
     super::target::ensure_available()?;
     let mut enumeration = WindowEnumeration::default();
     // SAFETY: The LPARAM points to `enumeration`, which remains uniquely borrowed for this

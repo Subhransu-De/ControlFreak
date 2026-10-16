@@ -14,6 +14,7 @@ mod report;
 mod security;
 mod stop;
 mod text_matching;
+pub mod timing;
 mod window;
 
 pub use capability::{Capability, CapabilityDescriptor, CapabilityState};

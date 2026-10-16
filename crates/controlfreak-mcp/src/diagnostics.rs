@@ -1,5 +1,6 @@
+use controlfreak_core::timing::StageTiming;
 use rmcp::{ErrorData, model::CallToolResponse};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
     sync::{
@@ -25,6 +26,21 @@ pub(super) struct OperationRecord {
     pub(super) status: &'static str,
     pub(super) elapsed_ms: u64,
     pub(super) gap_ms: Option<u64>,
+    pub(super) stages_ms: Value,
+}
+
+/// Renders stage totals as `{stage: milliseconds}` with microsecond precision.
+pub(super) fn stages_json(stages: &[StageTiming]) -> Value {
+    Value::Object(
+        stages
+            .iter()
+            .map(|stage| {
+                #[allow(clippy::cast_precision_loss)]
+                let milliseconds = stage.micros as f64 / 1_000.0;
+                (stage.stage.to_owned(), json!(milliseconds))
+            })
+            .collect(),
+    )
 }
 
 impl Diagnostics {
@@ -61,6 +77,7 @@ impl Diagnostics {
         started: Instant,
         gap_ms: Option<u64>,
         outcome: &Result<CallToolResponse, ErrorData>,
+        stages_ms: Value,
     ) -> u64 {
         let failed = match outcome {
             Err(_) => true,
@@ -93,13 +110,6 @@ impl Diagnostics {
             .last_completed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
-        self.record(OperationRecord {
-            operation_id,
-            tool: tool_name.to_owned(),
-            status,
-            elapsed_ms,
-            gap_ms,
-        });
         eprintln!(
             "{}",
             json!({
@@ -110,8 +120,17 @@ impl Diagnostics {
                 "status": status,
                 "elapsed_ms": elapsed_ms,
                 "gap_ms": gap_ms,
+                "stages_ms": &stages_ms,
             })
         );
+        self.record(OperationRecord {
+            operation_id,
+            tool: tool_name.to_owned(),
+            status,
+            elapsed_ms,
+            gap_ms,
+            stages_ms,
+        });
         elapsed_ms
     }
 }

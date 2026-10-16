@@ -756,7 +756,9 @@ impl WindowBackend for Backend {
                 control,
                 || target::validate(control, "switch_virtual_desktop", None),
             )?;
-            thread::sleep(Duration::from_millis(DESKTOP_SWITCH_SETTLE_MS));
+            controlfreak_core::timing::time("settle", || {
+                thread::sleep(Duration::from_millis(DESKTOP_SWITCH_SETTLE_MS));
+            });
         }
         control.input_complete();
         target::evidence(control);
@@ -806,7 +808,9 @@ impl WindowBackend for Backend {
             control,
             started: Instant::now(),
         };
-        let activation = activation::focus(&mut driver, request.timeout_ms);
+        let activation = controlfreak_core::timing::time("activate", || {
+            activation::focus(&mut driver, request.timeout_ms)
+        });
         if activation.is_err() {
             control.invalidate_target();
         }
