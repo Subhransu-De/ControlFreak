@@ -1,4 +1,9 @@
-use controlfreak_core::{InputOutcome, MutationControl, MutationProgress, PlatformError};
+use controlfreak_core::{
+    ActionObservation, InputOutcome, KeyboardActionResult, MutationControl, MutationProgress,
+    ObservationMode, ObservationOptions, PlatformError,
+};
+
+use super::requests::{ActionStep, RunActionsInput};
 
 use super::{
     Arc, CallToolResponse, CallToolResult, CaptureDisplayInput, CaptureDisplayRequest,
@@ -790,4 +795,202 @@ pub(super) async fn call_scroll_mouse(
 /// A tool error for a request rejected before any desktop work, with not-started progress.
 fn not_started(error: &PlatformError) -> CallToolResponse {
     super::results::with_progress(tool_error(error).into(), MutationProgress::default())
+}
+
+/// Runs validated steps in order on one target, stopping at the first failure. Each step uses
+/// the same backend path, target checks, and cleanup as the matching single-action tool;
+/// only the last step captures the requested observation.
+pub(super) async fn call_run_actions(
+    backend: Arc<dyn PlatformBackend>,
+    arguments: Option<JsonObject>,
+    operation_lease: Option<OperationLease>,
+) -> Result<CallToolResponse, ErrorData> {
+    let input = parse_arguments::<RunActionsInput>(arguments)?;
+    let steps = match input.validated_steps() {
+        Ok(steps) => steps,
+        Err(error) => return Ok(not_started(&error)),
+    };
+    let final_observation: ObservationOptions = input.observation.into();
+    let reports = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let worker_reports = Arc::clone(&reports);
+    let (result, progress) = run_mutation_operation(
+        operation_lease,
+        input.target_ref,
+        Arc::clone(&backend),
+        move |control| {
+            run_steps(
+                backend.as_ref(),
+                &steps,
+                &final_observation,
+                control,
+                &worker_reports,
+            )
+        },
+    )
+    .await;
+    let steps = std::mem::take(
+        &mut *reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    let action = json!({ "kind": "run_actions", "steps": steps });
+    match result {
+        Ok(observation) => {
+            Ok(keyboard_result(&KeyboardActionResult { observation }, &action).into())
+        }
+        Err(error) => {
+            let mut response = tool_error(&error);
+            if let Some(content) = response.structured_content.as_mut()
+                && content.get("error").is_some()
+            {
+                content["error"]["details"]["steps"] = action["steps"].clone();
+            }
+            Ok(response.into())
+        }
+    }
+    .map(|response| super::results::with_progress(response, progress))
+}
+
+fn run_steps(
+    backend: &dyn PlatformBackend,
+    steps: &[ActionStep],
+    final_observation: &ObservationOptions,
+    control: &MutationControl,
+    reports: &std::sync::Mutex<Vec<Value>>,
+) -> Result<ActionObservation, PlatformError> {
+    let report = |value: Value| {
+        reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(value);
+    };
+    // Resolve every image point before the first step sends input.
+    let resolved = steps
+        .iter()
+        .map(|step| match step {
+            ActionStep::Click { target, .. } | ActionStep::Scroll { target, .. } => {
+                target.resolve(backend).map(Some)
+            }
+            ActionStep::TypeText { .. } | ActionStep::PressKeys { .. } => Ok(None),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let quiet = ObservationOptions {
+        mode: ObservationMode::None,
+        ..ObservationOptions::default()
+    };
+    let mut observation = None;
+    for (index, (step, point)) in steps.iter().zip(resolved).enumerate() {
+        let options = if index + 1 == steps.len() {
+            final_observation.clone()
+        } else {
+            quiet.clone()
+        };
+        let sent_before = control.progress().sent_events;
+        let outcome = control
+            .check("run_actions")
+            .and_then(|()| run_step(backend, step, point, options, control));
+        let sent_events = control.progress().sent_events.saturating_sub(sent_before);
+        match outcome {
+            Ok(step_observation) => {
+                report(
+                    json!({ "index": index, "action": step.kind(), "status": "completed", "sent_events": sent_events }),
+                );
+                observation = Some(step_observation);
+            }
+            Err(error) => {
+                report(
+                    json!({ "index": index, "action": step.kind(), "status": "failed", "sent_events": sent_events, "error": error.to_string() }),
+                );
+                for (skipped, step) in steps.iter().enumerate().skip(index + 1) {
+                    report(
+                        json!({ "index": skipped, "action": step.kind(), "status": "skipped", "sent_events": 0 }),
+                    );
+                }
+                if index > 0 && !matches!(error, PlatformError::PostActionObservationFailed { .. })
+                {
+                    control.steps_incomplete();
+                }
+                return Err(error);
+            }
+        }
+    }
+    observation.ok_or_else(|| PlatformError::InvalidArgument {
+        argument: "steps".to_owned(),
+        reason: "at least one step is required".to_owned(),
+    })
+}
+
+fn run_step(
+    backend: &dyn PlatformBackend,
+    step: &ActionStep,
+    point: Option<(String, u32, u32)>,
+    observation: ObservationOptions,
+    control: &MutationControl,
+) -> Result<ActionObservation, PlatformError> {
+    let missing_point = || PlatformError::InvalidArgument {
+        argument: "point".to_owned(),
+        reason: "the step's point was not resolved".to_owned(),
+    };
+    match step {
+        ActionStep::Click {
+            button,
+            click_count,
+            modifiers,
+            ..
+        } => {
+            let (display_id, x, y) = point.ok_or_else(missing_point)?;
+            backend
+                .click_mouse_controlled(
+                    &MouseClickRequest {
+                        display_id,
+                        x,
+                        y,
+                        button: *button,
+                        click_count: *click_count,
+                        modifiers: modifiers.clone(),
+                        duration_ms: 0,
+                        observation,
+                    },
+                    control,
+                )
+                .map(|result| result.observation)
+        }
+        ActionStep::Scroll {
+            delta_x, delta_y, ..
+        } => {
+            let (display_id, x, y) = point.ok_or_else(missing_point)?;
+            backend
+                .scroll_mouse_controlled(
+                    &MouseScrollRequest {
+                        display_id,
+                        x,
+                        y,
+                        delta_x: *delta_x,
+                        delta_y: *delta_y,
+                        duration_ms: 0,
+                        observation,
+                    },
+                    control,
+                )
+                .map(|result| result.observation)
+        }
+        ActionStep::TypeText { text } => backend
+            .type_text_controlled(
+                &TextInputRequest {
+                    text: text.clone(),
+                    observation,
+                },
+                control,
+            )
+            .map(|result| result.observation),
+        ActionStep::PressKeys { keys } => backend
+            .press_keys_controlled(
+                &KeyChordRequest {
+                    keys: keys.clone(),
+                    observation,
+                },
+                control,
+            )
+            .map(|result| result.observation),
+    }
 }

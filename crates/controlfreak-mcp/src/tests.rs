@@ -838,6 +838,7 @@ fn tool_surface_includes_windows_and_keyboard() {
             "scroll_mouse",
             "press_keys",
             "type_text",
+            "run_actions",
         ]
     );
 }

@@ -602,7 +602,8 @@ fn assert_tool_names(tools: &Value) {
             "drag_mouse",
             "scroll_mouse",
             "press_keys",
-            "type_text"
+            "type_text",
+            "run_actions"
         ]
     );
 }

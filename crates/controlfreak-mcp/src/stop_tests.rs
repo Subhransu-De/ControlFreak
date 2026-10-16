@@ -395,7 +395,7 @@ async fn observation_cancellation_refuses_queued_work_and_discards_late_results(
     }
 }
 
-fn worker_requests() -> [(&'static str, Value); 6] {
+fn worker_requests() -> [(&'static str, Value); 7] {
     [
         (
             MOVE_MOUSE,
@@ -404,6 +404,10 @@ fn worker_requests() -> [(&'static str, Value); 6] {
         (
             TYPE_TEXT,
             json!({"target_ref":"fixture","text":"synthetic"}),
+        ),
+        (
+            RUN_ACTIONS,
+            json!({"target_ref":"fixture","steps":[{"action":"type_text","text":"synthetic"}]}),
         ),
         (
             WAIT_FOR_VISUAL_CHANGE,

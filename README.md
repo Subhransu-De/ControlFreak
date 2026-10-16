@@ -114,6 +114,18 @@ expire after five minutes, and at most 64 are retained. Mapped points pass the s
 as direct coordinates. Screenshots are downscaled by area averaging (`resize_method:
 area_average`), which preserves thin text strokes better than sampling.
 
+## Bounded action batches
+
+`run_actions` runs up to 16 `click`, `scroll`, `type_text`, and `press_keys` steps in order on one
+approved target and returns one final observation. Every step's arguments, including image
+points, are checked before the first step runs, so a malformed later step refuses the whole batch
+without input. Each step uses the same target checks, settle wait, and release cleanup as its
+single-action tool, and only the last step captures the requested observation. The batch stops at
+the first failure: `action.steps` (or `error.details.steps` on failure) reports each step as
+`completed`, `failed`, or `skipped` with its accepted event count, and `status` is
+`partially_sent` when earlier steps already ran. Use it for a known sequence such as filling a
+form; observe between calls when a later step depends on what an earlier one shows.
+
 ## Action results
 
 Mouse, keyboard, OCR-click, window-focus, and desktop-switch results report input dispatch

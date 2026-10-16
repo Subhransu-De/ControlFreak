@@ -3,9 +3,9 @@ use super::{
     CAPTURE_WINDOW, CLICK_MOUSE, CLICK_TEXT, DRAG_MOUSE, END_CONTROL_SESSION, FIND_TEXT_ON_SCREEN,
     FOCUS_WINDOW, GET_SERVER_STATUS, JsonObject, LIST_DISPLAYS, LIST_VIRTUAL_DESKTOPS,
     LIST_WINDOWS, MAX_CAPTURE_WIDTH, MAX_MOVE_DURATION_MS, MAX_SCROLL_DELTA, MAX_TEXT_UTF16_UNITS,
-    MAX_WAIT_MS, MOVE_MOUSE, PRESS_KEYS, READ_TEXT_IN_REGION, SCROLL_MOUSE, SWITCH_VIRTUAL_DESKTOP,
-    TYPE_TEXT, Tool, ToolAnnotations, Value, WAIT_FOR_CHANGE_SINCE, WAIT_FOR_TEXT,
-    WAIT_FOR_VISUAL_CHANGE, WAIT_FOR_WINDOW, json,
+    MAX_WAIT_MS, MOVE_MOUSE, PRESS_KEYS, READ_TEXT_IN_REGION, RUN_ACTIONS, SCROLL_MOUSE,
+    SWITCH_VIRTUAL_DESKTOP, TYPE_TEXT, Tool, ToolAnnotations, Value, WAIT_FOR_CHANGE_SINCE,
+    WAIT_FOR_TEXT, WAIT_FOR_VISUAL_CHANGE, WAIT_FOR_WINDOW, json, requests::MAX_RUN_ACTION_STEPS,
 };
 
 /// Tool descriptions and schemas used by both `tools/list` and offline contract export.
@@ -41,6 +41,7 @@ pub fn tools() -> Vec<Tool> {
         scroll_mouse_tool(),
         press_keys_tool(),
         type_text_tool(),
+        run_actions_tool(),
     ];
     for tool in &mut tools {
         if super::is_mutating_tool(&tool.name) && tool.name != FOCUS_WINDOW
@@ -693,6 +694,53 @@ fn press_keys_tool() -> Tool {
         PRESS_KEYS,
         "Send a key or chord only while the approved target remains foreground. Observe and explicitly approve a target before input.",
         object_schema(properties, &["keys"]),
+    )
+    .with_raw_output_schema(action_output_schema(false))
+    .with_annotations(
+        ToolAnnotations::default()
+            .read_only(false)
+            .destructive(true)
+            .idempotent(false)
+            .open_world(false),
+    )
+}
+
+fn run_actions_tool() -> Tool {
+    let mut step = pointer_properties();
+    step.remove("duration_ms");
+    step.remove("observation");
+    step.insert(
+        "action".to_owned(),
+        json!({ "type": "string", "enum": ["click", "scroll", "type_text", "press_keys"] }),
+    );
+    step.insert("button".to_owned(), json!({ "type": "string", "enum": ["left", "right", "middle"], "default": "left", "description": "click only." }));
+    step.insert("click_count".to_owned(), json!({ "type": "integer", "minimum": 1, "maximum": 3, "default": 1, "description": "click only." }));
+    step.insert("modifiers".to_owned(), modifier_schema());
+    step.insert("delta_x".to_owned(), json!({ "type": "integer", "minimum": -MAX_SCROLL_DELTA, "maximum": MAX_SCROLL_DELTA, "default": 0, "description": "scroll only." }));
+    step.insert("delta_y".to_owned(), json!({ "type": "integer", "minimum": -MAX_SCROLL_DELTA, "maximum": MAX_SCROLL_DELTA, "default": 0, "description": "scroll only. Positive scrolls up." }));
+    step.insert("text".to_owned(), json!({ "type": "string", "minLength": 1, "maxLength": MAX_TEXT_UTF16_UNITS, "description": "type_text only." }));
+    step.insert("keys".to_owned(), json!({ "type": "array", "minItems": 1, "maxItems": 8, "uniqueItems": true, "items": { "type": "string", "minLength": 1 }, "description": "press_keys only: one chord, as in press_keys." }));
+    let mut properties = JsonObject::new();
+    properties.insert(
+        "steps".to_owned(),
+        json!({
+            "type": "array",
+            "minItems": 1,
+            "maxItems": MAX_RUN_ACTION_STEPS,
+            "description": "Ordered steps. click and scroll take display_id/x/y or observation_id/image_x/image_y.",
+            "items": {
+                "type": "object",
+                "properties": step,
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        }),
+    );
+    add_observation(&mut properties);
+    Tool::new(
+        RUN_ACTIONS,
+        "Run up to 16 click, scroll, type_text, and press_keys steps in order on the approved target, with one final observation. All step arguments are checked before the first step runs. Each step keeps the single-action target checks and waits for the window to settle; the batch stops at the first failure and reports each step as completed, failed, or skipped. Use it for a known sequence, such as filling a form; observe between steps when the next step depends on the result.",
+        object_schema(properties, &["steps"]),
     )
     .with_raw_output_schema(action_output_schema(false))
     .with_annotations(

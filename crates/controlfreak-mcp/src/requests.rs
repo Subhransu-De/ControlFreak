@@ -537,3 +537,222 @@ impl DragMouseInput {
         ))
     }
 }
+
+/// Most steps one `run_actions` call accepts.
+pub(super) const MAX_RUN_ACTION_STEPS: usize = 16;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RunActionsInput {
+    pub(super) target_ref: String,
+    pub(super) steps: Vec<ActionStepInput>,
+    #[serde(default)]
+    pub(super) observation: ObservationInput,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ActionStepInput {
+    Click {
+        #[serde(default)]
+        display_id: Option<String>,
+        #[serde(default)]
+        x: Option<u32>,
+        #[serde(default)]
+        y: Option<u32>,
+        #[serde(default)]
+        observation_id: Option<String>,
+        #[serde(default)]
+        image_x: Option<u32>,
+        #[serde(default)]
+        image_y: Option<u32>,
+        #[serde(default = "default_left_button")]
+        button: MouseButton,
+        #[serde(default = "default_click_count")]
+        click_count: u8,
+        #[serde(default)]
+        modifiers: Vec<Key>,
+    },
+    Scroll {
+        #[serde(default)]
+        display_id: Option<String>,
+        #[serde(default)]
+        x: Option<u32>,
+        #[serde(default)]
+        y: Option<u32>,
+        #[serde(default)]
+        observation_id: Option<String>,
+        #[serde(default)]
+        image_x: Option<u32>,
+        #[serde(default)]
+        image_y: Option<u32>,
+        #[serde(default)]
+        delta_x: i32,
+        #[serde(default)]
+        delta_y: i32,
+    },
+    TypeText {
+        text: String,
+    },
+    PressKeys {
+        keys: Vec<Key>,
+    },
+}
+
+/// A batch step checked before any step runs. Image points are resolved later, on the worker,
+/// but still before the first step.
+#[derive(Debug, Clone)]
+pub(super) enum ActionStep {
+    Click {
+        target: PointerTarget,
+        button: MouseButton,
+        click_count: u8,
+        modifiers: Vec<Key>,
+    },
+    Scroll {
+        target: PointerTarget,
+        delta_x: i32,
+        delta_y: i32,
+    },
+    TypeText {
+        text: String,
+    },
+    PressKeys {
+        keys: Vec<Key>,
+    },
+}
+
+impl ActionStep {
+    pub(super) const fn kind(&self) -> &'static str {
+        match self {
+            Self::Click { .. } => "click",
+            Self::Scroll { .. } => "scroll",
+            Self::TypeText { .. } => "type_text",
+            Self::PressKeys { .. } => "press_keys",
+        }
+    }
+}
+
+fn point(
+    display: (Option<String>, Option<u32>, Option<u32>),
+    image: (Option<&str>, Option<u32>, Option<u32>),
+) -> Result<PointerTarget, String> {
+    PointerTarget::from_arguments(display, image, "point").map_err(|error| match error {
+        PlatformError::InvalidArgument { reason, .. } => reason,
+        other => other.to_string(),
+    })
+}
+
+fn validate_modifiers(modifiers: &[Key]) -> Result<(), String> {
+    let unique: std::collections::HashSet<_> = modifiers.iter().collect();
+    if modifiers.len() > 4
+        || unique.len() != modifiers.len()
+        || modifiers
+            .iter()
+            .any(|key| !matches!(key, Key::Ctrl | Key::Alt | Key::Shift | Key::Win))
+    {
+        return Err("modifiers may contain only distinct ctrl, alt, shift, and win".to_owned());
+    }
+    Ok(())
+}
+
+impl ActionStepInput {
+    /// Checks one step with the same limits as its single-action tool.
+    fn validate(&self) -> Result<ActionStep, String> {
+        match self {
+            Self::Click {
+                display_id,
+                x,
+                y,
+                observation_id,
+                image_x,
+                image_y,
+                button,
+                click_count,
+                modifiers,
+            } => {
+                if !(1..=3).contains(click_count) {
+                    return Err("click_count must be between 1 and 3".to_owned());
+                }
+                validate_modifiers(modifiers)?;
+                Ok(ActionStep::Click {
+                    target: point(
+                        (display_id.clone(), *x, *y),
+                        (observation_id.as_deref(), *image_x, *image_y),
+                    )?,
+                    button: *button,
+                    click_count: *click_count,
+                    modifiers: modifiers.clone(),
+                })
+            }
+            Self::Scroll {
+                display_id,
+                x,
+                y,
+                observation_id,
+                image_x,
+                image_y,
+                delta_x,
+                delta_y,
+            } => {
+                let limit = super::MAX_SCROLL_DELTA.unsigned_abs();
+                if (*delta_x == 0 && *delta_y == 0)
+                    || delta_x.unsigned_abs() > limit
+                    || delta_y.unsigned_abs() > limit
+                {
+                    return Err(format!(
+                        "scroll needs a nonzero delta within -{limit} to {limit}"
+                    ));
+                }
+                Ok(ActionStep::Scroll {
+                    target: point(
+                        (display_id.clone(), *x, *y),
+                        (observation_id.as_deref(), *image_x, *image_y),
+                    )?,
+                    delta_x: *delta_x,
+                    delta_y: *delta_y,
+                })
+            }
+            Self::TypeText { text } => {
+                let units = text.encode_utf16().count();
+                if units == 0 || units > super::MAX_TEXT_UTF16_UNITS {
+                    return Err(format!(
+                        "text must contain 1 to {} UTF-16 code units",
+                        super::MAX_TEXT_UTF16_UNITS
+                    ));
+                }
+                Ok(ActionStep::TypeText { text: text.clone() })
+            }
+            Self::PressKeys { keys } => {
+                let unique: std::collections::HashSet<_> = keys.iter().collect();
+                if keys.is_empty() || keys.len() > 8 || unique.len() != keys.len() {
+                    return Err("keys must be 1 to 8 distinct keys".to_owned());
+                }
+                Ok(ActionStep::PressKeys { keys: keys.clone() })
+            }
+        }
+    }
+}
+
+impl RunActionsInput {
+    /// Validates every step's arguments, so a malformed later step cannot strand earlier input.
+    pub(super) fn validated_steps(&self) -> Result<Vec<ActionStep>, PlatformError> {
+        if self.steps.is_empty() || self.steps.len() > MAX_RUN_ACTION_STEPS {
+            return Err(PlatformError::InvalidArgument {
+                argument: "steps".to_owned(),
+                reason: format!("must contain between 1 and {MAX_RUN_ACTION_STEPS} steps"),
+            });
+        }
+        self.steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                step.validate()
+                    .map_err(|reason| PlatformError::InvalidArgument {
+                        argument: format!("steps[{index}]"),
+                        reason,
+                    })
+            })
+            .collect()
+    }
+}
