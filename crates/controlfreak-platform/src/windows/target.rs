@@ -329,9 +329,7 @@ pub(super) fn issue(hwnd: HWND) -> Result<String, PlatformError> {
     // SAFETY: CoCreateGuid takes no borrowed input and the generated value is returned by value.
     let guid = unsafe { CoCreateGuid() }.map_err(unavailable)?;
     let id = format!("target-{guid:?}");
-    if references.len() >= MAX_REFERENCES {
-        references.pop_front();
-    }
+    evict_for_capacity(&mut references);
     references.push_back(Reference {
         id: id.clone(),
         identity,
@@ -341,6 +339,17 @@ pub(super) fn issue(hwnd: HWND) -> Result<String, PlatformError> {
         armed: false,
     });
     Ok(id)
+}
+
+// Observation churn must not evict a reference that an active session has armed.
+fn evict_for_capacity(references: &mut VecDeque<Reference>) {
+    while references.len() >= MAX_REFERENCES {
+        let index = references
+            .iter()
+            .position(|reference| !reference.armed)
+            .unwrap_or(0);
+        references.remove(index);
+    }
 }
 
 fn refresh_reference(
@@ -671,6 +680,30 @@ mod tests {
             .is_none()
         );
         assert_eq!(cached.back().unwrap().issued, fresh);
+    }
+
+    #[test]
+    fn capacity_eviction_keeps_armed_references() {
+        let mut approved = reference();
+        approved.armed = true;
+        let mut cached = VecDeque::from([approved]);
+        for index in 1..MAX_REFERENCES {
+            let mut other = reference();
+            other.id = format!("other-{index}");
+            cached.push_back(other);
+        }
+        evict_for_capacity(&mut cached);
+        assert_eq!(cached.len(), MAX_REFERENCES - 1);
+        assert_eq!(cached[0].id, "synthetic-reference");
+        assert_eq!(cached[1].id, "other-2");
+
+        // Only a cache made entirely of armed references falls back to the oldest entry.
+        cached.push_back(reference());
+        for reference in &mut cached {
+            reference.armed = true;
+        }
+        evict_for_capacity(&mut cached);
+        assert_eq!(cached[0].id, "other-2");
     }
 
     #[test]
