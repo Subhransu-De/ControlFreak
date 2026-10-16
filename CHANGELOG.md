@@ -9,6 +9,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+## [0.1.0-alpha.1] - 2026-10-16
+
 ### Changed
 
 - MCP discovery probes preserve subsequent classic initialization. Modern inline clients receive
