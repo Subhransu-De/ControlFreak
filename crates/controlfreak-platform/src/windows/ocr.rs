@@ -184,9 +184,24 @@ pub(super) fn wait_for_ocr_helper_controlled(
     }
 }
 
-fn read_ocr_pipe(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
+// Recognition of a full 8K display stays far below this; a larger reply means a faulty helper.
+const MAX_OCR_PIPE_BYTES: u64 = 32 * 1024 * 1024;
+
+fn read_ocr_pipe(pipe: impl Read) -> std::io::Result<Vec<u8>> {
+    read_bounded(pipe, MAX_OCR_PIPE_BYTES)
+}
+
+fn read_bounded(pipe: impl Read, limit: u64) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
+    let mut pipe = pipe.take(limit + 1);
     pipe.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        // Keep draining so the helper cannot block on a full pipe before its deadline.
+        std::io::copy(&mut pipe.into_inner(), &mut std::io::sink())?;
+        return Err(std::io::Error::other(format!(
+            "output exceeded {limit} bytes"
+        )));
+    }
     Ok(bytes)
 }
 
@@ -275,6 +290,16 @@ fn ocr_helper_failure(status: std::process::ExitStatus, stderr: &[u8]) -> String
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
+
+    #[test]
+    fn helper_output_beyond_the_limit_is_refused_after_draining() {
+        let mut source = std::io::Cursor::new(vec![b'x'; 64]);
+        assert_eq!(read_bounded(&mut source, 64).unwrap().len(), 64);
+        let mut oversized = std::io::Cursor::new(vec![b'x'; 65]);
+        let error = read_bounded(&mut oversized, 64).unwrap_err();
+        assert!(error.to_string().contains("exceeded 64 bytes"));
+        assert_eq!(oversized.position(), 65);
+    }
 
     #[test]
     fn stdin_closure_cancels_recognition_without_killing_the_helper() {
