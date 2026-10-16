@@ -9,7 +9,7 @@ MCP clients over STDIO.
 - Move, click, drag, and scroll the mouse across multiple displays.
 - Send keyboard shortcuts and type Unicode text without using the clipboard.
 - List, focus, capture, and wait for application windows.
-- Read and click on-screen text using the local Windows OCR engine.
+- Read, find, wait for, and click on-screen text using the local Windows OCR engine.
 - Inspect and switch between discoverable Windows virtual desktops.
 - Show a click-through animated desktop-edge glow while a client owns a mutating control session.
 
@@ -73,6 +73,13 @@ default, `exact`, and `tolerant`. Exact and substring ignore surrounding query w
 truncation flags, and up to `max_results` matches, each limited to 256 Unicode scalar values.
 A limited response containing one candidate does not establish uniqueness.
 
+`wait_for_text` repeats the same discovery in a region until the query `appears` (the default)
+or `disappears`, or until `timeout_ms` (default 5000, at most 30000) elapses. It returns
+`satisfied`, `timed_out`, `attempts`, `elapsed_ms`, and the final pass's matches, so a client
+can wait for a status message or a closing dialog in one call instead of a capture-and-read
+loop. Each pass is a full recognition, so a small region is faster. Like discovery, it never
+authorizes input.
+
 Tolerant discovery tries these tiers in order and stops at the first nonempty tier, even when
 that tier is ambiguous:
 
@@ -96,6 +103,29 @@ require OCR evaluation on synthetic light/dark, low-contrast, punctuation, Unico
 Prefer capability-supported UI Automation patterns for checkbox, selection, and value operations
 when available through a client or another tool. OCR text and checkbox glyphs do not prove control
 state. ControlFreak does not currently implement UI Automation.
+
+## Image-space points
+
+Every returned screenshot includes an `observation_id`. Pointer tools accept that ID with
+`image_x` and `image_y` in the screenshot's own pixels, instead of `display_id` with display-local
+`x` and `y`, and the server maps the point through the screenshot's crop and resize. This avoids
+DPI and resize arithmetic in the client. Give exactly one form per point. IDs keep only geometry,
+expire after five minutes, and at most 64 are retained. Mapped points pass the same target checks
+as direct coordinates. Screenshots are downscaled by area averaging (`resize_method:
+area_average`), which preserves thin text strokes better than sampling.
+
+## Bounded action batches
+
+`run_actions` runs up to 16 `click`, `scroll`, `type_text`, and `press_keys` steps in order on one
+approved target and returns one final observation. Every step's arguments, including image
+points and whether each point lies on an active display, are checked before the first step runs,
+so a malformed later step refuses the whole batch without input. Live checks that depend on
+desktop state, such as foreground ownership and the window under a point, run per step. Each step uses the same target checks, settle wait, and release cleanup as its
+single-action tool, and only the last step captures the requested observation. The batch stops at
+the first failure: `action.steps` (or `error.details.steps` on failure) reports each step as
+`completed`, `failed`, or `skipped` with its accepted event count, and `status` is
+`partially_sent` when earlier steps already ran. Use it for a known sequence such as filling a
+form; observe between calls when a later step depends on what an earlier one shows.
 
 ## Action results
 

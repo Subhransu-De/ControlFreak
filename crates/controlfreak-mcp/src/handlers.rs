@@ -1,4 +1,9 @@
-use controlfreak_core::{InputOutcome, MutationControl, MutationProgress, PlatformError};
+use controlfreak_core::{
+    ActionObservation, InputOutcome, KeyboardActionResult, MutationControl, MutationProgress,
+    ObservationMode, ObservationOptions, PlatformError,
+};
+
+use super::requests::{ActionStep, RunActionsInput};
 
 use super::{
     Arc, CallToolResponse, CallToolResult, CaptureDisplayInput, CaptureDisplayRequest,
@@ -9,7 +14,7 @@ use super::{
     MoveMouseInput, NoArguments, OcrRegionInput, OcrRegionRequest, OperationLease, Ordering,
     PlatformBackend, PressKeysInput, SafetyIndicator, ScrollMouseInput, SwitchVirtualDesktopInput,
     TextInputRequest, TypeTextInput, Value, VirtualDesktopSwitchRequest, VisualBaselineInput,
-    VisualBaselineRequest, WaitForChangeSinceInput, WaitForChangeSinceRequest,
+    VisualBaselineRequest, WaitForChangeSinceInput, WaitForChangeSinceRequest, WaitForTextInput,
     WaitForVisualChangeInput, WaitForVisualChangeRequest, WaitForWindowInput, WaitForWindowRequest,
     click_text_result, join_error, json, keyboard_result, parse_arguments, pointer_result,
     screenshot_result, tool_error, virtual_desktop_list_result, virtual_desktop_switch_result,
@@ -32,7 +37,12 @@ where
         if let Some(control) = control {
             control.check("observation_worker")?;
         }
+        controlfreak_core::timing::reset();
         let result = operation();
+        let taken = controlfreak_core::timing::take();
+        if let Some(work) = &work {
+            work.record_stages(taken);
+        }
         if let Some(control) = control {
             control.check("observation_worker")?;
         }
@@ -67,10 +77,17 @@ where
         let _operation_lease = operation_lease;
         let _cleanup = super::stop::CleanupOnDrop(registered_work.clone());
         worker_control.check("mutation_worker")?;
-        backend.validate_target_reference(&target_ref)?;
-        worker_control.bind_target(&target_ref)?;
-        let result = operation(&worker_control);
-        backend.record_target_evidence(&worker_control);
+        controlfreak_core::timing::reset();
+        let result = (|| {
+            backend.validate_target_reference(&target_ref)?;
+            worker_control.bind_target(&target_ref)?;
+            let result = operation(&worker_control);
+            backend.record_target_evidence(&worker_control);
+            result
+        })();
+        if let Some(work) = &registered_work {
+            work.record_stages(controlfreak_core::timing::take());
+        }
         result
     })
     .await;
@@ -107,6 +124,7 @@ pub(super) fn call_get_server_status(
                 "status": operation.status,
                 "elapsed_ms": operation.elapsed_ms,
                 "gap_ms": operation.gap_ms,
+                "stages_ms": operation.stages_ms,
             })
         })
         .collect();
@@ -320,6 +338,43 @@ pub(super) async fn call_find_text_on_screen(
     }
 }
 
+pub(super) async fn call_wait_for_text(
+    backend: Arc<dyn PlatformBackend>,
+    arguments: Option<JsonObject>,
+    operation_lease: Option<OperationLease>,
+) -> Result<CallToolResponse, ErrorData> {
+    let input = parse_arguments::<WaitForTextInput>(arguments)?;
+    let request = input.into_request();
+    let control =
+        super::stop::current().map_or_else(MutationControl::default, |work| work.control.clone());
+    let result = run_platform_operation(operation_lease, move || {
+        backend.wait_for_text_controlled(&request, &control)
+    })
+    .await?;
+    match result {
+        Ok(result) => Ok(CallToolResult::structured(json!({
+            "condition": result.condition,
+            "satisfied": result.satisfied,
+            "timed_out": result.timed_out,
+            "elapsed_ms": result.elapsed_ms,
+            "attempts": result.attempts,
+            "count": result.last.matches.len(),
+            "target_ref": result.last.target_ref,
+            "query": result.last.query,
+            "display": result.last.display,
+            "source_bounds": result.last.source_bounds,
+            "language": result.last.language,
+            "matches": result.last.matches,
+            "match_tier": result.last.details.match_tier,
+            "candidate_count": result.last.details.candidate_count,
+            "candidates_truncated": result.last.details.candidates_truncated,
+            "text_truncated": result.last.details.text_truncated,
+        }))
+        .into()),
+        Err(error) => Ok(tool_error(&error).into()),
+    }
+}
+
 pub(super) async fn call_click_text(
     backend: Arc<dyn PlatformBackend>,
     arguments: Option<JsonObject>,
@@ -372,18 +427,27 @@ pub(super) async fn call_move_mouse(
     operation_lease: Option<OperationLease>,
 ) -> Result<CallToolResponse, ErrorData> {
     let input = parse_arguments::<MoveMouseInput>(arguments)?;
-    let request = MouseMoveRequest {
-        display_id: input.display_id,
-        x: input.x,
-        y: input.y,
-        duration_ms: input.duration_ms,
-        observation: input.observation.into(),
+    let target = match input.pointer_target() {
+        Ok(target) => target,
+        Err(error) => return Ok(not_started(&error)),
     };
+    let duration_ms = input.duration_ms;
+    let observation = input.observation.into();
     let (result, progress) = run_mutation_operation(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
-        move |control| backend.move_mouse_controlled(&request, control),
+        move |control| {
+            let (display_id, x, y) = target.resolve(backend.as_ref())?;
+            let request = MouseMoveRequest {
+                display_id,
+                x,
+                y,
+                duration_ms,
+                observation,
+            };
+            backend.move_mouse_controlled(&request, control)
+        },
     )
     .await;
     match result {
@@ -399,22 +463,33 @@ pub(super) async fn call_click_mouse(
     operation_lease: Option<OperationLease>,
 ) -> Result<CallToolResponse, ErrorData> {
     let input = parse_arguments::<ClickMouseInput>(arguments)?;
-    let button = input.button;
-    let click_request = MouseClickRequest {
-        display_id: input.display_id,
-        x: input.x,
-        y: input.y,
-        button,
-        click_count: input.click_count,
-        modifiers: input.modifiers.clone(),
-        duration_ms: input.duration_ms,
-        observation: input.observation.into(),
+    let target = match input.pointer_target() {
+        Ok(target) => target,
+        Err(error) => return Ok(not_started(&error)),
     };
+    let button = input.button;
+    let click_count = input.click_count;
+    let modifiers = input.modifiers.clone();
+    let duration_ms = input.duration_ms;
+    let observation = input.observation.into();
     let (result, progress) = run_mutation_operation(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
-        move |control| backend.click_mouse_controlled(&click_request, control),
+        move |control| {
+            let (display_id, x, y) = target.resolve(backend.as_ref())?;
+            let click_request = MouseClickRequest {
+                display_id,
+                x,
+                y,
+                button,
+                click_count,
+                modifiers,
+                duration_ms,
+                observation,
+            };
+            backend.click_mouse_controlled(&click_request, control)
+        },
     )
     .await;
     match result {
@@ -439,38 +514,42 @@ pub(super) async fn call_drag_mouse(
     operation_lease: Option<OperationLease>,
 ) -> Result<CallToolResponse, ErrorData> {
     let input = parse_arguments::<DragMouseInput>(arguments)?;
+    let (start, end) = match input.pointer_targets() {
+        Ok(targets) => targets,
+        Err(error) => return Ok(not_started(&error)),
+    };
     let action = json!({
         "kind": "drag",
         "button": input.button,
         "modifiers": input.modifiers,
-        "start": {
-            "display_id": input.start_display_id,
-            "x": input.start_x,
-            "y": input.start_y,
-        },
-        "end": {
-            "display_id": input.end_display_id,
-            "x": input.end_x,
-            "y": input.end_y,
-        },
+        "start": start.to_json(),
+        "end": end.to_json(),
     });
-    let request = MouseDragRequest {
-        start_display_id: input.start_display_id,
-        start_x: input.start_x,
-        start_y: input.start_y,
-        end_display_id: input.end_display_id,
-        end_x: input.end_x,
-        end_y: input.end_y,
-        button: input.button,
-        modifiers: input.modifiers,
-        duration_ms: input.duration_ms,
-        observation: input.observation.into(),
-    };
+    let button = input.button;
+    let modifiers = input.modifiers;
+    let duration_ms = input.duration_ms;
+    let observation = input.observation.into();
     let (result, progress) = run_mutation_operation(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
-        move |control| backend.drag_mouse_controlled(&request, control),
+        move |control| {
+            let (start_display_id, start_x, start_y) = start.resolve(backend.as_ref())?;
+            let (end_display_id, end_x, end_y) = end.resolve(backend.as_ref())?;
+            let request = MouseDragRequest {
+                start_display_id,
+                start_x,
+                start_y,
+                end_display_id,
+                end_x,
+                end_y,
+                button,
+                modifiers,
+                duration_ms,
+                observation,
+            };
+            backend.drag_mouse_controlled(&request, control)
+        },
     )
     .await;
     match result {
@@ -488,9 +567,10 @@ pub(super) async fn call_list_windows(
     parse_arguments::<NoArguments>(arguments)?;
     let result = run_platform_operation(operation_lease, move || backend.list_windows()).await?;
     match result {
-        Ok(windows) => Ok(CallToolResult::structured(json!({
-            "count": windows.len(),
-            "windows": windows,
+        Ok(list) => Ok(CallToolResult::structured(json!({
+            "count": list.windows.len(),
+            "truncated": list.truncated,
+            "windows": list.windows,
         }))
         .into()),
         Err(error) => Ok(tool_error(&error).into()),
@@ -670,22 +750,31 @@ pub(super) async fn call_scroll_mouse(
     operation_lease: Option<OperationLease>,
 ) -> Result<CallToolResponse, ErrorData> {
     let input = parse_arguments::<ScrollMouseInput>(arguments)?;
+    let target = match input.pointer_target() {
+        Ok(target) => target,
+        Err(error) => return Ok(not_started(&error)),
+    };
     let delta_x = input.delta_x;
     let delta_y = input.delta_y;
-    let scroll_request = MouseScrollRequest {
-        display_id: input.display_id,
-        x: input.x,
-        y: input.y,
-        delta_x,
-        delta_y,
-        duration_ms: input.duration_ms,
-        observation: input.observation.into(),
-    };
+    let duration_ms = input.duration_ms;
+    let observation = input.observation.into();
     let (result, progress) = run_mutation_operation(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
-        move |control| backend.scroll_mouse_controlled(&scroll_request, control),
+        move |control| {
+            let (display_id, x, y) = target.resolve(backend.as_ref())?;
+            let scroll_request = MouseScrollRequest {
+                display_id,
+                x,
+                y,
+                delta_x,
+                delta_y,
+                duration_ms,
+                observation,
+            };
+            backend.scroll_mouse_controlled(&scroll_request, control)
+        },
     )
     .await;
     match result {
@@ -701,4 +790,231 @@ pub(super) async fn call_scroll_mouse(
         Err(error) => Ok(tool_error(&error).into()),
     }
     .map(|response| super::results::with_progress(response, progress))
+}
+
+/// A tool error for a request rejected before any desktop work, with not-started progress.
+fn not_started(error: &PlatformError) -> CallToolResponse {
+    super::results::with_progress(tool_error(error).into(), MutationProgress::default())
+}
+
+/// Runs validated steps in order on one target, stopping at the first failure. Each step uses
+/// the same backend path, target checks, and cleanup as the matching single-action tool;
+/// only the last step captures the requested observation.
+pub(super) async fn call_run_actions(
+    backend: Arc<dyn PlatformBackend>,
+    arguments: Option<JsonObject>,
+    operation_lease: Option<OperationLease>,
+) -> Result<CallToolResponse, ErrorData> {
+    let input = parse_arguments::<RunActionsInput>(arguments)?;
+    let steps = match input.validated_steps() {
+        Ok(steps) => steps,
+        Err(error) => return Ok(not_started(&error)),
+    };
+    let final_observation: ObservationOptions = input.observation.into();
+    let reports = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let worker_reports = Arc::clone(&reports);
+    let (result, progress) = run_mutation_operation(
+        operation_lease,
+        input.target_ref,
+        Arc::clone(&backend),
+        move |control| {
+            run_steps(
+                backend.as_ref(),
+                &steps,
+                &final_observation,
+                control,
+                &worker_reports,
+            )
+        },
+    )
+    .await;
+    let steps = std::mem::take(
+        &mut *reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    let action = json!({ "kind": "run_actions", "steps": steps });
+    match result {
+        Ok(observation) => {
+            Ok(keyboard_result(&KeyboardActionResult { observation }, &action).into())
+        }
+        Err(error) => {
+            let mut response = tool_error(&error);
+            if let Some(content) = response.structured_content.as_mut()
+                && content.get("error").is_some()
+            {
+                content["error"]["details"]["steps"] = action["steps"].clone();
+            }
+            Ok(response.into())
+        }
+    }
+    .map(|response| super::results::with_progress(response, progress))
+}
+
+fn run_steps(
+    backend: &dyn PlatformBackend,
+    steps: &[ActionStep],
+    final_observation: &ObservationOptions,
+    control: &MutationControl,
+    reports: &std::sync::Mutex<Vec<Value>>,
+) -> Result<ActionObservation, PlatformError> {
+    let report = |value: Value| {
+        reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(value);
+    };
+    // Resolve every image point before the first step sends input.
+    let resolved = steps
+        .iter()
+        .map(|step| match step {
+            ActionStep::Click { target, .. } | ActionStep::Scroll { target, .. } => {
+                target.resolve(backend).map(Some)
+            }
+            ActionStep::TypeText { .. } | ActionStep::PressKeys { .. } => Ok(None),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // Direct coordinates are only echoed by resolution, so check every point against the
+    // current displays now; a bad later point must not strand input from earlier steps.
+    let displays = backend.list_displays()?;
+    for (index, point) in resolved.iter().enumerate() {
+        let Some((display_id, x, y)) = point else {
+            continue;
+        };
+        let display = displays
+            .iter()
+            .find(|display| display.id.eq_ignore_ascii_case(display_id))
+            .ok_or_else(|| PlatformError::InvalidArgument {
+                argument: format!("steps[{index}]"),
+                reason: format!("display '{display_id}' is not active; call list_displays again"),
+            })?;
+        if *x >= display.bounds.width || *y >= display.bounds.height {
+            return Err(PlatformError::InvalidArgument {
+                argument: format!("steps[{index}]"),
+                reason: format!(
+                    "point ({x}, {y}) lies outside the {}x{} display",
+                    display.bounds.width, display.bounds.height
+                ),
+            });
+        }
+    }
+    let quiet = ObservationOptions {
+        mode: ObservationMode::None,
+        ..ObservationOptions::default()
+    };
+    let mut observation = None;
+    for (index, (step, point)) in steps.iter().zip(resolved).enumerate() {
+        let options = if index + 1 == steps.len() {
+            final_observation.clone()
+        } else {
+            quiet.clone()
+        };
+        let sent_before = control.progress().sent_events;
+        let outcome = control
+            .check("run_actions")
+            .and_then(|()| run_step(backend, step, point, options, control));
+        let sent_events = control.progress().sent_events.saturating_sub(sent_before);
+        match outcome {
+            Ok(step_observation) => {
+                report(
+                    json!({ "index": index, "action": step.kind(), "status": "completed", "sent_events": sent_events }),
+                );
+                observation = Some(step_observation);
+            }
+            Err(error) => {
+                report(
+                    json!({ "index": index, "action": step.kind(), "status": "failed", "sent_events": sent_events, "error": error.to_string() }),
+                );
+                for (skipped, step) in steps.iter().enumerate().skip(index + 1) {
+                    report(
+                        json!({ "index": skipped, "action": step.kind(), "status": "skipped", "sent_events": 0 }),
+                    );
+                }
+                if index > 0 && !matches!(error, PlatformError::PostActionObservationFailed { .. })
+                {
+                    control.steps_incomplete();
+                }
+                return Err(error);
+            }
+        }
+    }
+    observation.ok_or_else(|| PlatformError::InvalidArgument {
+        argument: "steps".to_owned(),
+        reason: "at least one step is required".to_owned(),
+    })
+}
+
+fn run_step(
+    backend: &dyn PlatformBackend,
+    step: &ActionStep,
+    point: Option<(String, u32, u32)>,
+    observation: ObservationOptions,
+    control: &MutationControl,
+) -> Result<ActionObservation, PlatformError> {
+    let missing_point = || PlatformError::InvalidArgument {
+        argument: "point".to_owned(),
+        reason: "the step's point was not resolved".to_owned(),
+    };
+    match step {
+        ActionStep::Click {
+            button,
+            click_count,
+            modifiers,
+            ..
+        } => {
+            let (display_id, x, y) = point.ok_or_else(missing_point)?;
+            backend
+                .click_mouse_controlled(
+                    &MouseClickRequest {
+                        display_id,
+                        x,
+                        y,
+                        button: *button,
+                        click_count: *click_count,
+                        modifiers: modifiers.clone(),
+                        duration_ms: 0,
+                        observation,
+                    },
+                    control,
+                )
+                .map(|result| result.observation)
+        }
+        ActionStep::Scroll {
+            delta_x, delta_y, ..
+        } => {
+            let (display_id, x, y) = point.ok_or_else(missing_point)?;
+            backend
+                .scroll_mouse_controlled(
+                    &MouseScrollRequest {
+                        display_id,
+                        x,
+                        y,
+                        delta_x: *delta_x,
+                        delta_y: *delta_y,
+                        duration_ms: 0,
+                        observation,
+                    },
+                    control,
+                )
+                .map(|result| result.observation)
+        }
+        ActionStep::TypeText { text } => backend
+            .type_text_controlled(
+                &TextInputRequest {
+                    text: text.clone(),
+                    observation,
+                },
+                control,
+            )
+            .map(|result| result.observation),
+        ActionStep::PressKeys { keys } => backend
+            .press_keys_controlled(
+                &KeyChordRequest {
+                    keys: keys.clone(),
+                    observation,
+                },
+                control,
+            )
+            .map(|result| result.observation),
+    }
 }

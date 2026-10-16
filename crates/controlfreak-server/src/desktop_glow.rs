@@ -258,9 +258,10 @@ fn actor_loop(
     let mut next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
     let mut shutdown_requested = false;
     let mut shutdown_acknowledged = false;
+    let mut deferred = None;
 
     loop {
-        while let Ok(request) = requests.try_recv() {
+        while let Some(request) = deferred.take().or_else(|| requests.try_recv().ok()) {
             match request {
                 ActorRequest::Command { command, reply } => {
                     if !matches!(current_health(health), IndicatorHealth::Healthy) {
@@ -334,7 +335,7 @@ fn actor_loop(
             }
         }
 
-        match process.events.recv_timeout(ACTOR_POLL) {
+        match next_process_event(&process, requests, pending.is_empty(), &mut deferred) {
             Ok(ProcessEvent::Line(Ok(line))) => match parse_marker(&line) {
                 Ok(marker) if marker.generation != generation => {}
                 Ok(marker) => {
@@ -437,6 +438,32 @@ fn actor_loop(
             return;
         }
     }
+}
+
+/// Waits for the next helper event. While no acknowledgement is pending, the wait is on new
+/// requests instead, so a command is written to the helper as soon as it arrives rather than
+/// after the current poll interval. A request that ends the wait is returned through `deferred`.
+fn next_process_event(
+    process: &ActorProcess,
+    requests: &mpsc::Receiver<ActorRequest>,
+    idle: bool,
+    deferred: &mut Option<ActorRequest>,
+) -> Result<ProcessEvent, mpsc::RecvTimeoutError> {
+    if idle {
+        match requests.recv_timeout(ACTOR_POLL) {
+            Ok(request) => *deferred = Some(request),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            // Without a requester, keep observing the helper at the normal interval.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return process.events.recv_timeout(ACTOR_POLL);
+            }
+        }
+        return process.events.try_recv().map_err(|error| match error {
+            mpsc::TryRecvError::Empty => mpsc::RecvTimeoutError::Timeout,
+            mpsc::TryRecvError::Disconnected => mpsc::RecvTimeoutError::Disconnected,
+        });
+    }
+    process.events.recv_timeout(ACTOR_POLL)
 }
 
 fn await_startup(mut process: ActorProcess, generation: u64) -> io::Result<ActorProcess> {

@@ -4,6 +4,7 @@
 mod cleanup_tests;
 mod diagnostics;
 mod handlers;
+mod observations;
 mod requests;
 mod session;
 mod stop;
@@ -16,11 +17,11 @@ use requests::{
     ClickMouseInput, ClickTextInput, DragMouseInput, FindTextInput, FocusWindowInput,
     MoveMouseInput, NoArguments, OcrRegionInput, PressKeysInput, ScrollMouseInput,
     SwitchVirtualDesktopInput, TypeTextInput, VisualBaselineInput, WaitForChangeSinceInput,
-    WaitForVisualChangeInput, WaitForWindowInput, parse_arguments,
+    WaitForTextInput, WaitForVisualChangeInput, WaitForWindowInput, parse_arguments,
 };
 pub use session::{
-    ActivityArbitrator, ActivityIndicator, ArbitrationBusy, IndicatorHealth, IndicatorLevel,
-    SafetyIndicator,
+    ActivityArbitrator, ActivityIndicator, ArbitrationBusy, ArbitrationError, IndicatorHealth,
+    IndicatorLevel, SafetyIndicator,
 };
 #[cfg(test)]
 use session::{GlowTiming, IdleCommand, IdleWorker};
@@ -35,6 +36,8 @@ mod protocol_tests;
 #[cfg(test)]
 mod recipe_tests;
 mod results;
+#[cfg(test)]
+mod run_actions_tests;
 mod schema;
 
 use handlers::{
@@ -42,8 +45,9 @@ use handlers::{
     call_click_mouse, call_click_text, call_drag_mouse, call_find_text_on_screen,
     call_focus_window, call_get_server_status, call_list_displays, call_list_virtual_desktops,
     call_list_windows, call_move_mouse, call_press_keys, call_read_text_in_region,
-    call_scroll_mouse, call_switch_virtual_desktop, call_type_text, call_wait_for_change_since,
-    call_wait_for_visual_change, call_wait_for_window,
+    call_run_actions, call_scroll_mouse, call_switch_virtual_desktop, call_type_text,
+    call_wait_for_change_since, call_wait_for_text, call_wait_for_visual_change,
+    call_wait_for_window,
 };
 use results::{
     click_text_result, keyboard_result, pointer_result, screenshot_result, tool_error,
@@ -106,6 +110,8 @@ const CAPTURE_VISUAL_BASELINE: &str = "capture_visual_baseline";
 const WAIT_FOR_CHANGE_SINCE: &str = "wait_for_change_since";
 const READ_TEXT_IN_REGION: &str = "read_text_in_region";
 const FIND_TEXT_ON_SCREEN: &str = "find_text_on_screen";
+const WAIT_FOR_TEXT: &str = "wait_for_text";
+const RUN_ACTIONS: &str = "run_actions";
 const CLICK_TEXT: &str = "click_text";
 const MOVE_MOUSE: &str = "move_mouse";
 const CLICK_MOUSE: &str = "click_mouse";
@@ -171,7 +177,7 @@ impl ServerHandler for ControlFreakServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "ControlFreak is a computer-use MCP server. For tasks with multiple input actions, call begin_control_session first and end_control_session when finished. Actions return screenshots by default. Reuse them; capture again only when needed. Choose a server-issued target_ref from current window or screenshot observations. Pass it to begin_control_session and every input action; focus_window uses window_id. End the session before changing targets. Prefer click_text for unique visible labels. Check isError, status, and error text. Input dispatch and observation do not verify application effects. Observe again before recovering from partial or unknown delivery. Read structuredContent without serializing image data. Never repeat an action when retry_action=false. A notifications/controlfreak/session_stopped event or stop_reason=user_stop means the user ended control. Do not resume desktop actions or restart the server without the user's permission.",
+                "ControlFreak is a computer-use MCP server. For tasks with multiple input actions, call begin_control_session first and end_control_session when finished. Actions return screenshots by default. Reuse them; capture again only when needed. Use observation.region to crop evidence to the affected area, or mode metadata/none when no image is needed; smaller images cost fewer tokens on every later turn. Every screenshot has an observation_id: pass it with image_x/image_y to pointer tools to act on a point in that image instead of converting coordinates. Use run_actions for a known sequence of clicks, scrolls, keys and text on one target, and wait_for_text to wait for a label to appear or disappear. Choose a server-issued target_ref from current window or screenshot observations. Pass it to begin_control_session and every input action; focus_window uses window_id. End the session before changing targets. Prefer click_text for unique visible labels. Check isError, status, and error text. Input dispatch and observation do not verify application effects. Observe again before recovering from partial or unknown delivery. Read structuredContent without serializing image data. Never repeat an action when retry_action=false. A notifications/controlfreak/session_stopped event or stop_reason=user_stop means the user ended control. Do not resume desktop actions or restart the server without the user's permission.",
             )
     }
 
@@ -238,6 +244,8 @@ impl ServerHandler for ControlFreakServer {
                 });
             let reporting = Arc::clone(&diagnostics);
             let report_name = tool_name.clone();
+            let request_stages = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let worker_stages = Arc::clone(&request_stages);
             let request_future = async move {
                 if request.name == "stop_desktop_work" {
                     parse_arguments::<NoArguments>(request.arguments)?;
@@ -297,7 +305,7 @@ impl ServerHandler for ControlFreakServer {
                     stop::Work::new(&stop)
                 };
                 let work = match admission {
-                    Ok(work) => work,
+                    Ok(work) => work.with_stages(worker_stages),
                     Err(error) => {
                         let response = tool_error(&error).into();
                         return Ok(if is_mutating_tool(&request.name) {
@@ -432,8 +440,20 @@ impl ServerHandler for ControlFreakServer {
                     })
                 }
             };
-            let elapsed_ms =
-                reporting.complete(&report_name, operation_id, started, gap_ms, &outcome);
+            let stages = std::mem::take(
+                &mut *request_stages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            let stages_ms = diagnostics::stages_json(&stages);
+            let elapsed_ms = reporting.complete(
+                &report_name,
+                operation_id,
+                started,
+                gap_ms,
+                &outcome,
+                stages_ms.clone(),
+            );
             outcome.map(|mut response| {
                 if let CallToolResponse::Complete(result) = &mut response {
                     let mut meta = result.meta.take().unwrap_or_default();
@@ -443,6 +463,7 @@ impl ServerHandler for ControlFreakServer {
                             "instance_id": reporting.instance_id,
                             "operation_id": operation_id,
                             "elapsed_ms": elapsed_ms,
+                            "stages_ms": stages_ms,
                         }),
                     );
                     result.meta = Some(meta);
@@ -487,6 +508,8 @@ async fn dispatch_tool(
         FIND_TEXT_ON_SCREEN => {
             call_find_text_on_screen(backend, request.arguments, operation_lease).await
         }
+        WAIT_FOR_TEXT => call_wait_for_text(backend, request.arguments, operation_lease).await,
+        RUN_ACTIONS => call_run_actions(backend, request.arguments, operation_lease).await,
         CLICK_TEXT => call_click_text(backend, request.arguments, operation_lease).await,
         MOVE_MOUSE => call_move_mouse(backend, request.arguments, operation_lease).await,
         CLICK_MOUSE => call_click_mouse(backend, request.arguments, operation_lease).await,
@@ -523,6 +546,7 @@ fn is_mutating_tool(tool: &str) -> bool {
             | FOCUS_WINDOW
             | PRESS_KEYS
             | TYPE_TEXT
+            | RUN_ACTIONS
     )
 }
 

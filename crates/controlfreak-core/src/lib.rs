@@ -14,6 +14,7 @@ mod report;
 mod security;
 mod stop;
 mod text_matching;
+pub mod timing;
 mod window;
 
 pub use capability::{Capability, CapabilityDescriptor, CapabilityState};
@@ -33,7 +34,8 @@ pub use keyboard::{Key, KeyChordRequest, KeyboardActionResult, TextInputRequest}
 pub use mutation::MutationControl;
 pub use ocr::{
     ClickTextRequest, ClickTextResult, FindTextRequest, FindTextResult, OcrLine, OcrMatchDetails,
-    OcrRegionRequest, OcrResult, OcrWord, TextMatch, TextMatchMode, TextMatchTier,
+    OcrRegionRequest, OcrResult, OcrWord, TextCondition, TextMatch, TextMatchMode, TextMatchTier,
+    WaitForTextRequest, WaitForTextResult,
 };
 pub use outcome::{CleanupStatus, InputOutcome, MutationProgress};
 pub use permission::{PermissionDescriptor, PermissionId, PermissionState};
@@ -47,5 +49,5 @@ pub use stop::{StopController, StopRegistration};
 pub use text_matching::{discover_text, select_text_candidate, validate_text_discovery};
 pub use window::{
     CaptureWindowRequest, FocusWindowRequest, WaitForWindowRequest, WindowBounds,
-    WindowFocusResult, WindowInfo, WindowScreenshot, WindowWaitResult,
+    WindowFocusResult, WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
 };

@@ -1,5 +1,7 @@
 #![allow(unsafe_code)]
 
+use controlfreak_core::timing;
+
 use super::{
     ActionObservation, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, BitmapPixelFormat, CAPTUREBLT,
     ComApartment, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS, DataWriter, DeleteDC,
@@ -212,6 +214,7 @@ pub(super) fn observe_display(
             screenshot: None,
         });
     }
+    let _timer = timing::start("observe");
     let display = find_display(display_id)?;
     let foreground_window = foreground_window_info();
     let screenshot = if options.mode == ObservationMode::Screenshot {
@@ -235,6 +238,7 @@ pub(super) fn observe_foreground(
             screenshot: None,
         });
     }
+    let _timer = timing::start("observe");
     let foreground_window = foreground_window_info();
     let display = if let Some(window) = &foreground_window {
         find_display(&window.display_id)?
@@ -377,19 +381,21 @@ pub(super) fn capture_bounds(
     max_width: Option<u32>,
     include_cursor_marker: bool,
 ) -> Result<(Vec<u8>, u32, u32, u32, bool), PlatformError> {
-    let bgra = capture_rgba(bounds)?;
+    let bgra = timing::time("capture_gdi", || capture_rgba(bounds))?;
     let (image_width, image_height, downscale_factor) =
         scaled_dimensions(bounds.width, bounds.height, max_width);
     let mut rgba = if image_width == bounds.width && image_height == bounds.height {
         bgra
     } else {
-        resize_rgba_bilinear(
-            &bgra,
-            bounds.width,
-            bounds.height,
-            image_width,
-            image_height,
-        )
+        timing::time("resize", || {
+            resize_rgba_area(
+                &bgra,
+                bounds.width,
+                bounds.height,
+                image_width,
+                image_height,
+            )
+        })
     };
     let cursor_marker = include_cursor_marker
         && cursor_position_in_bounds(bounds).is_some_and(|(local_x, local_y)| {
@@ -409,7 +415,9 @@ pub(super) fn capture_bounds(
             true
         });
 
-    let png = encode_png(image_width, image_height, &rgba)?;
+    let png = timing::time("encode_png", || {
+        encode_png(image_width, image_height, &rgba)
+    })?;
     Ok((
         png,
         image_width,
@@ -435,8 +443,98 @@ pub(super) fn scaled_dimensions(
     (image_width, image_height, legacy_downscale_factor)
 }
 
+/// Changed pixels needed before a repaint counts as the application's response. A blinking
+/// caret changes fewer pixels than this; one typed glyph or a pressed button changes more.
+const SETTLE_MIN_CHANGED_PIXELS: usize = 48;
+/// Largest window area watched for settling; bigger windows fall back to the fixed wait because
+/// each read of them costs about as much as the wait itself.
+const SETTLE_MAX_PIXELS: u64 = 2_560 * 1_600;
+const SETTLE_POLL: Duration = Duration::from_millis(4);
+/// How long the window must stay identical to count as settled. Applications often repaint in
+/// phases, for example a busy state and then the result; a short window returns between phases
+/// and the evidence shows the intermediate state. Live tests saw a second phase 65 ms after the
+/// first, so the window covers gaps up to 60 ms while still returning well under the 150 ms cap.
+const SETTLE_STABLE: Duration = Duration::from_millis(60);
+
+/// Watches the approved window across an input action, so the action returns as soon as the
+/// window has visibly responded and stopped changing, instead of always sleeping the full cap.
+pub(super) struct SettleWatch {
+    bounds: DisplayBounds,
+    before: Vec<u8>,
+}
+
+/// How a settle wait ended; recorded as a timing stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SettleOutcome {
+    /// The window changed and then held still for one read.
+    Settled,
+    /// The cap elapsed first; the result is the same as the previous fixed wait.
+    Capped,
+}
+
+impl SettleWatch {
+    /// Reads the window before input. Returns `None` when it is unknown, too large, or unreadable,
+    /// in which case the caller keeps the fixed wait.
+    pub(super) fn begin(bounds: Option<DisplayBounds>) -> Option<Self> {
+        let bounds = bounds?;
+        if bounds.width == 0
+            || bounds.height == 0
+            || u64::from(bounds.width) * u64::from(bounds.height) > SETTLE_MAX_PIXELS
+        {
+            return None;
+        }
+        let before = timing::time("settle_capture", || capture_rgba(bounds)).ok()?;
+        Some(Self { bounds, before })
+    }
+
+    /// Waits until the window changed and then stayed identical for at least `SETTLE_STABLE`,
+    /// or until `cap`.
+    pub(super) fn wait(self, cap: Duration) -> SettleOutcome {
+        let started = Instant::now();
+        let mut changed: Option<(Vec<u8>, Instant)> = None;
+        loop {
+            let remaining = cap.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return SettleOutcome::Capped;
+            }
+            std::thread::sleep(SETTLE_POLL.min(remaining));
+            let read_at = Instant::now();
+            let Ok(frame) = timing::time("settle_capture", || capture_rgba(self.bounds)) else {
+                std::thread::sleep(cap.saturating_sub(started.elapsed()));
+                return SettleOutcome::Capped;
+            };
+            match &changed {
+                Some((last, since)) if changed_pixels(last, &frame, 1) == 0 => {
+                    if read_at.saturating_duration_since(*since) >= SETTLE_STABLE {
+                        return SettleOutcome::Settled;
+                    }
+                }
+                Some(_) => changed = Some((frame, read_at)),
+                None if changed_pixels(&self.before, &frame, SETTLE_MIN_CHANGED_PIXELS)
+                    >= SETTLE_MIN_CHANGED_PIXELS =>
+                {
+                    changed = Some((frame, read_at));
+                }
+                None => {}
+            }
+        }
+    }
+}
+
+/// Counts RGBA pixels that differ between two equally sized frames, stopping at `limit`.
+fn changed_pixels(left: &[u8], right: &[u8], limit: usize) -> usize {
+    if left.len() != right.len() {
+        return limit;
+    }
+    left.chunks_exact(4)
+        .zip(right.chunks_exact(4))
+        .filter(|(left, right)| left != right)
+        .take(limit)
+        .count()
+}
+
 pub(super) fn capture_comparison_frame(bounds: DisplayBounds) -> Result<Vec<u8>, PlatformError> {
-    let rgba = capture_rgba(bounds)?;
+    let rgba = timing::time("capture_gdi", || capture_rgba(bounds))?;
     let factor = bounds.width.div_ceil(VISUAL_COMPARE_WIDTH).max(1);
     if factor == 1 {
         Ok(rgba)
@@ -525,6 +623,7 @@ pub(super) fn recognize_text(
     control: &controlfreak_core::MutationControl,
 ) -> Result<OcrResult, PlatformError> {
     control.check("windows_ocr")?;
+    let _timer = timing::start("ocr_recognize");
     ensure_dpi_awareness()?;
     let _apartment = ComApartment::initialize()?;
     let display = find_display(&request.display_id)?;
@@ -544,7 +643,7 @@ pub(super) fn recognize_text(
             ),
         });
     }
-    let rgba = capture_rgba(source_bounds)?;
+    let rgba = timing::time("capture_gdi", || capture_rgba(source_bounds))?;
     let writer = DataWriter::new().map_err(ocr_error)?;
     writer.WriteBytes(&rgba).map_err(ocr_error)?;
     let buffer = writer.DetachBuffer().map_err(ocr_error)?;
@@ -559,17 +658,9 @@ pub(super) fn recognize_text(
     let bitmap =
         SoftwareBitmap::CreateCopyFromBuffer(&buffer, BitmapPixelFormat::Rgba8, width, height)
             .map_err(ocr_error)?;
-    let engine = if let Some(tag) = request.language.as_deref() {
-        let language = Language::CreateLanguage(&HSTRING::from(tag)).map_err(ocr_error)?;
-        if !OcrEngine::IsLanguageSupported(&language).map_err(ocr_error)? {
-            return Err(PlatformError::Unavailable {
-                reason: format!("OCR language '{tag}' is not installed"),
-            });
-        }
-        OcrEngine::TryCreateFromLanguage(&language).map_err(ocr_error)?
-    } else {
-        OcrEngine::TryCreateFromUserProfileLanguages().map_err(ocr_error)?
-    };
+    let engine = timing::time("ocr_engine_create", || {
+        ocr_engine(request.language.as_deref())
+    })?;
     let language = engine
         .RecognizerLanguage()
         .and_then(|language| language.LanguageTag())
@@ -584,7 +675,7 @@ pub(super) fn recognize_text(
             let _ = operation.Cancel();
             break;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(2));
     }
     let recognized = operation.join().map_err(ocr_error)?;
     control.check("windows_ocr")?;
@@ -624,6 +715,19 @@ pub(super) fn recognize_text(
         text: recognized.Text().map_err(ocr_error)?.to_string(),
         lines,
     })
+}
+
+fn ocr_engine(language: Option<&str>) -> Result<OcrEngine, PlatformError> {
+    let Some(tag) = language else {
+        return OcrEngine::TryCreateFromUserProfileLanguages().map_err(ocr_error);
+    };
+    let language = Language::CreateLanguage(&HSTRING::from(tag)).map_err(ocr_error)?;
+    if !OcrEngine::IsLanguageSupported(&language).map_err(ocr_error)? {
+        return Err(PlatformError::Unavailable {
+            reason: format!("OCR language '{tag}' is not installed"),
+        });
+    }
+    OcrEngine::TryCreateFromLanguage(&language).map_err(ocr_error)
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -778,61 +882,95 @@ pub(super) fn resize_rgba_box(
     target
 }
 
+/// Fixed-point scale for resampling weights; one source pixel's full coverage.
+const AREA_WEIGHT_BITS: u32 = 14;
+const AREA_WEIGHT_ONE: u32 = 1 << AREA_WEIGHT_BITS;
+
+/// Coverage of each output pixel along one axis: `spans[i]` is the first source pixel and the
+/// range of `weights` for output pixel `i`. Each output pixel's weights sum to `AREA_WEIGHT_ONE`.
+struct AreaWeights {
+    spans: Vec<(usize, std::ops::Range<usize>)>,
+    weights: Vec<u32>,
+}
+
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn resize_rgba_bilinear(
+fn area_weights(source: u32, target: u32) -> AreaWeights {
+    let scale = f64::from(source) / f64::from(target);
+    let mut spans = Vec::with_capacity(target as usize);
+    let mut weights = Vec::with_capacity(target as usize * (scale.ceil() as usize + 1));
+    for index in 0..target {
+        let start = f64::from(index) * scale;
+        let end = (f64::from(index + 1) * scale).min(f64::from(source));
+        let first = (start.floor() as u32).min(source - 1);
+        let last = (end.ceil() as u32).max(first + 1).min(source);
+        let span = (end - start).max(f64::MIN_POSITIVE);
+        let begin = weights.len();
+        weights.extend((first..last).map(|pixel| {
+            let overlap = (f64::from(pixel + 1).min(end) - f64::from(pixel).max(start)).max(0.0);
+            (overlap / span * f64::from(AREA_WEIGHT_ONE)).round() as u32
+        }));
+        // Rounding can leave the total slightly off; correct it on the largest weight.
+        let output = &mut weights[begin..];
+        let total: u32 = output.iter().sum();
+        if let Some(largest) = output.iter_mut().max() {
+            *largest = (*largest + AREA_WEIGHT_ONE).saturating_sub(total);
+        }
+        spans.push((first as usize, begin..weights.len()));
+    }
+    AreaWeights { spans, weights }
+}
+
+/// Downscales RGBA by averaging the exact source area under each output pixel. Thin strokes such
+/// as text survive large reductions, unlike point or bilinear sampling of a few source pixels.
+fn resize_rgba_area(
     source: &[u8],
     source_width: u32,
     source_height: u32,
     target_width: u32,
     target_height: u32,
 ) -> Vec<u8> {
-    let target_length = usize::try_from(target_width)
-        .ok()
-        .and_then(|width| {
-            usize::try_from(target_height)
-                .ok()
-                .and_then(|height| width.checked_mul(height))
-        })
-        .and_then(|pixels| pixels.checked_mul(4))
-        .unwrap_or(0);
-    let mut target = vec![0_u8; target_length];
-    for target_y in 0..target_height {
-        let source_y = if target_height == 1 {
-            0.0
-        } else {
-            f64::from(target_y) * f64::from(source_height.saturating_sub(1))
-                / f64::from(target_height - 1)
-        };
-        let top = source_y.floor() as u32;
-        let bottom = top.saturating_add(1).min(source_height - 1);
-        let y_weight = source_y - f64::from(top);
-        for target_x in 0..target_width {
-            let source_x = if target_width == 1 {
-                0.0
-            } else {
-                f64::from(target_x) * f64::from(source_width.saturating_sub(1))
-                    / f64::from(target_width - 1)
-            };
-            let left = source_x.floor() as u32;
-            let right = left.saturating_add(1).min(source_width - 1);
-            let x_weight = source_x - f64::from(left);
-            let target_index = usize::try_from(
-                (u64::from(target_y) * u64::from(target_width) + u64::from(target_x)) * 4,
-            )
-            .unwrap_or(0);
-            for channel in 0..4_u64 {
-                let pixel = |x: u32, y: u32| {
-                    let index = usize::try_from(
-                        (u64::from(y) * u64::from(source_width) + u64::from(x)) * 4 + channel,
-                    )
-                    .unwrap_or(0);
-                    f64::from(source[index])
-                };
-                let top_value = pixel(left, top) * (1.0 - x_weight) + pixel(right, top) * x_weight;
-                let bottom_value =
-                    pixel(left, bottom) * (1.0 - x_weight) + pixel(right, bottom) * x_weight;
-                target[target_index + usize::try_from(channel).unwrap_or(0)] =
-                    (top_value * (1.0 - y_weight) + bottom_value * y_weight).round() as u8;
+    // After the vertical pass a value is at most 255 << 14; dropping 6 bits keeps the horizontal
+    // products below 2^32 while retaining 8 fractional bits.
+    const VERTICAL_SHIFT: u32 = 6;
+    let columns = area_weights(source_width, target_width);
+    let rows = area_weights(source_height, target_height);
+    let source_stride = source_width as usize * 4;
+    let mut target = vec![0_u8; target_width as usize * target_height as usize * 4];
+    let mut vertical = vec![0_u32; source_stride];
+    let horizontal_bits = AREA_WEIGHT_BITS * 2 - VERTICAL_SHIFT;
+    let rounding = 1_u32 << (horizontal_bits - 1);
+    for (target_row, (first_row, row_range)) in target
+        .chunks_exact_mut(target_width as usize * 4)
+        .zip(&rows.spans)
+    {
+        vertical.fill(0);
+        for (offset, weight) in rows.weights[row_range.clone()].iter().enumerate() {
+            let start = (first_row + offset) * source_stride;
+            for (sum, value) in vertical
+                .iter_mut()
+                .zip(&source[start..start + source_stride])
+            {
+                *sum += u32::from(*value) * weight;
+            }
+        }
+        for sum in &mut vertical {
+            *sum >>= VERTICAL_SHIFT;
+        }
+        for (pixel, (first_column, column_range)) in
+            target_row.chunks_exact_mut(4).zip(&columns.spans)
+        {
+            let mut sums = [rounding; 4];
+            let taps = &vertical[first_column * 4..];
+            for (tap, weight) in taps
+                .chunks_exact(4)
+                .zip(&columns.weights[column_range.clone()])
+            {
+                for channel in 0..4 {
+                    sums[channel] += tap[channel] * weight;
+                }
+            }
+            for channel in 0..4 {
+                pixel[channel] = u8::try_from(sums[channel] >> horizontal_bits).unwrap_or(u8::MAX);
             }
         }
     }
@@ -882,11 +1020,20 @@ fn set_marker_pixel(rgba: &mut [u8], width: u32, height: u32, x: i64, y: i64) {
     rgba[index..index + 4].copy_from_slice(&[255, 0, 255, 255]);
 }
 
+/// Encodes opaque RGBA pixels as an RGB PNG; dropping the constant alpha channel makes the image
+/// smaller and faster to encode without changing what the client sees.
 pub(super) fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, PlatformError> {
+    let rgb: Vec<u8> = rgba
+        .chunks_exact(4)
+        .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+        .collect();
     let mut output = Vec::new();
     let mut encoder = png::Encoder::new(&mut output, width, height);
-    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_color(png::ColorType::Rgb);
     encoder.set_depth(png::BitDepth::Eight);
+    // On real 1280-pixel screenshots, zlib level 2 encodes about four times faster than the
+    // default level for roughly 8% more bytes. Images do not cost more model tokens by size.
+    encoder.set_deflate_compression(png::DeflateCompression::Level(2));
     let mut writer = encoder
         .write_header()
         .map_err(|error| PlatformError::OperationFailed {
@@ -894,7 +1041,7 @@ pub(super) fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>
             reason: error.to_string(),
         })?;
     writer
-        .write_image_data(rgba)
+        .write_image_data(&rgb)
         .map_err(|error| PlatformError::OperationFailed {
             operation: "encode_png".to_owned(),
             reason: error.to_string(),
@@ -906,4 +1053,266 @@ pub(super) fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>
             reason: error.to_string(),
         })?;
     Ok(output)
+}
+
+#[cfg(test)]
+mod benchmarks {
+    use super::*;
+
+    /// A desktop-like synthetic frame: flat panels, borders, and dense text-like strokes.
+    fn synthetic_frame(width: u32, height: u32) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let panel: u8 = if x < width / 5 { 32 } else { 245 };
+                let text = (y % 24 < 12) && (x % 9 < 5) && ((x / 9 + y / 24) % 7 != 0);
+                let value = if x % 400 == 0 || y % 300 == 0 {
+                    128
+                } else if text && panel > 128 {
+                    24
+                } else {
+                    panel
+                };
+                rgba.extend_from_slice(&[value, value, value.saturating_add(8), 255]);
+            }
+        }
+        rgba
+    }
+
+    fn median_ms(mut samples: Vec<f64>) -> f64 {
+        samples.sort_by(f64::total_cmp);
+        samples[samples.len() / 2]
+    }
+
+    fn measure(runs: usize, mut operation: impl FnMut()) -> f64 {
+        median_ms(
+            (0..runs)
+                .map(|_| {
+                    let started = Instant::now();
+                    operation();
+                    started.elapsed().as_secs_f64() * 1_000.0
+                })
+                .collect(),
+        )
+    }
+
+    /// Run with `cargo test -p controlfreak-platform --release --lib benchmarks -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "synthetic latency benchmark; run explicitly"]
+    fn synthetic_capture_pipeline_latency() {
+        for (width, height) in [(1920_u32, 1080_u32), (2560, 1440), (3840, 2160)] {
+            let frame = synthetic_frame(width, height);
+            let (image_width, image_height, _) = scaled_dimensions(width, height, Some(1280));
+            let mut resized = Vec::new();
+            let resize = measure(9, || {
+                resized = resize_rgba_area(&frame, width, height, image_width, image_height);
+            });
+            let encode_full = measure(5, || {
+                encode_png(width, height, &frame).unwrap();
+            });
+            let encode_action = measure(9, || {
+                encode_png(image_width, image_height, &resized).unwrap();
+            });
+            let factor = width.div_ceil(VISUAL_COMPARE_WIDTH).max(1);
+            let mut compare = Vec::new();
+            let downscale_compare = measure(9, || {
+                compare = resize_rgba_box(&frame, width, height, factor);
+            });
+            let difference = measure(9, || {
+                image_difference(&compare, &compare).unwrap();
+            });
+            eprintln!(
+                "{width}x{height}: resize_to_1280={resize:.1}ms encode_png_full={encode_full:.1}ms encode_png_1280={encode_action:.1}ms compare_downscale={downscale_compare:.1}ms compare_difference={difference:.2}ms"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::*;
+
+    fn gray(width: u32, height: u32, value: impl Fn(u32, u32) -> u8) -> Vec<u8> {
+        (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .flat_map(|(x, y)| {
+                let level = value(x, y);
+                [level, level, level, 255]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn area_weights_cover_every_output_pixel_exactly_once() {
+        for (source, target) in [(1920, 1280), (3840, 1280), (7, 3), (5, 5), (1, 1), (3, 5)] {
+            let weights = area_weights(source, target);
+            assert_eq!(weights.spans.len(), target as usize);
+            for (first, range) in &weights.spans {
+                assert!(*first + range.len() <= source as usize);
+                assert_eq!(
+                    weights.weights[range.clone()].iter().sum::<u32>(),
+                    AREA_WEIGHT_ONE
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn area_resize_keeps_flat_color_and_averages_integer_blocks() {
+        let flat = gray(1920, 1080, |_, _| 77);
+        let resized = resize_rgba_area(&flat, 1920, 1080, 1280, 720);
+        assert_eq!(resized.len(), 1280 * 720 * 4);
+        assert!(
+            resized
+                .chunks_exact(4)
+                .all(|pixel| pixel == [77, 77, 77, 255])
+        );
+        let source = [
+            0, 0, 0, 255, 100, 0, 0, 255, 0, 100, 0, 255, 100, 100, 0, 255,
+        ];
+        assert_eq!(resize_rgba_area(&source, 2, 2, 1, 1), [50, 50, 0, 255]);
+    }
+
+    #[test]
+    fn one_pixel_strokes_survive_a_three_to_one_reduction() {
+        // A dark one-pixel vertical stroke every 9 columns, like thin text on a light page.
+        let source = gray(90, 30, |x, _| if x % 9 == 4 { 0 } else { 255 });
+        let resized = resize_rgba_area(&source, 90, 30, 30, 10);
+        let darkest = resized.chunks_exact(4).map(|pixel| pixel[0]).min().unwrap();
+        // Area averaging keeps a third of the stroke's contrast instead of skipping it.
+        assert!((165..=175).contains(&darkest), "{darkest}");
+    }
+}
+
+#[cfg(test)]
+mod live_capture_benchmarks {
+    use super::*;
+
+    /// Times screen reads only; no pixels are stored or written anywhere.
+    #[test]
+    #[ignore = "reads the live desktop; run only on an approved disposable desktop"]
+    fn live_gdi_capture_latency() {
+        ensure_dpi_awareness().unwrap();
+        for (width, height) in [(64_u32, 64_u32), (400, 300), (760, 560), (1920, 1080)] {
+            let bounds = DisplayBounds {
+                left: 0,
+                top: 0,
+                width,
+                height,
+            };
+            let mut samples: Vec<f64> = (0..15)
+                .map(|_| {
+                    let started = Instant::now();
+                    capture_rgba(bounds).unwrap();
+                    started.elapsed().as_secs_f64() * 1_000.0
+                })
+                .collect();
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "{width}x{height}: median={:.1}ms min={:.1}ms",
+                samples[samples.len() / 2],
+                samples[0]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod settle_tests {
+    use super::*;
+
+    #[test]
+    fn changed_pixel_counts_stop_at_the_limit_and_ignore_identical_pixels() {
+        let base = vec![10_u8; 4 * 100];
+        let mut caret = base.clone();
+        for pixel in caret
+            .chunks_exact_mut(4)
+            .take(SETTLE_MIN_CHANGED_PIXELS - 1)
+        {
+            pixel[0] = 0;
+        }
+        assert_eq!(changed_pixels(&base, &base, 1), 0);
+        assert_eq!(
+            changed_pixels(&base, &caret, SETTLE_MIN_CHANGED_PIXELS),
+            SETTLE_MIN_CHANGED_PIXELS - 1
+        );
+        let glyph = vec![0_u8; 4 * 100];
+        assert_eq!(changed_pixels(&base, &glyph, 7), 7);
+        assert_eq!(changed_pixels(&base, &base[..4], 5), 5);
+    }
+
+    #[test]
+    fn settle_watch_skips_unknown_empty_and_oversized_windows() {
+        assert!(SettleWatch::begin(None).is_none());
+        for (width, height) in [(0, 10), (10, 0), (7_680, 4_320)] {
+            assert!(
+                SettleWatch::begin(Some(DisplayBounds {
+                    left: 0,
+                    top: 0,
+                    width,
+                    height,
+                }))
+                .is_none()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod live_encode_benchmarks {
+    use super::*;
+
+    /// Times the shipped encoder against the previous default on the live primary display.
+    /// Only sizes and times are printed; no pixels are kept.
+    #[test]
+    #[ignore = "reads the live desktop; run only on an approved disposable desktop"]
+    fn live_png_encode_cost() {
+        ensure_dpi_awareness().unwrap();
+        let display = enumerate_displays()
+            .unwrap()
+            .into_iter()
+            .find(|display| display.is_primary)
+            .unwrap();
+        let frame = capture_rgba(display.bounds).unwrap();
+        let (width, height, _) =
+            scaled_dimensions(display.bounds.width, display.bounds.height, Some(1280));
+        let resized = resize_rgba_area(
+            &frame,
+            display.bounds.width,
+            display.bounds.height,
+            width,
+            height,
+        );
+        let median = |encode: &dyn Fn() -> usize| {
+            let mut size = 0;
+            let mut samples: Vec<f64> = (0..7)
+                .map(|_| {
+                    let started = Instant::now();
+                    size = encode();
+                    started.elapsed().as_secs_f64() * 1_000.0
+                })
+                .collect();
+            samples.sort_by(f64::total_cmp);
+            (samples[samples.len() / 2], size)
+        };
+        let shipped = median(&|| encode_png(width, height, &resized).unwrap().len());
+        let previous = median(&|| {
+            let rgb: Vec<u8> = resized
+                .chunks_exact(4)
+                .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+                .collect();
+            let mut output = Vec::new();
+            let mut encoder = png::Encoder::new(&mut output, width, height);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&rgb).unwrap();
+            writer.finish().unwrap();
+            output.len()
+        });
+        eprintln!(
+            "{width}x{height}: shipped {:.1}ms {} bytes; balanced default {:.1}ms {} bytes",
+            shipped.0, shipped.1, previous.0, previous.1
+        );
+    }
 }

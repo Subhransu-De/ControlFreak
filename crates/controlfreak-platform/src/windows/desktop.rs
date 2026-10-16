@@ -31,6 +31,15 @@ pub(super) fn window_desktop_id(
     unsafe { manager.GetWindowDesktopId(hwnd) }
 }
 
+pub(super) fn window_on_current_desktop(
+    manager: &IVirtualDesktopManager,
+    hwnd: HWND,
+) -> windows::core::Result<bool> {
+    // SAFETY: `manager` is an initialized COM interface and `hwnd` is a borrowed window handle.
+    // The windows crate owns the result storage.
+    unsafe { manager.IsWindowOnCurrentVirtualDesktop(hwnd) }.map(BOOL::as_bool)
+}
+
 pub(super) fn window_is_on_current_desktop(manager: &IVirtualDesktopManager, hwnd: HWND) -> bool {
     // SAFETY: `manager` is an initialized COM interface and `hwnd` comes from the current Windows
     // enumeration. The windows crate owns the result storage.
@@ -79,6 +88,13 @@ impl ComApartment {
     }
 }
 
+impl ComApartment {
+    /// Whether this thread is in the multithreaded apartment rather than a host-owned STA.
+    const fn is_multithreaded(&self) -> bool {
+        self.uninitialize
+    }
+}
+
 impl Drop for ComApartment {
     fn drop(&mut self) {
         if self.uninitialize {
@@ -94,6 +110,73 @@ pub(super) fn virtual_desktop_manager() -> Result<IVirtualDesktopManager, Platfo
     // the windows crate for IVirtualDesktopManager.
     unsafe { CoCreateInstance(&VirtualDesktopManager, None, CLSCTX_ALL) }
         .map_err(|error| win32_error("CoCreateInstance(VirtualDesktopManager)", &error))
+}
+
+/// A virtual-desktop manager proxy created in the process multithreaded apartment.
+struct SharedVirtualDesktopManager(IVirtualDesktopManager);
+
+// SAFETY: The proxy is created on an MTA thread and is only used by callers that have joined the
+// MTA (checked through `ComApartment::is_multithreaded`). COM permits any MTA thread to call an
+// MTA proxy without marshaling, and the windows crate reference-counts it with atomic AddRef.
+unsafe impl Send for SharedVirtualDesktopManager {}
+// SAFETY: See `Send`; the shared slot only hands out AddRef'd clones under its mutex.
+unsafe impl Sync for SharedVirtualDesktopManager {}
+
+static SHARED_VIRTUAL_DESKTOP_MANAGER: std::sync::Mutex<Option<SharedVirtualDesktopManager>> =
+    std::sync::Mutex::new(None);
+
+/// Keeps the process MTA alive between worker threads, so the shared proxy and its connection to
+/// the shell are not torn down whenever a short-lived worker thread uninitializes COM.
+fn keep_multithreaded_apartment() -> Result<(), PlatformError> {
+    static USAGE: OnceLock<Result<(), String>> = OnceLock::new();
+    USAGE
+        .get_or_init(|| {
+            // SAFETY: The call has no inputs. The returned cookie is intentionally never passed to
+            // CoDecrementMTAUsage, so MTA support stays active for the life of the process.
+            unsafe { windows::Win32::System::Com::CoIncrementMTAUsage() }
+                .map(|_cookie| ())
+                .map_err(|error| error.to_string())
+        })
+        .clone()
+        .map_err(|reason| PlatformError::OperationFailed {
+            operation: "CoIncrementMTAUsage".to_owned(),
+            reason,
+        })
+}
+
+fn shared_virtual_desktop_manager(fresh: bool) -> Result<IVirtualDesktopManager, PlatformError> {
+    let mut slot = SHARED_VIRTUAL_DESKTOP_MANAGER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if fresh {
+        *slot = None;
+    }
+    if let Some(shared) = slot.as_ref() {
+        return Ok(shared.0.clone());
+    }
+    let manager = virtual_desktop_manager()?;
+    *slot = Some(SharedVirtualDesktopManager(manager.clone()));
+    Ok(manager)
+}
+
+/// Runs a virtual-desktop query through a process-wide manager. Creating a manager is a
+/// cross-process activation in the shell that costs milliseconds, and target checks need several
+/// per action. A failed query is retried once with a new manager, for example after the shell
+/// restarts. The outer error reports COM setup failure; the inner result is the query's own.
+pub(super) fn with_virtual_desktop_manager<T>(
+    query: impl Fn(&IVirtualDesktopManager) -> windows::core::Result<T>,
+) -> Result<windows::core::Result<T>, PlatformError> {
+    let apartment = ComApartment::initialize()?;
+    if !apartment.is_multithreaded() {
+        // A host-initialized single-threaded apartment cannot call an MTA proxy directly.
+        return Ok(query(&virtual_desktop_manager()?));
+    }
+    keep_multithreaded_apartment()?;
+    let manager = shared_virtual_desktop_manager(false)?;
+    match query(&manager) {
+        Ok(value) => Ok(Ok(value)),
+        Err(_) => Ok(query(&shared_virtual_desktop_manager(true)?)),
+    }
 }
 
 pub(super) fn current_virtual_desktop_id(manager: &IVirtualDesktopManager) -> Option<String> {
@@ -275,20 +358,33 @@ pub(super) fn find_display_at_point(point: POINT) -> Option<DisplayInfo> {
     })
 }
 
+// Bounds native enumeration work on desktops with unusually many top-level windows.
+const MAX_WINDOW_CANDIDATES: usize = 4_096;
+
+/// A described window that has not yet been issued a target reference.
+pub(super) struct WindowCandidate {
+    pub(super) hwnd: HWND,
+    pub(super) window: WindowInfo,
+}
+
 #[derive(Default)]
 struct WindowEnumeration {
-    windows: Vec<WindowInfo>,
+    candidates: Vec<WindowCandidate>,
+    truncated: bool,
     error: Option<PlatformError>,
 }
 
 impl WindowEnumeration {
-    fn accept(&mut self, outcome: Result<WindowInfo, PlatformError>) -> BOOL {
+    fn accept(&mut self, hwnd: HWND, outcome: Result<WindowInfo, PlatformError>) -> BOOL {
         match outcome {
             Ok(window) => {
-                if self.windows.len() < MAX_WINDOWS {
-                    self.windows.push(window);
+                if self.candidates.len() < MAX_WINDOW_CANDIDATES {
+                    self.candidates.push(WindowCandidate { hwnd, window });
+                    BOOL(1)
+                } else {
+                    self.truncated = true;
+                    BOOL(0)
                 }
-                BOOL(1)
             }
             Err(error @ PlatformError::Unavailable { .. }) => {
                 self.error = Some(error);
@@ -304,9 +400,9 @@ unsafe extern "system" fn window_callback(hwnd: HWND, data: LPARAM) -> BOOL {
     // SAFETY: `data` was created from the unique mutable `WindowEnumeration` reference passed to
     // synchronous EnumWindows and remains valid for the complete callback invocation.
     let enumeration = unsafe { &mut *(data.0 as *mut WindowEnumeration) };
-    let outcome = catch_unwind(AssertUnwindSafe(|| window_info(hwnd)));
+    let outcome = catch_unwind(AssertUnwindSafe(|| describe_window(hwnd)));
     if let Ok(result) = outcome {
-        enumeration.accept(result)
+        enumeration.accept(hwnd, result)
     } else {
         enumeration.error = Some(PlatformError::OperationFailed {
             operation: "EnumWindows".into(),
@@ -316,7 +412,9 @@ unsafe extern "system" fn window_callback(hwnd: HWND, data: LPARAM) -> BOOL {
     }
 }
 
-pub(super) fn enumerate_windows() -> Result<Vec<WindowInfo>, PlatformError> {
+/// Describes eligible windows in foreground-then-title order without issuing references.
+pub(super) fn enumerate_window_candidates() -> Result<(Vec<WindowCandidate>, bool), PlatformError> {
+    let _timer = controlfreak_core::timing::start("enumerate_windows");
     super::target::ensure_available()?;
     let mut enumeration = WindowEnumeration::default();
     // SAFETY: The LPARAM points to `enumeration`, which remains uniquely borrowed for this
@@ -330,19 +428,70 @@ pub(super) fn enumerate_windows() -> Result<Vec<WindowInfo>, PlatformError> {
     if let Some(error) = enumeration.error {
         return Err(error);
     }
-    result.map_err(|error| win32_error("EnumWindows", &error))?;
+    // EnumWindows reports failure when the callback stops early at the candidate cap.
+    if !enumeration.truncated {
+        result.map_err(|error| win32_error("EnumWindows", &error))?;
+    }
+    sort_candidates(&mut enumeration.candidates);
+    Ok((enumeration.candidates, enumeration.truncated))
+}
 
-    enumeration.windows.sort_by(|left, right| {
+fn sort_candidates(candidates: &mut [WindowCandidate]) {
+    candidates.sort_by(|left, right| {
         right
+            .window
             .is_foreground
-            .cmp(&left.is_foreground)
-            .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
-            .then_with(|| left.id.cmp(&right.id))
+            .cmp(&left.window.is_foreground)
+            .then_with(|| {
+                left.window
+                    .title
+                    .to_lowercase()
+                    .cmp(&right.window.title.to_lowercase())
+            })
+            .then_with(|| (left.hwnd.0 as usize).cmp(&(right.hwnd.0 as usize)))
     });
-    Ok(enumeration.windows)
+}
+
+/// Issues a reference for a described window, or `None` if it vanished or became ineligible.
+pub(super) fn issue_candidate(
+    candidate: WindowCandidate,
+) -> Result<Option<WindowInfo>, PlatformError> {
+    match super::target::issue(candidate.hwnd) {
+        Ok(id) => Ok(Some(WindowInfo {
+            id,
+            ..candidate.window
+        })),
+        Err(error @ PlatformError::Unavailable { .. }) => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Lists at most `MAX_WINDOWS` windows; references are issued only for returned windows.
+pub(super) fn enumerate_windows() -> Result<(Vec<WindowInfo>, bool), PlatformError> {
+    let (candidates, mut truncated) = enumerate_window_candidates()?;
+    let mut windows = Vec::with_capacity(candidates.len().min(MAX_WINDOWS));
+    for candidate in candidates {
+        if windows.len() == MAX_WINDOWS {
+            truncated = true;
+            break;
+        }
+        if let Some(window) = issue_candidate(candidate)? {
+            windows.push(window);
+        }
+    }
+    Ok((windows, truncated))
 }
 
 pub(super) fn window_info(hwnd: HWND) -> Result<WindowInfo, PlatformError> {
+    let window = describe_window(hwnd)?;
+    Ok(WindowInfo {
+        id: super::target::issue(hwnd)?,
+        ..window
+    })
+}
+
+/// Reads window metadata with an empty `id`; callers issue a reference only when they return it.
+fn describe_window(hwnd: HWND) -> Result<WindowInfo, PlatformError> {
     ensure_window_target(hwnd)?;
     let title = window_title(hwnd)?;
     let class_name = window_class_name(hwnd)?;
@@ -374,7 +523,7 @@ pub(super) fn window_info(hwnd: HWND) -> Result<WindowInfo, PlatformError> {
     }
 
     Ok(WindowInfo {
-        id: super::target::issue(hwnd)?,
+        id: String::new(),
         title,
         class_name,
         process_id,
@@ -537,15 +686,12 @@ pub(super) fn validate_window_wait(request: &WaitForWindowRequest) -> Result<(),
     Ok(())
 }
 
+/// Matches every criterion except `window_id`, which callers resolve to a handle first.
 pub(super) fn window_matches(window: &WindowInfo, request: &WaitForWindowRequest) -> bool {
     request
-        .window_id
+        .title_contains
         .as_ref()
-        .is_none_or(|id| window.id.eq_ignore_ascii_case(id))
-        && request
-            .title_contains
-            .as_ref()
-            .is_none_or(|title| window.title.to_lowercase().contains(&title.to_lowercase()))
+        .is_none_or(|title| window.title.to_lowercase().contains(&title.to_lowercase()))
         && request
             .class_name
             .as_ref()
@@ -578,20 +724,61 @@ mod enumeration_tests {
         let mut enumeration = WindowEnumeration::default();
         assert!(
             enumeration
-                .accept(Err(window_not_available("window disappeared")))
+                .accept(
+                    HWND::default(),
+                    Err(window_not_available("window disappeared"))
+                )
                 .as_bool()
         );
         assert!(enumeration.error.is_none());
         assert!(
             enumeration
-                .accept(Err(super::super::target::invalid("process exited")))
+                .accept(
+                    HWND::default(),
+                    Err(super::super::target::invalid("process exited"))
+                )
                 .as_bool()
         );
         assert!(enumeration.error.is_none());
         let failure = PlatformError::Unavailable {
             reason: "target reference initialization failed".into(),
         };
-        assert!(!enumeration.accept(Err(failure.clone())).as_bool());
+        assert!(
+            !enumeration
+                .accept(HWND::default(), Err(failure.clone()))
+                .as_bool()
+        );
         assert_eq!(enumeration.error, Some(failure));
+    }
+
+    #[test]
+    fn enumeration_stops_and_reports_truncation_at_the_candidate_cap() {
+        let window = WindowInfo {
+            id: String::new(),
+            title: "fixture".into(),
+            class_name: "fixture".into(),
+            process_id: 1,
+            bounds: WindowBounds {
+                left: 0,
+                top: 0,
+                width: 1,
+                height: 1,
+            },
+            display_id: "display".into(),
+            is_foreground: false,
+            is_minimized: false,
+        };
+        let mut enumeration = WindowEnumeration::default();
+        for _ in 0..MAX_WINDOW_CANDIDATES {
+            assert!(
+                enumeration
+                    .accept(HWND::default(), Ok(window.clone()))
+                    .as_bool()
+            );
+        }
+        assert!(!enumeration.truncated);
+        assert!(!enumeration.accept(HWND::default(), Ok(window)).as_bool());
+        assert!(enumeration.truncated);
+        assert_eq!(enumeration.candidates.len(), MAX_WINDOW_CANDIDATES);
     }
 }

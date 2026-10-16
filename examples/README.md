@@ -35,7 +35,13 @@ session after pending actions finish. An agent should use its equivalent of `fin
 
 ## Map a resized crop
 
-Input coordinates use display-local physical pixels. Screenshot `source_bounds` use signed
+The simplest way is to let the server map it. Every returned screenshot carries an
+`observation_id`. Pass it with `image_x` and `image_y` in that image's own pixels to
+`click_mouse`, `move_mouse`, or `scroll_mouse`, or with `start_image_x`/`start_image_y` and
+`end_image_x`/`end_image_y` to `drag_mouse`, instead of `display_id` with `x` and `y`. The server
+applies the arithmetic below. Observation IDs expire after five minutes or 64 newer screenshots.
+
+To map manually: input coordinates use display-local physical pixels. Screenshot `source_bounds` use signed
 virtual-desktop coordinates. For an image point `image_x, image_y`, map each axis independently:
 
 ```text

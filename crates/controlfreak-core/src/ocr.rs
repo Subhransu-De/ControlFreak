@@ -57,6 +57,38 @@ pub struct FindTextRequest {
     pub ocr_confusions: bool,
 }
 
+/// What `wait_for_text` waits for.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextCondition {
+    /// At least one match is visible.
+    #[default]
+    Appears,
+    /// No match is visible.
+    Disappears,
+}
+
+/// Longest wait accepted by `wait_for_text`, matching the other bounded waits.
+pub(crate) const MAX_TEXT_WAIT_MS: u32 = 30_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitForTextRequest {
+    pub find: FindTextRequest,
+    pub condition: TextCondition,
+    pub timeout_ms: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitForTextResult {
+    pub condition: TextCondition,
+    pub satisfied: bool,
+    pub timed_out: bool,
+    pub elapsed_ms: u64,
+    pub attempts: u32,
+    /// The final recognition pass, which decided the outcome.
+    pub last: FindTextResult,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextMatch {
     pub text: String,

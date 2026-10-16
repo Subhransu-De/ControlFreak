@@ -149,19 +149,56 @@ pub struct ArbitrationBusy {
     pub retry_after_ms: u64,
 }
 
+/// Why desktop ownership could not be acquired.
+#[derive(Debug, Clone)]
+pub enum ArbitrationError {
+    /// Another server owns the desktop; retrying later can succeed.
+    Busy(ArbitrationBusy),
+    /// The arbitration mechanism itself failed; retrying will not help until it is fixed.
+    Unavailable { reason: String },
+}
+
+impl From<ArbitrationBusy> for ArbitrationError {
+    fn from(busy: ArbitrationBusy) -> Self {
+        Self::Busy(busy)
+    }
+}
+
 pub trait ActivityArbitrator: Send + Sync {
-    fn try_acquire(&self) -> Result<(), ArbitrationBusy>;
+    fn try_acquire(&self) -> Result<(), ArbitrationError>;
     fn release(&self);
 }
 
 pub(super) struct LocalArbitrator;
 
 impl ActivityArbitrator for LocalArbitrator {
-    fn try_acquire(&self) -> Result<(), ArbitrationBusy> {
+    fn try_acquire(&self) -> Result<(), ArbitrationError> {
         Ok(())
     }
 
     fn release(&self) {}
+}
+
+fn arbitration_error_message(error: &ArbitrationError) -> String {
+    let value = match error {
+        ArbitrationError::Busy(busy) => json!({
+            "code": "desktop_in_use",
+            "retryable": true,
+            "owner_instance_id": busy.owner_instance_id,
+            "session_state": "dormant",
+            "retry_after_ms": busy.retry_after_ms,
+            "remedy": "wait, or ask the owning client to call end_control_session",
+        }),
+        ArbitrationError::Unavailable { reason } => json!({
+            "code": "desktop_arbitration_unavailable",
+            "retryable": false,
+            "session_state": "dormant",
+            "reason": reason,
+            "remedy": "restart the ControlFreak server; report the reason if it persists",
+        }),
+    };
+    serde_json::to_string(&value)
+        .unwrap_or_else(|_| "desktop ownership could not be acquired".to_owned())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,9 +355,14 @@ impl IndicatorRuntime {
                     .check("admission")
                     .map_err(|error| error.to_string())?;
             }
-            runtime
-                .acquire_mutation_blocking()
-                .map(|lease| (lease, work))
+            controlfreak_core::timing::reset();
+            let lease = controlfreak_core::timing::time("session_admission", || {
+                runtime.acquire_mutation_blocking()
+            });
+            if let Some(work) = &work {
+                work.record_stages(controlfreak_core::timing::take());
+            }
+            lease.map(|lease| (lease, work))
         })
         .await
         .map_err(|error| {
@@ -643,17 +685,9 @@ impl IndicatorRuntime {
             .stop
             .register(cancellation.clone())
             .map_err(|error| error.to_string())?;
-        self.arbitrator.try_acquire().map_err(|busy| {
-            serde_json::to_string(&json!({
-                "code": "desktop_in_use",
-                "retryable": true,
-                "owner_instance_id": busy.owner_instance_id,
-                "session_state": "dormant",
-                "retry_after_ms": busy.retry_after_ms,
-                "remedy": "wait, or ask the owning client to call end_control_session",
-            }))
-            .unwrap_or_else(|_| "another ControlFreak server owns the desktop".to_owned())
-        })?;
+        self.arbitrator
+            .try_acquire()
+            .map_err(|error| arbitration_error_message(&error))?;
         state.session = ControlSession::dormant(self.short_hold);
         state.session.owns_arbitration = true;
         self.stop.set_session_active(true);

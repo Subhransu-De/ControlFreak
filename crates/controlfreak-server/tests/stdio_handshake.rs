@@ -589,6 +589,7 @@ fn assert_tool_names(tools: &Value) {
             "wait_for_change_since",
             "read_text_in_region",
             "find_text_on_screen",
+            "wait_for_text",
             "click_text",
             "list_virtual_desktops",
             "switch_virtual_desktop",
@@ -601,7 +602,8 @@ fn assert_tool_names(tools: &Value) {
             "drag_mouse",
             "scroll_mouse",
             "press_keys",
-            "type_text"
+            "type_text",
+            "run_actions"
         ]
     );
 }

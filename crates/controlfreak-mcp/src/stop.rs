@@ -1,6 +1,8 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use controlfreak_core::{MutationControl, PlatformError, StopController, StopRegistration};
+use controlfreak_core::{
+    MutationControl, PlatformError, StopController, StopRegistration, timing::StageTiming,
+};
 
 tokio::task_local! {
     pub(super) static WORK: Work;
@@ -10,6 +12,8 @@ tokio::task_local! {
 pub(super) struct Work {
     pub(super) control: MutationControl,
     registration: Option<Arc<StopRegistration>>,
+    /// Stage timings reported by blocking workers that ran for this request.
+    stages: Arc<Mutex<Vec<StageTiming>>>,
 }
 
 impl Work {
@@ -18,7 +22,29 @@ impl Work {
         Ok(Self {
             registration: Some(Arc::new(stop.register(control.clone())?)),
             control,
+            stages: Arc::default(),
         })
+    }
+
+    /// Reports this request's worker stage timings into a slot owned by the caller.
+    pub(super) fn with_stages(self, stages: Arc<Mutex<Vec<StageTiming>>>) -> Self {
+        Self { stages, ..self }
+    }
+
+    /// Adds stage timings measured on a worker thread to this request's totals.
+    pub(super) fn record_stages(&self, measured: Vec<StageTiming>) {
+        let mut stages = self
+            .stages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for stage in measured {
+            if let Some(existing) = stages.iter_mut().find(|entry| entry.stage == stage.stage) {
+                existing.micros = existing.micros.saturating_add(stage.micros);
+                existing.calls = existing.calls.saturating_add(stage.calls);
+            } else {
+                stages.push(stage);
+            }
+        }
     }
 }
 

@@ -3,9 +3,9 @@ use super::{
     CAPTURE_WINDOW, CLICK_MOUSE, CLICK_TEXT, DRAG_MOUSE, END_CONTROL_SESSION, FIND_TEXT_ON_SCREEN,
     FOCUS_WINDOW, GET_SERVER_STATUS, JsonObject, LIST_DISPLAYS, LIST_VIRTUAL_DESKTOPS,
     LIST_WINDOWS, MAX_CAPTURE_WIDTH, MAX_MOVE_DURATION_MS, MAX_SCROLL_DELTA, MAX_TEXT_UTF16_UNITS,
-    MAX_WAIT_MS, MOVE_MOUSE, PRESS_KEYS, READ_TEXT_IN_REGION, SCROLL_MOUSE, SWITCH_VIRTUAL_DESKTOP,
-    TYPE_TEXT, Tool, ToolAnnotations, Value, WAIT_FOR_CHANGE_SINCE, WAIT_FOR_VISUAL_CHANGE,
-    WAIT_FOR_WINDOW, json,
+    MAX_WAIT_MS, MOVE_MOUSE, PRESS_KEYS, READ_TEXT_IN_REGION, RUN_ACTIONS, SCROLL_MOUSE,
+    SWITCH_VIRTUAL_DESKTOP, TYPE_TEXT, Tool, ToolAnnotations, Value, WAIT_FOR_CHANGE_SINCE,
+    WAIT_FOR_TEXT, WAIT_FOR_VISUAL_CHANGE, WAIT_FOR_WINDOW, json, requests::MAX_RUN_ACTION_STEPS,
 };
 
 /// Tool descriptions and schemas used by both `tools/list` and offline contract export.
@@ -27,6 +27,7 @@ pub fn tools() -> Vec<Tool> {
         wait_for_change_since_tool(),
         read_text_in_region_tool(),
         find_text_on_screen_tool(),
+        wait_for_text_tool(),
         click_text_tool(),
         list_virtual_desktops_tool(),
         switch_virtual_desktop_tool(),
@@ -40,6 +41,7 @@ pub fn tools() -> Vec<Tool> {
         scroll_mouse_tool(),
         press_keys_tool(),
         type_text_tool(),
+        run_actions_tool(),
     ];
     for tool in &mut tools {
         if super::is_mutating_tool(&tool.name) && tool.name != FOCUS_WINDOW
@@ -308,6 +310,42 @@ fn find_text_on_screen_tool() -> Tool {
     )
 }
 
+fn wait_for_text_tool() -> Tool {
+    let mut properties = region_properties();
+    add_ocr_language(&mut properties);
+    properties.insert("query".to_owned(), json!({ "type": "string", "minLength": 1, "description": "Text to wait for, matched as in find_text_on_screen." }));
+    properties.insert("condition".to_owned(), json!({ "type": "string", "enum": ["appears", "disappears"], "default": "appears", "description": "appears: wait until at least one match is visible. disappears: wait until none is." }));
+    properties.insert(
+        "timeout_ms".to_owned(),
+        json!({ "type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS, "default": 5000 }),
+    );
+    properties.insert(
+        "case_sensitive".to_owned(),
+        json!({ "type": "boolean", "default": false }),
+    );
+    properties.insert(
+        "max_results".to_owned(),
+        json!({ "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }),
+    );
+    properties.insert("match_mode".into(), json!({"type": "string", "enum": ["exact", "substring", "tolerant"], "default": "substring"}));
+    properties.insert(
+        "ocr_confusions".into(),
+        json!({"type": "boolean", "default": false, "description": "Tolerant matching only."}),
+    );
+    Tool::new(
+        WAIT_FOR_TEXT,
+        "Repeat OCR discovery in a region until query appears or disappears, or timeout_ms elapses. Returns satisfied, timed_out, attempts, and the final pass's matches with display-local bounds. Each pass is a full recognition; prefer a small region. Discovery only: it never authorizes input.",
+        object_schema(properties, &["display_id", "x", "y", "width", "height", "query"]),
+    )
+    .with_annotations(
+        ToolAnnotations::default()
+            .read_only(true)
+            .destructive(false)
+            .idempotent(false)
+            .open_world(false),
+    )
+}
+
 fn click_text_tool() -> Tool {
     let mut properties = region_properties();
     add_ocr_language(&mut properties);
@@ -436,16 +474,17 @@ fn switch_virtual_desktop_tool() -> Tool {
 fn list_windows_tool() -> Tool {
     Tool::new(
         LIST_WINDOWS,
-        "List visible titled top-level windows. Refresh IDs after windows open, close, or change ownership.",
+        "List visible titled top-level windows, foreground first, then by title. Returns at most 200; truncated=true means more exist, so use wait_for_window with title_contains, class_name, or process_id to reach them. Refresh IDs after windows open, close, or change ownership.",
         object_schema(JsonObject::new(), &[]),
     )
     .with_raw_output_schema(Arc::new(rmcp::object!({
         "type": "object",
         "properties": {
             "count": { "type": "integer", "minimum": 0 },
+            "truncated": { "type": "boolean", "description": "More eligible windows existed than were returned." },
             "windows": { "type": "array", "items": window_schema() }
         },
-        "required": ["count", "windows"],
+        "required": ["count", "truncated", "windows"],
         "additionalProperties": false
     })))
     .with_annotations(
@@ -526,8 +565,8 @@ fn wait_for_window_tool() -> Tool {
 fn move_mouse_tool() -> Tool {
     Tool::new(
         MOVE_MOUSE,
-        "Move the pointer within or between displays using display-local physical pixels.",
-        object_schema(pointer_properties(), &["display_id", "x", "y"]),
+        "Move the pointer within or between displays. Give display_id with display-local physical x/y, or observation_id with image_x/image_y from a returned screenshot.",
+        object_schema(pointer_properties(), &[]),
     )
     .with_raw_output_schema(pointer_action_output_schema())
     .with_annotations(
@@ -553,8 +592,8 @@ fn click_mouse_tool() -> Tool {
     properties.insert("modifiers".to_owned(), modifier_schema());
     Tool::new(
         CLICK_MOUSE,
-        "Click at display-local physical-pixel coordinates. Clicks and modifiers execute as one input sequence.",
-        object_schema(properties, &["display_id", "x", "y", "button"]),
+        "Click at display_id with display-local physical x/y, or at observation_id with image_x/image_y from a returned screenshot. Clicks and modifiers execute as one input sequence.",
+        object_schema(properties, &["button"]),
     )
     .with_raw_output_schema(pointer_action_output_schema())
     .with_annotations(
@@ -573,6 +612,12 @@ fn drag_mouse_tool() -> Tool {
         properties.insert(format!("{prefix}_x"), json!({ "type": "integer", "minimum": 0, "description": format!("{prefix} physical-pixel X coordinate local to its display.") }));
         properties.insert(format!("{prefix}_y"), json!({ "type": "integer", "minimum": 0, "description": format!("{prefix} physical-pixel Y coordinate local to its display.") }));
     }
+    properties.insert("observation_id".to_owned(), json!({ "type": "string", "minLength": 1, "description": "Screenshot observation_id for start/end image points." }));
+    for prefix in ["start", "end"] {
+        for axis in ["x", "y"] {
+            properties.insert(format!("{prefix}_image_{axis}"), json!({ "type": "integer", "minimum": 0, "description": format!("{prefix} {axis} in the observation_id image's own pixels; replaces {prefix}_display_id/{prefix}_x/{prefix}_y.") }));
+        }
+    }
     properties.insert(
         "button".to_owned(),
         json!({ "type": "string", "enum": ["left", "right", "middle"] }),
@@ -582,8 +627,8 @@ fn drag_mouse_tool() -> Tool {
     add_observation(&mut properties);
     Tool::new(
         DRAG_MOUSE,
-        "Drag within or between displays. Hold the button and modifiers for the drag, then release all held inputs.",
-        object_schema(properties, &["start_display_id", "start_x", "start_y", "end_display_id", "end_x", "end_y", "button"]),
+        "Drag within or between displays. Give each end as display_id with display-local x/y, or as image points in one observation_id. Hold the button and modifiers for the drag, then release all held inputs.",
+        object_schema(properties, &["button"]),
     )
     .with_raw_output_schema(pointer_action_output_schema())
     .with_annotations(
@@ -618,8 +663,8 @@ fn scroll_mouse_tool() -> Tool {
     );
     Tool::new(
         SCROLL_MOUSE,
-        "Move to display-local physical-pixel coordinates and scroll vertically or horizontally.",
-        object_schema(properties, &["display_id", "x", "y", "delta_y"]),
+        "Move to display_id with display-local physical x/y, or observation_id with image_x/image_y, then scroll vertically or horizontally.",
+        object_schema(properties, &["delta_y"]),
     )
     .with_raw_output_schema(pointer_action_output_schema())
     .with_annotations(
@@ -649,6 +694,53 @@ fn press_keys_tool() -> Tool {
         PRESS_KEYS,
         "Send a key or chord only while the approved target remains foreground. Observe and explicitly approve a target before input.",
         object_schema(properties, &["keys"]),
+    )
+    .with_raw_output_schema(action_output_schema(false))
+    .with_annotations(
+        ToolAnnotations::default()
+            .read_only(false)
+            .destructive(true)
+            .idempotent(false)
+            .open_world(false),
+    )
+}
+
+fn run_actions_tool() -> Tool {
+    let mut step = pointer_properties();
+    step.remove("duration_ms");
+    step.remove("observation");
+    step.insert(
+        "action".to_owned(),
+        json!({ "type": "string", "enum": ["click", "scroll", "type_text", "press_keys"] }),
+    );
+    step.insert("button".to_owned(), json!({ "type": "string", "enum": ["left", "right", "middle"], "default": "left", "description": "click only." }));
+    step.insert("click_count".to_owned(), json!({ "type": "integer", "minimum": 1, "maximum": 3, "default": 1, "description": "click only." }));
+    step.insert("modifiers".to_owned(), modifier_schema());
+    step.insert("delta_x".to_owned(), json!({ "type": "integer", "minimum": -MAX_SCROLL_DELTA, "maximum": MAX_SCROLL_DELTA, "default": 0, "description": "scroll only." }));
+    step.insert("delta_y".to_owned(), json!({ "type": "integer", "minimum": -MAX_SCROLL_DELTA, "maximum": MAX_SCROLL_DELTA, "default": 0, "description": "scroll only. Positive scrolls up." }));
+    step.insert("text".to_owned(), json!({ "type": "string", "minLength": 1, "maxLength": MAX_TEXT_UTF16_UNITS, "description": "type_text only." }));
+    step.insert("keys".to_owned(), json!({ "type": "array", "minItems": 1, "maxItems": 8, "uniqueItems": true, "items": { "type": "string", "minLength": 1 }, "description": "press_keys only: one chord, as in press_keys." }));
+    let mut properties = JsonObject::new();
+    properties.insert(
+        "steps".to_owned(),
+        json!({
+            "type": "array",
+            "minItems": 1,
+            "maxItems": MAX_RUN_ACTION_STEPS,
+            "description": "Ordered steps. click and scroll take display_id/x/y or observation_id/image_x/image_y.",
+            "items": {
+                "type": "object",
+                "properties": step,
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        }),
+    );
+    add_observation(&mut properties);
+    Tool::new(
+        RUN_ACTIONS,
+        "Run up to 16 click, scroll, type_text, and press_keys steps in order on the approved target, with one final observation. All step arguments are checked before the first step runs. Each step keeps the single-action target checks and waits for the window to settle; the batch stops at the first failure and reports each step as completed, failed, or skipped. Use it for a known sequence, such as filling a form; observe between steps when the next step depends on the result.",
+        object_schema(properties, &["steps"]),
     )
     .with_raw_output_schema(action_output_schema(false))
     .with_annotations(
@@ -794,6 +886,30 @@ fn modifier_schema() -> Value {
 
 fn pointer_properties() -> JsonObject {
     let mut properties = JsonObject::new();
+    properties.insert(
+        "observation_id".to_owned(),
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "description": "observation_id of a returned screenshot. Use with image_x/image_y instead of display_id/x/y."
+        }),
+    );
+    properties.insert(
+        "image_x".to_owned(),
+        json!({
+            "type": "integer",
+            "minimum": 0,
+            "description": "X in that screenshot's own pixels; the server maps it through the crop and scale."
+        }),
+    );
+    properties.insert(
+        "image_y".to_owned(),
+        json!({
+            "type": "integer",
+            "minimum": 0,
+            "description": "Y in that screenshot's own pixels."
+        }),
+    );
     properties.insert(
         "display_id".to_owned(),
         json!({
@@ -948,8 +1064,9 @@ fn screenshot_schema() -> Value {
             "image_width": { "type": "integer", "minimum": 1 },
             "image_height": { "type": "integer", "minimum": 1 },
             "downscale_factor": { "type": "integer", "minimum": 1, "description": "Backward-compatible ceiling ratio. For exact mapping use source_bounds and image dimensions." },
-            "resize_method": { "type": "string", "enum": ["native", "bilinear"] },
-            "cursor_marker": { "type": "boolean" }
+            "resize_method": { "type": "string", "enum": ["native", "area_average"] },
+            "cursor_marker": { "type": "boolean" },
+            "observation_id": { "type": "string", "description": "Pass with image_x/image_y to pointer tools to act on a point in this image." }
         },
         "required": ["display", "source_bounds", "mime_type", "byte_length", "capture_method", "image_width", "image_height", "downscale_factor", "resize_method", "cursor_marker"],
         "additionalProperties": false

@@ -157,6 +157,16 @@ impl MutationControl {
         self.update_progress(|progress| progress.input_outcome = InputOutcome::InputSent);
     }
 
+    /// Records that a multi-step operation stopped after delivering some steps: completed
+    /// earlier steps no longer describe the whole operation as sent.
+    pub fn steps_incomplete(&self) {
+        self.update_progress(|progress| {
+            if progress.input_outcome == InputOutcome::InputSent {
+                progress.input_outcome = InputOutcome::PartiallySent;
+            }
+        });
+    }
+
     pub fn cleanup_status(&self, status: CleanupStatus) {
         self.update_progress(|progress| progress.cleanup = status);
     }

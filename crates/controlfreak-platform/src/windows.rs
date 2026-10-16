@@ -26,7 +26,7 @@ use controlfreak_core::{
     VirtualDesktopDirection, VirtualDesktopInfo, VirtualDesktopList, VirtualDesktopSwitchRequest,
     VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest, VisualChangeResult,
     WaitForChangeSinceRequest, WaitForVisualChangeRequest, WaitForWindowRequest, WindowBackend,
-    WindowBounds, WindowFocusResult, WindowInfo, WindowScreenshot, WindowWaitResult,
+    WindowBounds, WindowFocusResult, WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
 };
 use windows::Win32::{
     Foundation::{E_ACCESSDENIED, HWND, LPARAM, POINT, RECT, RPC_E_CHANGED_MODE},
@@ -64,10 +64,8 @@ mod actions;
 mod activation;
 mod ocr;
 mod target;
-use ocr::recognize_text_with_helper;
 pub(crate) use ocr::serve_ocr_helper;
-#[cfg(test)]
-use ocr::wait_for_ocr_helper;
+use ocr::{OcrHelperPool, recognize_text_with_helper};
 mod arbitration;
 mod capture;
 mod desktop;
@@ -110,10 +108,10 @@ use capture::{
 };
 use desktop::{
     ComApartment, activate_window, current_cursor_position, current_virtual_desktop_id,
-    ensure_dpi_awareness, enumerate_displays, enumerate_windows, find_display,
-    find_display_at_point, find_window, foreground_window_handle, parse_window_id, restore_window,
-    validate_window_wait, virtual_desktop_manager, window_desktop_id, window_info,
-    window_is_on_current_desktop, window_matches,
+    ensure_dpi_awareness, enumerate_displays, enumerate_window_candidates, enumerate_windows,
+    find_display, find_display_at_point, find_window, foreground_window_handle, issue_candidate,
+    parse_window_id, restore_window, validate_window_wait, virtual_desktop_manager,
+    window_desktop_id, window_info, window_is_on_current_desktop, window_matches,
 };
 use environment::ensure_interactive_input_desktop;
 use input::{
@@ -168,13 +166,18 @@ struct PointerActionSpec<'a> {
     y: u32,
     duration_ms: u32,
     observation: &'a ObservationOptions,
+    /// Refuse dispatch if any other input action completed since this generation was read.
+    input_generation: Option<u64>,
 }
 
 pub struct Backend {
     input_lock: Mutex<()>,
+    /// Counts completed input-lock holders, so slow observations can detect intervening input.
+    input_generation: AtomicU64,
     visual_baselines: Mutex<Vec<StoredVisualBaseline>>,
     next_baseline_id: AtomicU64,
     ocr_helper: Option<OcrHelperCommand>,
+    ocr_helpers: OcrHelperPool,
     security_context: SecurityContext,
 }
 
@@ -253,9 +256,11 @@ impl Backend {
         let security_context = privilege::current_security_context(false).unwrap_or_default();
         Self {
             input_lock: Mutex::new(()),
+            input_generation: AtomicU64::new(0),
             visual_baselines: Mutex::new(Vec::new()),
             next_baseline_id: AtomicU64::new(1),
             ocr_helper: None,
+            ocr_helpers: OcrHelperPool::default(),
             security_context,
         }
     }
@@ -263,9 +268,11 @@ impl Backend {
     pub fn with_security(security_context: SecurityContext) -> Self {
         Self {
             input_lock: Mutex::new(()),
+            input_generation: AtomicU64::new(0),
             visual_baselines: Mutex::new(Vec::new()),
             next_baseline_id: AtomicU64::new(1),
             ocr_helper: None,
+            ocr_helpers: OcrHelperPool::default(),
             security_context,
         }
     }
@@ -276,9 +283,11 @@ impl Backend {
     ) -> Self {
         Self {
             input_lock: Mutex::new(()),
+            input_generation: AtomicU64::new(0),
             visual_baselines: Mutex::new(Vec::new()),
             next_baseline_id: AtomicU64::new(1),
             ocr_helper: Some(command),
+            ocr_helpers: OcrHelperPool::default(),
             security_context,
         }
     }
@@ -291,7 +300,7 @@ impl Backend {
         let target_before = target::observe();
         let mut result = self.ocr_helper.as_ref().map_or_else(
             || recognize_text_in_process(request, control),
-            |command| recognize_text_with_helper(command, request, control),
+            |command| recognize_text_with_helper(command, &self.ocr_helpers, request, control),
         )?;
         result.target_ref = target::finish_observation(target_before);
         Ok(result)
@@ -300,11 +309,13 @@ impl Backend {
 
 impl BackendMetadata for Backend {
     fn validate_target_reference(&self, target: &str) -> Result<(), PlatformError> {
+        let _timer = controlfreak_core::timing::start("approve_target");
         let (hwnd, _) = target::resolve(target)?;
         Self::ensure_window_input_target("approve_target", hwnd)?;
         target::arm_if_foreground(target)
     }
     fn record_target_evidence(&self, control: &MutationControl) {
+        let _timer = controlfreak_core::timing::start("target_evidence");
         target::evidence(control);
     }
 
@@ -511,15 +522,38 @@ impl DisplayBackend for Backend {
             argument: "baseline_id".to_owned(),
             reason: "baseline was not found or has expired; capture a new baseline".to_owned(),
         })?;
-        wait_for_change(
-            baseline.display,
+        ensure_dpi_awareness()?;
+        ensure_baseline_display(&baseline.display, enumerate_displays()?.as_slice())?;
+        let result = wait_for_change(
+            baseline.display.clone(),
             baseline.bounds,
             &baseline.frame,
             request.timeout_ms,
             request.stable_ms,
             request.difference_threshold,
             control,
-        )
+        )?;
+        // A layout change during the wait would make the comparison meaningless.
+        ensure_baseline_display(&baseline.display, enumerate_displays()?.as_slice())?;
+        Ok(result)
+    }
+}
+
+/// Refuses a stored baseline whose display moved, resized, or disappeared since capture.
+fn ensure_baseline_display(
+    captured: &DisplayInfo,
+    current: &[DisplayInfo],
+) -> Result<(), PlatformError> {
+    if current
+        .iter()
+        .any(|display| display.id == captured.id && display.bounds == captured.bounds)
+    {
+        Ok(())
+    } else {
+        Err(PlatformError::InvalidArgument {
+            argument: "baseline_id".to_owned(),
+            reason: "the display layout changed since this baseline was captured; capture a new baseline".to_owned(),
+        })
     }
 }
 
@@ -594,6 +628,8 @@ impl OcrBackend for Backend {
             });
         }
         target::validate(control, "click_text", None)?;
+        // OCR runs outside the input lock; input that lands meanwhile can move the matched text.
+        let input_generation = self.input_generation.load(Ordering::Acquire);
         let ocr = self.recognize_text(&request.region, control)?;
         target::validate(control, "click_text", None)?;
         if ocr.target_ref != control.approved_target() {
@@ -613,7 +649,7 @@ impl OcrBackend for Backend {
         let x = candidate.x.saturating_add(candidate.width / 2);
         let y = candidate.y.saturating_add(candidate.height / 2);
         control.check("click_text")?;
-        let result = self.click_mouse_controlled(
+        let result = self.click_mouse_at_generation(
             &MouseClickRequest {
                 display_id: request.region.display_id.clone(),
                 x,
@@ -625,6 +661,7 @@ impl OcrBackend for Backend {
                 observation: request.observation.clone(),
             },
             control,
+            Some(input_generation),
         )?;
         Ok(ClickTextResult {
             matched_text: candidate,
@@ -635,9 +672,10 @@ impl OcrBackend for Backend {
 }
 
 impl WindowBackend for Backend {
-    fn list_windows(&self) -> Result<Vec<WindowInfo>, PlatformError> {
+    fn list_windows(&self) -> Result<WindowList, PlatformError> {
         ensure_dpi_awareness()?;
-        enumerate_windows()
+        let (windows, truncated) = enumerate_windows()?;
+        Ok(WindowList { windows, truncated })
     }
 
     fn list_virtual_desktops(&self) -> Result<VirtualDesktopList, PlatformError> {
@@ -647,7 +685,7 @@ impl WindowBackend for Backend {
         let current_id = current_virtual_desktop_id(&manager);
         let mut current_ids = std::collections::BTreeSet::<String>::new();
         let mut grouped = std::collections::BTreeMap::<String, Vec<WindowInfo>>::new();
-        for window in enumerate_windows()? {
+        for window in enumerate_windows()?.0 {
             let Ok((hwnd, _)) = parse_window_id(&window.id) else {
                 continue;
             };
@@ -722,7 +760,9 @@ impl WindowBackend for Backend {
                 control,
                 || target::validate(control, "switch_virtual_desktop", None),
             )?;
-            thread::sleep(Duration::from_millis(DESKTOP_SWITCH_SETTLE_MS));
+            controlfreak_core::timing::time("settle", || {
+                thread::sleep(Duration::from_millis(DESKTOP_SWITCH_SETTLE_MS));
+            });
         }
         control.input_complete();
         target::evidence(control);
@@ -772,7 +812,9 @@ impl WindowBackend for Backend {
             control,
             started: Instant::now(),
         };
-        let activation = activation::focus(&mut driver, request.timeout_ms);
+        let activation = controlfreak_core::timing::time("activate", || {
+            activation::focus(&mut driver, request.timeout_ms)
+        });
         if activation.is_err() {
             control.invalidate_target();
         }
@@ -848,10 +890,27 @@ impl WindowBackend for Backend {
         let started = Instant::now();
         let deadline = started + Duration::from_millis(u64::from(request.timeout_ms));
         loop {
-            if let Some(window) = enumerate_windows()?
-                .into_iter()
-                .find(|window| window_matches(window, request))
-            {
+            // A window_id names one handle; matching it never depends on the list_windows cap.
+            let target = match &request.window_id {
+                Some(id) => match parse_window_id(id) {
+                    Ok((hwnd, _)) => Some(hwnd),
+                    Err(_) => None,
+                },
+                None => None,
+            };
+            let matched = if request.window_id.is_some() && target.is_none() {
+                None
+            } else {
+                enumerate_window_candidates()?
+                    .0
+                    .into_iter()
+                    .filter(|candidate| target.is_none_or(|hwnd| hwnd == candidate.hwnd))
+                    .find(|candidate| window_matches(&candidate.window, request))
+                    .map(issue_candidate)
+                    .transpose()?
+                    .flatten()
+            };
+            if let Some(window) = matched {
                 return Ok(WindowWaitResult {
                     matched: true,
                     timed_out: false,
@@ -922,36 +981,8 @@ mod tests {
         capture::{encode_png, image_difference, resize_rgba_box, scaled_dimensions, word_union},
         display_region_bounds, frame_fingerprint,
         input::{click_inputs, interpolate, key_chord_inputs, scroll_inputs},
-        wait_for_ocr_helper, window_matches,
+        window_matches,
     };
-
-    #[test]
-    fn isolated_ocr_process_is_killed_after_its_deadline() {
-        use std::{process::Stdio, time::Duration};
-
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "windows::tests::ocr_timeout_test_helper",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let started = std::time::Instant::now();
-        let error = wait_for_ocr_helper(child, Duration::from_millis(100)).unwrap_err();
-
-        assert!(started.elapsed() < Duration::from_secs(5));
-        match error {
-            PlatformError::OperationFailed { operation, reason } => {
-                assert_eq!(operation, "windows_ocr_helper");
-                assert!(reason.contains("timed out"));
-            }
-            other => panic!("unexpected OCR timeout error: {other:?}"),
-        }
-    }
 
     #[test]
     fn queued_input_cancels_while_another_worker_still_owns_the_input_lock() {
@@ -973,72 +1004,6 @@ mod tests {
         assert!(result.recv_timeout(Duration::from_secs(2)).unwrap());
         drop(owner);
         worker.join().unwrap();
-    }
-
-    #[test]
-    fn isolated_ocr_process_drains_output_before_exit() {
-        use std::{process::Stdio, time::Duration};
-
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "windows::tests::ocr_large_output_test_helper",
-                "--nocapture",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let output = wait_for_ocr_helper(child, Duration::from_secs(5)).unwrap();
-
-        assert!(output.status.success());
-        assert!(output.stdout.len() >= 512 * 1024);
-    }
-
-    #[test]
-    fn cancelled_ocr_helper_drains_without_waiting_for_its_kill_deadline() {
-        use std::{
-            process::Stdio,
-            time::{Duration, Instant},
-        };
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "windows::tests::ocr_large_output_test_helper",
-                "--nocapture",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let control = controlfreak_core::MutationControl::default();
-        control.cancel();
-        let started = Instant::now();
-        let error =
-            super::ocr::wait_for_ocr_helper_controlled(child, Duration::from_secs(30), &control)
-                .unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(error.to_string().contains("cancelled"));
-    }
-
-    #[test]
-    #[ignore = "spawned only by isolated_ocr_process_is_killed_after_its_deadline"]
-    fn ocr_timeout_test_helper() {
-        std::thread::sleep(std::time::Duration::from_secs(30));
-    }
-
-    #[test]
-    #[ignore = "spawned only by isolated_ocr_process_drains_output_before_exit"]
-    fn ocr_large_output_test_helper() {
-        use std::io::Write as _;
-
-        std::io::stdout()
-            .write_all(&vec![b'x'; 512 * 1024])
-            .unwrap();
     }
 
     fn mouse_flags(input: &INPUT) -> MOUSE_EVENT_FLAGS {
@@ -1125,6 +1090,32 @@ mod tests {
         );
         assert!(display_region_bounds(&display, 1900, 0, 100, 100).is_err());
         assert!(display_region_bounds(&display, u32::MAX, 0, 2, 1).is_err());
+    }
+
+    #[test]
+    fn baselines_are_refused_after_their_display_moves_resizes_or_disappears() {
+        let captured = DisplayInfo {
+            id: "display".to_owned(),
+            name: "display".to_owned(),
+            bounds: DisplayBounds {
+                left: -1920,
+                top: 0,
+                width: 1920,
+                height: 1080,
+            },
+            is_primary: false,
+        };
+        assert!(super::ensure_baseline_display(&captured, std::slice::from_ref(&captured)).is_ok());
+        let mut moved = captured.clone();
+        moved.bounds.left = 0;
+        let mut resized = captured.clone();
+        resized.bounds.width = 2560;
+        for current in [vec![], vec![moved], vec![resized]] {
+            assert!(matches!(
+                super::ensure_baseline_display(&captured, &current),
+                Err(PlatformError::InvalidArgument { argument, .. }) if argument == "baseline_id"
+            ));
+        }
     }
 
     #[test]
@@ -1457,7 +1448,8 @@ mod tests {
         let backend = Backend::new();
         let windows = backend
             .list_windows()
-            .expect("enumerate visible Windows windows");
+            .expect("enumerate visible Windows windows")
+            .windows;
 
         assert!(windows.iter().all(|window| !window.title.is_empty()));
         assert!(

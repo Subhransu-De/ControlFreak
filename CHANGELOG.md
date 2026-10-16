@@ -9,6 +9,48 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Added
+
+- `run_actions` runs up to 16 click, scroll, `type_text`, and `press_keys` steps on one approved
+  target with one final observation. All step arguments are validated before the first step, the
+  batch stops at the first failure, and each step reports `completed`, `failed`, or `skipped`.
+- `wait_for_text` repeats OCR discovery in a region until text appears or disappears, bounded to
+  30 seconds, and returns the final pass.
+- Every screenshot carries an `observation_id`. `click_mouse`, `move_mouse`, `scroll_mouse`, and
+  `drag_mouse` accept it with `image_x`/`image_y` as an alternative to display coordinates, and
+  the server maps the point through the screenshot's crop and resize.
+- Per-stage timings (`stages_ms`) in the `tool_completed` stderr event, `get_server_status`
+  recent operations, and response `_meta`, plus a synthetic capture benchmark.
+
+### Changed
+
+- Key and text actions return once the approved window has visibly responded and then stayed
+  unchanged for 60 ms, instead of always waiting 150 ms. Windows that never visibly respond keep
+  the previous wait. Pointer actions keep their fixed 75 ms wait, which a safe stillness window
+  could not shorten.
+- One OCR helper process is kept warm between requests and recycled after errors, timeouts,
+  cancellation, 100 requests, or a minute idle. `read_text_in_region` takes about half as long.
+- Target checks share one virtual-desktop manager instead of activating one per check, and glow
+  indicator commands are delivered without poll delays. A click without a screenshot takes about
+  a third of its previous time on a live test window.
+- Screenshots are downscaled by exact area averaging, which keeps thin text strokes, and encoded
+  as RGB PNG at a faster compression level. `resize_method` reports `area_average`.
+- `list_windows` returns `truncated` when more than 200 windows exist and issues references only
+  for returned windows. `wait_for_window` searches every eligible window.
+- A broken desktop-arbitration mutex is reported as `desktop_arbitration_unavailable` without a
+  retry hint, instead of as a busy desktop.
+
+### Fixed
+
+- The stop-key hook no longer delays every keystroke on the system by up to 10 ms while a server
+  runs.
+- `click_text` refuses if another input action ran while its OCR was in progress, and clicks and
+  scrolls refuse if the cursor moved after validation.
+- An armed session target is no longer evicted from the reference cache by observation churn.
+- `wait_for_change_since` refuses a baseline after its display moved, resized, or disappeared.
+- `type_text` never ends an input batch on half of a surrogate pair.
+- OCR helper output is read with a size limit.
+
 ## [0.1.0-alpha.1] - 2026-10-16
 
 ### Changed
