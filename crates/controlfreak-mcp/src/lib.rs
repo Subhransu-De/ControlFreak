@@ -19,8 +19,8 @@ use requests::{
     WaitForVisualChangeInput, WaitForWindowInput, parse_arguments,
 };
 pub use session::{
-    ActivityArbitrator, ActivityIndicator, ArbitrationBusy, IndicatorHealth, IndicatorLevel,
-    SafetyIndicator,
+    ActivityArbitrator, ActivityIndicator, ArbitrationBusy, ArbitrationError, IndicatorHealth,
+    IndicatorLevel, SafetyIndicator,
 };
 #[cfg(test)]
 use session::{GlowTiming, IdleCommand, IdleWorker};

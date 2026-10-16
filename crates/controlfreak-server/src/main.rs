@@ -10,13 +10,15 @@ struct PlatformArbitrator(controlfreak_platform::DesktopArbitrator);
 
 #[cfg(target_os = "windows")]
 impl controlfreak_mcp::ActivityArbitrator for PlatformArbitrator {
-    fn try_acquire(&self) -> Result<(), controlfreak_mcp::ArbitrationBusy> {
+    fn try_acquire(&self) -> Result<(), controlfreak_mcp::ArbitrationError> {
         match self.0.try_acquire() {
             Ok(true) => Ok(()),
-            Ok(false) | Err(_) => Err(controlfreak_mcp::ArbitrationBusy {
+            Ok(false) => Err(controlfreak_mcp::ArbitrationBusy {
                 owner_instance_id: None,
                 retry_after_ms: 500,
-            }),
+            }
+            .into()),
+            Err(reason) => Err(controlfreak_mcp::ArbitrationError::Unavailable { reason }),
         }
     }
 

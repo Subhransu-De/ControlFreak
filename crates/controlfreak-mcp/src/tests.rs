@@ -14,10 +14,10 @@ use controlfreak_core::{
 };
 
 use super::{
-    ActivityArbitrator, ActivityIndicator, ArbitrationBusy, BeginSessionError, CaptureDisplayInput,
-    FocusWindowInput, GlowTiming, IndicatorHealth, IndicatorRuntime, PressKeysInput,
-    SafetyIndicator, handlers::run_platform_operation, parse_arguments, pointer_result, tool_error,
-    tool_execution_error, tools,
+    ActivityArbitrator, ActivityIndicator, ArbitrationBusy, ArbitrationError, BeginSessionError,
+    CaptureDisplayInput, FocusWindowInput, GlowTiming, IndicatorHealth, IndicatorRuntime,
+    PressKeysInput, SafetyIndicator, handlers::run_platform_operation, parse_arguments,
+    pointer_result, tool_error, tool_execution_error, tools,
 };
 
 pub(super) async fn wait_until(expected: &str, timeout: Duration, mut ready: impl FnMut() -> bool) {
@@ -88,19 +88,70 @@ struct ExclusiveArbitrator {
 }
 
 impl ActivityArbitrator for ExclusiveArbitrator {
-    fn try_acquire(&self) -> Result<(), ArbitrationBusy> {
+    fn try_acquire(&self) -> Result<(), ArbitrationError> {
         self.owned
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| ())
-            .map_err(|_| ArbitrationBusy {
-                owner_instance_id: Some("other-test-server".to_owned()),
-                retry_after_ms: 25,
+            .map_err(|_| {
+                ArbitrationBusy {
+                    owner_instance_id: Some("other-test-server".to_owned()),
+                    retry_after_ms: 25,
+                }
+                .into()
             })
     }
 
     fn release(&self) {
         self.owned.store(false, Ordering::Release);
     }
+}
+
+struct BrokenArbitrator;
+
+impl ActivityArbitrator for BrokenArbitrator {
+    fn try_acquire(&self) -> Result<(), ArbitrationError> {
+        Err(ArbitrationError::Unavailable {
+            reason: "synthetic mutex access denied".to_owned(),
+        })
+    }
+
+    fn release(&self) {
+        panic!("an unacquired desktop must not be released");
+    }
+}
+
+#[test]
+fn failed_arbitration_is_not_reported_as_a_busy_desktop() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let runtime = Arc::new(IndicatorRuntime::new_with_timing(
+        SafetyIndicator::dormant(),
+        {
+            let starts = Arc::clone(&starts);
+            move || {
+                starts.fetch_add(1, Ordering::Relaxed);
+                Ok(RecordingIndicator {
+                    events: Arc::new(Mutex::new(Vec::new())),
+                    fail_hide: false,
+                })
+            }
+        },
+        Arc::new(BrokenArbitrator),
+        GlowTiming {
+            short_hold: Duration::from_millis(20),
+            session_hold: Duration::from_millis(20),
+            max_hold: Duration::from_secs(1),
+        },
+    ));
+    let Err(BeginSessionError::Indicator(message)) = runtime.begin_session(None, "synthetic")
+    else {
+        panic!("broken arbitration must refuse the session");
+    };
+    let error: serde_json::Value = serde_json::from_str(&message).unwrap();
+    assert_eq!(error["code"], "desktop_arbitration_unavailable");
+    assert_eq!(error["retryable"], false);
+    assert_eq!(error["reason"], "synthetic mutex access denied");
+    assert!(error.get("retry_after_ms").is_none());
+    assert_eq!(starts.load(Ordering::Relaxed), 0);
 }
 
 impl ActivityIndicator for FailingSecondShowIndicator {

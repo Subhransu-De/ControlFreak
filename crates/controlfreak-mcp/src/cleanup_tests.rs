@@ -209,7 +209,7 @@ struct Fixture {
     shutdowns: AtomicUsize,
 }
 impl ActivityArbitrator for Fixture {
-    fn try_acquire(&self) -> Result<(), ArbitrationBusy> {
+    fn try_acquire(&self) -> Result<(), ArbitrationError> {
         assert!(!self.owned.swap(true, Ordering::SeqCst));
         Ok(())
     }
