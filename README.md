@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="ControlFreak mascot: a blue octopus holding two app windows, pressing a key and clicking a mouse cursor" width="240">
+  <img src="https://raw.githubusercontent.com/Subhransu-De/ControlFreak/main/assets/logo.png" alt="ControlFreak mascot: a blue octopus holding two app windows, pressing a key and clicking a mouse cursor" width="240">
 </p>
 
 <h1 align="center">ControlFreak</h1>
@@ -18,7 +18,7 @@ Code, Codex, Claude Desktop, OpenCode or Pi, starts it on your computer and talk
 STDIO. The agent can take screenshots, read text with the Windows OCR engine on your computer,
 and click, scroll and type in one window that it chose.
 
-[Install](#install) · [Documentation](docs/README.md) · [Privacy](PRIVACY.md) ·
+[Install](#install) · [Documentation](https://github.com/Subhransu-De/ControlFreak/blob/main/docs/README.md) · [Privacy](PRIVACY.md) ·
 [Changelog](CHANGELOG.md)
 
 ## What it can do
@@ -31,7 +31,7 @@ and click, scroll and type in one window that it chose.
 - Run up to 16 clicks, scrolls and keystrokes on one window in a single call.
 - Inspect and switch between discoverable Windows virtual desktops.
 
-See all 27 tools in the [tool reference](docs/tools.md).
+See all 27 tools in the [tool reference](https://github.com/Subhransu-De/ControlFreak/blob/main/docs/tools.md).
 
 ## How it works
 
@@ -72,7 +72,7 @@ Setup adds a `controlfreak` entry to each client you tick, and keeps a backup of
 | Pi | `%USERPROFILE%\.pi\agent\mcp.json` |
 
 Needs Windows 10 (2004) or Windows 11 on x86-64. For the portable ZIP, silent install, manual
-setup and uninstall, see [Install and configure](docs/install.md).
+setup and uninstall, see [Install and configure](https://github.com/Subhransu-De/ControlFreak/blob/main/docs/install.md).
 
 ## Privacy
 
@@ -82,11 +82,11 @@ AI model. ControlFreak itself has no network code and keeps data only in memory.
 
 ## Documentation
 
-Detailed reference for agents and client authors is in [`docs/`](docs/README.md):
+Detailed reference for agents and client authors is in [`docs/`](https://github.com/Subhransu-De/ControlFreak/blob/main/docs/README.md):
 
-- [Tools](docs/tools.md): every tool, targets, OCR matching, waits, results and errors.
-- [Control sessions](docs/sessions.md): sessions, the indicator, stopping and elevated mode.
-- [Install and configure](docs/install.md): everything about setup.
+- [Tools](https://github.com/Subhransu-De/ControlFreak/blob/main/docs/tools.md): every tool, targets, OCR matching, waits, results and errors.
+- [Control sessions](https://github.com/Subhransu-De/ControlFreak/blob/main/docs/sessions.md): sessions, the indicator, stopping and elevated mode.
+- [Install and configure](https://github.com/Subhransu-De/ControlFreak/blob/main/docs/install.md): everything about setup.
 
 ## License
 
