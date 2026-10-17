@@ -9,6 +9,17 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Changed
+
+- Session admission failures now carry their own top-level `error.code` with `error.retryable` and
+  `error.details`, instead of `tool_execution_failed` with the raw JSON repeated in a reason. A
+  busy desktop is `desktop_in_use` (details: `owner_instance_id`, `retry_after_ms`,
+  `session_state`, `remedy`). A shutting-down server is `server_shutting_down`, and a session
+  that is still closing is `session_closing`. A stopped server is `desktop_work_stopped`, an
+  unusable control environment is `control_environment_unavailable`, and a broken arbitration
+  mechanism is `desktop_arbitration_unavailable`. Indicator failures keep `tool_execution_failed`
+  with `details.code` `indicator_unavailable`.
+
 ## [0.1.0-alpha.2] - 2026-10-16
 
 ### Added

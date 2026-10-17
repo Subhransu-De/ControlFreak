@@ -26,7 +26,7 @@ pub use session::{
 #[cfg(test)]
 use session::{GlowTiming, IdleCommand, IdleWorker};
 use session::{
-    IndicatorRuntime, LocalArbitrator, OperationLease, glow_timing_from_environment,
+    IndicatorRuntime, LocalArbitrator, OperationLease, SessionError, glow_timing_from_environment,
     indicator_unavailable,
 };
 #[cfg(test)]
@@ -39,6 +39,8 @@ mod results;
 #[cfg(test)]
 mod run_actions_tests;
 mod schema;
+#[cfg(test)]
+mod session_error_tests;
 
 use handlers::{
     call_capture_display, call_capture_region, call_capture_visual_baseline, call_capture_window,
@@ -100,7 +102,13 @@ const BEGIN_CONTROL_SESSION: &str = "begin_control_session";
 #[derive(Debug)]
 enum BeginSessionError {
     Target(PlatformError),
-    Indicator(String),
+    Session(SessionError),
+}
+
+impl From<SessionError> for BeginSessionError {
+    fn from(error: SessionError) -> Self {
+        Self::Session(error)
+    }
 }
 const END_CONTROL_SESSION: &str = "end_control_session";
 const CAPTURE_DISPLAY: &str = "capture_display";
@@ -346,10 +354,11 @@ impl ServerHandler for ControlFreakServer {
                                     {
                                         runtime_for_worker
                                             .end_session()
-                                            .map_err(BeginSessionError::Indicator)?;
-                                        return Err(BeginSessionError::Indicator(
+                                            .map_err(SessionError::Indicator)?;
+                                        return Err(SessionError::Indicator(
                                             "session request was cancelled".to_owned(),
-                                        ));
+                                        )
+                                        .into());
                                     }
                                     Ok(())
                                 })
@@ -363,8 +372,8 @@ impl ServerHandler for ControlFreakServer {
                                     Ok(Err(BeginSessionError::Target(error))) => {
                                         Ok(tool_error(&error).into())
                                     }
-                                    Ok(Err(BeginSessionError::Indicator(reason))) => {
-                                        Err(indicator_unavailable(&safety_indicator, &reason))
+                                    Ok(Err(BeginSessionError::Session(error))) => {
+                                        Ok(error.into_tool_result(&safety_indicator).into())
                                     }
                                     Err(error) => Err(join_error(&error)),
                                 }
@@ -388,7 +397,10 @@ impl ServerHandler for ControlFreakServer {
                                     )
                                     .await
                                 }
-                                Err(error) => Err(error),
+                                Err(error) => Ok(results::with_progress(
+                                    error.into_tool_result(&safety_indicator).into(),
+                                    controlfreak_core::MutationProgress::default(),
+                                )),
                             },
                             None => {
                                 dispatch_tool(
