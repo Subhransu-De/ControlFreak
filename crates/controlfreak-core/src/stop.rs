@@ -81,6 +81,16 @@ impl StopController {
             .cleanup_failed = true;
     }
 
+    /// Why admission is closed, or `None` while work is still admitted.
+    pub fn stop_message(&self) -> Option<&'static str> {
+        stop_message(
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .stop_reason,
+        )
+    }
+
     pub fn is_stopped(&self) -> bool {
         self.0
             .lock()
@@ -111,14 +121,10 @@ impl StopController {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.stop_reason.is_some() {
+        if let Some(reason) = stop_message(state.stop_reason) {
             return Err(PlatformError::OperationFailed {
                 operation: "admission".to_owned(),
-                reason: if state.stop_reason == Some(StopReason::User) {
-                    "the user stopped the control session; do not resume or restart without the user's permission"
-                } else {
-                    "desktop work is stopped; only the user may restart the server"
-                }.to_owned(),
+                reason: reason.to_owned(),
             });
         }
         let id = state.next_id;
@@ -162,6 +168,15 @@ impl Drop for StopRegistration {
                 control.cancel();
             }
         }
+    }
+}
+
+fn stop_message(reason: Option<StopReason>) -> Option<&'static str> {
+    match reason? {
+        StopReason::User => Some(
+            "the user stopped the control session; do not resume or restart without the user's permission",
+        ),
+        StopReason::Other => Some("desktop work is stopped; only the user may restart the server"),
     }
 }
 

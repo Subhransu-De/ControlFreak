@@ -70,9 +70,9 @@ async fn missing_transition_has_a_bounded_failure() {
     wait_until("missing transition", Duration::ZERO, || false).await;
 }
 
-struct RecordingIndicator {
-    events: Arc<Mutex<Vec<&'static str>>>,
-    fail_hide: bool,
+pub(super) struct RecordingIndicator {
+    pub(super) events: Arc<Mutex<Vec<&'static str>>>,
+    pub(super) fail_hide: bool,
 }
 
 struct FailingSecondShowIndicator {
@@ -83,8 +83,8 @@ struct HealthControlledIndicator {
     health: Arc<Mutex<IndicatorHealth>>,
 }
 
-struct ExclusiveArbitrator {
-    owned: Arc<AtomicBool>,
+pub(super) struct ExclusiveArbitrator {
+    pub(super) owned: Arc<AtomicBool>,
 }
 
 impl ActivityArbitrator for ExclusiveArbitrator {
@@ -142,15 +142,15 @@ fn failed_arbitration_is_not_reported_as_a_busy_desktop() {
             max_hold: Duration::from_secs(1),
         },
     ));
-    let Err(BeginSessionError::Indicator(message)) = runtime.begin_session(None, "synthetic")
-    else {
+    let Err(BeginSessionError::Session(error)) = runtime.begin_session(None, "synthetic") else {
         panic!("broken arbitration must refuse the session");
     };
-    let error: serde_json::Value = serde_json::from_str(&message).unwrap();
+    let result = error.into_tool_result(&SafetyIndicator::dormant());
+    let error = &result.structured_content.unwrap()["error"];
     assert_eq!(error["code"], "desktop_arbitration_unavailable");
     assert_eq!(error["retryable"], false);
-    assert_eq!(error["reason"], "synthetic mutex access denied");
-    assert!(error.get("retry_after_ms").is_none());
+    assert_eq!(error["details"]["reason"], "synthetic mutex access denied");
+    assert!(error["details"].get("retry_after_ms").is_none());
     assert_eq!(starts.load(Ordering::Relaxed), 0);
 }
 
@@ -685,7 +685,8 @@ fn failed_helper_start_releases_arbitration_for_the_next_server() {
 
     assert!(matches!(
         first.begin_session(None, "synthetic").unwrap_err(),
-        BeginSessionError::Indicator(reason) if reason == "native indicator initialization failed"
+        BeginSessionError::Session(super::SessionError::Indicator(reason))
+            if reason == "native indicator initialization failed"
     ));
     assert_eq!(failed_starts.load(Ordering::Relaxed), 3);
     assert_eq!(first.status()["owns_arbitration"], false);
@@ -931,7 +932,7 @@ fn pointer_result_contains_post_action_png() {
         },
     };
     let action = serde_json::json!({ "kind": "move" });
-    let result = pointer_result(&action_result, &action);
+    let result = pointer_result(super::Encoded::new(action_result), &action);
     let serialized = serde_json::to_value(result).expect("serialize tool result");
     let encoded = serialized["content"][0]["data"]
         .as_str()
@@ -968,7 +969,10 @@ fn pointer_result_without_screenshot_has_no_image_block() {
             screenshot: None,
         },
     };
-    let result = pointer_result(&action_result, &serde_json::json!({ "kind": "move" }));
+    let result = pointer_result(
+        super::Encoded::new(action_result),
+        &serde_json::json!({ "kind": "move" }),
+    );
     let serialized = serde_json::to_value(result).expect("serialize tool result");
 
     assert!(

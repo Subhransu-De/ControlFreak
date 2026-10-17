@@ -7,9 +7,9 @@ use super::requests::{ActionStep, RunActionsInput};
 
 use super::{
     Arc, CallToolResponse, CallToolResult, CaptureDisplayInput, CaptureDisplayRequest,
-    CaptureRegionInput, CaptureRegionRequest, CaptureWindowInput, CaptureWindowRequest,
-    ClickMouseInput, ClickTextInput, ClickTextRequest, Diagnostics, DragMouseInput, ErrorData,
-    FindTextInput, FocusWindowInput, FocusWindowRequest, IndicatorRuntime, JsonObject,
+    CaptureRegionInput, CaptureRegionRequest, CaptureWindowInput, CaptureWindowRequest, CarriesPng,
+    ClickMouseInput, ClickTextInput, ClickTextRequest, Diagnostics, DragMouseInput, Encoded,
+    ErrorData, FindTextInput, FocusWindowInput, FocusWindowRequest, IndicatorRuntime, JsonObject,
     KeyChordRequest, MouseClickRequest, MouseDragRequest, MouseMoveRequest, MouseScrollRequest,
     MoveMouseInput, NoArguments, OcrRegionInput, OcrRegionRequest, OperationLease, Ordering,
     PlatformBackend, PressKeysInput, SafetyIndicator, ScrollMouseInput, SwitchVirtualDesktopInput,
@@ -30,6 +30,34 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, PlatformError> + Send + 'static,
 {
+    run_platform_operation_then(operation_lease, operation, |value| value).await
+}
+
+/// Runs an image-producing observation and base64-encodes its PNG on the blocking worker,
+/// after the last cancellation check, so a cancelled request never pays for encoding.
+pub(super) async fn run_image_operation<T, F>(
+    operation_lease: Option<OperationLease>,
+    operation: F,
+) -> Result<Result<Encoded<T>, PlatformError>, ErrorData>
+where
+    T: CarriesPng + Send + 'static,
+    F: FnOnce() -> Result<T, PlatformError> + Send + 'static,
+{
+    run_platform_operation_then(operation_lease, operation, Encoded::new).await
+}
+
+/// `finish` runs on the blocking worker only when the operation succeeded and the request was
+/// not cancelled, and its time is recorded with the operation's stages.
+async fn run_platform_operation_then<T, U, F>(
+    operation_lease: Option<OperationLease>,
+    operation: F,
+    finish: impl FnOnce(T) -> U + Send + 'static,
+) -> Result<Result<U, PlatformError>, ErrorData>
+where
+    T: Send + 'static,
+    U: Send + 'static,
+    F: FnOnce() -> Result<T, PlatformError> + Send + 'static,
+{
     let work = super::stop::current();
     tokio::task::spawn_blocking(move || {
         let _operation_lease = operation_lease;
@@ -39,17 +67,36 @@ where
         }
         controlfreak_core::timing::reset();
         let result = operation();
+        let cancelled = control.map_or(Ok(()), |control| control.check("observation_worker"));
+        let result = match cancelled {
+            Ok(()) => result.map(finish),
+            Err(error) => Err(error),
+        };
         let taken = controlfreak_core::timing::take();
         if let Some(work) = &work {
             work.record_stages(taken);
-        }
-        if let Some(control) = control {
-            control.check("observation_worker")?;
         }
         result
     })
     .await
     .map_err(|error| join_error(&error))
+}
+
+/// Runs a mutation whose result may carry a screenshot, encoding it inside the blocking worker.
+pub(super) async fn run_encoded_mutation<T, F>(
+    operation_lease: Option<OperationLease>,
+    target_ref: String,
+    backend: Arc<dyn PlatformBackend>,
+    operation: F,
+) -> (Result<Encoded<T>, PlatformError>, MutationProgress)
+where
+    T: CarriesPng + Send + 'static,
+    F: FnOnce(&MutationControl) -> Result<T, PlatformError> + Send + 'static,
+{
+    run_mutation_operation(operation_lease, target_ref, backend, move |control| {
+        operation(control).map(Encoded::new)
+    })
+    .await
 }
 
 pub(super) async fn run_mutation_operation<T, F>(
@@ -181,9 +228,9 @@ pub(super) async fn call_capture_display(
         include_cursor: input.include_cursor,
     };
     let result =
-        run_platform_operation(operation_lease, move || backend.capture_display(&request)).await?;
+        run_image_operation(operation_lease, move || backend.capture_display(&request)).await?;
     match result {
-        Ok(screenshot) => Ok(screenshot_result(&screenshot).into()),
+        Ok(screenshot) => Ok(screenshot_result(screenshot).into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
 }
@@ -204,9 +251,9 @@ pub(super) async fn call_capture_region(
         include_cursor: input.include_cursor,
     };
     let result =
-        run_platform_operation(operation_lease, move || backend.capture_region(&request)).await?;
+        run_image_operation(operation_lease, move || backend.capture_region(&request)).await?;
     match result {
-        Ok(screenshot) => Ok(screenshot_result(&screenshot).into()),
+        Ok(screenshot) => Ok(screenshot_result(screenshot).into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
 }
@@ -229,12 +276,12 @@ pub(super) async fn call_wait_for_visual_change(
     };
     let control =
         super::stop::current().map_or_else(MutationControl::default, |work| work.control.clone());
-    let result = run_platform_operation(operation_lease, move || {
+    let result = run_image_operation(operation_lease, move || {
         backend.wait_for_visual_change_controlled(&request, &control)
     })
     .await?;
     match result {
-        Ok(result) => Ok(visual_change_result(&result).into()),
+        Ok(result) => Ok(visual_change_result(result).into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
 }
@@ -276,12 +323,12 @@ pub(super) async fn call_wait_for_change_since(
     };
     let control =
         super::stop::current().map_or_else(MutationControl::default, |work| work.control.clone());
-    let result = run_platform_operation(operation_lease, move || {
+    let result = run_image_operation(operation_lease, move || {
         backend.wait_for_change_since_controlled(&request, &control)
     })
     .await?;
     match result {
-        Ok(result) => Ok(visual_change_result(&result).into()),
+        Ok(result) => Ok(visual_change_result(result).into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
 }
@@ -407,7 +454,7 @@ pub(super) async fn call_click_text(
         duration_ms: input.duration_ms,
         observation: input.observation.into(),
     };
-    let (result, progress) = run_mutation_operation(
+    let (result, progress) = run_encoded_mutation(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
@@ -415,7 +462,7 @@ pub(super) async fn call_click_text(
     )
     .await;
     match result {
-        Ok(result) => Ok(click_text_result(&result, &action).into()),
+        Ok(result) => Ok(click_text_result(result, &action).into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
     .map(|response| super::results::with_progress(response, progress))
@@ -433,7 +480,7 @@ pub(super) async fn call_move_mouse(
     };
     let duration_ms = input.duration_ms;
     let observation = input.observation.into();
-    let (result, progress) = run_mutation_operation(
+    let (result, progress) = run_encoded_mutation(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
@@ -451,7 +498,7 @@ pub(super) async fn call_move_mouse(
     )
     .await;
     match result {
-        Ok(result) => Ok(pointer_result(&result, &json!({ "kind": "move" })).into()),
+        Ok(result) => Ok(pointer_result(result, &json!({ "kind": "move" })).into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
     .map(|response| super::results::with_progress(response, progress))
@@ -472,7 +519,7 @@ pub(super) async fn call_click_mouse(
     let modifiers = input.modifiers.clone();
     let duration_ms = input.duration_ms;
     let observation = input.observation.into();
-    let (result, progress) = run_mutation_operation(
+    let (result, progress) = run_encoded_mutation(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
@@ -494,7 +541,7 @@ pub(super) async fn call_click_mouse(
     .await;
     match result {
         Ok(result) => Ok(pointer_result(
-            &result,
+            result,
             &json!({
                 "kind": "click",
                 "button": button,
@@ -529,7 +576,7 @@ pub(super) async fn call_drag_mouse(
     let modifiers = input.modifiers;
     let duration_ms = input.duration_ms;
     let observation = input.observation.into();
-    let (result, progress) = run_mutation_operation(
+    let (result, progress) = run_encoded_mutation(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
@@ -553,7 +600,7 @@ pub(super) async fn call_drag_mouse(
     )
     .await;
     match result {
-        Ok(result) => Ok(pointer_result(&result, &action).into()),
+        Ok(result) => Ok(pointer_result(result, &action).into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
     .map(|response| super::results::with_progress(response, progress))
@@ -602,7 +649,7 @@ pub(super) async fn call_switch_virtual_desktop(
         steps: input.steps,
         observation: input.observation.into(),
     };
-    let (result, progress) = run_mutation_operation(
+    let (result, progress) = run_encoded_mutation(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
@@ -610,7 +657,7 @@ pub(super) async fn call_switch_virtual_desktop(
     )
     .await;
     match result {
-        Ok(result) => Ok(virtual_desktop_switch_result(&result).into()),
+        Ok(result) => Ok(virtual_desktop_switch_result(result).into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
     .map(|response| super::results::with_progress(response, progress))
@@ -627,7 +674,7 @@ pub(super) async fn call_focus_window(
         window_id: input.window_id,
         observation: input.observation.into(),
     };
-    let (result, progress) = run_mutation_operation(
+    let (result, progress) = run_encoded_mutation(
         operation_lease,
         request.window_id.clone(),
         Arc::clone(&backend),
@@ -635,7 +682,7 @@ pub(super) async fn call_focus_window(
     )
     .await;
     match result {
-        Ok(result) => Ok(window_focus_result(&result).into()),
+        Ok(result) => Ok(window_focus_result(result).into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
     .map(|response| super::results::with_progress(response, progress))
@@ -653,9 +700,9 @@ pub(super) async fn call_capture_window(
         include_cursor: input.include_cursor,
     };
     let result =
-        run_platform_operation(operation_lease, move || backend.capture_window(&request)).await?;
+        run_image_operation(operation_lease, move || backend.capture_window(&request)).await?;
     match result {
-        Ok(result) => Ok(window_screenshot_result(&result).into()),
+        Ok(result) => Ok(window_screenshot_result(result).into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
 }
@@ -697,7 +744,7 @@ pub(super) async fn call_press_keys(
         keys: input.keys,
         observation: input.observation.into(),
     };
-    let (result, progress) = run_mutation_operation(
+    let (result, progress) = run_encoded_mutation(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
@@ -706,7 +753,7 @@ pub(super) async fn call_press_keys(
     .await;
     match result {
         Ok(result) => Ok(keyboard_result(
-            &result,
+            result,
             &json!({ "kind": "key_chord", "keys": action_keys }),
         )
         .into()),
@@ -726,7 +773,7 @@ pub(super) async fn call_type_text(
         text: input.text,
         observation: input.observation.into(),
     };
-    let (result, progress) = run_mutation_operation(
+    let (result, progress) = run_encoded_mutation(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
@@ -735,7 +782,7 @@ pub(super) async fn call_type_text(
     .await;
     match result {
         Ok(result) => Ok(keyboard_result(
-            &result,
+            result,
             &json!({ "kind": "text", "requested_utf16_units": text_length }),
         )
         .into()),
@@ -758,7 +805,7 @@ pub(super) async fn call_scroll_mouse(
     let delta_y = input.delta_y;
     let duration_ms = input.duration_ms;
     let observation = input.observation.into();
-    let (result, progress) = run_mutation_operation(
+    let (result, progress) = run_encoded_mutation(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
@@ -779,7 +826,7 @@ pub(super) async fn call_scroll_mouse(
     .await;
     match result {
         Ok(result) => Ok(pointer_result(
-            &result,
+            result,
             &json!({
                 "kind": "scroll",
                 "delta_x": delta_x,
@@ -813,7 +860,7 @@ pub(super) async fn call_run_actions(
     let final_observation: ObservationOptions = input.observation.into();
     let reports = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
     let worker_reports = Arc::clone(&reports);
-    let (result, progress) = run_mutation_operation(
+    let (result, progress) = run_encoded_mutation(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
@@ -825,6 +872,7 @@ pub(super) async fn call_run_actions(
                 control,
                 &worker_reports,
             )
+            .map(|observation| KeyboardActionResult { observation })
         },
     )
     .await;
@@ -835,9 +883,7 @@ pub(super) async fn call_run_actions(
     );
     let action = json!({ "kind": "run_actions", "steps": steps });
     match result {
-        Ok(observation) => {
-            Ok(keyboard_result(&KeyboardActionResult { observation }, &action).into())
-        }
+        Ok(result) => Ok(keyboard_result(result, &action).into()),
         Err(error) => {
             let mut response = tool_error(&error);
             if let Some(content) = response.structured_content.as_mut() {

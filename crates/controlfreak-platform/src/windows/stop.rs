@@ -12,27 +12,35 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{
+            COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_FAILED, WAIT_TIMEOUT,
+            WPARAM,
+        },
         Graphics::Gdi::{
-            BeginPaint, CreateFontIndirectW, DC_BRUSH, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
-            DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, HBRUSH,
-            HFONT, InvalidateRect, LOGFONTW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-            MonitorFromPoint, PAINTSTRUCT, SelectObject, SetBkMode, SetDCBrushColor, SetTextColor,
-            TRANSPARENT,
+            BeginPaint, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, CreateFontIndirectW, DC_BRUSH,
+            DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect,
+            GetMonitorInfoW, GetStockObject, GetSysColor, HBRUSH, HFONT, InvalidateRect, LOGFONTW,
+            MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, PAINTSTRUCT, SelectObject,
+            SetBkMode, SetDCBrushColor, SetTextColor, TRANSPARENT,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
+            Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
             HiDpi::GetDpiForWindow,
             Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE},
             WindowsAndMessaging::{
                 CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-                GetClientRect, HHOOK, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG,
-                MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassW,
-                SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetWindowDisplayAffinity, SetWindowPos,
-                SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, UnregisterClassW,
-                WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WM_CLOSE, WM_KEYDOWN, WM_KEYUP, WM_PAINT,
-                WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-                WS_EX_TOPMOST, WS_POPUP,
+                GetClientRect, HHOOK, HTTRANSPARENT, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+                LWA_ALPHA, MA_NOACTIVATE, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx,
+                PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassW, SPI_GETHIGHCONTRAST, SW_HIDE,
+                SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+                SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowPos,
+                SetWindowsHookExW, ShowWindow, SystemParametersInfoW, UnhookWindowsHookEx,
+                UnregisterClassW, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WM_CLOSE, WM_KEYDOWN,
+                WM_KEYUP, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WM_SETTINGCHANGE,
+                WM_SYSCOLORCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WNDCLASSW,
+                WS_DISABLED, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                WS_EX_TRANSPARENT, WS_POPUP,
             },
         },
     },
@@ -41,6 +49,9 @@ use windows::{
 
 const BAR_TEXT: &str = "ControlFreak is controlling your system (Use Esc to stop)";
 const CLASS_NAME: windows::core::PCWSTR = w!("ControlFreakUserStop");
+/// Longest the UI thread blocks while idle. It only bounds how soon a session start, status text
+/// change or shutdown is noticed; hook callbacks and window messages wake the wait immediately.
+const POLL_INTERVAL_MS: u32 = 100;
 const NAVY: COLORREF = COLORREF(0x0080_0000); // RGB #000080; COLORREF is BGR.
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -109,6 +120,12 @@ struct NativeBar {
 
 impl NativeBar {
     fn create() -> windows::core::Result<Self> {
+        Self::create_with_hook(true)
+    }
+
+    /// Tests pass `false`: a low-level hook on a thread that never pumps messages would delay
+    /// every keystroke on the machine.
+    fn create_with_hook(install_hook: bool) -> windows::core::Result<Self> {
         // SAFETY: This UI thread owns the class, hidden window and hook. The guard
         // releases every successfully created resource if a later call fails.
         unsafe {
@@ -131,10 +148,17 @@ impl NativeBar {
                 font_height: 0,
             };
             bar.window = CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT,
                 CLASS_NAME,
                 w!("ControlFreak session"),
-                WS_POPUP,
+                // The bar is purely informational. WindowFromPoint skips disabled windows, so
+                // point-integrity checks resolve the application beneath the bar instead of
+                // this process, and physical clicks pass through the transparent layered window.
+                WS_POPUP | WS_DISABLED,
                 0,
                 0,
                 600,
@@ -144,6 +168,9 @@ impl NativeBar {
                 Some(instance),
                 None,
             )?;
+            // A layered window paints nothing until its attributes are set; fully opaque
+            // alpha keeps the normal WM_PAINT rendering while input passes through.
+            SetLayeredWindowAttributes(bar.window, COLORREF(0), 255, LWA_ALPHA)?;
             SetWindowDisplayAffinity(bar.window, WDA_EXCLUDEFROMCAPTURE)?;
             // A key already held before monitoring must retain its matching release.
             ESC_STATE.with(|state| {
@@ -153,7 +180,10 @@ impl NativeBar {
                     EscapeState::Released
                 });
             });
-            bar.hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), Some(instance), 0)?;
+            if install_hook {
+                bar.hook =
+                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), Some(instance), 0)?;
+            }
             Ok(bar)
         }
     }
@@ -242,6 +272,50 @@ fn bar_bounds(monitor: RECT, dpi: u32) -> RECT {
     }
 }
 
+const WHITE: COLORREF = COLORREF(0x00ff_ffff);
+
+/// Navy on white normally; the system highlight pair when High Contrast is on.
+fn choose_palette(
+    high_contrast: bool,
+    highlight: COLORREF,
+    highlight_text: COLORREF,
+) -> (COLORREF, COLORREF) {
+    if high_contrast {
+        (highlight, highlight_text)
+    } else {
+        (NAVY, WHITE)
+    }
+}
+
+fn high_contrast_enabled() -> bool {
+    let mut contrast = HIGHCONTRASTW {
+        cbSize: u32::try_from(std::mem::size_of::<HIGHCONTRASTW>()).unwrap_or(0),
+        ..Default::default()
+    };
+    // SAFETY: For SPI_GETHIGHCONTRAST, pvParam is a writable HIGHCONTRASTW whose cbSize matches
+    // uiParam; it outlives this synchronous call and is not retained.
+    let result = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            contrast.cbSize,
+            Some((&raw mut contrast).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    result.is_ok() && contrast.dwFlags.contains(HCF_HIGHCONTRASTON)
+}
+
+fn bar_palette() -> (COLORREF, COLORREF) {
+    // SAFETY: GetSysColor takes a constant index and returns a value; no pointers are involved.
+    let (highlight, text) = unsafe {
+        (
+            COLORREF(GetSysColor(COLOR_HIGHLIGHT)),
+            COLORREF(GetSysColor(COLOR_HIGHLIGHTTEXT)),
+        )
+    };
+    choose_palette(high_contrast_enabled(), highlight, text)
+}
+
 fn bar_text(controller: &StopController) -> &'static str {
     match controller.status() {
         "cleanup_failed" => "ControlFreak stopped. Input cleanup needs attention.",
@@ -289,15 +363,39 @@ fn run(
             }
             visible = active;
         }
-        // Low-level keyboard hook calls arrive as sent messages on this thread. Wake for them at
-        // once: sleeping here would delay every keystroke on the system, injected or physical.
-        // SAFETY: No handles are passed; the call only waits on this thread's message queue.
-        unsafe {
-            let _ = MsgWaitForMultipleObjects(None, false, 10, QS_ALLINPUT);
-        }
+        wait_for_input(POLL_INTERVAL_MS)?;
     }
     Ok(())
 }
+
+/// What ended a [`wait_for_input`] call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitOutcome {
+    /// Input, a posted message or a sent message (such as a hook callback) needs this thread.
+    Input,
+    /// The poll interval elapsed with nothing to dispatch.
+    TimedOut,
+}
+
+/// Blocks until this thread has queue input or `timeout_ms` elapses. Low-level keyboard hook
+/// calls arrive as sent messages and run inside this wait, so keystrokes are answered at once
+/// instead of after a sleep. `MWMO_INPUTAVAILABLE` also returns for messages that an earlier
+/// peek already saw but did not remove, which a plain wait would sleep through. The timeout is
+/// only for the session and status polling, so an idle thread wakes `1000 / timeout_ms` times
+/// per second.
+fn wait_for_input(timeout_ms: u32) -> windows::core::Result<WaitOutcome> {
+    // SAFETY: No handles are passed; the call only waits on this thread's message queue.
+    let result =
+        unsafe { MsgWaitForMultipleObjectsEx(None, timeout_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
+    if result == WAIT_TIMEOUT {
+        Ok(WaitOutcome::TimedOut)
+    } else if result == WAIT_FAILED {
+        Err(windows::core::Error::from_thread())
+    } else {
+        Ok(WaitOutcome::Input)
+    }
+}
+
 fn consume_escape(
     controller: &StopController,
     key: u32,
@@ -366,10 +464,11 @@ unsafe extern "system" fn window_proc(
             let dc = BeginPaint(window, &raw mut paint);
             let mut rect = RECT::default();
             let _ = GetClientRect(window, &raw mut rect);
-            SetDCBrushColor(dc, NAVY);
+            let (background, foreground) = bar_palette();
+            SetDCBrushColor(dc, background);
             FillRect(dc, &raw const rect, HBRUSH(GetStockObject(DC_BRUSH).0));
             SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, COLORREF(0x00ff_ffff));
+            SetTextColor(dc, foreground);
             let old = BAR_FONT.with(|font| SelectObject(dc, font.get().into()));
             let mut text: Vec<u16> = CONTROLLER
                 .with(|slot| slot.borrow().as_ref().map_or(BAR_TEXT, bar_text))
@@ -386,8 +485,18 @@ unsafe extern "system" fn window_proc(
         }
         return LRESULT(0);
     }
-    if message == WM_CLOSE {
-        return LRESULT(0);
+    match message {
+        WM_CLOSE => return LRESULT(0),
+        // The palette is read at paint time, so repaint when Windows changes its colors.
+        WM_SETTINGCHANGE | WM_SYSCOLORCHANGE | WM_THEMECHANGED => {
+            // SAFETY: The message is for this live window; invalidation retains no pointers.
+            unsafe {
+                let _ = InvalidateRect(Some(window), None, false);
+            }
+        }
+        WM_NCHITTEST => return LRESULT(isize::try_from(HTTRANSPARENT).unwrap_or(-1)),
+        WM_MOUSEACTIVATE => return LRESULT(isize::try_from(MA_NOACTIVATE).unwrap_or(3)),
+        _ => {}
     }
     // SAFETY: Forward unchanged Win32 callback arguments to the default procedure.
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
@@ -396,6 +505,12 @@ unsafe extern "system" fn window_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::{
+        System::Threading::GetCurrentThreadId,
+        UI::WindowsAndMessaging::{
+            GetWindowRect, PM_NOREMOVE, PostThreadMessageW, SendMessageW, WM_APP, WindowFromPoint,
+        },
+    };
 
     #[test]
     fn bar_is_centered_with_scaled_top_gap_even_at_negative_origins() {
@@ -411,6 +526,86 @@ mod tests {
             assert_eq!(bounds.top - monitor.top, i32::try_from(dpi).unwrap() / 6);
             assert!(bounds.left >= monitor.left && bounds.right <= monitor.right);
         }
+    }
+
+    #[test]
+    fn input_wait_blocks_for_the_interval_then_wakes_for_pending_messages() {
+        // Create this thread's queue and make sure nothing is pending.
+        let mut message = MSG::default();
+        // SAFETY: `message` is writable and this test thread owns its queue.
+        while unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }.as_bool() {}
+
+        let started = std::time::Instant::now();
+        assert_eq!(wait_for_input(60).unwrap(), WaitOutcome::TimedOut);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(40));
+
+        // SAFETY: Posting a plain-value message to this thread's own queue.
+        unsafe { PostThreadMessageW(GetCurrentThreadId(), WM_APP, WPARAM(0), LPARAM(0)) }.unwrap();
+        // A peek without removal marks the message as seen. A plain wait would sleep through
+        // it; MWMO_INPUTAVAILABLE must still return at once.
+        // SAFETY: Same writable message and owned queue; PM_NOREMOVE leaves it queued.
+        assert!(unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_NOREMOVE) }.as_bool());
+        let started = std::time::Instant::now();
+        assert_eq!(wait_for_input(5_000).unwrap(), WaitOutcome::Input);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // SAFETY: Remove the test message so the queue is left empty.
+        while unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }.as_bool() {}
+    }
+
+    #[test]
+    fn high_contrast_uses_the_system_highlight_pair() {
+        let highlight = COLORREF(0x0012_3456);
+        let text = COLORREF(0x00ab_cdef);
+        assert_eq!(choose_palette(true, highlight, text), (highlight, text));
+        assert_eq!(choose_palette(false, highlight, text), (NAVY, WHITE));
+    }
+
+    #[test]
+    fn point_targeting_skips_the_disabled_control_bar() {
+        super::super::ensure_dpi_awareness().unwrap();
+        let bar = NativeBar::create_with_hook(false).unwrap();
+        // SAFETY: The bar owns this live window; showing it without activation retains no pointers.
+        let _ = unsafe { ShowWindow(bar.window, SW_SHOWNOACTIVATE) };
+        let mut rect = RECT::default();
+        // SAFETY: `rect` is writable for the synchronous call and the window is live.
+        unsafe { GetWindowRect(bar.window, &raw mut rect) }.unwrap();
+        for point in [
+            POINT {
+                x: rect.left + 1,
+                y: rect.top + 1,
+            },
+            POINT {
+                x: i32::midpoint(rect.left, rect.right),
+                y: i32::midpoint(rect.top, rect.bottom),
+            },
+        ] {
+            // SAFETY: `point` is a plain value and the returned HWND is only compared.
+            let target = unsafe { WindowFromPoint(point) };
+            assert_ne!(target, bar.window);
+            // SAFETY: Same value-only hit test; the bar must also answer as transparent.
+            let hit = unsafe {
+                SendMessageW(
+                    bar.window,
+                    WM_NCHITTEST,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(
+                        (isize::try_from(point.y).unwrap() << 16)
+                            | isize::try_from(point.x).unwrap(),
+                    )),
+                )
+            };
+            assert_eq!(hit.0, isize::try_from(HTTRANSPARENT).unwrap());
+        }
+        // SAFETY: Same live window; MA_NOACTIVATE keeps a physical click from focusing the bar.
+        let activate = unsafe {
+            SendMessageW(
+                bar.window,
+                WM_MOUSEACTIVATE,
+                Some(WPARAM(0)),
+                Some(LPARAM(0)),
+            )
+        };
+        assert_eq!(activate.0, isize::try_from(MA_NOACTIVATE).unwrap());
     }
 
     #[test]

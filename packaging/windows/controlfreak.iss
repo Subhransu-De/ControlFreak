@@ -59,6 +59,7 @@ Source: "{#PayloadDir}\controlfreak-installer.exe"; Flags: dontcopy
 Source: "{#PayloadDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\SECURITY.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\PRIVACY.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\Cargo.lock"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\version.txt"; DestDir: "{app}"; Flags: ignoreversion

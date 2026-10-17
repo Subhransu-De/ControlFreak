@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest a new tool or a change to an existing one.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ControlFreak deliberately has no shell, application launch, filesystem, clipboard, registry,
+        network or elevation tools. Requests for those are product-scope decisions, so explain the
+        need in detail.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you are trying to do
+      description: The task an agent could not do, or did badly, with the current tools.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: The tool, argument or result field you would add or change.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you tried

@@ -9,6 +9,48 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Added
+
+- Release files have GitHub build provenance attestations. `gh attestation verify <file> --repo
+  Subhransu-De/ControlFreak` confirms that a download, or the `controlfreak.exe` inside the ZIP,
+  was built by this repository's release workflow. The recorded source commit is the `main`
+  commit the release started from, not the release commit that adds the version number.
+- PRIVACY.md describes what the server reads, returns to the MCP client and keeps in memory, and
+  what the setup program changes. It is installed with ControlFreak.
+- Every tool now publishes an `outputSchema`. The 14 tools that lacked one (`stop_desktop_work`,
+  `get_server_status`, `begin_control_session`, `end_control_session`, `capture_display`,
+  `capture_region`, `capture_window`, `wait_for_visual_change`, `wait_for_change_since`,
+  `capture_visual_baseline`, `read_text_in_region`, `find_text_on_screen`, `wait_for_text`, and
+  `wait_for_window`) describe their `structuredContent`. Screenshot and wait results share one
+  image-metadata definition. Error results keep the common `error` envelope and are not covered by
+  these schemas.
+
+### Changed
+
+- The Esc monitor thread now blocks on a message-aware wait (100 ms poll) instead of waking
+  about 100 times per second, while still answering keyboard hook callbacks immediately.
+- The desktop glow holds a steady opacity instead of breathing when Windows animation effects are
+  off; level changes still fade, and the setting is re-read during a session. The session control
+  bar paints with the system highlight colors when High Contrast is on.
+- Session admission failures now carry their own top-level `error.code` with `error.retryable` and
+  `error.details`, instead of `tool_execution_failed` with the raw JSON repeated in a reason. A
+  busy desktop is `desktop_in_use` (details: `owner_instance_id`, `retry_after_ms`,
+  `session_state`, `remedy`). A shutting-down server is `server_shutting_down`, and a session
+  that is still closing is `session_closing`. After Esc or `stop_desktop_work`, every request
+  that needs admission returns `desktop_work_stopped` instead of `platform_operation_failed`. An
+  unusable control environment is `control_environment_unavailable`, and a broken arbitration
+  mechanism is `desktop_arbitration_unavailable`. Indicator failures keep `tool_execution_failed`
+  with `details.code` `indicator_unavailable`.
+
+### Fixed
+
+- The session control bar no longer blocks input. Pointer actions aimed at the strip it covers
+  now reach the window beneath instead of being refused as a different window, physical clicks
+  pass through it, and it never takes focus. It stays excluded from screen capture.
+- Base64 encoding of screenshot data now runs on the blocking worker, after the last cancellation
+  check, instead of on a Tokio worker. A cancelled request is no longer encoded. The cost appears
+  as the `encode_base64` stage in `stages_ms`. PNG output is unchanged: 8-bit RGB.
+
 ## [0.1.0-alpha.2] - 2026-10-16
 
 ### Added
