@@ -183,7 +183,7 @@ fn every_session_error_has_a_distinct_wire_shape() {
             false,
         ),
         (
-            SessionError::StopRegistration("stopped".to_owned()),
+            SessionError::Stopped("stopped".to_owned()),
             "desktop_work_stopped",
             false,
         ),
@@ -210,4 +210,52 @@ fn every_session_error_has_a_distinct_wire_shape() {
         value["error"]["details"]["reason"],
         "{\"code\":\"spoofed\"}"
     );
+}
+
+#[tokio::test]
+async fn stopped_server_returns_desktop_work_stopped_for_new_requests() {
+    for (name, arguments) in [begin(), mutate()] {
+        let mut harness = harness(Arc::new(AtomicBool::new(false))).await;
+        harness.runtime.stop.stop();
+        let result = call(&mut harness, name, arguments).await;
+        let structured = assert_session_error(&result, "desktop_work_stopped", false);
+        assert_eq!(
+            structured["error"]["message"],
+            "desktop work is stopped; only the user may restart the server"
+        );
+        assert!(!result.to_string().contains("platform_operation_failed"));
+        if name == MOVE_MOUSE {
+            assert_eq!(structured["status"], "not_started");
+            assert_eq!(structured["retry_action"], false);
+        }
+        harness.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn stop_during_admission_is_reported_as_stopped() {
+    let harness = harness(Arc::new(AtomicBool::new(false))).await;
+    // The request registered before the latch; admission then sees it.
+    harness.runtime.stop.stop();
+    let Err(error) = harness.runtime.acquire_mutation_blocking() else {
+        panic!("a stopped server admitted a mutation");
+    };
+    assert!(matches!(error, SessionError::Stopped(_)), "{error:?}");
+    harness.finish().await;
+}
+
+#[tokio::test]
+async fn user_stop_keeps_its_own_message() {
+    let harness = harness(Arc::new(AtomicBool::new(false))).await;
+    let lease = harness.runtime.acquire().await.unwrap();
+    assert!(harness.runtime.stop.stop_by_user());
+    drop(lease);
+    let Err(error) = harness.runtime.acquire_mutation_blocking() else {
+        panic!("a user-stopped server admitted a mutation");
+    };
+    let SessionError::Stopped(message) = error else {
+        panic!("expected a stopped error, got {error:?}");
+    };
+    assert!(message.starts_with("the user stopped the control session"));
+    harness.finish().await;
 }

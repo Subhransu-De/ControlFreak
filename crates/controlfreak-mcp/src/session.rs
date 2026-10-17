@@ -195,7 +195,7 @@ pub(super) enum SessionError {
     },
     ShuttingDown,
     StillClosing,
-    StopRegistration(String),
+    Stopped(String),
     Environment(String),
     Indicator(String),
     Worker(String),
@@ -214,6 +214,15 @@ impl From<ArbitrationError> for SessionError {
 }
 
 impl SessionError {
+    /// The stop latch is set: by Esc, `stop_desktop_work`, or failed cleanup.
+    pub(super) fn stopped(stop: &controlfreak_core::StopController) -> Self {
+        Self::Stopped(
+            stop.stop_message()
+                .unwrap_or("desktop work is stopped; only the user may restart the server")
+                .to_owned(),
+        )
+    }
+
     pub(super) fn into_tool_result(self, safety_indicator: &SafetyIndicator) -> CallToolResult {
         let (code, message, retryable, details) = match self {
             Self::DesktopInUse {
@@ -252,7 +261,7 @@ impl SessionError {
                 true,
                 json!({"remedy": "retry after the prior session finishes closing"}),
             ),
-            Self::StopRegistration(reason) => (
+            Self::Stopped(reason) => (
                 "desktop_work_stopped",
                 reason.clone(),
                 false,
@@ -435,9 +444,13 @@ impl IndicatorRuntime {
         let work = super::stop::current();
         let result = tokio::task::spawn_blocking(move || {
             if let Some(work) = &work {
-                work.control
-                    .check("admission")
-                    .map_err(|error| SessionError::Indicator(error.to_string()))?;
+                work.control.check("admission").map_err(|error| {
+                    if runtime.stop.is_stopped() {
+                        SessionError::stopped(&runtime.stop)
+                    } else {
+                        SessionError::Indicator(error.to_string())
+                    }
+                })?;
             }
             controlfreak_core::timing::reset();
             let lease = controlfreak_core::timing::time("session_admission", || {
@@ -640,9 +653,7 @@ impl IndicatorRuntime {
         }
         if self.stop.is_stopped() {
             let _ = self.close_session_locked("stop", false);
-            return Err(SessionError::Environment(
-                "desktop work is stopped; the user must restart the server".to_owned(),
-            ));
+            return Err(SessionError::stopped(&self.stop));
         }
         if let Some(backend) = &self.environment
             && let Err(error) = backend.check_control_environment()
@@ -763,7 +774,7 @@ impl IndicatorRuntime {
         let stop_registration = self
             .stop
             .register(cancellation.clone())
-            .map_err(|error| SessionError::StopRegistration(error.to_string()))?;
+            .map_err(|_| SessionError::stopped(&self.stop))?;
         self.arbitrator.try_acquire().map_err(SessionError::from)?;
         state.session = ControlSession::dormant(self.short_hold);
         state.session.owns_arbitration = true;

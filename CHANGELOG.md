@@ -36,7 +36,8 @@ versioned section and uses that section for the corresponding GitHub Release not
   `error.details`, instead of `tool_execution_failed` with the raw JSON repeated in a reason. A
   busy desktop is `desktop_in_use` (details: `owner_instance_id`, `retry_after_ms`,
   `session_state`, `remedy`). A shutting-down server is `server_shutting_down`, and a session
-  that is still closing is `session_closing`. A stopped server is `desktop_work_stopped`, an
+  that is still closing is `session_closing`. After Esc or `stop_desktop_work`, every request
+  that needs admission returns `desktop_work_stopped` instead of `platform_operation_failed`. An
   unusable control environment is `control_environment_unavailable`, and a broken arbitration
   mechanism is `desktop_arbitration_unavailable`. Indicator failures keep `tool_execution_failed`
   with `details.code` `indicator_unavailable`.

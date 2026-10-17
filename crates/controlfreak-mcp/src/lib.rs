@@ -319,7 +319,13 @@ impl ServerHandler for ControlFreakServer {
                 let work = match admission {
                     Ok(work) => work.with_stages(worker_stages),
                     Err(error) => {
-                        let response = tool_error(&error).into();
+                        let response = if stop.is_stopped() {
+                            SessionError::stopped(&stop)
+                                .into_tool_result(&safety_indicator)
+                                .into()
+                        } else {
+                            tool_error(&error).into()
+                        };
                         return Ok(if is_mutating_tool(&request.name) {
                             results::with_progress(
                                 response,
