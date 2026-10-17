@@ -17,6 +17,20 @@ versioned section and uses that section for the corresponding GitHub Release not
 - PRIVACY.md describes what the server reads, returns to the MCP client and keeps in memory, and
   what the setup program changes. It is installed with ControlFreak.
 
+### Changed
+
+- The Esc monitor thread now blocks on a message-aware wait (100 ms poll) instead of waking
+  about 100 times per second, while still answering keyboard hook callbacks immediately.
+- The desktop glow holds a steady opacity instead of breathing when Windows animation effects are
+  off; level changes still fade, and the setting is re-read during a session. The session control
+  bar paints with the system highlight colors when High Contrast is on.
+
+### Fixed
+
+- The session control bar no longer blocks input. Pointer actions aimed at the strip it covers
+  now reach the window beneath instead of being refused as a different window, physical clicks
+  pass through it, and it never takes focus. It stays excluded from screen capture.
+
 ## [0.1.0-alpha.2] - 2026-10-16
 
 ### Added
