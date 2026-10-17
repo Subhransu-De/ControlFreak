@@ -13,6 +13,9 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 - The Esc monitor thread now blocks on a message-aware wait (100 ms poll) instead of waking
   about 100 times per second, while still answering keyboard hook callbacks immediately.
+- The desktop glow holds a steady opacity instead of breathing when Windows animation effects are
+  off; level changes still fade, and the setting is re-read during a session. The session control
+  bar paints with the system highlight colors when High Contrast is on.
 
 ### Fixed
 

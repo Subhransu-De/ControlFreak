@@ -17,25 +17,28 @@ use windows::{
             WPARAM,
         },
         Graphics::Gdi::{
-            BeginPaint, CreateFontIndirectW, DC_BRUSH, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
-            DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, HBRUSH,
-            HFONT, InvalidateRect, LOGFONTW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-            MonitorFromPoint, PAINTSTRUCT, SelectObject, SetBkMode, SetDCBrushColor, SetTextColor,
-            TRANSPARENT,
+            BeginPaint, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, CreateFontIndirectW, DC_BRUSH,
+            DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect,
+            GetMonitorInfoW, GetStockObject, GetSysColor, HBRUSH, HFONT, InvalidateRect, LOGFONTW,
+            MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, PAINTSTRUCT, SelectObject,
+            SetBkMode, SetDCBrushColor, SetTextColor, TRANSPARENT,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
+            Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
             HiDpi::GetDpiForWindow,
             Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE},
             WindowsAndMessaging::{
                 CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
                 GetClientRect, HHOOK, HTTRANSPARENT, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
                 LWA_ALPHA, MA_NOACTIVATE, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx,
-                PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
-                SWP_NOACTIVATE, SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowPos,
-                SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, UnregisterClassW,
-                WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WM_CLOSE, WM_KEYDOWN, WM_KEYUP,
-                WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
+                PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassW, SPI_GETHIGHCONTRAST, SW_HIDE,
+                SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+                SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowPos,
+                SetWindowsHookExW, ShowWindow, SystemParametersInfoW, UnhookWindowsHookEx,
+                UnregisterClassW, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WM_CLOSE, WM_KEYDOWN,
+                WM_KEYUP, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WM_SETTINGCHANGE,
+                WM_SYSCOLORCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WNDCLASSW,
                 WS_DISABLED, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
                 WS_EX_TRANSPARENT, WS_POPUP,
             },
@@ -269,6 +272,50 @@ fn bar_bounds(monitor: RECT, dpi: u32) -> RECT {
     }
 }
 
+const WHITE: COLORREF = COLORREF(0x00ff_ffff);
+
+/// Navy on white normally; the system highlight pair when High Contrast is on.
+fn choose_palette(
+    high_contrast: bool,
+    highlight: COLORREF,
+    highlight_text: COLORREF,
+) -> (COLORREF, COLORREF) {
+    if high_contrast {
+        (highlight, highlight_text)
+    } else {
+        (NAVY, WHITE)
+    }
+}
+
+fn high_contrast_enabled() -> bool {
+    let mut contrast = HIGHCONTRASTW {
+        cbSize: u32::try_from(std::mem::size_of::<HIGHCONTRASTW>()).unwrap_or(0),
+        ..Default::default()
+    };
+    // SAFETY: For SPI_GETHIGHCONTRAST, pvParam is a writable HIGHCONTRASTW whose cbSize matches
+    // uiParam; it outlives this synchronous call and is not retained.
+    let result = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            contrast.cbSize,
+            Some((&raw mut contrast).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    result.is_ok() && contrast.dwFlags.contains(HCF_HIGHCONTRASTON)
+}
+
+fn bar_palette() -> (COLORREF, COLORREF) {
+    // SAFETY: GetSysColor takes a constant index and returns a value; no pointers are involved.
+    let (highlight, text) = unsafe {
+        (
+            COLORREF(GetSysColor(COLOR_HIGHLIGHT)),
+            COLORREF(GetSysColor(COLOR_HIGHLIGHTTEXT)),
+        )
+    };
+    choose_palette(high_contrast_enabled(), highlight, text)
+}
+
 fn bar_text(controller: &StopController) -> &'static str {
     match controller.status() {
         "cleanup_failed" => "ControlFreak stopped. Input cleanup needs attention.",
@@ -417,10 +464,11 @@ unsafe extern "system" fn window_proc(
             let dc = BeginPaint(window, &raw mut paint);
             let mut rect = RECT::default();
             let _ = GetClientRect(window, &raw mut rect);
-            SetDCBrushColor(dc, NAVY);
+            let (background, foreground) = bar_palette();
+            SetDCBrushColor(dc, background);
             FillRect(dc, &raw const rect, HBRUSH(GetStockObject(DC_BRUSH).0));
             SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, COLORREF(0x00ff_ffff));
+            SetTextColor(dc, foreground);
             let old = BAR_FONT.with(|font| SelectObject(dc, font.get().into()));
             let mut text: Vec<u16> = CONTROLLER
                 .with(|slot| slot.borrow().as_ref().map_or(BAR_TEXT, bar_text))
@@ -439,6 +487,13 @@ unsafe extern "system" fn window_proc(
     }
     match message {
         WM_CLOSE => return LRESULT(0),
+        // The palette is read at paint time, so repaint when Windows changes its colors.
+        WM_SETTINGCHANGE | WM_SYSCOLORCHANGE | WM_THEMECHANGED => {
+            // SAFETY: The message is for this live window; invalidation retains no pointers.
+            unsafe {
+                let _ = InvalidateRect(Some(window), None, false);
+            }
+        }
         WM_NCHITTEST => return LRESULT(isize::try_from(HTTRANSPARENT).unwrap_or(-1)),
         WM_MOUSEACTIVATE => return LRESULT(isize::try_from(MA_NOACTIVATE).unwrap_or(3)),
         _ => {}
@@ -492,9 +547,17 @@ mod tests {
         assert!(unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_NOREMOVE) }.as_bool());
         let started = std::time::Instant::now();
         assert_eq!(wait_for_input(5_000).unwrap(), WaitOutcome::Input);
-        assert!(started.elapsed() < std::time::Duration::from_millis(1_000));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
         // SAFETY: Remove the test message so the queue is left empty.
         while unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }.as_bool() {}
+    }
+
+    #[test]
+    fn high_contrast_uses_the_system_highlight_pair() {
+        let highlight = COLORREF(0x0012_3456);
+        let text = COLORREF(0x00ab_cdef);
+        assert_eq!(choose_palette(true, highlight, text), (highlight, text));
+        assert_eq!(choose_palette(false, highlight, text), (NAVY, WHITE));
     }
 
     #[test]
@@ -512,8 +575,8 @@ mod tests {
                 y: rect.top + 1,
             },
             POINT {
-                x: (rect.left + rect.right) / 2,
-                y: (rect.top + rect.bottom) / 2,
+                x: i32::midpoint(rect.left, rect.right),
+                y: i32::midpoint(rect.top, rect.bottom),
             },
         ] {
             // SAFETY: `point` is a plain value and the returned HWND is only compared.

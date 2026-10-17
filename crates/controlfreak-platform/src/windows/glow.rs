@@ -35,11 +35,13 @@ use windows::{
             WindowsAndMessaging::{
                 CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
                 DispatchMessageW, GetForegroundWindow, HTTRANSPARENT, HWND_TOPMOST, MA_NOACTIVATE,
-                MSG, PM_REMOVE, PeekMessageW, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
-                SWP_NOACTIVATE, SWP_SHOWWINDOW, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
-                TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WDA_EXCLUDEFROMCAPTURE,
-                WM_MOUSEACTIVATE, WM_NCHITTEST, WNDCLASSW, WS_DISABLED, WS_EX_LAYERED,
-                WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+                MSG, PM_REMOVE, PeekMessageW, RegisterClassW, SPI_GETCLIENTAREAANIMATION, SW_HIDE,
+                SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowDisplayAffinity, SetWindowPos,
+                ShowWindow, SystemParametersInfoW, TranslateMessage, ULW_ALPHA,
+                UpdateLayeredWindow, WDA_EXCLUDEFROMCAPTURE, WM_MOUSEACTIVATE, WM_NCHITTEST,
+                WNDCLASSW, WS_DISABLED, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+                WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
             },
         },
     },
@@ -492,6 +494,8 @@ struct Renderer {
     monitors: Vec<MonitorRect>,
     windows: Vec<LayerWindow>,
     visible: bool,
+    /// Mirrors the Windows "Show animations" setting; re-read on every topology poll.
+    animated: bool,
 }
 
 impl Renderer {
@@ -502,12 +506,14 @@ impl Renderer {
             monitors: Vec::new(),
             windows: Vec::new(),
             visible: false,
+            animated: client_area_animation_enabled(),
         };
         renderer.sync_topology(false)?;
         Ok(renderer)
     }
 
     fn sync_topology(&mut self, require_foreground: bool) -> io::Result<()> {
+        self.animated = client_area_animation_enabled();
         let monitors = enumerate_monitors()?;
         if monitors != self.monitors {
             let mut replacement = Vec::with_capacity(monitors.len() * 4);
@@ -581,7 +587,7 @@ impl Renderer {
     }
 
     fn render(&mut self, seconds: f64, level: Level, opacity: f64) -> io::Result<()> {
-        let opacity = (opacity * breathing_opacity(seconds)).clamp(0.0, 1.0);
+        let opacity = (opacity * breathing_opacity(seconds, self.animated)).clamp(0.0, 1.0);
         for window in &mut self.windows {
             window.render(level, opacity)?;
         }
@@ -926,10 +932,32 @@ const CORE_STOPS: [(f64, f64); 3] = [
     (1.0, 0.0),
 ];
 
-fn breathing_opacity(seconds: f64) -> f64 {
+/// Glow strength at `seconds`. With Windows animation effects off the glow holds the midpoint of
+/// its breathing range instead of oscillating; level changes still fade through `VisualState`.
+fn breathing_opacity(seconds: f64, animated: bool) -> f64 {
+    if !animated {
+        return GLOW_OPACITY * (1.0 - BREATHING_AMOUNT);
+    }
     GLOW_OPACITY
         * (1.0 - BREATHING_AMOUNT
             + BREATHING_AMOUNT * (seconds * std::f64::consts::TAU / BREATHING_SECONDS).sin())
+}
+
+/// Reads the per-user "Show animations in Windows" setting. Keeps the animated default if the
+/// query fails, so an unreadable setting never changes the indicator unexpectedly.
+fn client_area_animation_enabled() -> bool {
+    let mut enabled = BOOL(1);
+    // SAFETY: For SPI_GETCLIENTAREAANIMATION, pvParam must point to a writable BOOL that outlives
+    // this synchronous call; `enabled` is such a local and is not retained.
+    let result = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some((&raw mut enabled).cast::<c_void>()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    result.is_err() || enabled.as_bool()
 }
 
 fn gradient_alpha(position: f64, stops: &[(f64, f64)]) -> f64 {
@@ -1279,17 +1307,43 @@ mod tests {
 
     #[test]
     fn breathing_and_armed_strength_match_the_profile() {
-        let peak = breathing_opacity(4.7 / 4.0);
-        let trough = breathing_opacity(4.7 * 3.0 / 4.0);
+        let peak = breathing_opacity(4.7 / 4.0, true);
+        let trough = breathing_opacity(4.7 * 3.0 / 4.0, true);
         assert!((peak - 0.42).abs() < 1e-12);
         assert!((trough - 0.42 * 0.64).abs() < 1e-12);
-        assert!((breathing_opacity(4.7) - breathing_opacity(0.0)).abs() < 1e-12);
+        assert!((breathing_opacity(4.7, true) - breathing_opacity(0.0, true)).abs() < 1e-12);
         for level in [Level::Armed, Level::ElevatedArmed] {
             assert!((level.target_opacity() - 0.48).abs() < 1e-12);
             let pixel = glow_pixel(0.0, level, peak * level.target_opacity());
             assert!(pixel >> 24 > 0);
             assert!(pixel >> 24 < glow_pixel(0.0, Level::Acting, peak) >> 24);
         }
+    }
+
+    #[test]
+    fn disabled_animation_holds_a_steady_midpoint_opacity() {
+        let steady = breathing_opacity(0.0, false);
+        assert!((steady - 0.42 * (1.0 - 0.18)).abs() < 1e-12);
+        for step in 0..=94 {
+            let seconds = f64::from(step) / 20.0;
+            assert!((breathing_opacity(seconds, false) - steady).abs() < 1e-12);
+        }
+        assert!(steady > breathing_opacity(4.7 * 3.0 / 4.0, true));
+        assert!(steady < breathing_opacity(4.7 / 4.0, true));
+    }
+
+    #[test]
+    fn level_changes_still_fade_when_animation_is_off() {
+        let mut visual = VisualState::new();
+        let started = Instant::now();
+        visual.set_level(Level::Armed, started);
+        let settled = started + FADE_IN;
+        visual.set_level(Level::Acting, settled);
+        let before = visual.opacity(settled);
+        let during = visual.opacity(settled + LEVEL_TRANSITION / 2);
+        let after = visual.opacity(settled + LEVEL_TRANSITION);
+        assert!(before < during && during < after);
+        assert!((after - Level::Acting.target_opacity()).abs() < 1e-12);
     }
 
     #[test]
@@ -1377,7 +1431,7 @@ mod tests {
                     *height,
                     *side,
                     Level::Acting,
-                    breathing_opacity(f64::from(frame) / 30.0),
+                    breathing_opacity(f64::from(frame) / 30.0, true),
                 );
                 std::hint::black_box(&*pixels);
             }
