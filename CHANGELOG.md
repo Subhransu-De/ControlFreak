@@ -9,6 +9,16 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Added
+
+- Every tool now publishes an `outputSchema`. The 14 tools that lacked one (`stop_desktop_work`,
+  `get_server_status`, `begin_control_session`, `end_control_session`, `capture_display`,
+  `capture_region`, `capture_window`, `wait_for_visual_change`, `wait_for_change_since`,
+  `capture_visual_baseline`, `read_text_in_region`, `find_text_on_screen`, `wait_for_text`, and
+  `wait_for_window`) describe their `structuredContent`. Screenshot and wait results share one
+  image-metadata definition. Error results keep the common `error` envelope and are not covered by
+  these schemas.
+
 ### Changed
 
 - Session admission failures now carry their own top-level `error.code` with `error.retryable` and

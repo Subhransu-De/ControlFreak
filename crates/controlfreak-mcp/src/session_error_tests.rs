@@ -5,13 +5,20 @@ use super::tests::{ExclusiveArbitrator, RecordingIndicator};
 use super::*;
 use tokio::io::{AsyncWriteExt, BufReader};
 
-struct Harness {
-    client: BufReader<tokio::io::DuplexStream>,
+pub(super) struct Harness {
+    pub(super) client: BufReader<tokio::io::DuplexStream>,
     runtime: Arc<IndicatorRuntime>,
     serving: tokio::task::JoinHandle<()>,
 }
 
 async fn harness(owned: Arc<AtomicBool>) -> Harness {
+    harness_with_backend(Arc::new(WaitingBackend::idle()), owned).await
+}
+
+pub(super) async fn harness_with_backend(
+    backend: Arc<dyn PlatformBackend>,
+    owned: Arc<AtomicBool>,
+) -> Harness {
     let runtime = Arc::new(IndicatorRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         || {
@@ -28,7 +35,7 @@ async fn harness(owned: Arc<AtomicBool>) -> Harness {
         },
     ));
     let server = ControlFreakServer::with_indicator(
-        Arc::new(WaitingBackend::idle()),
+        backend,
         SafetyIndicator::dormant(),
         Some(Arc::clone(&runtime)),
     );
@@ -58,7 +65,7 @@ async fn harness(owned: Arc<AtomicBool>) -> Harness {
     }
 }
 
-async fn call(harness: &mut Harness, name: &str, arguments: Value) -> Value {
+pub(super) async fn call(harness: &mut Harness, name: &str, arguments: Value) -> Value {
     let response = outcome_tests::exchange(
         &mut harness.client,
         json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":arguments}}),
@@ -96,7 +103,7 @@ fn assert_session_error(result: &Value, code: &str, retryable: bool) -> Value {
 }
 
 impl Harness {
-    async fn finish(self) {
+    pub(super) async fn finish(self) {
         drop(self.client);
         tokio::time::timeout(Duration::from_secs(5), self.serving)
             .await
