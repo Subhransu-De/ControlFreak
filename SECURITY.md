@@ -2,6 +2,9 @@
 
 ControlFreak is security-sensitive because it observes and controls the Windows desktop.
 
+[PRIVACY.md](PRIVACY.md) describes what desktop data the server reads, returns to the MCP client,
+and keeps, and what the setup program changes.
+
 The MCP can capture displays, regions, and windows; run local Windows OCR; retain up to sixteen
 short-lived visual baselines in memory; move/click/drag/scroll the pointer; focus existing windows;
 and inject keyboard input. Mouse clicks and drags are bounded atomic operations: the server

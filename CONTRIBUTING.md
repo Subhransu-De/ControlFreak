@@ -2,6 +2,8 @@
 
 ControlFreak targets 64-bit Windows and uses the Rust toolchain pinned in `rust-toolchain.toml`.
 
+Everyone taking part is expected to follow the [code of conduct](CODE_OF_CONDUCT.md).
+
 ## Local checks
 
 Install GNU Make and the Microsoft C++ Build Tools, then run this command from the workspace root before opening a pull request:

@@ -9,6 +9,14 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Added
+
+- Release files have GitHub build provenance attestations. `gh attestation verify <file> --repo
+  Subhransu-De/ControlFreak` confirms that a download, or the `controlfreak.exe` inside the ZIP,
+  was built by this repository's release workflow.
+- PRIVACY.md describes what the server reads, returns to the MCP client and keeps in memory, and
+  what the setup program changes. It is installed with ControlFreak.
+
 ## [0.1.0-alpha.2] - 2026-10-16
 
 ### Added

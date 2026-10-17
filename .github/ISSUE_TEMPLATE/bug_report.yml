@@ -1,0 +1,57 @@
+name: Bug report
+description: Something ControlFreak did, or refused to do, that it should not have.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste screenshots or text from windows that contain personal information. Use a test
+        window such as Notepad with sample text. Report security problems privately instead.
+  - type: input
+    id: version
+    attributes:
+      label: ControlFreak version
+      description: Run `controlfreak --version`.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: For example Windows 11 24H2. Mention display count and scaling if the problem involves coordinates or capture.
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      description: For example Claude Code, Codex, Claude Desktop, OpenCode or Pi, with its version.
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The tool you called, its arguments, and the result. Include the `code` and `message` of any error.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open Notepad and type "hello".
+        2. Ask the agent to ...
+  - type: textarea
+    id: stderr
+    attributes:
+      label: Server stderr
+      description: The `tool_completed` lines around the failure, if your client shows them. They contain no screen content.
+      render: text

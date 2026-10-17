@@ -88,10 +88,10 @@ state and ends control. The drag performs its press, motion, and release within 
 attempts release cleanup on failure. `begin_control_session` reserves control; it does not hold
 a mouse button down.
 
-Managed drags across calls and caller-specified target guards are not shipped. No recipe assumes
-those contracts. Focusing a window does not pin later keyboard input to that window. Refresh
-observations before acting and stop if the intended target has changed. Existing integrity and
-input-desktop checks remain enforced, but do not prove the intended application has focus.
+Managed drags across calls are not shipped, and no recipe assumes them. Every input action is
+checked against the session's `target_ref` before it is sent: if another window has taken the
+foreground or lies under the point, the action is refused instead of delivered. These checks do
+not prove what the application did with the input, so observe again before the next step.
 Add recipes for future contracts with their implementations.
 
 ## Export the tool contract
