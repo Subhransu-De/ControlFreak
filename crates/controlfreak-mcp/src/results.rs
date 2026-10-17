@@ -204,15 +204,15 @@ fn image_result(encoded: String, metadata: Value) -> CallToolResult {
 }
 
 pub(super) fn tool_error(error: &PlatformError) -> CallToolResult {
-    if let PlatformError::PostActionObservationFailed { operation, reason } = error {
-        return CallToolResult::structured(json!({
-            "status": "completed_unverified",
-            "operation": operation,
-            "warning": reason,
-            "retry_action": false,
-        }));
-    }
     let code = match error {
+        PlatformError::PostActionObservationFailed { operation, reason } => {
+            return CallToolResult::structured(json!({
+                "status": "completed_unverified",
+                "operation": operation,
+                "warning": reason,
+                "retry_action": false,
+            }));
+        }
         PlatformError::TargetInvalidated { .. } => "target_invalidated",
         PlatformError::ActivationFailed { reason, .. } => reason.as_str(),
         PlatformError::OcrNoMatch { .. } => "ocr_no_match",
@@ -222,7 +222,6 @@ pub(super) fn tool_error(error: &PlatformError) -> CallToolResult {
         PlatformError::HigherIntegrityTarget { .. } => "higher_integrity_target",
         PlatformError::TargetIntegrityUnavailable { .. } => "target_integrity_unavailable",
         PlatformError::InvalidArgument { .. } => "invalid_argument",
-        PlatformError::PostActionObservationFailed { .. } => unreachable!(),
         PlatformError::OperationFailed { .. } | PlatformError::Unavailable { .. } => {
             "platform_operation_failed"
         }

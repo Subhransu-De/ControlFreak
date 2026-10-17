@@ -561,7 +561,7 @@ fn join_error(error: &tokio::task::JoinError) -> ErrorData {
 pub async fn serve_stdio(
     backend: Box<dyn PlatformBackend>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    serve_stdio_inner(backend, SafetyIndicator::ready(), None).await
+    serve_stdio_inner(Arc::from(backend), SafetyIndicator::ready(), None).await
 }
 
 pub async fn serve_stdio_with_indicator<F, G>(
@@ -594,6 +594,7 @@ where
     F: Fn() -> Result<G, String> + Send + Sync + 'static,
     G: ActivityIndicator + 'static,
 {
+    let backend: Arc<dyn PlatformBackend> = Arc::from(backend);
     let mut runtime = IndicatorRuntime::new_with_timing(
         safety_indicator.clone(),
         start_indicator,
@@ -601,6 +602,7 @@ where
         glow_timing_from_environment(),
     );
     runtime.stop = stop;
+    runtime.environment = Some(Arc::clone(&backend));
     let indicator_runtime = Arc::new(runtime);
     serve_stdio_inner(backend, safety_indicator, Some(indicator_runtime)).await
 }
@@ -665,17 +667,10 @@ async fn wait_for_cleanup(runtime: &IndicatorRuntime, timeout: Duration) -> std:
 }
 
 async fn serve_stdio_inner(
-    backend: Box<dyn PlatformBackend>,
+    backend: Arc<dyn PlatformBackend>,
     safety_indicator: SafetyIndicator,
     indicator_runtime: Option<Arc<IndicatorRuntime>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let backend: Arc<dyn PlatformBackend> = Arc::from(backend);
-    let mut indicator_runtime = indicator_runtime;
-    if let Some(runtime) = indicator_runtime.as_mut() {
-        Arc::get_mut(runtime)
-            .expect("runtime is not shared before serving")
-            .environment = Some(Arc::clone(&backend));
-    }
     let cleanup = ServerCleanup(indicator_runtime.clone());
     let server = ControlFreakServer::with_indicator(backend, safety_indicator, indicator_runtime);
     let instance_id = server.diagnostics.instance_id.clone();

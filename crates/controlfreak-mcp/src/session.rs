@@ -716,7 +716,8 @@ impl IndicatorRuntime {
     }
 
     fn ensure_indicator_level(&self, level: IndicatorLevel) -> Result<(), String> {
-        for attempt in 0..=MAX_INDICATOR_RESTARTS {
+        let mut attempt = 0;
+        loop {
             let result = self.ensure_control().and_then(|()| {
                 let mut state = self
                     .state
@@ -751,17 +752,17 @@ impl IndicatorRuntime {
                         let _ = self.close_session_locked("admission_failure", false);
                         return Err(error);
                     }
-                    if !can_restart || attempt == MAX_INDICATOR_RESTARTS {
+                    if !can_restart || attempt >= MAX_INDICATOR_RESTARTS {
                         if can_restart {
                             let _ = self.close_session_locked("admission_failure", false);
                         }
                         self.safety_indicator.mark_failed(reason.clone());
                         return Err(reason);
                     }
+                    attempt += 1;
                 }
             }
         }
-        unreachable!()
     }
 
     fn retire_failed_control(&self, reason: &str) -> (Option<IndicatorControl>, bool) {
