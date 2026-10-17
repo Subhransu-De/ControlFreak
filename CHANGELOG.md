@@ -9,6 +9,11 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Changed
+
+- The Esc monitor thread now blocks on a message-aware wait (100 ms poll) instead of waking
+  about 100 times per second, while still answering keyboard hook callbacks immediately.
+
 ### Fixed
 
 - The session control bar no longer blocks input. Pointer actions aimed at the strip it covers

@@ -12,7 +12,10 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{
+            COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_FAILED, WAIT_TIMEOUT,
+            WPARAM,
+        },
         Graphics::Gdi::{
             BeginPaint, CreateFontIndirectW, DC_BRUSH, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
             DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, HBRUSH,
@@ -27,9 +30,9 @@ use windows::{
             WindowsAndMessaging::{
                 CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
                 GetClientRect, HHOOK, HTTRANSPARENT, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
-                LWA_ALPHA, MA_NOACTIVATE, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW,
-                QS_ALLINPUT, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-                SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowPos,
+                LWA_ALPHA, MA_NOACTIVATE, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx,
+                PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
+                SWP_NOACTIVATE, SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowPos,
                 SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, UnregisterClassW,
                 WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WM_CLOSE, WM_KEYDOWN, WM_KEYUP,
                 WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
@@ -43,6 +46,9 @@ use windows::{
 
 const BAR_TEXT: &str = "ControlFreak is controlling your system (Use Esc to stop)";
 const CLASS_NAME: windows::core::PCWSTR = w!("ControlFreakUserStop");
+/// Longest the UI thread blocks while idle. It only bounds how soon a session start, status text
+/// change or shutdown is noticed; hook callbacks and window messages wake the wait immediately.
+const POLL_INTERVAL_MS: u32 = 100;
 const NAVY: COLORREF = COLORREF(0x0080_0000); // RGB #000080; COLORREF is BGR.
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -310,15 +316,39 @@ fn run(
             }
             visible = active;
         }
-        // Low-level keyboard hook calls arrive as sent messages on this thread. Wake for them at
-        // once: sleeping here would delay every keystroke on the system, injected or physical.
-        // SAFETY: No handles are passed; the call only waits on this thread's message queue.
-        unsafe {
-            let _ = MsgWaitForMultipleObjects(None, false, 10, QS_ALLINPUT);
-        }
+        wait_for_input(POLL_INTERVAL_MS)?;
     }
     Ok(())
 }
+
+/// What ended a [`wait_for_input`] call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitOutcome {
+    /// Input, a posted message or a sent message (such as a hook callback) needs this thread.
+    Input,
+    /// The poll interval elapsed with nothing to dispatch.
+    TimedOut,
+}
+
+/// Blocks until this thread has queue input or `timeout_ms` elapses. Low-level keyboard hook
+/// calls arrive as sent messages and run inside this wait, so keystrokes are answered at once
+/// instead of after a sleep. `MWMO_INPUTAVAILABLE` also returns for messages that an earlier
+/// peek already saw but did not remove, which a plain wait would sleep through. The timeout is
+/// only for the session and status polling, so an idle thread wakes `1000 / timeout_ms` times
+/// per second.
+fn wait_for_input(timeout_ms: u32) -> windows::core::Result<WaitOutcome> {
+    // SAFETY: No handles are passed; the call only waits on this thread's message queue.
+    let result =
+        unsafe { MsgWaitForMultipleObjectsEx(None, timeout_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
+    if result == WAIT_TIMEOUT {
+        Ok(WaitOutcome::TimedOut)
+    } else if result == WAIT_FAILED {
+        Err(windows::core::Error::from_thread())
+    } else {
+        Ok(WaitOutcome::Input)
+    }
+}
+
 fn consume_escape(
     controller: &StopController,
     key: u32,
@@ -420,7 +450,12 @@ unsafe extern "system" fn window_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, SendMessageW, WindowFromPoint};
+    use windows::Win32::{
+        System::Threading::GetCurrentThreadId,
+        UI::WindowsAndMessaging::{
+            GetWindowRect, PM_NOREMOVE, PostThreadMessageW, SendMessageW, WM_APP, WindowFromPoint,
+        },
+    };
 
     #[test]
     fn bar_is_centered_with_scaled_top_gap_even_at_negative_origins() {
@@ -436,6 +471,30 @@ mod tests {
             assert_eq!(bounds.top - monitor.top, i32::try_from(dpi).unwrap() / 6);
             assert!(bounds.left >= monitor.left && bounds.right <= monitor.right);
         }
+    }
+
+    #[test]
+    fn input_wait_blocks_for_the_interval_then_wakes_for_pending_messages() {
+        // Create this thread's queue and make sure nothing is pending.
+        let mut message = MSG::default();
+        // SAFETY: `message` is writable and this test thread owns its queue.
+        while unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }.as_bool() {}
+
+        let started = std::time::Instant::now();
+        assert_eq!(wait_for_input(60).unwrap(), WaitOutcome::TimedOut);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(40));
+
+        // SAFETY: Posting a plain-value message to this thread's own queue.
+        unsafe { PostThreadMessageW(GetCurrentThreadId(), WM_APP, WPARAM(0), LPARAM(0)) }.unwrap();
+        // A peek without removal marks the message as seen. A plain wait would sleep through
+        // it; MWMO_INPUTAVAILABLE must still return at once.
+        // SAFETY: Same writable message and owned queue; PM_NOREMOVE leaves it queued.
+        assert!(unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_NOREMOVE) }.as_bool());
+        let started = std::time::Instant::now();
+        assert_eq!(wait_for_input(5_000).unwrap(), WaitOutcome::Input);
+        assert!(started.elapsed() < std::time::Duration::from_millis(1_000));
+        // SAFETY: Remove the test message so the queue is left empty.
+        while unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }.as_bool() {}
     }
 
     #[test]
