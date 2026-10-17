@@ -95,7 +95,9 @@ jobs:
         run: cargo xtask test-installer --package dist --output "$env:RUNNER_TEMP/installer-test" --production-installer
 
       # The installer, the ZIP and the executables inside it, so an extracted
-      # controlfreak.exe can be verified on its own.
+      # controlfreak.exe can be verified on its own. A release started from main
+      # records main's commit as the source: the release commit, which only adds
+      # the version and changelog date, is created after the build.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:

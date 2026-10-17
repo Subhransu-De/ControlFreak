@@ -13,7 +13,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 - Release files have GitHub build provenance attestations. `gh attestation verify <file> --repo
   Subhransu-De/ControlFreak` confirms that a download, or the `controlfreak.exe` inside the ZIP,
-  was built by this repository's release workflow.
+  was built by this repository's release workflow. The recorded source commit is the `main`
+  commit the release started from, not the release commit that adds the version number.
 - PRIVACY.md describes what the server reads, returns to the MCP client and keeps in memory, and
   what the setup program changes. It is installed with ControlFreak.
 - Every tool now publishes an `outputSchema`. The 14 tools that lacked one (`stop_desktop_work`,
