@@ -4,6 +4,8 @@
   <img src="assets/logo.png" width="240" alt="ControlFreak mascot: a blue octopus holding two app windows, pressing a key and clicking a mouse cursor">
 </p>
 
+<p align="center"><strong>Your agent steers. You keep the brake.</strong></p>
+
 [![CI](https://github.com/Subhransu-De/ControlFreak/actions/workflows/ci.yml/badge.svg)](https://github.com/Subhransu-De/ControlFreak/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Subhransu-De/ControlFreak?include_prereleases)](https://github.com/Subhransu-De/ControlFreak/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
