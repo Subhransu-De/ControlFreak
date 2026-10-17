@@ -9,6 +9,12 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Fixed
+
+- The session control bar no longer blocks input. Pointer actions aimed at the strip it covers
+  now reach the window beneath instead of being refused as a different window, physical clicks
+  pass through it, and it never takes focus. It stays excluded from screen capture.
+
 ## [0.1.0-alpha.2] - 2026-10-16
 
 ### Added

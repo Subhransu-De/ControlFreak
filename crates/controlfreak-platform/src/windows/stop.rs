@@ -26,13 +26,15 @@ use windows::{
             Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE},
             WindowsAndMessaging::{
                 CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-                GetClientRect, HHOOK, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG,
-                MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassW,
-                SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetWindowDisplayAffinity, SetWindowPos,
+                GetClientRect, HHOOK, HTTRANSPARENT, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+                LWA_ALPHA, MA_NOACTIVATE, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW,
+                QS_ALLINPUT, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+                SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowPos,
                 SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, UnregisterClassW,
-                WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WM_CLOSE, WM_KEYDOWN, WM_KEYUP, WM_PAINT,
-                WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-                WS_EX_TOPMOST, WS_POPUP,
+                WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WM_CLOSE, WM_KEYDOWN, WM_KEYUP,
+                WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
+                WS_DISABLED, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                WS_EX_TRANSPARENT, WS_POPUP,
             },
         },
     },
@@ -109,6 +111,12 @@ struct NativeBar {
 
 impl NativeBar {
     fn create() -> windows::core::Result<Self> {
+        Self::create_with_hook(true)
+    }
+
+    /// Tests pass `false`: a low-level hook on a thread that never pumps messages would delay
+    /// every keystroke on the machine.
+    fn create_with_hook(install_hook: bool) -> windows::core::Result<Self> {
         // SAFETY: This UI thread owns the class, hidden window and hook. The guard
         // releases every successfully created resource if a later call fails.
         unsafe {
@@ -131,10 +139,17 @@ impl NativeBar {
                 font_height: 0,
             };
             bar.window = CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT,
                 CLASS_NAME,
                 w!("ControlFreak session"),
-                WS_POPUP,
+                // The bar is purely informational. WindowFromPoint skips disabled windows, so
+                // point-integrity checks resolve the application beneath the bar instead of
+                // this process, and physical clicks pass through the transparent layered window.
+                WS_POPUP | WS_DISABLED,
                 0,
                 0,
                 600,
@@ -144,6 +159,9 @@ impl NativeBar {
                 Some(instance),
                 None,
             )?;
+            // A layered window paints nothing until its attributes are set; fully opaque
+            // alpha keeps the normal WM_PAINT rendering while input passes through.
+            SetLayeredWindowAttributes(bar.window, COLORREF(0), 255, LWA_ALPHA)?;
             SetWindowDisplayAffinity(bar.window, WDA_EXCLUDEFROMCAPTURE)?;
             // A key already held before monitoring must retain its matching release.
             ESC_STATE.with(|state| {
@@ -153,7 +171,10 @@ impl NativeBar {
                     EscapeState::Released
                 });
             });
-            bar.hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), Some(instance), 0)?;
+            if install_hook {
+                bar.hook =
+                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), Some(instance), 0)?;
+            }
             Ok(bar)
         }
     }
@@ -386,8 +407,11 @@ unsafe extern "system" fn window_proc(
         }
         return LRESULT(0);
     }
-    if message == WM_CLOSE {
-        return LRESULT(0);
+    match message {
+        WM_CLOSE => return LRESULT(0),
+        WM_NCHITTEST => return LRESULT(isize::try_from(HTTRANSPARENT).unwrap_or(-1)),
+        WM_MOUSEACTIVATE => return LRESULT(isize::try_from(MA_NOACTIVATE).unwrap_or(3)),
+        _ => {}
     }
     // SAFETY: Forward unchanged Win32 callback arguments to the default procedure.
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
@@ -396,6 +420,7 @@ unsafe extern "system" fn window_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, SendMessageW, WindowFromPoint};
 
     #[test]
     fn bar_is_centered_with_scaled_top_gap_even_at_negative_origins() {
@@ -411,6 +436,54 @@ mod tests {
             assert_eq!(bounds.top - monitor.top, i32::try_from(dpi).unwrap() / 6);
             assert!(bounds.left >= monitor.left && bounds.right <= monitor.right);
         }
+    }
+
+    #[test]
+    fn point_targeting_skips_the_disabled_control_bar() {
+        super::super::ensure_dpi_awareness().unwrap();
+        let bar = NativeBar::create_with_hook(false).unwrap();
+        // SAFETY: The bar owns this live window; showing it without activation retains no pointers.
+        let _ = unsafe { ShowWindow(bar.window, SW_SHOWNOACTIVATE) };
+        let mut rect = RECT::default();
+        // SAFETY: `rect` is writable for the synchronous call and the window is live.
+        unsafe { GetWindowRect(bar.window, &raw mut rect) }.unwrap();
+        for point in [
+            POINT {
+                x: rect.left + 1,
+                y: rect.top + 1,
+            },
+            POINT {
+                x: (rect.left + rect.right) / 2,
+                y: (rect.top + rect.bottom) / 2,
+            },
+        ] {
+            // SAFETY: `point` is a plain value and the returned HWND is only compared.
+            let target = unsafe { WindowFromPoint(point) };
+            assert_ne!(target, bar.window);
+            // SAFETY: Same value-only hit test; the bar must also answer as transparent.
+            let hit = unsafe {
+                SendMessageW(
+                    bar.window,
+                    WM_NCHITTEST,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(
+                        (isize::try_from(point.y).unwrap() << 16)
+                            | isize::try_from(point.x).unwrap(),
+                    )),
+                )
+            };
+            assert_eq!(hit.0, isize::try_from(HTTRANSPARENT).unwrap());
+        }
+        // SAFETY: Same live window; MA_NOACTIVATE keeps a physical click from focusing the bar.
+        let activate = unsafe {
+            SendMessageW(
+                bar.window,
+                WM_MOUSEACTIVATE,
+                Some(WPARAM(0)),
+                Some(LPARAM(0)),
+            )
+        };
+        assert_eq!(activate.0, isize::try_from(MA_NOACTIVATE).unwrap());
     }
 
     #[test]
