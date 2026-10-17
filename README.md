@@ -1,14 +1,16 @@
-# ControlFreak
-
 <p align="center">
-  <img src="assets/logo.png" width="240" alt="ControlFreak mascot: a blue octopus holding two app windows, pressing a key and clicking a mouse cursor">
+  <img src="assets/logo.png" alt="ControlFreak mascot: a blue octopus holding two app windows, pressing a key and clicking a mouse cursor" width="240">
 </p>
 
-<p align="center"><strong>Let your agents work for you.</strong></p>
+<h1 align="center">ControlFreak</h1>
 
-[![CI](https://github.com/Subhransu-De/ControlFreak/actions/workflows/ci.yml/badge.svg)](https://github.com/Subhransu-De/ControlFreak/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/Subhransu-De/ControlFreak?include_prereleases)](https://github.com/Subhransu-De/ControlFreak/releases)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+<p align="center">Let your agents work for you.</p>
+
+<p align="center">
+  <a href="https://github.com/Subhransu-De/ControlFreak/releases"><img src="https://img.shields.io/github/v/release/Subhransu-De/ControlFreak?include_prereleases&amp;label=Release&amp;style=flat" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Subhransu-De/ControlFreak?label=License&amp;style=flat" alt="MIT License"></a>
+  <a href="https://github.com/Subhransu-De/ControlFreak/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Subhransu-De/ControlFreak/ci.yml?branch=main&amp;label=Build&amp;style=flat" alt="Build status"></a>
+</p>
 
 ControlFreak lets an AI agent use your Windows desktop. It is a computer-use
 [MCP](https://modelcontextprotocol.io) server written in Rust. Your MCP client, such as Claude
