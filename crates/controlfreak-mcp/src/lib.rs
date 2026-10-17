@@ -353,10 +353,18 @@ impl ServerHandler for ControlFreakServer {
                                 let work = stop::current();
                                 let backend = Arc::clone(&backend);
                                 match tokio::task::spawn_blocking(move || {
+                                    // A stop or shutdown cancels the request; report it as such.
+                                    let cancelled = |error| {
+                                        if runtime_for_worker.stop.is_stopped() {
+                                            runtime_for_worker.stop_refusal().into()
+                                        } else {
+                                            error
+                                        }
+                                    };
                                     if let Some(work) = &work {
-                                        work.control
-                                            .check("begin_control_session")
-                                            .map_err(BeginSessionError::Target)?;
+                                        work.control.check("begin_control_session").map_err(
+                                            |error| cancelled(BeginSessionError::Target(error)),
+                                        )?;
                                     }
                                     backend
                                         .validate_target_reference(&input.target_ref)
@@ -370,10 +378,12 @@ impl ServerHandler for ControlFreakServer {
                                         runtime_for_worker
                                             .end_session()
                                             .map_err(SessionError::Indicator)?;
-                                        return Err(SessionError::Indicator(
-                                            "session request was cancelled".to_owned(),
-                                        )
-                                        .into());
+                                        return Err(cancelled(
+                                            SessionError::Indicator(
+                                                "session request was cancelled".to_owned(),
+                                            )
+                                            .into(),
+                                        ));
                                     }
                                     Ok(())
                                 })
