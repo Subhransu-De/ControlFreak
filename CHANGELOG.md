@@ -27,6 +27,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ### Changed
 
+- The README is now a short overview. Tool behavior, control sessions and full setup details
+  moved to the `docs/` folder.
 - The Esc monitor thread now blocks on a message-aware wait (100 ms poll) instead of waking
   about 100 times per second, while still answering keyboard hook callbacks immediately.
 - The desktop glow holds a steady opacity instead of breathing when Windows animation effects are
@@ -44,6 +46,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ### Fixed
 
+- The manual Pi setup path is `%USERPROFILE%\.pi\agent\mcp.json`. The README previously gave
+  `%USERPROFILE%\.config\mcp\mcp.json`, which Pi does not read.
 - The session control bar no longer blocks input. Pointer actions aimed at the strip it covers
   now reach the window beneath instead of being refused as a different window, physical clicks
   pass through it, and it never takes focus. It stays excluded from screen capture.

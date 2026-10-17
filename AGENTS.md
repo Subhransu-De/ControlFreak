@@ -4,7 +4,7 @@ ControlFreak is a native Windows computer-use MCP server communicating locally o
 
 Prioritize predictable desktop actions, truthful capability and error reporting, privacy, and responsive local operation. Keep changes focused on the requested outcome. Prefer the smallest design that fits the existing crate boundaries.
 
-Read README.md for supported behavior, CONTRIBUTING.md for contribution requirements, and SECURITY.md before changing desktop control or privilege handling. Use rust-toolchain.toml as the toolchain source of truth. Windows x86-64 with the MSVC build tools is the supported development target.
+Read README.md and docs/ for supported behavior, CONTRIBUTING.md for contribution requirements, and SECURITY.md before changing desktop control or privilege handling. Use rust-toolchain.toml as the toolchain source of truth. Windows x86-64 with the MSVC build tools is the supported development target.
 
 ## Architecture and vocabulary
 
@@ -71,7 +71,7 @@ Passing mock or transport tests does not establish real desktop behavior. Report
 
 ## Documentation and delivery
 
-Update CHANGELOG.md for user-visible changes as required by CONTRIBUTING.md. Update README.md when setup or user-facing behavior changes, and SECURITY.md when its documented boundaries change. Keep explanations of local implementation decisions near the relevant code; avoid duplicate inventories and task diaries.
+Update CHANGELOG.md for user-visible changes as required by CONTRIBUTING.md. Update docs/ when tool, session or setup behavior changes, README.md when the user-facing summary changes, and SECURITY.md when its documented boundaries change. Keep explanations of local implementation decisions near the relevant code; avoid duplicate inventories and task diaries.
 
 Keep each change focused, preserve unrelated work, and follow the PR template when a PR is requested. Explain the problem, resulting behavior, verification, and remaining limitations. Check the current PR head's pipeline and review feedback; investigate failures and validate review findings against the actual change before acting.
 
