@@ -320,7 +320,12 @@ impl ServerHandler for ControlFreakServer {
                     Ok(work) => work.with_stages(worker_stages),
                     Err(error) => {
                         let response = if stop.is_stopped() {
-                            SessionError::stopped(&stop)
+                            indicator_runtime
+                                .as_ref()
+                                .map_or_else(
+                                    || SessionError::stopped(&stop),
+                                    |runtime| runtime.stop_refusal(),
+                                )
                                 .into_tool_result(&safety_indicator)
                                 .into()
                         } else {
@@ -649,8 +654,8 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for DisconnectReader<
             && matches!(&result, std::task::Poll::Ready(result) if result.is_err() || buffer.filled().len() == before)
             && let Some(runtime) = this.runtime.take()
         {
-            runtime.stop.stop();
             runtime.terminated.store(true, Ordering::Release);
+            runtime.stop.stop();
             tokio::task::spawn_blocking(move || runtime.close_session("disconnect", true));
         }
         result

@@ -259,3 +259,20 @@ async fn user_stop_keeps_its_own_message() {
     assert!(message.starts_with("the user stopped the control session"));
     harness.finish().await;
 }
+
+#[tokio::test]
+async fn shutdown_is_not_reported_as_a_user_stop() {
+    for (name, arguments) in [begin(), mutate()] {
+        let mut harness = harness(Arc::new(AtomicBool::new(false))).await;
+        // The same latch and flag a real shutdown sets.
+        harness.runtime.terminated.store(true, Ordering::Release);
+        harness.runtime.stop.stop();
+        let result = call(&mut harness, name, arguments).await;
+        assert_session_error(&result, "server_shutting_down", false);
+        assert!(matches!(
+            harness.runtime.acquire_mutation_blocking(),
+            Err(SessionError::ShuttingDown)
+        ));
+        harness.finish().await;
+    }
+}

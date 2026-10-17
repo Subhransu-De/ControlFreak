@@ -446,7 +446,7 @@ impl IndicatorRuntime {
             if let Some(work) = &work {
                 work.control.check("admission").map_err(|error| {
                     if runtime.stop.is_stopped() {
-                        SessionError::stopped(&runtime.stop)
+                        runtime.stop_refusal()
                     } else {
                         SessionError::Indicator(error.to_string())
                     }
@@ -604,8 +604,8 @@ impl IndicatorRuntime {
 
     pub(super) fn close_session(&self, reason: &str, terminate: bool) -> Result<(), String> {
         if terminate {
-            self.stop.stop();
             self.terminated.store(true, Ordering::Release);
+            self.stop.stop();
         }
         let _lifecycle = self
             .lifecycle
@@ -622,8 +622,8 @@ impl IndicatorRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if terminate {
-            self.stop.stop();
             self.terminated.store(true, Ordering::Release);
+            self.stop.stop();
         }
         if !state.session.owns_arbitration {
             if terminate && state.last_cleanup_reason.is_none() {
@@ -647,13 +647,22 @@ impl IndicatorRuntime {
         self.finish_session_close()
     }
 
+    /// The refusal for a closed stop latch. Shutdown also closes the latch, so check it first.
+    pub(super) fn stop_refusal(&self) -> SessionError {
+        if self.terminated.load(Ordering::Acquire) {
+            SessionError::ShuttingDown
+        } else {
+            SessionError::stopped(&self.stop)
+        }
+    }
+
     fn check_environment(&self) -> Result<(), SessionError> {
         if self.terminated.load(Ordering::Acquire) {
             return Err(SessionError::ShuttingDown);
         }
         if self.stop.is_stopped() {
             let _ = self.close_session_locked("stop", false);
-            return Err(SessionError::stopped(&self.stop));
+            return Err(self.stop_refusal());
         }
         if let Some(backend) = &self.environment
             && let Err(error) = backend.check_control_environment()
@@ -774,7 +783,7 @@ impl IndicatorRuntime {
         let stop_registration = self
             .stop
             .register(cancellation.clone())
-            .map_err(|_| SessionError::stopped(&self.stop))?;
+            .map_err(|_| self.stop_refusal())?;
         self.arbitrator.try_acquire().map_err(SessionError::from)?;
         state.session = ControlSession::dormant(self.short_hold);
         state.session.owns_arbitration = true;
