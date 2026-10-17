@@ -3,6 +3,8 @@
 #[cfg(test)]
 mod cleanup_tests;
 mod diagnostics;
+#[cfg(test)]
+mod encoding_tests;
 mod handlers;
 mod observations;
 mod requests;
@@ -26,11 +28,13 @@ pub use session::{
 #[cfg(test)]
 use session::{GlowTiming, IdleCommand, IdleWorker};
 use session::{
-    IndicatorRuntime, LocalArbitrator, OperationLease, glow_timing_from_environment,
+    IndicatorRuntime, LocalArbitrator, OperationLease, SessionError, glow_timing_from_environment,
     indicator_unavailable,
 };
 #[cfg(test)]
 mod outcome_tests;
+#[cfg(test)]
+mod output_schema_tests;
 #[cfg(test)]
 mod protocol_tests;
 #[cfg(test)]
@@ -39,6 +43,8 @@ mod results;
 #[cfg(test)]
 mod run_actions_tests;
 mod schema;
+#[cfg(test)]
+mod session_error_tests;
 
 use handlers::{
     call_capture_display, call_capture_region, call_capture_visual_baseline, call_capture_window,
@@ -50,8 +56,8 @@ use handlers::{
     call_wait_for_window,
 };
 use results::{
-    click_text_result, keyboard_result, pointer_result, screenshot_result, tool_error,
-    tool_execution_error, virtual_desktop_list_result, virtual_desktop_switch_result,
+    CarriesPng, Encoded, click_text_result, keyboard_result, pointer_result, screenshot_result,
+    tool_error, tool_execution_error, virtual_desktop_list_result, virtual_desktop_switch_result,
     visual_baseline_result, visual_change_result, window_focus_result, window_screenshot_result,
     window_wait_result,
 };
@@ -100,7 +106,13 @@ const BEGIN_CONTROL_SESSION: &str = "begin_control_session";
 #[derive(Debug)]
 enum BeginSessionError {
     Target(PlatformError),
-    Indicator(String),
+    Session(SessionError),
+}
+
+impl From<SessionError> for BeginSessionError {
+    fn from(error: SessionError) -> Self {
+        Self::Session(error)
+    }
 }
 const END_CONTROL_SESSION: &str = "end_control_session";
 const CAPTURE_DISPLAY: &str = "capture_display";
@@ -346,10 +358,11 @@ impl ServerHandler for ControlFreakServer {
                                     {
                                         runtime_for_worker
                                             .end_session()
-                                            .map_err(BeginSessionError::Indicator)?;
-                                        return Err(BeginSessionError::Indicator(
+                                            .map_err(SessionError::Indicator)?;
+                                        return Err(SessionError::Indicator(
                                             "session request was cancelled".to_owned(),
-                                        ));
+                                        )
+                                        .into());
                                     }
                                     Ok(())
                                 })
@@ -363,8 +376,8 @@ impl ServerHandler for ControlFreakServer {
                                     Ok(Err(BeginSessionError::Target(error))) => {
                                         Ok(tool_error(&error).into())
                                     }
-                                    Ok(Err(BeginSessionError::Indicator(reason))) => {
-                                        Err(indicator_unavailable(&safety_indicator, &reason))
+                                    Ok(Err(BeginSessionError::Session(error))) => {
+                                        Ok(error.into_tool_result(&safety_indicator).into())
                                     }
                                     Err(error) => Err(join_error(&error)),
                                 }
@@ -388,7 +401,10 @@ impl ServerHandler for ControlFreakServer {
                                     )
                                     .await
                                 }
-                                Err(error) => Err(error),
+                                Err(error) => Ok(results::with_progress(
+                                    error.into_tool_result(&safety_indicator).into(),
+                                    controlfreak_core::MutationProgress::default(),
+                                )),
                             },
                             None => {
                                 dispatch_tool(
@@ -561,7 +577,7 @@ fn join_error(error: &tokio::task::JoinError) -> ErrorData {
 pub async fn serve_stdio(
     backend: Box<dyn PlatformBackend>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    serve_stdio_inner(backend, SafetyIndicator::ready(), None).await
+    serve_stdio_inner(Arc::from(backend), SafetyIndicator::ready(), None).await
 }
 
 pub async fn serve_stdio_with_indicator<F, G>(
@@ -594,6 +610,7 @@ where
     F: Fn() -> Result<G, String> + Send + Sync + 'static,
     G: ActivityIndicator + 'static,
 {
+    let backend: Arc<dyn PlatformBackend> = Arc::from(backend);
     let mut runtime = IndicatorRuntime::new_with_timing(
         safety_indicator.clone(),
         start_indicator,
@@ -601,6 +618,7 @@ where
         glow_timing_from_environment(),
     );
     runtime.stop = stop;
+    runtime.environment = Some(Arc::clone(&backend));
     let indicator_runtime = Arc::new(runtime);
     serve_stdio_inner(backend, safety_indicator, Some(indicator_runtime)).await
 }
@@ -665,17 +683,10 @@ async fn wait_for_cleanup(runtime: &IndicatorRuntime, timeout: Duration) -> std:
 }
 
 async fn serve_stdio_inner(
-    backend: Box<dyn PlatformBackend>,
+    backend: Arc<dyn PlatformBackend>,
     safety_indicator: SafetyIndicator,
     indicator_runtime: Option<Arc<IndicatorRuntime>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let backend: Arc<dyn PlatformBackend> = Arc::from(backend);
-    let mut indicator_runtime = indicator_runtime;
-    if let Some(runtime) = indicator_runtime.as_mut() {
-        Arc::get_mut(runtime)
-            .expect("runtime is not shared before serving")
-            .environment = Some(Arc::clone(&backend));
-    }
     let cleanup = ServerCleanup(indicator_runtime.clone());
     let server = ControlFreakServer::with_indicator(backend, safety_indicator, indicator_runtime);
     let instance_id = server.diagnostics.instance_id.clone();

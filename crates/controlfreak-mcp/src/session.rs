@@ -1,6 +1,7 @@
 use super::{
-    Arc, AtomicBool, AtomicU8, BeginSessionError, Duration, ErrorData, Instant, MutationControl,
-    Mutex, Ordering, PlatformBackend, Value, VecDeque, json, mpsc, thread,
+    Arc, AtomicBool, AtomicU8, BeginSessionError, CallToolResult, Duration, ErrorData, Instant,
+    MutationControl, Mutex, Ordering, PlatformBackend, Value, VecDeque, json, mpsc, thread,
+    tool_execution_error,
 };
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -179,26 +180,109 @@ impl ActivityArbitrator for LocalArbitrator {
     fn release(&self) {}
 }
 
-fn arbitration_error_message(error: &ArbitrationError) -> String {
-    let value = match error {
-        ArbitrationError::Busy(busy) => json!({
-            "code": "desktop_in_use",
-            "retryable": true,
-            "owner_instance_id": busy.owner_instance_id,
-            "session_state": "dormant",
-            "retry_after_ms": busy.retry_after_ms,
-            "remedy": "wait, or ask the owning client to call end_control_session",
-        }),
-        ArbitrationError::Unavailable { reason } => json!({
-            "code": "desktop_arbitration_unavailable",
-            "retryable": false,
-            "session_state": "dormant",
-            "reason": reason,
-            "remedy": "restart the ControlFreak server; report the reason if it persists",
-        }),
-    };
-    serde_json::to_string(&value)
-        .unwrap_or_else(|_| "desktop ownership could not be acquired".to_owned())
+/// Why the session layer refused or failed to admit work.
+///
+/// This stays typed until [`SessionError::into_tool_result`], the only place that
+/// chooses wire codes and messages.
+#[derive(Debug)]
+pub(super) enum SessionError {
+    DesktopInUse {
+        owner_instance_id: Option<String>,
+        retry_after_ms: u64,
+    },
+    ArbitrationUnavailable {
+        reason: String,
+    },
+    ShuttingDown,
+    StillClosing,
+    StopRegistration(String),
+    Environment(String),
+    Indicator(String),
+    Worker(String),
+}
+
+impl From<ArbitrationError> for SessionError {
+    fn from(error: ArbitrationError) -> Self {
+        match error {
+            ArbitrationError::Busy(busy) => Self::DesktopInUse {
+                owner_instance_id: busy.owner_instance_id,
+                retry_after_ms: busy.retry_after_ms,
+            },
+            ArbitrationError::Unavailable { reason } => Self::ArbitrationUnavailable { reason },
+        }
+    }
+}
+
+impl SessionError {
+    pub(super) fn into_tool_result(self, safety_indicator: &SafetyIndicator) -> CallToolResult {
+        let (code, message, retryable, details) = match self {
+            Self::DesktopInUse {
+                owner_instance_id,
+                retry_after_ms,
+            } => (
+                "desktop_in_use",
+                "another ControlFreak server owns the desktop".to_owned(),
+                true,
+                json!({
+                    "owner_instance_id": owner_instance_id,
+                    "session_state": "dormant",
+                    "retry_after_ms": retry_after_ms,
+                    "remedy": "wait, or ask the owning client to call end_control_session",
+                }),
+            ),
+            Self::ArbitrationUnavailable { reason } => (
+                "desktop_arbitration_unavailable",
+                "desktop ownership could not be checked".to_owned(),
+                false,
+                json!({
+                    "reason": reason,
+                    "session_state": "dormant",
+                    "remedy": "restart the ControlFreak server; report the reason if it persists",
+                }),
+            ),
+            Self::ShuttingDown => (
+                "server_shutting_down",
+                "the server is shutting down".to_owned(),
+                false,
+                json!({"remedy": "start a new ControlFreak server"}),
+            ),
+            Self::StillClosing => (
+                "session_closing",
+                "the prior control session is still closing".to_owned(),
+                true,
+                json!({"remedy": "retry after the prior session finishes closing"}),
+            ),
+            Self::StopRegistration(reason) => (
+                "desktop_work_stopped",
+                reason.clone(),
+                false,
+                json!({"reason": reason}),
+            ),
+            Self::Environment(reason) => (
+                "control_environment_unavailable",
+                reason.clone(),
+                false,
+                json!({"reason": reason}),
+            ),
+            Self::Indicator(reason) => {
+                return tool_execution_error(&indicator_unavailable(safety_indicator, &reason));
+            }
+            Self::Worker(reason) => {
+                return tool_execution_error(&ErrorData::internal_error(
+                    "ControlFreak safety indicator worker failed",
+                    Some(json!({ "reason": reason })),
+                ));
+            }
+        };
+        CallToolResult::structured_error(json!({
+            "error": {
+                "code": code,
+                "message": message,
+                "retryable": retryable,
+                "details": details,
+            }
+        }))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,14 +430,14 @@ impl IndicatorRuntime {
         }
     }
 
-    pub(super) async fn acquire_mutation(self: &Arc<Self>) -> Result<OperationLease, ErrorData> {
+    pub(super) async fn acquire_mutation(self: &Arc<Self>) -> Result<OperationLease, SessionError> {
         let runtime = Arc::clone(self);
         let work = super::stop::current();
         let result = tokio::task::spawn_blocking(move || {
             if let Some(work) = &work {
                 work.control
                     .check("admission")
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| SessionError::Indicator(error.to_string()))?;
             }
             controlfreak_core::timing::reset();
             let lease = controlfreak_core::timing::time("session_admission", || {
@@ -365,23 +449,18 @@ impl IndicatorRuntime {
             lease.map(|lease| (lease, work))
         })
         .await
-        .map_err(|error| {
-            ErrorData::internal_error(
-                "ControlFreak safety indicator worker failed",
-                Some(json!({ "reason": error.to_string() })),
-            )
-        })?;
-        result
-            .map(|(lease, _work)| lease)
-            .map_err(|reason| indicator_unavailable(&self.safety_indicator, &reason))
+        .map_err(|error| SessionError::Worker(error.to_string()))?;
+        result.map(|(lease, _work)| lease)
     }
 
     #[cfg(test)]
-    pub(super) async fn acquire(self: &Arc<Self>) -> Result<OperationLease, ErrorData> {
+    pub(super) async fn acquire(self: &Arc<Self>) -> Result<OperationLease, SessionError> {
         self.acquire_mutation().await
     }
 
-    pub(super) fn acquire_mutation_blocking(self: &Arc<Self>) -> Result<OperationLease, String> {
+    pub(super) fn acquire_mutation_blocking(
+        self: &Arc<Self>,
+    ) -> Result<OperationLease, SessionError> {
         let _lifecycle = self
             .lifecycle
             .lock()
@@ -390,9 +469,10 @@ impl IndicatorRuntime {
         self.ensure_session_owned()?;
         if let Err(reason) = self.schedule_close(0, self.max_hold) {
             let _ = self.close_session_locked("admission_failure", false);
-            return Err(reason);
+            return Err(SessionError::Indicator(reason));
         }
-        self.ensure_indicator_level(IndicatorLevel::Acting)?;
+        self.ensure_indicator_level(IndicatorLevel::Acting)
+            .map_err(SessionError::Indicator)?;
         self.check_environment()?;
         let mut state = self
             .state
@@ -443,16 +523,14 @@ impl IndicatorRuntime {
             .lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.check_environment()
-            .map_err(BeginSessionError::Indicator)?;
+        self.check_environment()?;
         let already_owned = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .session
             .owns_arbitration;
-        self.ensure_session_owned()
-            .map_err(BeginSessionError::Indicator)?;
+        self.ensure_session_owned()?;
         // Bind under the lifecycle lock before changing an existing hold or indicator.
         if let Err(error) = self.bind_target(target) {
             if !already_owned {
@@ -462,7 +540,7 @@ impl IndicatorRuntime {
         }
         if let Err(reason) = self.schedule_close(0, self.max_hold) {
             let _ = self.close_session_locked("admission_failure", false);
-            return Err(BeginSessionError::Indicator(reason));
+            return Err(SessionError::Indicator(reason).into());
         }
         let active = self
             .state
@@ -476,9 +554,8 @@ impl IndicatorRuntime {
             IndicatorLevel::Armed
         };
         self.ensure_indicator_level(level)
-            .map_err(BeginSessionError::Indicator)?;
-        self.check_environment()
-            .map_err(BeginSessionError::Indicator)?;
+            .map_err(SessionError::Indicator)?;
+        self.check_environment()?;
         let mut state = self
             .state
             .lock()
@@ -504,7 +581,7 @@ impl IndicatorRuntime {
                 .inspect_err(|_| {
                     let _ = self.close_session_locked("admission_failure", false);
                 })
-                .map_err(BeginSessionError::Indicator)
+                .map_err(|reason| SessionError::Indicator(reason).into())
         }
     }
 
@@ -557,20 +634,22 @@ impl IndicatorRuntime {
         self.finish_session_close()
     }
 
-    fn check_environment(&self) -> Result<(), String> {
+    fn check_environment(&self) -> Result<(), SessionError> {
         if self.terminated.load(Ordering::Acquire) {
-            return Err("the server is shutting down".to_owned());
+            return Err(SessionError::ShuttingDown);
         }
         if self.stop.is_stopped() {
             let _ = self.close_session_locked("stop", false);
-            return Err("desktop work is stopped; the user must restart the server".to_owned());
+            return Err(SessionError::Environment(
+                "desktop work is stopped; the user must restart the server".to_owned(),
+            ));
         }
         if let Some(backend) = &self.environment
             && let Err(error) = backend.check_control_environment()
         {
             let reason = error.to_string();
             let _ = self.close_session_locked(&reason, false);
-            return Err(reason);
+            return Err(SessionError::Environment(reason));
         }
         Ok(())
     }
@@ -666,28 +745,26 @@ impl IndicatorRuntime {
         }
     }
 
-    fn ensure_session_owned(&self) -> Result<(), String> {
+    fn ensure_session_owned(&self) -> Result<(), SessionError> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.terminated.load(Ordering::Acquire) {
-            return Err("the server is shutting down".to_owned());
+            return Err(SessionError::ShuttingDown);
         }
         if state.session.owns_arbitration && state.session.state != ControlSessionState::Closing {
             return Ok(());
         }
         if state.session.state == ControlSessionState::Closing {
-            return Err("the prior control session is still closing".to_owned());
+            return Err(SessionError::StillClosing);
         }
         let cancellation = MutationControl::default();
         let stop_registration = self
             .stop
             .register(cancellation.clone())
-            .map_err(|error| error.to_string())?;
-        self.arbitrator
-            .try_acquire()
-            .map_err(|error| arbitration_error_message(&error))?;
+            .map_err(|error| SessionError::StopRegistration(error.to_string()))?;
+        self.arbitrator.try_acquire().map_err(SessionError::from)?;
         state.session = ControlSession::dormant(self.short_hold);
         state.session.owns_arbitration = true;
         self.stop.set_session_active(true);
@@ -716,7 +793,8 @@ impl IndicatorRuntime {
     }
 
     fn ensure_indicator_level(&self, level: IndicatorLevel) -> Result<(), String> {
-        for attempt in 0..=MAX_INDICATOR_RESTARTS {
+        let mut attempt = 0;
+        loop {
             let result = self.ensure_control().and_then(|()| {
                 let mut state = self
                     .state
@@ -751,17 +829,17 @@ impl IndicatorRuntime {
                         let _ = self.close_session_locked("admission_failure", false);
                         return Err(error);
                     }
-                    if !can_restart || attempt == MAX_INDICATOR_RESTARTS {
+                    if !can_restart || attempt >= MAX_INDICATOR_RESTARTS {
                         if can_restart {
                             let _ = self.close_session_locked("admission_failure", false);
                         }
                         self.safety_indicator.mark_failed(reason.clone());
                         return Err(reason);
                     }
+                    attempt += 1;
                 }
             }
         }
-        unreachable!()
     }
 
     fn retire_failed_control(&self, reason: &str) -> (Option<IndicatorControl>, bool) {
@@ -1100,23 +1178,14 @@ impl Drop for IndicatorRuntime {
 }
 
 pub(super) fn indicator_unavailable(safety_indicator: &SafetyIndicator, reason: &str) -> ErrorData {
-    let mut details = serde_json::from_str::<serde_json::Map<String, Value>>(reason)
-        .unwrap_or_else(|_| serde_json::Map::new());
-    details
-        .entry("code".to_owned())
-        .or_insert_with(|| Value::String("indicator_unavailable".to_owned()));
-    details.insert(
-        "indicator_status".to_owned(),
-        Value::String(safety_indicator.status().to_owned()),
-    );
-    details
-        .entry("reason".to_owned())
-        .or_insert_with(|| Value::String(reason.to_owned()));
-    details
-        .entry("retryable".to_owned())
-        .or_insert_with(|| Value::Bool(matches!(safety_indicator.status(), "starting" | "failed")));
+    let status = safety_indicator.status();
     ErrorData::internal_error(
         "ControlFreak safety indicator is not visible",
-        Some(Value::Object(details)),
+        Some(json!({
+            "code": "indicator_unavailable",
+            "indicator_status": status,
+            "reason": reason,
+            "retryable": matches!(status, "starting" | "failed"),
+        })),
     )
 }

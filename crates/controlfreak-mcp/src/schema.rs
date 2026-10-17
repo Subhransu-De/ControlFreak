@@ -15,7 +15,14 @@ pub fn tools() -> Vec<Tool> {
             "stop_desktop_work",
             "Cancel active desktop work and close admission until the user restarts the server. Cleanup may still be draining. Cannot undo dispatched application operations.",
             object_schema(JsonObject::new(), &[]),
-        ).with_annotations(ToolAnnotations::default().read_only(false).destructive(false).idempotent(true).open_world(false)),
+        )
+        .with_raw_output_schema(object_output_schema(json!({
+            "type": "object",
+            "properties": {"status": {"enum": ["ready", "draining", "stopped", "cleanup_failed"]}},
+            "required": ["status"],
+            "additionalProperties": false
+        })))
+        .with_annotations(ToolAnnotations::default().read_only(false).destructive(false).idempotent(true).open_world(false)),
         get_server_status_tool(),
         begin_control_session_tool(),
         end_control_session_tool(),
@@ -76,6 +83,7 @@ fn begin_control_session_tool() -> Tool {
         "Reserve desktop control. Returns a retryable failure if another ControlFreak server owns it.",
         object_schema(properties, &[]),
     )
+    .with_raw_output_schema(session_change_output_schema("armed"))
     .with_annotations(
         ToolAnnotations::default()
             .read_only(false)
@@ -91,6 +99,7 @@ fn end_control_session_tool() -> Tool {
         "Stop accepting new input actions and release desktop control after pending actions finish.",
         object_schema(JsonObject::new(), &[]),
     )
+    .with_raw_output_schema(session_change_output_schema("closing"))
     .with_annotations(
         ToolAnnotations::default()
             .read_only(false)
@@ -106,6 +115,7 @@ fn get_server_status_tool() -> Tool {
         "Return server identity, version, uptime, privileges, operation diagnostics, stop_state and any user stop_reason. A user_stop requires the user's permission before restarting or resuming control.",
         object_schema(JsonObject::new(), &[]),
     )
+    .with_raw_output_schema(server_status_output_schema())
     .with_annotations(
         ToolAnnotations::default()
             .read_only(true)
@@ -158,6 +168,7 @@ fn capture_display_tool() -> Tool {
         "Capture a display as PNG. Protected or HDR content may render incorrectly.",
         object_schema(properties, &["display_id"]),
     )
+    .with_raw_output_schema(object_output_schema(screenshot_schema()))
     .with_annotations(
         ToolAnnotations::default()
             .read_only(true)
@@ -178,6 +189,7 @@ fn capture_region_tool() -> Tool {
             &["display_id", "x", "y", "width", "height"],
         ),
     )
+    .with_raw_output_schema(object_output_schema(screenshot_schema()))
     .with_annotations(
         ToolAnnotations::default()
             .read_only(true)
@@ -218,6 +230,7 @@ fn wait_for_visual_change_tool() -> Tool {
             &["display_id", "x", "y", "width", "height"],
         ),
     )
+    .with_raw_output_schema(visual_change_output_schema())
     .with_annotations(
         ToolAnnotations::default()
             .read_only(true)
@@ -233,6 +246,7 @@ fn capture_visual_baseline_tool() -> Tool {
         "Save a region's visual baseline without returning an image. Capture before an action, then use wait_for_change_since afterward to wait for its effects.",
         object_schema(region_properties(), &["display_id", "x", "y", "width", "height"]),
     )
+    .with_raw_output_schema(visual_baseline_output_schema())
     .with_annotations(
         ToolAnnotations::default()
             .read_only(true)
@@ -256,6 +270,7 @@ fn wait_for_change_since_tool() -> Tool {
         "Wait for a region to differ from its saved baseline and settle, then return a screenshot. Timeout is normal. Baselines expire after five minutes and can be reused while retained.",
         object_schema(properties, &["baseline_id"]),
     )
+    .with_raw_output_schema(visual_change_output_schema())
     .with_annotations(
         ToolAnnotations::default()
             .read_only(true)
@@ -273,6 +288,7 @@ fn read_text_in_region_tool() -> Tool {
         "Read text in a region using OCR. Return lines and words with bounds in display-local physical pixels. No image or confidence scores.",
         object_schema(properties, &["display_id", "x", "y", "width", "height"]),
     )
+    .with_raw_output_schema(read_text_output_schema())
     .with_annotations(
         ToolAnnotations::default()
             .read_only(true)
@@ -301,6 +317,7 @@ fn find_text_on_screen_tool() -> Tool {
         "Discover OCR text within a region without authorizing input. Returns display-local bounds, match_tier, full candidate_count, and truncation flags. At most max_results candidates and 256 Unicode characters per candidate; ambiguity is never hidden by the limit.",
         object_schema(properties, &["display_id", "x", "y", "width", "height", "query"]),
     )
+    .with_raw_output_schema(find_text_output_schema())
     .with_annotations(
         ToolAnnotations::default()
             .read_only(true)
@@ -337,6 +354,7 @@ fn wait_for_text_tool() -> Tool {
         "Repeat OCR discovery in a region until query appears or disappears, or timeout_ms elapses. Returns satisfied, timed_out, attempts, and the final pass's matches with display-local bounds. Each pass is a full recognition; prefer a small region. Discovery only: it never authorizes input.",
         object_schema(properties, &["display_id", "x", "y", "width", "height", "query"]),
     )
+    .with_raw_output_schema(wait_for_text_output_schema())
     .with_annotations(
         ToolAnnotations::default()
             .read_only(true)
@@ -525,6 +543,7 @@ fn capture_window_tool() -> Tool {
         "Capture a window's visible frame without focusing it. Use a fresh window ID and restore minimized windows first.",
         object_schema(properties, &["window_id"]),
     )
+    .with_raw_output_schema(object_output_schema(window_screenshot_schema()))
     .with_annotations(
         ToolAnnotations::default()
             .read_only(true)
@@ -553,6 +572,7 @@ fn wait_for_window_tool() -> Tool {
         "Wait for a visible top-level window matching all supplied criteria. Requires at least one criterion. Timeout returns matched=false and timed_out=true.",
         object_schema(properties, &[]),
     )
+    .with_raw_output_schema(wait_for_window_output_schema())
     .with_annotations(
         ToolAnnotations::default()
             .read_only(true)
@@ -1052,26 +1072,321 @@ fn mutation_progress_properties() -> Value {
     })
 }
 
+/// Image metadata shared by every screenshot-bearing result. `subject` adds the
+/// fields that say what was captured, as `(name, schema, required)`.
+fn image_metadata_schema(subject: Vec<(&str, Value, bool)>) -> Value {
+    let mut properties = json!({
+        "mime_type": { "const": "image/png" },
+        "byte_length": { "type": "integer", "minimum": 1 },
+        "capture_method": { "type": "string" },
+        "image_width": { "type": "integer", "minimum": 1 },
+        "image_height": { "type": "integer", "minimum": 1 },
+        "downscale_factor": { "type": "integer", "minimum": 1, "description": "Backward-compatible ceiling ratio. For exact mapping use source_bounds and image dimensions." },
+        "resize_method": { "type": "string", "enum": ["native", "area_average"] },
+        "cursor_marker": { "type": "boolean" },
+        "observation_id": { "type": "string", "description": "Pass with image_x/image_y to pointer tools to act on a point in this image." }
+    });
+    let mut required: Vec<&str> = vec![
+        "mime_type",
+        "byte_length",
+        "capture_method",
+        "image_width",
+        "image_height",
+        "downscale_factor",
+        "resize_method",
+        "cursor_marker",
+    ];
+    for (name, schema, is_required) in subject {
+        properties[name] = schema;
+        if is_required {
+            required.push(name);
+        }
+    }
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false
+    })
+}
+
 fn screenshot_schema() -> Value {
+    image_metadata_schema(vec![
+        ("target_ref", json!({"type": ["string", "null"]}), false),
+        ("display", display_schema(), true),
+        ("source_bounds", bounds_schema(), true),
+    ])
+}
+
+fn window_screenshot_schema() -> Value {
+    image_metadata_schema(vec![
+        ("window", window_schema(), true),
+        ("source_bounds", bounds_schema(), true),
+    ])
+}
+
+fn object_output_schema(schema: Value) -> Arc<JsonObject> {
+    // Every caller passes an object literal; a test requires each tool to publish one.
+    match schema {
+        Value::Object(schema) => Arc::new(schema),
+        _ => Arc::default(),
+    }
+}
+
+/// Session snapshot from `IndicatorRuntime::status` or the busy fallback of `try_status`.
+fn session_status_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "target_ref": {"type": ["string", "null"]},
-            "display": display_schema(),
-            "source_bounds": bounds_schema(),
-            "mime_type": { "const": "image/png" },
-            "byte_length": { "type": "integer", "minimum": 1 },
-            "capture_method": { "type": "string" },
-            "image_width": { "type": "integer", "minimum": 1 },
-            "image_height": { "type": "integer", "minimum": 1 },
-            "downscale_factor": { "type": "integer", "minimum": 1, "description": "Backward-compatible ceiling ratio. For exact mapping use source_bounds and image dimensions." },
-            "resize_method": { "type": "string", "enum": ["native", "area_average"] },
-            "cursor_marker": { "type": "boolean" },
-            "observation_id": { "type": "string", "description": "Pass with image_x/image_y to pointer tools to act on a point in this image." }
+            "state": { "enum": ["dormant", "armed", "acting", "closing", "busy"] },
+            "last_cleanup_reason": { "type": ["string", "null"] },
+            "draining": { "type": "boolean" },
+            "stop_state": { "type": "string" },
+            "call_count": { "type": "integer", "minimum": 0 },
+            "approved_target_ref": { "type": ["string", "null"] },
+            "active_mutations": { "type": "integer", "minimum": 0 },
+            "hold_ms": { "type": "integer", "minimum": 0 },
+            "time_until_close_ms": { "type": ["integer", "null"], "minimum": 0 },
+            "owns_arbitration": { "type": "boolean" },
+            "restart_count": { "type": "integer", "minimum": 0 },
+            "containment": { "type": "string" },
+            "containment_reason": { "type": ["string", "null"] }
         },
-        "required": ["display", "source_bounds", "mime_type", "byte_length", "capture_method", "image_width", "image_height", "downscale_factor", "resize_method", "cursor_marker"],
+        "required": ["state", "draining"],
         "additionalProperties": false
     })
+}
+
+fn session_change_output_schema(status: &str) -> Arc<JsonObject> {
+    object_output_schema(json!({
+        "type": "object",
+        "properties": {
+            "status": { "const": status },
+            "session": session_status_schema()
+        },
+        "required": ["status", "session"],
+        "additionalProperties": false
+    }))
+}
+
+fn server_status_output_schema() -> Arc<JsonObject> {
+    object_output_schema(json!({
+        "type": "object",
+        "properties": {
+            "status": { "enum": ["ready", "degraded"] },
+            "safety_indicator": {
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string" },
+                    "reason": { "type": ["string", "null"] }
+                },
+                "required": ["status", "reason"],
+                "additionalProperties": false
+            },
+            "session": { "oneOf": [session_status_schema(), { "type": "null" }] },
+            "version": { "type": "string" },
+            "instance_id": { "type": "string" },
+            "process_id": { "type": "integer", "minimum": 0 },
+            "server_elevated": { "type": "boolean" },
+            "windows_integrity_level": { "enum": ["untrusted", "low", "medium", "medium_plus", "high", "system", "protected", "unknown"] },
+            "elevated_operation_allowed": { "type": "boolean" },
+            "uptime_ms": { "type": "integer", "minimum": 0 },
+            "operations_started": { "type": "integer", "minimum": 0 },
+            "operations_completed": { "type": "integer", "minimum": 0 },
+            "operations_failed": { "type": "integer", "minimum": 0 },
+            "recent_operations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "operation_id": { "type": "integer", "minimum": 0 },
+                        "tool": { "type": "string" },
+                        "status": { "type": "string" },
+                        "elapsed_ms": { "type": "integer", "minimum": 0 },
+                        "gap_ms": { "type": ["integer", "null"], "minimum": 0 },
+                        "stages_ms": { "type": "object", "additionalProperties": { "type": "number" } }
+                    },
+                    "required": ["operation_id", "tool", "status", "elapsed_ms", "gap_ms", "stages_ms"],
+                    "additionalProperties": false
+                }
+            },
+            "backend": {
+                "type": "object",
+                "properties": {
+                    "platform": { "type": "string" },
+                    "display_server": { "type": "string" },
+                    "backend_id": { "type": "string" }
+                },
+                "required": ["platform", "display_server", "backend_id"],
+                "additionalProperties": false
+            },
+            "stop_state": { "type": "string" },
+            "stop_reason": { "const": "user_stop" }
+        },
+        "required": [
+            "status", "safety_indicator", "session", "version", "instance_id", "process_id",
+            "server_elevated", "windows_integrity_level", "elevated_operation_allowed", "uptime_ms",
+            "operations_started", "operations_completed", "operations_failed", "recent_operations",
+            "backend", "stop_state"
+        ],
+        "additionalProperties": false
+    }))
+}
+
+fn visual_change_output_schema() -> Arc<JsonObject> {
+    let mut schema = json!({
+        "type": "object",
+        "properties": {
+            "changed": { "type": "boolean" },
+            "timed_out": { "type": "boolean" },
+            "difference": { "type": "number", "minimum": 0 },
+            "elapsed_ms": { "type": "integer", "minimum": 0 },
+            "screenshot": screenshot_schema()
+        },
+        "required": ["changed", "timed_out", "difference", "elapsed_ms", "screenshot"],
+        "additionalProperties": false
+    });
+    schema["properties"]["screenshot"]["description"] =
+        json!("The final image; the PNG itself is the image content block.");
+    object_output_schema(schema)
+}
+
+fn visual_baseline_output_schema() -> Arc<JsonObject> {
+    object_output_schema(json!({
+        "type": "object",
+        "properties": {
+            "baseline_id": { "type": "string", "pattern": "^vb-[0-9a-f]{32}-[0-9a-f]{16}$" },
+            "display": display_schema(),
+            "source_bounds": bounds_schema(),
+            "fingerprint": { "type": "string" },
+            "expires_in_ms": { "type": "integer", "minimum": 0 }
+        },
+        "required": ["baseline_id", "display", "source_bounds", "fingerprint", "expires_in_ms"],
+        "additionalProperties": false
+    }))
+}
+
+fn wait_for_window_output_schema() -> Arc<JsonObject> {
+    object_output_schema(json!({
+        "type": "object",
+        "properties": {
+            "matched": { "type": "boolean" },
+            "timed_out": { "type": "boolean" },
+            "elapsed_ms": { "type": "integer", "minimum": 0 },
+            "window": { "oneOf": [window_schema(), { "type": "null" }] }
+        },
+        "required": ["matched", "timed_out", "elapsed_ms", "window"],
+        "additionalProperties": false
+    }))
+}
+
+fn text_box_schema(extra: Value, extra_required: &[&str]) -> Value {
+    let mut properties = json!({
+        "text": { "type": "string" },
+        "x": { "type": "integer", "minimum": 0 },
+        "y": { "type": "integer", "minimum": 0 },
+        "width": { "type": "integer", "minimum": 0 },
+        "height": { "type": "integer", "minimum": 0 }
+    });
+    if let (Some(base), Value::Object(extra)) = (properties.as_object_mut(), extra) {
+        base.extend(extra);
+    }
+    let mut required = vec!["text", "x", "y", "width", "height"];
+    required.extend_from_slice(extra_required);
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false
+    })
+}
+
+fn read_text_output_schema() -> Arc<JsonObject> {
+    let word = text_box_schema(json!({}), &[]);
+    let line = text_box_schema(
+        json!({"words": {"type": "array", "items": word}}),
+        &["words"],
+    );
+    object_output_schema(json!({
+        "type": "object",
+        "properties": {
+            "target_ref": { "type": ["string", "null"] },
+            "display": display_schema(),
+            "source_bounds": bounds_schema(),
+            "language": { "type": "string" },
+            "text": { "type": "string" },
+            "lines": { "type": "array", "items": line }
+        },
+        "required": ["display", "source_bounds", "language", "text", "lines"],
+        "additionalProperties": false
+    }))
+}
+
+/// Fields shared by `find_text_on_screen` and `wait_for_text` discovery passes.
+fn text_discovery_properties() -> Value {
+    json!({
+        "count": { "type": "integer", "minimum": 0 },
+        "target_ref": { "type": ["string", "null"] },
+        "query": { "type": "string" },
+        "display": display_schema(),
+        "source_bounds": bounds_schema(),
+        "language": { "type": "string" },
+        "matches": { "type": "array", "items": text_box_schema(json!({}), &[]) },
+        "match_tier": { "enum": ["exact", "substring", "normalized", "joined", "ocr_confusion", null] },
+        "candidate_count": { "type": "integer", "minimum": 0 },
+        "candidates_truncated": { "type": "boolean" },
+        "text_truncated": { "type": "boolean" }
+    })
+}
+
+const TEXT_DISCOVERY_REQUIRED: [&str; 11] = [
+    "count",
+    "target_ref",
+    "query",
+    "display",
+    "source_bounds",
+    "language",
+    "matches",
+    "match_tier",
+    "candidate_count",
+    "candidates_truncated",
+    "text_truncated",
+];
+
+fn find_text_output_schema() -> Arc<JsonObject> {
+    let mut properties = text_discovery_properties();
+    properties["recovery"] = json!({ "type": "string" });
+    let mut required = TEXT_DISCOVERY_REQUIRED.to_vec();
+    required.push("recovery");
+    object_output_schema(json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false
+    }))
+}
+
+fn wait_for_text_output_schema() -> Arc<JsonObject> {
+    let mut properties = text_discovery_properties();
+    properties["condition"] = json!({ "enum": ["appears", "disappears"] });
+    properties["satisfied"] = json!({ "type": "boolean" });
+    properties["timed_out"] = json!({ "type": "boolean" });
+    properties["elapsed_ms"] = json!({ "type": "integer", "minimum": 0 });
+    properties["attempts"] = json!({ "type": "integer", "minimum": 0 });
+    let mut required = TEXT_DISCOVERY_REQUIRED.to_vec();
+    required.extend([
+        "condition",
+        "satisfied",
+        "timed_out",
+        "elapsed_ms",
+        "attempts",
+    ]);
+    object_output_schema(json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false
+    }))
 }
 
 fn bounds_schema() -> Value {
