@@ -33,18 +33,6 @@ and click, scroll and type in one window that it chose.
 
 Run `controlfreak --print-tools` to see all 27 tools with their input and output schemas.
 
-## What it will not do
-
-- It has no tools to run commands, launch applications, open files, read the clipboard, edit
-  the registry, use the network, or elevate privileges.
-- Every click and keystroke is checked against the one window the agent approved. If another
-  window has the focus or lies under the pointer, the action is refused instead of sent.
-- It refuses to start with administrator rights unless you add `--allow-elevated`. Even then, it
-  never acts on the lock screen, the UAC prompt, or a window with higher integrity.
-
-This is a limit on the tools, not a sandbox. Keyboard input can still use whatever an approved
-application can do, so only let an agent control applications you would let it use.
-
 ## When the agent is in control
 
 A blue glow appears around the edges of every display while an agent controls the desktop, and
