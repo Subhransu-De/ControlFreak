@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/Subhransu-De/ControlFreak/releases"><img src="https://img.shields.io/github/v/release/Subhransu-De/ControlFreak?include_prereleases&amp;label=Release&amp;style=flat" alt="Latest release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/Subhransu-De/ControlFreak?label=License&amp;style=flat" alt="MIT License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue?style=flat" alt="MIT License"></a>
   <a href="https://github.com/Subhransu-De/ControlFreak/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Subhransu-De/ControlFreak/ci.yml?branch=main&amp;label=Build&amp;style=flat" alt="Build status"></a>
 </p>
 
