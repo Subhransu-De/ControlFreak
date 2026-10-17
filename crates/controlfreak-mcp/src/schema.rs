@@ -1127,7 +1127,10 @@ fn window_screenshot_schema() -> Value {
 
 fn object_output_schema(schema: Value) -> Arc<JsonObject> {
     // Every caller passes an object literal; a test requires each tool to publish one.
-    Arc::new(schema.as_object().cloned().unwrap_or_default())
+    match schema {
+        Value::Object(schema) => Arc::new(schema),
+        _ => Arc::default(),
+    }
 }
 
 /// Session snapshot from `IndicatorRuntime::status` or the busy fallback of `try_status`.
@@ -1285,8 +1288,8 @@ fn text_box_schema(extra: Value, extra_required: &[&str]) -> Value {
         "width": { "type": "integer", "minimum": 0 },
         "height": { "type": "integer", "minimum": 0 }
     });
-    if let (Some(base), Some(extra)) = (properties.as_object_mut(), extra.as_object()) {
-        base.extend(extra.clone());
+    if let (Some(base), Value::Object(extra)) = (properties.as_object_mut(), extra) {
+        base.extend(extra);
     }
     let mut required = vec!["text", "x", "y", "width", "height"];
     required.extend_from_slice(extra_required);

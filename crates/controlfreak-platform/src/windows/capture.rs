@@ -1079,6 +1079,19 @@ mod benchmarks {
         rgba
     }
 
+    /// The pre-RGB encoder, kept only so the benchmark can show what dropping alpha saves.
+    fn encode_png_rgba_reference(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut encoder = png::Encoder::new(&mut output, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_deflate_compression(png::DeflateCompression::Level(2));
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(rgba).unwrap();
+        writer.finish().unwrap();
+        output
+    }
+
     fn median_ms(mut samples: Vec<f64>) -> f64 {
         samples.sort_by(f64::total_cmp);
         samples[samples.len() / 2]
@@ -1110,6 +1123,11 @@ mod benchmarks {
             let encode_full = measure(5, || {
                 encode_png(width, height, &frame).unwrap();
             });
+            let png_bytes = encode_png(width, height, &frame).unwrap().len();
+            let encode_full_rgba = measure(5, || {
+                encode_png_rgba_reference(width, height, &frame);
+            });
+            let png_bytes_rgba = encode_png_rgba_reference(width, height, &frame).len();
             let encode_action = measure(9, || {
                 encode_png(image_width, image_height, &resized).unwrap();
             });
@@ -1122,9 +1140,45 @@ mod benchmarks {
                 image_difference(&compare, &compare).unwrap();
             });
             eprintln!(
-                "{width}x{height}: resize_to_1280={resize:.1}ms encode_png_full={encode_full:.1}ms encode_png_1280={encode_action:.1}ms compare_downscale={downscale_compare:.1}ms compare_difference={difference:.2}ms"
+                "{width}x{height}: resize_to_1280={resize:.1}ms encode_png_full={encode_full:.1}ms ({png_bytes} bytes, RGB) encode_png_full_rgba_reference={encode_full_rgba:.1}ms ({png_bytes_rgba} bytes) encode_png_1280={encode_action:.1}ms compare_downscale={downscale_compare:.1}ms compare_difference={difference:.2}ms"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod png_tests {
+    use super::*;
+
+    #[test]
+    fn encoded_png_is_eight_bit_rgb_and_round_trips_every_pixel() {
+        let (width, height) = (37_u32, 23_u32);
+        let rgba: Vec<u8> = (0..width * height)
+            .flat_map(|index| {
+                let value = u8::try_from(index % 251).unwrap();
+                [
+                    value,
+                    value.wrapping_mul(3),
+                    255 - value,
+                    255, // captures are opaque
+                ]
+            })
+            .collect();
+        let encoded = encode_png(width, height, &rgba).unwrap();
+        let mut reader = png::Decoder::new(std::io::Cursor::new(encoded))
+            .read_info()
+            .unwrap();
+        let info = reader.info();
+        assert_eq!((info.width, info.height), (width, height));
+        assert_eq!(info.color_type, png::ColorType::Rgb);
+        assert_eq!(info.bit_depth, png::BitDepth::Eight);
+        let mut decoded = vec![0; reader.output_buffer_size().unwrap()];
+        let frame = reader.next_frame(&mut decoded).unwrap();
+        let expected: Vec<u8> = rgba
+            .chunks_exact(4)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect();
+        assert_eq!(&decoded[..frame.buffer_size()], expected.as_slice());
     }
 }
 

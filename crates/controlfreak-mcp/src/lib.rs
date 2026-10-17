@@ -3,6 +3,8 @@
 #[cfg(test)]
 mod cleanup_tests;
 mod diagnostics;
+#[cfg(test)]
+mod encoding_tests;
 mod handlers;
 mod observations;
 mod requests;
@@ -54,8 +56,8 @@ use handlers::{
     call_wait_for_window,
 };
 use results::{
-    click_text_result, keyboard_result, pointer_result, screenshot_result, tool_error,
-    tool_execution_error, virtual_desktop_list_result, virtual_desktop_switch_result,
+    CarriesPng, Encoded, click_text_result, keyboard_result, pointer_result, screenshot_result,
+    tool_error, tool_execution_error, virtual_desktop_list_result, virtual_desktop_switch_result,
     visual_baseline_result, visual_change_result, window_focus_result, window_screenshot_result,
     window_wait_result,
 };

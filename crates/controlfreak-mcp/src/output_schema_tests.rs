@@ -251,8 +251,8 @@ fn region() -> Value {
 }
 
 fn with(mut base: Value, extra: Value) -> Value {
-    if let (Some(base), Some(extra)) = (base.as_object_mut(), extra.as_object()) {
-        base.extend(extra.clone());
+    if let (Some(base), Value::Object(extra)) = (base.as_object_mut(), extra) {
+        base.extend(extra);
     }
     base
 }

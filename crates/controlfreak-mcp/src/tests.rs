@@ -932,7 +932,7 @@ fn pointer_result_contains_post_action_png() {
         },
     };
     let action = serde_json::json!({ "kind": "move" });
-    let result = pointer_result(&action_result, &action);
+    let result = pointer_result(super::Encoded::new(action_result), &action);
     let serialized = serde_json::to_value(result).expect("serialize tool result");
     let encoded = serialized["content"][0]["data"]
         .as_str()
@@ -969,7 +969,10 @@ fn pointer_result_without_screenshot_has_no_image_block() {
             screenshot: None,
         },
     };
-    let result = pointer_result(&action_result, &serde_json::json!({ "kind": "move" }));
+    let result = pointer_result(
+        super::Encoded::new(action_result),
+        &serde_json::json!({ "kind": "move" }),
+    );
     let serialized = serde_json::to_value(result).expect("serialize tool result");
 
     assert!(

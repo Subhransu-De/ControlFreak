@@ -1,5 +1,68 @@
 use super::*;
 
+/// Results that may carry a PNG.
+pub(super) trait CarriesPng {
+    fn png(&self) -> Option<&[u8]>;
+}
+
+/// A result with its PNG already base64-encoded. Build it on a blocking worker: encoding a
+/// large capture is CPU work that must not run on a Tokio worker.
+pub(super) struct Encoded<T> {
+    value: T,
+    base64: Option<String>,
+}
+
+impl<T: CarriesPng> Encoded<T> {
+    pub(super) fn new(value: T) -> Self {
+        let base64 = value
+            .png()
+            .map(|png| controlfreak_core::timing::time("encode_base64", || STANDARD.encode(png)));
+        Self { value, base64 }
+    }
+}
+
+impl CarriesPng for DisplayScreenshot {
+    fn png(&self) -> Option<&[u8]> {
+        Some(&self.png)
+    }
+}
+
+impl CarriesPng for WindowScreenshot {
+    fn png(&self) -> Option<&[u8]> {
+        Some(&self.png)
+    }
+}
+
+impl CarriesPng for VisualChangeResult {
+    fn png(&self) -> Option<&[u8]> {
+        self.screenshot.png()
+    }
+}
+
+impl CarriesPng for ActionObservation {
+    fn png(&self) -> Option<&[u8]> {
+        self.screenshot.as_ref().and_then(CarriesPng::png)
+    }
+}
+
+macro_rules! observed_result {
+    ($($result:ty),+) => {$(
+        impl CarriesPng for $result {
+            fn png(&self) -> Option<&[u8]> {
+                self.observation.png()
+            }
+        }
+    )+};
+}
+
+observed_result!(
+    PointerActionResult,
+    KeyboardActionResult,
+    ClickTextResult,
+    WindowFocusResult,
+    VirtualDesktopSwitchResult
+);
+
 fn screenshot_metadata(screenshot: &DisplayScreenshot) -> Value {
     json!({
         "display": screenshot.display,
@@ -34,10 +97,13 @@ fn resize_method(source_width: u32, source_height: u32, width: u32, height: u32)
     }
 }
 
-pub(super) fn visual_change_result(result: &VisualChangeResult) -> CallToolResult {
-    let encoded = STANDARD.encode(&result.screenshot.png);
+pub(super) fn visual_change_result(result: Encoded<VisualChangeResult>) -> CallToolResult {
+    let Encoded {
+        value: result,
+        base64,
+    } = result;
     image_result(
-        encoded,
+        base64,
         json!({
             "changed": result.changed,
             "timed_out": result.timed_out,
@@ -58,10 +124,13 @@ pub(super) fn visual_baseline_result(result: &VisualBaseline) -> CallToolResult 
     }))
 }
 
-pub(super) fn window_screenshot_result(screenshot: &WindowScreenshot) -> CallToolResult {
-    let encoded = STANDARD.encode(&screenshot.png);
+pub(super) fn window_screenshot_result(screenshot: Encoded<WindowScreenshot>) -> CallToolResult {
+    let Encoded {
+        value: screenshot,
+        base64,
+    } = screenshot;
     image_result(
-        encoded,
+        base64,
         json!({
             "window": screenshot.window,
             "source_bounds": screenshot.source_bounds,
@@ -129,9 +198,16 @@ pub(super) fn virtual_desktop_list_result(result: &VirtualDesktopList) -> CallTo
     }))
 }
 
-pub(super) fn virtual_desktop_switch_result(result: &VirtualDesktopSwitchResult) -> CallToolResult {
+pub(super) fn virtual_desktop_switch_result(
+    result: Encoded<VirtualDesktopSwitchResult>,
+) -> CallToolResult {
+    let Encoded {
+        value: result,
+        base64,
+    } = result;
     action_result(
         &result.observation,
+        base64,
         &json!({
             "kind": "switch_virtual_desktop",
             "direction": result.direction,
@@ -142,17 +218,39 @@ pub(super) fn virtual_desktop_switch_result(result: &VirtualDesktopSwitchResult)
     )
 }
 
-pub(super) fn screenshot_result(screenshot: &DisplayScreenshot) -> CallToolResult {
-    let encoded = STANDARD.encode(&screenshot.png);
-    let metadata = screenshot_metadata(screenshot);
-    image_result(encoded, metadata)
+pub(super) fn screenshot_result(screenshot: Encoded<DisplayScreenshot>) -> CallToolResult {
+    let Encoded {
+        value: screenshot,
+        base64,
+    } = screenshot;
+    let metadata = screenshot_metadata(&screenshot);
+    image_result(base64, metadata)
 }
 
-pub(super) fn pointer_result(result: &PointerActionResult, action: &Value) -> CallToolResult {
-    action_result(&result.observation, action, Some(json!(result.position)))
+pub(super) fn pointer_result(
+    result: Encoded<PointerActionResult>,
+    action: &Value,
+) -> CallToolResult {
+    let Encoded {
+        value: result,
+        base64,
+    } = result;
+    action_result(
+        &result.observation,
+        base64,
+        action,
+        Some(json!(result.position)),
+    )
 }
 
-pub(super) fn click_text_result(result: &ClickTextResult, action: &Value) -> CallToolResult {
+pub(super) fn click_text_result(
+    result: Encoded<ClickTextResult>,
+    action: &Value,
+) -> CallToolResult {
+    let Encoded {
+        value: result,
+        base64,
+    } = result;
     let mut action = action.clone();
     action["matched_text"] = json!(result.matched_text);
     action["match_tier"] = json!(if action["exact_match"] == true {
@@ -160,20 +258,37 @@ pub(super) fn click_text_result(result: &ClickTextResult, action: &Value) -> Cal
     } else {
         "substring"
     });
-    action_result(&result.observation, &action, Some(json!(result.position)))
+    action_result(
+        &result.observation,
+        base64,
+        &action,
+        Some(json!(result.position)),
+    )
 }
 
-pub(super) fn window_focus_result(result: &WindowFocusResult) -> CallToolResult {
+pub(super) fn window_focus_result(result: Encoded<WindowFocusResult>) -> CallToolResult {
+    let Encoded {
+        value: result,
+        base64,
+    } = result;
     let action = json!({ "kind": "focus_window", "window": result.window, "attempts": result.attempts, "elapsed_ms": result.elapsed_ms });
-    action_result(&result.observation, &action, None)
+    action_result(&result.observation, base64, &action, None)
 }
 
-pub(super) fn keyboard_result(result: &KeyboardActionResult, action: &Value) -> CallToolResult {
-    action_result(&result.observation, action, None)
+pub(super) fn keyboard_result(
+    result: Encoded<KeyboardActionResult>,
+    action: &Value,
+) -> CallToolResult {
+    let Encoded {
+        value: result,
+        base64,
+    } = result;
+    action_result(&result.observation, base64, action, None)
 }
 
 fn action_result(
     observation: &ActionObservation,
+    encoded: Option<String>,
     action: &Value,
     position: Option<Value>,
 ) -> CallToolResult {
@@ -187,14 +302,14 @@ fn action_result(
     if let Some(position) = position {
         metadata["position"] = position;
     }
-    if let Some(screenshot) = &observation.screenshot {
-        image_result(STANDARD.encode(&screenshot.png), metadata)
-    } else {
-        CallToolResult::structured(metadata)
-    }
+    image_result(encoded, metadata)
 }
 
-fn image_result(encoded: String, metadata: Value) -> CallToolResult {
+/// Builds the result; `encoded` is `None` only when the result has no image.
+fn image_result(encoded: Option<String>, metadata: Value) -> CallToolResult {
+    let Some(encoded) = encoded else {
+        return CallToolResult::structured(metadata);
+    };
     let mut tool_result = CallToolResult::success(vec![
         ContentBlock::image(encoded, "image/png"),
         ContentBlock::text(metadata.to_string()),

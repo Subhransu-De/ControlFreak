@@ -30,6 +30,12 @@ versioned section and uses that section for the corresponding GitHub Release not
   mechanism is `desktop_arbitration_unavailable`. Indicator failures keep `tool_execution_failed`
   with `details.code` `indicator_unavailable`.
 
+### Fixed
+
+- Base64 encoding of screenshot data now runs on the blocking worker, after the last cancellation
+  check, instead of on a Tokio worker. A cancelled request is no longer encoded. The cost appears
+  as the `encode_base64` stage in `stages_ms`. PNG output is unchanged: 8-bit RGB.
+
 ## [0.1.0-alpha.2] - 2026-10-16
 
 ### Added
