@@ -9,6 +9,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+## [0.1.0] - 2026-10-18
+
 ### Added
 
 - Release files have GitHub build provenance attestations. `gh attestation verify <file> --repo
