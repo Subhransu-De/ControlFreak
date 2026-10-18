@@ -136,16 +136,16 @@ pub fn notes(changelog: &str, version: &str) -> Result<String> {
 /// broken mid-sentence. Join each list item's indented continuation lines onto the item.
 fn unwrap_list_items(body: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
-    let mut in_code = false;
+    // The fence that opened the current code block; only the same kind closes it.
+    let mut open_fence: Option<&str> = None;
     for line in body.lines() {
-        let fence = line.trim_start().starts_with("```");
-        let continues_item = !in_code
-            && !fence
+        let fence = fence_marker(line);
+        let continues_item = open_fence.is_none()
+            && fence.is_none()
             && line.starts_with("  ")
             && !starts_block(line.trim_start())
             && lines.last().is_some_and(|previous| {
-                let previous = previous.trim_start();
-                !previous.is_empty() && !previous.starts_with("```")
+                !previous.trim().is_empty() && fence_marker(previous).is_none()
             });
         match lines.last_mut() {
             Some(previous) if continues_item => {
@@ -154,11 +154,21 @@ fn unwrap_list_items(body: &str) -> String {
             }
             _ => lines.push(line.to_owned()),
         }
-        if fence {
-            in_code = !in_code;
+        match (open_fence, fence) {
+            (None, Some(marker)) => open_fence = Some(marker),
+            (Some(open), Some(marker)) if open == marker => open_fence = None,
+            _ => {}
         }
     }
     lines.join("\n")
+}
+
+/// The fence kind a line opens or closes, for both backtick and tilde code fences.
+fn fence_marker(line: &str) -> Option<&'static str> {
+    let line = line.trim_start();
+    ["```", "~~~"]
+        .into_iter()
+        .find(|marker| line.starts_with(marker))
 }
 
 /// Whether an indented line starts its own Markdown block instead of continuing the item text.
@@ -233,6 +243,15 @@ mod tests {
         assert_eq!(
             notes(source, "1.2.3").unwrap(),
             "- Parent entry wraps here.\n  1. First step\n  2) Second step\n  + Plus bullet\n  > Quote\n- Entry with code:\n\n  ```text\n  code line\n  ```\n  Text after the block continues.\n"
+        );
+    }
+
+    #[test]
+    fn tilde_fences_are_kept_and_only_close_their_own_kind() {
+        let source = "## [1.2.3] - 2026-01-02\n\n- Entry with tilde code:\n\n  ~~~text\n  first line\n  ```not a closer\n  second line\n  ~~~\n";
+        assert_eq!(
+            notes(source, "1.2.3").unwrap(),
+            "- Entry with tilde code:\n\n  ~~~text\n  first line\n  ```not a closer\n  second line\n  ~~~\n"
         );
     }
 
