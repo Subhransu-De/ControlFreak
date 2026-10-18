@@ -138,12 +138,11 @@ fn unwrap_list_items(body: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     let mut in_code = false;
     for line in body.lines() {
-        if line.trim_start().starts_with("```") {
-            in_code = !in_code;
-        }
+        let fence = line.trim_start().starts_with("```");
         let continues_item = !in_code
+            && !fence
             && line.starts_with("  ")
-            && !line.trim_start().starts_with(['-', '*'])
+            && !starts_block(line.trim_start())
             && lines.last().is_some_and(|previous| {
                 let previous = previous.trim_start();
                 !previous.is_empty() && !previous.starts_with("```")
@@ -155,8 +154,22 @@ fn unwrap_list_items(body: &str) -> String {
             }
             _ => lines.push(line.to_owned()),
         }
+        if fence {
+            in_code = !in_code;
+        }
     }
     lines.join("\n")
+}
+
+/// Whether an indented line starts its own Markdown block instead of continuing the item text.
+fn starts_block(line: &str) -> bool {
+    let ordered = line.find(|c: char| !c.is_ascii_digit()).is_some_and(|end| {
+        end > 0 && (line[end..].starts_with(". ") || line[end..].starts_with(") "))
+    });
+    ordered
+        || ["- ", "* ", "+ ", "> ", "| ", "#"]
+            .iter()
+            .any(|marker| line.starts_with(marker))
 }
 
 #[cfg(test)]
@@ -211,6 +224,15 @@ mod tests {
         assert_eq!(
             notes(source, "1.2.3").unwrap(),
             "### Fixed\n\n- First line of a fix continues here and ends here.\n- Second fix\n\n```text\n  indented code stays\n```\n"
+        );
+    }
+
+    #[test]
+    fn nested_blocks_and_indented_fences_are_kept() {
+        let source = "## [1.2.3] - 2026-01-02\n\n- Parent entry\n  wraps here.\n  1. First step\n  2) Second step\n  + Plus bullet\n  > Quote\n- Entry with code:\n\n  ```text\n  code line\n  ```\n  Text after the block\n  continues.\n";
+        assert_eq!(
+            notes(source, "1.2.3").unwrap(),
+            "- Parent entry wraps here.\n  1. First step\n  2) Second step\n  + Plus bullet\n  > Quote\n- Entry with code:\n\n  ```text\n  code line\n  ```\n  Text after the block continues.\n"
         );
     }
 
