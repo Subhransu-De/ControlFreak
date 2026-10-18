@@ -129,7 +129,34 @@ pub fn notes(changelog: &str, version: &str) -> Result<String> {
     {
         return Err("Release changelog section has no change entries".into());
     }
-    Ok(format!("{}\n", body.trim()))
+    Ok(format!("{}\n", unwrap_list_items(body.trim())))
+}
+
+/// GitHub release bodies keep single line breaks, so a hard-wrapped changelog entry would render
+/// broken mid-sentence. Join each list item's indented continuation lines onto the item.
+fn unwrap_list_items(body: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut in_code = false;
+    for line in body.lines() {
+        if line.trim_start().starts_with("```") {
+            in_code = !in_code;
+        }
+        let continues_item = !in_code
+            && line.starts_with("  ")
+            && !line.trim_start().starts_with(['-', '*'])
+            && lines.last().is_some_and(|previous| {
+                let previous = previous.trim_start();
+                !previous.is_empty() && !previous.starts_with("```")
+            });
+        match lines.last_mut() {
+            Some(previous) if continues_item => {
+                previous.push(' ');
+                previous.push_str(line.trim());
+            }
+            _ => lines.push(line.to_owned()),
+        }
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -175,6 +202,15 @@ mod tests {
         assert_eq!(
             notes(source, "1.2.3").unwrap(),
             "### Fixed\n- Synthetic fix\n"
+        );
+    }
+
+    #[test]
+    fn wrapped_entries_become_single_lines() {
+        let source = "## [1.2.3] - 2026-01-02\n\n### Fixed\n\n- First line of a fix\n  continues here\n  and ends here.\n- Second fix\n\n```text\n  indented code stays\n```\n";
+        assert_eq!(
+            notes(source, "1.2.3").unwrap(),
+            "### Fixed\n\n- First line of a fix continues here and ends here.\n- Second fix\n\n```text\n  indented code stays\n```\n"
         );
     }
 

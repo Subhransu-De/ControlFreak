@@ -9,6 +9,11 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Fixed
+
+- GitHub release notes no longer break each changelog entry mid-sentence. Wrapped entries are
+  joined into single lines when the notes are generated.
+
 ## [0.1.0] - 2026-10-18
 
 ### Added
