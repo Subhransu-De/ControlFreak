@@ -136,12 +136,13 @@ pub fn notes(changelog: &str, version: &str) -> Result<String> {
 /// broken mid-sentence. Join only plain prose that continues a top-level list item; every other
 /// line, whatever Markdown it is, is kept as written.
 fn unwrap_list_items(body: &str) -> String {
+    let source: Vec<&str> = body.lines().collect();
     let mut lines: Vec<String> = Vec::new();
     // The fence that opened the current code block, as (character, length).
     let mut open_fence: Option<(char, usize)> = None;
     // Whether the last kept line is a top-level item, or prose already joined onto one.
     let mut in_item = false;
-    for line in body.lines() {
+    for (index, line) in source.iter().copied().enumerate() {
         if let Some(open) = open_fence {
             if closes_fence(line, open) {
                 open_fence = None;
@@ -156,10 +157,24 @@ fn unwrap_list_items(body: &str) -> String {
             in_item = false;
             continue;
         }
+        // A pipe-less table header is only recognizable by the delimiter row after it.
+        let table_header = source
+            .get(index + 1)
+            .is_some_and(|next| is_table_delimiter(next));
         match lines.last_mut() {
-            Some(previous) if in_item && is_item_prose(line) => {
+            Some(previous)
+                if in_item
+                    && !table_header
+                    && !ends_with_hard_break(previous)
+                    && is_item_prose(line) =>
+            {
+                let text = line.trim_start();
                 previous.push(' ');
-                previous.push_str(line.trim());
+                previous.push_str(if ends_with_hard_break(text) {
+                    text
+                } else {
+                    text.trim_end()
+                });
             }
             _ => {
                 in_item = line.starts_with("- ") || line.starts_with("* ");
@@ -175,14 +190,43 @@ fn is_item_prose(line: &str) -> bool {
     let Some(text) = line.strip_prefix("  ") else {
         return false;
     };
+    // An ordered-list marker is digits, then `.` or `)`, then whitespace or the end of the line.
     let ordered = text.find(|c: char| !c.is_ascii_digit()).is_some_and(|end| {
-        end > 0 && (text[end..].starts_with('.') || text[end..].starts_with(')'))
+        let rest = &text[end..];
+        end > 0
+            && (rest.starts_with('.') || rest.starts_with(')'))
+            && rest[1..].chars().next().is_none_or(char::is_whitespace)
     });
+    // `*` and `_` open inline emphasis unless followed by whitespace, which makes `*` a bullet.
+    let emphasis = (text.starts_with('*') || text.starts_with('_'))
+        && text[1..].chars().next().is_some_and(|c| !c.is_whitespace());
     !ordered
-        && text
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_alphanumeric() || "`'\"([".contains(c))
+        && (emphasis
+            || text
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || "`'\"([".contains(c)))
+}
+
+/// Markdown's explicit line break: two trailing spaces or a trailing backslash.
+fn ends_with_hard_break(line: &str) -> bool {
+    line.ends_with("  ") || line.ends_with('\\')
+}
+
+/// A GFM table delimiter row such as `--- | :---:` or `|---|---|`.
+fn is_table_delimiter(line: &str) -> bool {
+    let cells: Vec<&str> = line
+        .trim()
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect();
+    line.contains('-')
+        && cells.iter().all(|cell| {
+            let dashes = cell.trim_start_matches(':').trim_end_matches(':');
+            !dashes.is_empty() && dashes.chars().all(|c| c == '-')
+        })
+        && (cells.len() > 1 || line.contains('|'))
 }
 
 /// A backtick or tilde fence of at least three characters, as (character, length).
@@ -278,6 +322,15 @@ mod tests {
         assert_eq!(
             notes(source, "1.2.3").unwrap(),
             "- Entry with indented code:\n\n      let kept = true;\n      let also = kept;\n- Entry with a table:\n  |a|b|\n  |-|-|\n- Entry with a long fence:\n  ````markdown\n  ```\n  inner\n  ```\n  ````\n- Last entry wraps.\n"
+        );
+    }
+
+    #[test]
+    fn versions_emphasis_hard_breaks_and_pipeless_tables() {
+        let source = "## [1.2.3] - 2026-01-02\n\n- Support for\n  2.0 is new and\n  **Windows 11** works, as does\n  _this_ line.\n- A line with a hard break  \n  stays on its own line.\n- Entry with a table:\n  Name | Value\n  --- | ---\n  a | b\n";
+        assert_eq!(
+            notes(source, "1.2.3").unwrap(),
+            "- Support for 2.0 is new and **Windows 11** works, as does _this_ line.\n- A line with a hard break  \n  stays on its own line.\n- Entry with a table:\n  Name | Value\n  --- | ---\n  a | b\n"
         );
     }
 
