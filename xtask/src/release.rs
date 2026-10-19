@@ -133,53 +133,70 @@ pub fn notes(changelog: &str, version: &str) -> Result<String> {
 }
 
 /// GitHub release bodies keep single line breaks, so a hard-wrapped changelog entry would render
-/// broken mid-sentence. Join each list item's indented continuation lines onto the item.
+/// broken mid-sentence. Join only plain prose that continues a top-level list item; every other
+/// line, whatever Markdown it is, is kept as written.
 fn unwrap_list_items(body: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
-    // The fence that opened the current code block; only the same kind closes it.
-    let mut open_fence: Option<&str> = None;
+    // The fence that opened the current code block, as (character, length).
+    let mut open_fence: Option<(char, usize)> = None;
+    // Whether the last kept line is a top-level item, or prose already joined onto one.
+    let mut in_item = false;
     for line in body.lines() {
-        let fence = fence_marker(line);
-        let continues_item = open_fence.is_none()
-            && fence.is_none()
-            && line.starts_with("  ")
-            && !starts_block(line.trim_start())
-            && lines.last().is_some_and(|previous| {
-                !previous.trim().is_empty() && fence_marker(previous).is_none()
-            });
+        if let Some(open) = open_fence {
+            if closes_fence(line, open) {
+                open_fence = None;
+            }
+            lines.push(line.to_owned());
+            in_item = false;
+            continue;
+        }
+        if let Some(fence) = opening_fence(line) {
+            open_fence = Some(fence);
+            lines.push(line.to_owned());
+            in_item = false;
+            continue;
+        }
         match lines.last_mut() {
-            Some(previous) if continues_item => {
+            Some(previous) if in_item && is_item_prose(line) => {
                 previous.push(' ');
                 previous.push_str(line.trim());
             }
-            _ => lines.push(line.to_owned()),
-        }
-        match (open_fence, fence) {
-            (None, Some(marker)) => open_fence = Some(marker),
-            (Some(open), Some(marker)) if open == marker => open_fence = None,
-            _ => {}
+            _ => {
+                in_item = line.starts_with("- ") || line.starts_with("* ");
+                lines.push(line.to_owned());
+            }
         }
     }
     lines.join("\n")
 }
 
-/// The fence kind a line opens or closes, for both backtick and tilde code fences.
-fn fence_marker(line: &str) -> Option<&'static str> {
-    let line = line.trim_start();
-    ["```", "~~~"]
-        .into_iter()
-        .find(|marker| line.starts_with(marker))
+/// A line indented exactly two spaces that starts like ordinary text, not a new Markdown block.
+fn is_item_prose(line: &str) -> bool {
+    let Some(text) = line.strip_prefix("  ") else {
+        return false;
+    };
+    let ordered = text.find(|c: char| !c.is_ascii_digit()).is_some_and(|end| {
+        end > 0 && (text[end..].starts_with('.') || text[end..].starts_with(')'))
+    });
+    !ordered
+        && text
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || "`'\"([".contains(c))
 }
 
-/// Whether an indented line starts its own Markdown block instead of continuing the item text.
-fn starts_block(line: &str) -> bool {
-    let ordered = line.find(|c: char| !c.is_ascii_digit()).is_some_and(|end| {
-        end > 0 && (line[end..].starts_with(". ") || line[end..].starts_with(") "))
-    });
-    ordered
-        || ["- ", "* ", "+ ", "> ", "| ", "#"]
-            .iter()
-            .any(|marker| line.starts_with(marker))
+/// A backtick or tilde fence of at least three characters, as (character, length).
+fn opening_fence(line: &str) -> Option<(char, usize)> {
+    let line = line.trim_start();
+    let marker = line.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let length = line.chars().take_while(|c| *c == marker).count();
+    (length >= 3).then_some((marker, length))
+}
+
+/// A fence of the same character, at least as long as the opener, with nothing after it.
+fn closes_fence(line: &str, (marker, length): (char, usize)) -> bool {
+    let line = line.trim();
+    line.chars().count() >= length && line.chars().all(|c| c == marker)
 }
 
 #[cfg(test)]
@@ -242,7 +259,7 @@ mod tests {
         let source = "## [1.2.3] - 2026-01-02\n\n- Parent entry\n  wraps here.\n  1. First step\n  2) Second step\n  + Plus bullet\n  > Quote\n- Entry with code:\n\n  ```text\n  code line\n  ```\n  Text after the block\n  continues.\n";
         assert_eq!(
             notes(source, "1.2.3").unwrap(),
-            "- Parent entry wraps here.\n  1. First step\n  2) Second step\n  + Plus bullet\n  > Quote\n- Entry with code:\n\n  ```text\n  code line\n  ```\n  Text after the block continues.\n"
+            "- Parent entry wraps here.\n  1. First step\n  2) Second step\n  + Plus bullet\n  > Quote\n- Entry with code:\n\n  ```text\n  code line\n  ```\n  Text after the block\n  continues.\n"
         );
     }
 
@@ -252,6 +269,15 @@ mod tests {
         assert_eq!(
             notes(source, "1.2.3").unwrap(),
             "- Entry with tilde code:\n\n  ~~~text\n  first line\n  ```not a closer\n  second line\n  ~~~\n"
+        );
+    }
+
+    #[test]
+    fn indented_code_compact_tables_and_long_fences_are_kept() {
+        let source = "## [1.2.3] - 2026-01-02\n\n- Entry with indented code:\n\n      let kept = true;\n      let also = kept;\n- Entry with a table:\n  |a|b|\n  |-|-|\n- Entry with a long fence:\n  ````markdown\n  ```\n  inner\n  ```\n  ````\n- Last entry\n  wraps.\n";
+        assert_eq!(
+            notes(source, "1.2.3").unwrap(),
+            "- Entry with indented code:\n\n      let kept = true;\n      let also = kept;\n- Entry with a table:\n  |a|b|\n  |-|-|\n- Entry with a long fence:\n  ````markdown\n  ```\n  inner\n  ```\n  ````\n- Last entry wraps.\n"
         );
     }
 
