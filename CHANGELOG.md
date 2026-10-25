@@ -9,6 +9,10 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Changed
+
+- Apps & Features and `winget list` now show the app as `ControlFreak` instead of `ControlFreak version <version>`. The version stays in its own column.
+
 ### Fixed
 
 - GitHub release notes no longer break each changelog entry mid-sentence. Wrapped entries are joined into single lines when the notes are generated.
