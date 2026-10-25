@@ -126,8 +126,10 @@ the setup helper, and the release preparation commands remain developer-only.
 After the tests and package checks pass, the workflow commits those three files and pushes `main`
 and the version tag atomically. If `main` advances during the build, the push fails without adding
 a tag; run again from the updated `main`. Repository rules must permit the workflow token to push
-this release commit. No personal access token is required. The same workflow then publishes the
+this release commit. Publishing needs no personal access token. The same workflow then publishes the
 installer, ZIP, checksums and the version's changelog notes. Alpha/beta/RC versions are prereleases.
+
+After a stable release is published, a separate job uses a pinned, checksum-verified Komac to open a pull request in [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) for `SubhransuDe.ControlFreak`. It needs a `WINGET_TOKEN` repository secret: a classic personal access token with the `public_repo` and `workflow` scopes, whose owner has a fork of winget-pkgs. Without the secret the job only records a notice, and prereleases are never submitted. If only this job fails, use **Re-run failed jobs** on the same workflow run.
 
 Manual tag pushes remain supported for versions whose manifest and dated changelog section have
 already been prepared. If publication fails after the tag was pushed, dispatch **Release** against

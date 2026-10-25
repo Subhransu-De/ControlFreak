@@ -45,6 +45,7 @@ WizardSizePercent=120,130
 SetupMutex={#Identity}.Setup
 CloseApplications=no
 RestartApplications=no
+UninstallDisplayName=ControlFreak
 UninstallDisplayIcon={app}\controlfreak.exe
 OutputDir={#OutputPath}
 OutputBaseFilename=ControlFreak-{#Version}
