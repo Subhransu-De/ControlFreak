@@ -23,6 +23,8 @@ jobs:
     name: Build and verify Windows release
     runs-on: windows-latest
     timeout-minutes: 45
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
     permissions:
       contents: write
       # Build provenance attestations for the published files.
@@ -43,6 +45,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Prepare and validate release version and changelog
+        id: version
         env:
           REQUESTED_VERSION: ${{ inputs.version }}
         run: |
@@ -64,6 +67,7 @@ jobs:
           $releaseVersion = cargo xtask version
           if ($LASTEXITCODE -ne 0) { throw 'Cannot determine release version.' }
           "RELEASE_TAG=v$releaseVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "tag=v$releaseVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           cargo xtask release-notes --output "$env:RUNNER_TEMP/release-notes.md"
           if ($LASTEXITCODE -ne 0) { throw 'Release changelog is missing or empty.' }
 
@@ -133,3 +137,45 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: cargo xtask publish --package dist --tag $env:RELEASE_TAG
+
+  # A separate job keeps the winget token out of the job that holds write
+  # access to this repository. Prereleases are not submitted.
+  winget:
+    name: Submit stable release to winget
+    needs: release
+    if: ${{ !contains(needs.release.outputs.tag, '-') }}
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ needs.release.outputs.tag }}
+      HAS_WINGET_TOKEN: ${{ secrets.WINGET_TOKEN != '' }}
+      KOMAC_VERSION: 2.17.1
+      KOMAC_SHA256: A97C002C5FFA15F232AF117EFAC6774E755D27ACC47EBA00F1661033267D7438
+
+    steps:
+      - name: Skip without a winget token
+        if: env.HAS_WINGET_TOKEN != 'true'
+        run: echo "::notice::WINGET_TOKEN is not set, so $env:RELEASE_TAG was not submitted to winget."
+
+      - name: Install pinned Komac
+        if: env.HAS_WINGET_TOKEN == 'true'
+        run: |
+          $komac = Join-Path $env:RUNNER_TEMP 'komac.exe'
+          Invoke-WebRequest "https://github.com/russellbanks/Komac/releases/download/v$env:KOMAC_VERSION/komac-$env:KOMAC_VERSION-x86_64-pc-windows-msvc.exe" -OutFile $komac
+          if ((Get-FileHash $komac -Algorithm SHA256).Hash -ne $env:KOMAC_SHA256) { throw 'Komac checksum mismatch.' }
+
+      - name: Open winget-pkgs pull request
+        if: env.HAS_WINGET_TOKEN == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          $version = $env:RELEASE_TAG.Substring(1)
+          $release = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/releases"
+          & (Join-Path $env:RUNNER_TEMP 'komac.exe') update SubhransuDe.ControlFreak `
+            --version $version `
+            --urls "$release/download/$env:RELEASE_TAG/ControlFreak-$version.exe" `
+            --release-notes-url "$release/tag/$env:RELEASE_TAG" `
+            --submit
+          if ($LASTEXITCODE -ne 0) { throw 'Komac could not submit the winget update.' }

@@ -91,7 +91,10 @@ fn stdio_handshake_reports_complete_windows_tool_surface() {
 }
 
 fn assert_target_arguments(tools: &Value) {
-    for tool in tools["result"]["tools"].as_array().unwrap() {
+    let tools = tools["result"]["tools"]
+        .as_array()
+        .expect("tools/list tool array");
+    for tool in tools {
         if matches!(
             tool["name"].as_str(),
             Some(
@@ -109,7 +112,7 @@ fn assert_target_arguments(tools: &Value) {
             assert!(
                 tool["inputSchema"]["required"]
                     .as_array()
-                    .unwrap()
+                    .expect("targeted tool required array")
                     .iter()
                     .any(|field| field == "target_ref")
             );

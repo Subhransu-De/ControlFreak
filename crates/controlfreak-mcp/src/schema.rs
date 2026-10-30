@@ -55,13 +55,17 @@ pub fn tools() -> Vec<Tool> {
             || tool.name == BEGIN_CONTROL_SESSION
         {
             let schema = Arc::make_mut(&mut tool.input_schema);
-            schema.get_mut("properties").and_then(Value::as_object_mut).unwrap().insert(
+            schema
+                .get_mut("properties")
+                .and_then(Value::as_object_mut)
+                .expect("targeted tool schemas define a properties object")
+                .insert(
                 "target_ref".into(), json!({"type": "string", "minLength": 1,
                 "description": "Server-issued target reference from a current window or screenshot observation. Must match the session's approved target. End the session before approving another target."}));
             schema
                 .get_mut("required")
                 .and_then(Value::as_array_mut)
-                .unwrap()
+                .expect("targeted tool schemas define a required array")
                 .push(json!("target_ref"));
         }
     }
