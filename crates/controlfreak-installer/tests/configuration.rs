@@ -13,7 +13,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         Self {
-            root: tempfile::tempdir().unwrap(),
+            root: tempfile::tempdir().expect("fixture directory"),
         }
     }
     fn path(&self, path: &str) -> PathBuf {
@@ -21,8 +21,9 @@ impl Fixture {
     }
     fn write(&self, path: &str, text: &str) {
         let path = self.path(path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, text).unwrap();
+        fs::create_dir_all(path.parent().expect("fixture file parent"))
+            .expect("fixture parent directories");
+        fs::write(path, text).expect("fixture file write");
     }
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_controlfreak-installer"));
@@ -52,7 +53,7 @@ impl Fixture {
             .arg(self.path("result.ini"))
             .arg(policy)
             .output()
-            .unwrap()
+            .expect("installer configure process")
     }
     fn remove(&self) -> Output {
         self.command()
@@ -60,13 +61,14 @@ impl Fixture {
             .arg(self.path("state"))
             .arg(self.path("result.ini"))
             .output()
-            .unwrap()
+            .expect("installer remove process")
     }
     fn report(&self) -> String {
-        fs::read_to_string(self.path("result.ini")).unwrap()
+        fs::read_to_string(self.path("result.ini")).expect("installer result report")
     }
     fn json(&self, path: &str) -> Value {
-        serde_json::from_str(&fs::read_to_string(self.path(path)).unwrap()).unwrap()
+        let text = fs::read_to_string(self.path(path)).expect("client configuration file");
+        serde_json::from_str(&text).expect("client configuration JSON")
     }
 }
 
