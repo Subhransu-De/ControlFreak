@@ -85,9 +85,9 @@ const KEYLINE_DIP: f32 = 1.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LampGeometry {
     pub(crate) lamp: i32,
-    pub(crate) keyline: i32,
+    keyline: i32,
     /// Two lit bands with a gap between them, instead of one solid band.
-    pub(crate) double: bool,
+    double: bool,
 }
 
 impl LampGeometry {
@@ -133,7 +133,7 @@ pub(crate) fn warning_geometry(dpi: u32) -> LampGeometry {
 }
 
 /// Rounds a DIP length to whole physical pixels, never below one pixel.
-pub(crate) fn scale_px(dip: f32, dpi: u32) -> i32 {
+fn scale_px(dip: f32, dpi: u32) -> i32 {
     to_px(dip * scale(dpi)).max(1)
 }
 
@@ -303,7 +303,7 @@ impl Rgb {
     }
 
     /// `amount` of `self` over `base`; the tab's rim takes its tint from the state colour.
-    pub(crate) fn mix(self, base: Self, amount: f32) -> Self {
+    fn mix(self, base: Self, amount: f32) -> Self {
         let channel = |a: u8, b: u8| {
             let value = f32::from(a) * amount + f32::from(b) * (1.0 - amount);
             u8::try_from(to_px(value).clamp(0, 255)).unwrap_or(u8::MAX)
@@ -367,7 +367,7 @@ impl Palette {
 
     /// High Contrast uses only the theme's window, window text, highlight and highlight text
     /// colours.
-    pub(crate) const fn high_contrast(
+    const fn high_contrast(
         window: Rgb,
         window_text: Rgb,
         highlight: Rgb,
@@ -424,7 +424,7 @@ pub(crate) fn lamp_color(tone: LampTone, palette: &Palette) -> Rgb {
     }
 }
 
-pub(crate) fn high_contrast_enabled() -> bool {
+fn high_contrast_enabled() -> bool {
     let mut contrast = HIGHCONTRASTW {
         cbSize: u32::try_from(size_of::<HIGHCONTRASTW>()).unwrap_or(0),
         ..Default::default()
@@ -494,14 +494,14 @@ pub(crate) const FADE_IN_FROM: f32 = 0.18;
 // ---------------------------------------------------------------------------------------------
 
 /// How long the two-line tab introduces a new session before settling into one row.
-pub(crate) const INTRO: Duration = Duration::from_secs(3);
+const INTRO: Duration = Duration::from_secs(3);
 /// Waiting shows only after this long without an action, so quick actions never flicker.
-pub(crate) const WAITING_DELAY: Duration = Duration::from_secs(1);
+const WAITING_DELAY: Duration = Duration::from_secs(1);
 /// How long "This PC is yours again" stays, with or without animations.
-pub(crate) const HANDBACK: Duration = Duration::from_millis(2_500);
+const HANDBACK: Duration = Duration::from_millis(2_500);
 /// A session that starts this soon after the last one ended skips the two-line introduction, so
 /// an agent working through one-shot actions does not keep re-announcing itself.
-pub(crate) const RETURN_GRACE: Duration = Duration::from_mins(1);
+const RETURN_GRACE: Duration = Duration::from_mins(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Activity {
@@ -837,7 +837,7 @@ pub(crate) struct DibSurface {
     previous: HGDIOBJ,
     bits: NonNull<u32>,
     pub(crate) width: usize,
-    pub(crate) height: usize,
+    height: usize,
 }
 
 impl DibSurface {
