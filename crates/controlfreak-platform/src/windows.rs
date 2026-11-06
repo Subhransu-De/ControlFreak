@@ -71,11 +71,12 @@ mod capture;
 mod desktop;
 mod environment;
 mod glow;
+mod indicator;
 mod input;
 mod privilege;
 mod process;
 mod stop;
-pub use stop::UserStop;
+pub use stop::{SessionSignals, UserStop};
 
 pub use arbitration::DesktopArbitrator;
 pub use process::ManagedChild;

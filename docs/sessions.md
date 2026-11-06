@@ -15,16 +15,54 @@ and shows the user that an agent is in control.
 
 ## Indicator
 
-While a session is active:
+While a session is active, a steady turquoise lamp runs along the top edge of every display, and
+a tab hangs from it in the middle of each display. Turquoise is the color SAE J3134 recommends for
+lamps that show an automated system is driving a car.
 
-- A blue glow surrounds every display. It is bright while an action runs and dim between actions.
-- A navy bar at the top of the primary display reads "ControlFreak is controlling your system
-  (Use Esc to stop)".
-- Both are excluded from screen capture, so screenshots never show them.
+| State | Lamp | Tab |
+| --- | --- | --- |
+| Working | Turquoise | "An agent is using this PC", "ControlFreak is working", "Press Esc to stop" |
+| Waiting | Turquoise | The same, with "ControlFreak is waiting" once no action has run for 1 second |
+| Stopping | Unchanged | "Stopping desktop control", "ControlFreak is releasing held keys and mouse buttons" |
+| Cleanup failed | Amber double line | "A key or mouse button may still be held" and steps to release it |
+| Session ended | Off | "This PC is yours again" for 2.5 seconds |
+
+- For the first 3 seconds of a session the tab shows two lines. It then shrinks to one row:
+  "An agent is using this PC", "ControlFreak is working" or "ControlFreak is waiting", and
+  "Esc to stop". A session that starts within a minute of the last one ending, such as a run of
+  one-shot actions, starts as one row. Every change of message, including from two lines to one
+  row, appears at once at full strength; only the tab appearing and disappearing fades.
+- After a normal end, "This PC is yours again" is one row. After Esc or a client stop it has a
+  second line: "Restart your agent app to use ControlFreak".
+- An elevated server shows a red lamp and an "Administrator" label on the tab. The label stays
+  while stopping and after a cleanup failure, when the lamp becomes the amber double line.
+- After a cleanup failure, the lamp becomes a double amber line and the tab stays, unchanged,
+  until the server exits. It says "ControlFreak stopped but could not confirm it released
+  everything", then three steps: "Press and release any key or mouse button that seems stuck",
+  "If typing or the pointer still misbehaves, sign out or restart Windows" and "Restart your
+  agent app to use ControlFreak again". On a display too short for all of it, the tab drops the
+  first sentence, then the last step, without rewording the rest.
+- Stopping and a possible held key appear at once at full strength, even mid-fade.
+- The tab follows the virtual desktop of the foreground window, like the lamp.
+- Each tab window is named with the words the tab shows, so screen readers can read it; an
+  elevated server's name says "Running as administrator", and after a cleanup failure the name
+  keeps the whole warning, even on a short display. A session that introduces itself,
+  stopping, a possible held key, and the handback after a stop also raise a system alert once the
+  tab is fully on screen. Working and waiting, and quick returns within a minute, only rename the
+  window.
+- On a narrow display, or with a large Windows text size, the stop key moves under the message
+  instead of being cut off. If a tab still does not fit its display, its type steps down from the
+  Windows text size until it does, never below 100%. A cleanup-failure warning first gives up
+  its first sentence and last step, keeping the type size.
+- The lamp and the tab are excluded from screen capture, so screenshots never show them.
 - Both are click-through and never take the focus.
-- With Windows animation effects off, the glow does not pulse.
-- With a High Contrast theme on, the bar uses the system highlight colors.
-- An elevated server shows a red glow instead of a blue one.
+- Nothing pulses. With Windows animation effects off, the tab and lamp also appear and disappear
+  without fading.
+- With a High Contrast theme on, both use the theme's colors, and an elevated server's lamp is
+  thicker instead of red.
+- The tab sits at the top center of each display, where some apps put their own bars, such as the
+  Remote Desktop connection bar or a meeting app's sharing bar. Clicks pass through the tab to
+  them, but the tab can hide them while a session holds the PC.
 
 | Setting | Effect |
 | --- | --- |

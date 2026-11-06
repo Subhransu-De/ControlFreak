@@ -12,9 +12,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use controlfreak_core::MutationControl;
+use controlfreak_core::{MutationControl, StopController};
 use controlfreak_mcp::{ActivityIndicator, IndicatorHealth, IndicatorLevel};
-use controlfreak_platform::ManagedChild;
+use controlfreak_platform::{ManagedChild, SessionSignals};
 
 const TEST_DISABLE_ENV: &str = "CONTROLFREAK_DISABLE_DESKTOP_GLOW_FOR_TESTS";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -28,6 +28,8 @@ static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// Owns one hidden, reusable desktop-glow actor for an MCP server.
 pub(crate) struct DesktopGlow {
     actor: Option<GlowActor>,
+    /// Acknowledged levels, read by the session tab to say whether the agent is acting.
+    signals: Arc<SessionSignals>,
     health: Arc<Mutex<IndicatorHealth>>,
     cancellation: MutationControl,
     containment: (&'static str, Option<String>),
@@ -78,12 +80,17 @@ struct ActorProcess {
 }
 
 impl DesktopGlow {
-    pub(crate) fn start(elevated: bool) -> Result<Self, String> {
+    pub(crate) fn start(
+        elevated: bool,
+        stop: StopController,
+        signals: Arc<SessionSignals>,
+    ) -> Result<Self, String> {
         let health = Arc::new(Mutex::new(IndicatorHealth::Healthy));
         let cancellation = MutationControl::default();
         if cfg!(debug_assertions) && std::env::var_os(TEST_DISABLE_ENV).is_some() {
             return Ok(Self {
                 actor: None,
+                signals,
                 draining: None,
                 shutdown_failure: None,
                 health,
@@ -118,12 +125,14 @@ impl DesktopGlow {
                     &health_for_actor,
                     &cancellation_for_actor,
                     elevated,
+                    &stop,
                 );
             })
             .map_err(|error| format!("desktop glow actor could not start: {error}"))?;
         Ok(Self {
             draining: None,
             shutdown_failure: None,
+            signals,
             actor: Some(GlowActor {
                 sender,
                 thread: Some(actor),
@@ -165,10 +174,14 @@ impl DesktopGlow {
 
 impl ActivityIndicator for DesktopGlow {
     fn set_level(&mut self, level: IndicatorLevel) -> Result<(), String> {
-        self.command(GlowCommand::Level(level))
+        self.command(GlowCommand::Level(level))?;
+        self.signals
+            .set_acting(matches!(level, IndicatorLevel::Acting));
+        Ok(())
     }
 
     fn hide(&mut self) -> Result<(), String> {
+        self.signals.clear();
         self.command(GlowCommand::Hide)
     }
 
@@ -251,6 +264,7 @@ fn actor_loop(
     health: &Mutex<IndicatorHealth>,
     cancellation: &MutationControl,
     elevated: bool,
+    stop: &StopController,
 ) {
     let mut sequence = 1_u64;
     let mut pending = HashMap::<u64, PendingCommand>::new();
@@ -258,6 +272,7 @@ fn actor_loop(
     let mut next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
     let mut shutdown_requested = false;
     let mut shutdown_acknowledged = false;
+    let mut warning_sent = false;
     let mut deferred = None;
 
     loop {
@@ -341,10 +356,9 @@ fn actor_loop(
                 Ok(marker) => {
                     if let Some(command) = pending.remove(&marker.sequence) {
                         if marker.state == command.expected {
-                            visible = matches!(
-                                marker.state.as_str(),
-                                "ARMED" | "ACTING" | "ELEVATED_ARMED" | "ELEVATED_ACTING"
-                            );
+                            if let Some(shown) = lamp_shown_after(&marker.state) {
+                                visible = shown;
+                            }
                             next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
                             shutdown_acknowledged |= command.shutdown;
                             if let Some(reply) = command.reply {
@@ -412,22 +426,46 @@ fn actor_loop(
             }
         }
 
+        // Once input may still be held, the lamp turns amber until the helper exits. The stop
+        // latch never clears, so one acknowledged tone per helper is enough.
+        if !warning_sent
+            && !shutdown_requested
+            && stop.status() == "cleanup_failed"
+            && matches!(current_health(health), IndicatorHealth::Healthy)
+        {
+            warning_sent = true;
+            if let Err(error) = watch_command(
+                &mut process.stdin,
+                generation,
+                (&mut sequence, &mut pending),
+                ("TONE WARNING", "TONE_WARNING"),
+                now + COMMAND_TIMEOUT,
+            ) {
+                mark_unhealthy(
+                    health,
+                    cancellation,
+                    format!("desktop glow tone write failed: {error}"),
+                );
+            }
+        }
+
         if visible
             && pending.is_empty()
             && now >= next_heartbeat
             && matches!(current_health(health), IndicatorHealth::Healthy)
-            && send_command(&mut process.stdin, generation, sequence, "PING").is_ok()
+            && let Err(error) = watch_command(
+                &mut process.stdin,
+                generation,
+                (&mut sequence, &mut pending),
+                ("PING", "PONG"),
+                now + HEARTBEAT_TIMEOUT,
+            )
         {
-            pending.insert(
-                sequence,
-                PendingCommand {
-                    expected: "PONG",
-                    deadline: now + HEARTBEAT_TIMEOUT,
-                    reply: None,
-                    shutdown: false,
-                },
+            mark_unhealthy(
+                health,
+                cancellation,
+                format!("desktop glow heartbeat write failed: {error}"),
             );
-            sequence = sequence.wrapping_add(1);
         }
 
         if shutdown_requested
@@ -437,6 +475,17 @@ fn actor_loop(
             drain_until_stopped(|| stop_process_bounded(&mut process));
             return;
         }
+    }
+}
+
+/// Whether the lamp is on after the helper acknowledges `state`, or `None` when that
+/// acknowledgement leaves it as it was. Heartbeats and tone changes must not stop the heartbeat
+/// that watches a visible lamp.
+fn lamp_shown_after(state: &str) -> Option<bool> {
+    match state {
+        "ARMED" | "ACTING" | "ELEVATED_ARMED" | "ELEVATED_ACTING" => Some(true),
+        "HIDDEN" | "STOPPED" => Some(false),
+        _ => None,
     }
 }
 
@@ -540,9 +589,38 @@ fn parse_marker(line: &str) -> Result<Marker, String> {
     })
 }
 
-fn send_command(stdin: &mut File, generation: u64, sequence: u64, command: &str) -> io::Result<()> {
+fn send_command(
+    stdin: &mut impl Write,
+    generation: u64,
+    sequence: u64,
+    command: &str,
+) -> io::Result<()> {
     writeln!(stdin, "CFP/1 {generation} {sequence} {command}")?;
     stdin.flush()
+}
+
+/// Sends a command the actor issues on its own, such as a heartbeat or a tone change, and waits
+/// for `expected` until `deadline`. A failed write leaves nothing pending and is returned, so the
+/// caller can report the helper as lost instead of retrying silently.
+fn watch_command(
+    stdin: &mut impl Write,
+    generation: u64,
+    (sequence, pending): (&mut u64, &mut HashMap<u64, PendingCommand>),
+    (command, expected): (&str, &'static str),
+    deadline: Instant,
+) -> io::Result<()> {
+    send_command(stdin, generation, *sequence, command)?;
+    pending.insert(
+        *sequence,
+        PendingCommand {
+            expected,
+            deadline,
+            reply: None,
+            shutdown: false,
+        },
+    );
+    *sequence = sequence.wrapping_add(1);
+    Ok(())
 }
 
 fn mark_unhealthy(health: &Mutex<IndicatorHealth>, cancellation: &MutationControl, reason: String) {
@@ -732,7 +810,9 @@ fn record_glow_event(message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopGlow, finish_actor_shutdown, parse_marker};
+    use super::{
+        DesktopGlow, finish_actor_shutdown, lamp_shown_after, parse_marker, watch_command,
+    };
     use controlfreak_mcp::{ActivityIndicator, IndicatorHealth};
 
     #[test]
@@ -777,6 +857,7 @@ mod tests {
         });
         let mut glow = DesktopGlow {
             actor: None,
+            signals: Arc::new(controlfreak_platform::SessionSignals::new(false)),
             health: Arc::new(std::sync::Mutex::new(IndicatorHealth::Healthy)),
             cancellation: controlfreak_core::MutationControl::default(),
             containment: ("unavailable", None),
@@ -812,9 +893,70 @@ mod tests {
     }
 
     #[test]
+    fn heartbeats_and_tone_changes_keep_watching_a_visible_lamp() {
+        for level in ["ARMED", "ACTING", "ELEVATED_ARMED", "ELEVATED_ACTING"] {
+            assert_eq!(lamp_shown_after(level), Some(true), "{level}");
+        }
+        for gone in ["HIDDEN", "STOPPED"] {
+            assert_eq!(lamp_shown_after(gone), Some(false), "{gone}");
+        }
+        for unchanged in ["PONG", "TONE_WARNING", "TONE_NORMAL"] {
+            assert_eq!(lamp_shown_after(unchanged), None, "{unchanged}");
+        }
+    }
+
+    #[test]
+    fn a_heartbeat_that_cannot_be_written_is_reported_not_left_waiting() {
+        struct BrokenPipe;
+        impl std::io::Write for BrokenPipe {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let deadline = std::time::Instant::now();
+        let mut sequence = 3;
+        let mut pending = std::collections::HashMap::new();
+        let failed = watch_command(
+            &mut BrokenPipe,
+            7,
+            (&mut sequence, &mut pending),
+            ("PING", "PONG"),
+            deadline,
+        );
+        assert_eq!(
+            failed.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "returned for the actor to mark the helper unhealthy"
+        );
+        assert!(pending.is_empty(), "nothing waits for a reply never asked");
+        assert_eq!(sequence, 3);
+
+        let mut written = Vec::new();
+        watch_command(
+            &mut written,
+            7,
+            (&mut sequence, &mut pending),
+            ("PING", "PONG"),
+            deadline,
+        )
+        .unwrap();
+        assert_eq!(written, b"CFP/1 7 3 PING\n");
+        assert_eq!(pending[&3].expected, "PONG");
+        assert_eq!(sequence, 4);
+    }
+
+    #[test]
     #[ignore = "starts the real hidden Windows helper for release qualification"]
     fn live_hidden_helper_starts_healthy_and_stops() {
-        let mut glow = DesktopGlow::start(false).expect("desktop glow helper should start");
+        let mut glow = DesktopGlow::start(
+            false,
+            controlfreak_core::StopController::default(),
+            std::sync::Arc::new(controlfreak_platform::SessionSignals::new(false)),
+        )
+        .expect("desktop glow helper should start");
         assert_eq!(glow.health(), IndicatorHealth::Healthy);
         glow.shutdown().expect("desktop glow helper should stop");
     }

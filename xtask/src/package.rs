@@ -12,12 +12,13 @@ use std::{
 use zip::{ZipWriter, write::SimpleFileOptions};
 
 pub const BINARIES: [&str; 2] = ["controlfreak.exe", "controlfreak-installer.exe"];
-pub const DOCUMENTS: [&str; 6] = [
+pub const DOCUMENTS: [&str; 7] = [
     "README.md",
     "CHANGELOG.md",
     "SECURITY.md",
     "PRIVACY.md",
     "LICENSE",
+    "THIRD-PARTY-NOTICES.md",
     "Cargo.lock",
 ];
 const COMPILER_HASH: &str = "4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0";
