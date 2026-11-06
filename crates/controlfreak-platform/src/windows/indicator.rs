@@ -5,6 +5,7 @@
 #![allow(unsafe_code)]
 
 use std::{
+    cell::RefCell,
     ffi::c_void,
     io,
     mem::size_of,
@@ -14,7 +15,7 @@ use std::{
 
 use windows::{
     Win32::{
-        Foundation::{COLORREF, HWND, LPARAM, POINT, RECT, SIZE},
+        Foundation::{COLORREF, D2DERR_RECREATE_TARGET, HWND, LPARAM, POINT, RECT, SIZE},
         Graphics::{
             Direct2D::{
                 Common::{
@@ -1007,7 +1008,8 @@ pub(crate) struct Painter {
     dwrite: IDWriteFactory,
     fonts: IDWriteFontCollection,
     family: PCWSTR,
-    target: ID2D1DCRenderTarget,
+    /// Replaced when Direct2D loses it, as after a display driver reset (see `Painter::draw`).
+    target: RefCell<ID2D1DCRenderTarget>,
 }
 
 /// A painted tab: lamp segment, shoulders, body and shadow, in physical pixels.
@@ -1105,22 +1107,7 @@ impl Painter {
             Ok(fonts) => (fonts, w!("Inter")),
             Err(_) => (system_fonts(&dwrite)?, w!("Segoe UI")),
         };
-        let properties = D2D1_RENDER_TARGET_PROPERTIES {
-            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            // One drawing unit is one physical pixel; the painter scales every DIP itself so
-            // straight edges land on whole pixels.
-            dpiX: 96.0,
-            dpiY: 96.0,
-            usage: D2D1_RENDER_TARGET_USAGE_NONE,
-            minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
-        };
-        // SAFETY: `properties` is a fully initialized local that outlives this synchronous call.
-        let target = unsafe { d2d.CreateDCRenderTarget(&raw const properties) }
-            .map_err(|error| windows_error("CreateDCRenderTarget", &error))?;
+        let target = RefCell::new(create_target(&d2d)?);
         Ok(Self {
             d2d,
             dwrite,
@@ -1794,15 +1781,60 @@ fn system_fonts(factory: &IDWriteFactory) -> io::Result<IDWriteFontCollection> {
     collection.ok_or_else(|| io::Error::other("Windows returned no system font collection"))
 }
 
+fn create_target(d2d: &ID2D1Factory) -> io::Result<ID2D1DCRenderTarget> {
+    let properties = D2D1_RENDER_TARGET_PROPERTIES {
+        r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        // One drawing unit is one physical pixel; the painter scales every DIP itself so
+        // straight edges land on whole pixels.
+        dpiX: 96.0,
+        dpiY: 96.0,
+        usage: D2D1_RENDER_TARGET_USAGE_NONE,
+        minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+    };
+    // SAFETY: `properties` is a fully initialized local that outlives this synchronous call.
+    unsafe { d2d.CreateDCRenderTarget(&raw const properties) }
+        .map_err(|error| windows_error("CreateDCRenderTarget", &error))
+}
+
+/// Whether Direct2D has lost the drawing target, as after a display driver reset, so it must be
+/// rebuilt before the next draw.
+fn target_lost(ended: &windows::core::Result<()>) -> bool {
+    ended
+        .as_ref()
+        .is_err_and(|error| error.code() == D2DERR_RECREATE_TARGET)
+}
+
 impl Painter {
+    /// Draws `layout` into `surface`. A lost target is rebuilt and the tab drawn again once, so a
+    /// graphics reset does not take the tab, and with it desktop work, down; any other failure,
+    /// or losing the new target too, is returned.
     fn draw(&self, layout: &Layout, surface: &mut DibSurface) -> io::Result<()> {
+        if self.draw_once(layout, surface)? {
+            return Ok(());
+        }
+        self.target.replace(create_target(&self.d2d)?);
+        if self.draw_once(layout, surface)? {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "Direct2D lost the tab's drawing target twice in a row",
+            ))
+        }
+    }
+
+    /// Draws once; `Ok(false)` means Direct2D lost the target and nothing usable was drawn.
+    fn draw_once(&self, layout: &Layout, surface: &mut DibSurface) -> io::Result<bool> {
         let rect = RECT {
             left: 0,
             top: 0,
             right: layout.width,
             bottom: layout.height,
         };
-        let target = &self.target;
+        let target = self.target.borrow();
         let clear = D2D1_COLOR_F::default();
         // SAFETY: The surface's memory DC and DIB are live for the whole draw, `rect` matches the
         // DIB, and every Direct2D object used below is created from this factory and target.
@@ -1836,12 +1868,17 @@ impl Painter {
         }
         // SAFETY: Ends the draw begun above on the same target, even if a step failed.
         let ended = unsafe { target.EndDraw(None, None) };
+        if target_lost(&ended) {
+            return Ok(false);
+        }
         drawn?;
-        ended.map_err(|error| windows_error("EndDraw", &error))
+        ended
+            .map(|()| true)
+            .map_err(|error| windows_error("EndDraw", &error))
     }
 
     fn draw_tab(&self, layout: &Layout) -> io::Result<()> {
-        let target = &self.target;
+        let target = self.target.borrow();
         let palette = &layout.palette;
         let s = layout.s;
         if !palette.high_contrast {
@@ -1916,7 +1953,7 @@ impl Painter {
     }
 
     fn draw_key(&self, layout: &Layout, esc: &EscLayout) -> io::Result<()> {
-        let target = &self.target;
+        let target = self.target.borrow();
         let palette = &layout.palette;
         let s = layout.s;
         let (x0, y0, x1, y1) = esc.key;
@@ -1967,7 +2004,7 @@ impl Painter {
         let brush = self.brush(color)?;
         // SAFETY: The layout and brush are live objects; the origin is a value.
         unsafe {
-            self.target.DrawTextLayout(
+            self.target.borrow().DrawTextLayout(
                 Vector2::new(x, y),
                 &text.layout,
                 &brush,
@@ -1980,8 +2017,12 @@ impl Painter {
     fn brush(&self, color: Rgb) -> io::Result<ID2D1SolidColorBrush> {
         let color = color.d2d();
         // SAFETY: `color` is a local that outlives this synchronous call.
-        unsafe { self.target.CreateSolidColorBrush(&raw const color, None) }
-            .map_err(|error| windows_error("CreateSolidColorBrush", &error))
+        unsafe {
+            self.target
+                .borrow()
+                .CreateSolidColorBrush(&raw const color, None)
+        }
+        .map_err(|error| windows_error("CreateSolidColorBrush", &error))
     }
 
     /// The tab outline: concave shoulders flaring into the lamp, straight sides, rounded lower
@@ -2074,7 +2115,7 @@ impl Painter {
             let ink = self.brush(palette.ink)?;
             // SAFETY: The rectangle is a local and the brush is live.
             unsafe {
-                self.target.DrawRoundedRectangle(
+                self.target.borrow().DrawRoundedRectangle(
                     &raw const inner,
                     &ink,
                     outline,
@@ -2085,7 +2126,11 @@ impl Painter {
         } else {
             let red = self.brush(ADMIN_RED)?;
             // SAFETY: The rectangle is a local and the brush is live.
-            unsafe { self.target.FillRoundedRectangle(&raw const chip, &red) };
+            unsafe {
+                self.target
+                    .borrow()
+                    .FillRoundedRectangle(&raw const chip, &red);
+            }
             self.draw_text(text, ADMIN_INK)
         }
     }
@@ -2096,7 +2141,7 @@ impl Painter {
         let (x, y) = layout.badge;
         let size = layout.badge_size;
         let tones = layout.tones;
-        let target = &self.target;
+        let target = self.target.borrow();
         let rect = D2D1_ROUNDED_RECT {
             rect: D2D_RECT_F {
                 left: x,
@@ -2152,7 +2197,7 @@ impl Painter {
         glyph: &ID2D1SolidColorBrush,
     ) -> io::Result<()> {
         let s = layout.badge_size / 18.0;
-        let target = &self.target;
+        let target = self.target.borrow();
         match layout.badge_kind {
             Badge::Pointer { .. } => {
                 // The arrow from a 16 x 22 design grid, drawn 12 DIP tall.
@@ -2938,6 +2983,34 @@ mod tests {
         tab.surface.pixels()[..width * rows]
             .iter()
             .all(|pixel| *pixel >> 24 == 255)
+    }
+
+    #[test]
+    fn a_lost_drawing_target_is_rebuilt_instead_of_failing_the_tab() {
+        assert!(target_lost(&Err(D2DERR_RECREATE_TARGET.into())));
+        assert!(
+            !target_lost(&Err(windows::Win32::Foundation::E_FAIL.into())),
+            "other drawing failures still fail closed"
+        );
+        assert!(!target_lost(&Ok(())));
+
+        let painter = Painter::new().unwrap();
+        let view = TabView {
+            kind: TabKind::Working,
+            admin: false,
+            expanded: true,
+        };
+        let mut before = painter
+            .paint(view, &Palette::STANDARD, 96, 1920, 1.0)
+            .unwrap();
+        painter.target.replace(create_target(&painter.d2d).unwrap());
+        let mut after = painter
+            .paint(view, &Palette::STANDARD, 96, 1920, 1.0)
+            .unwrap();
+        assert!(
+            before.surface.rgba_rows() == after.surface.rgba_rows(),
+            "a rebuilt target draws the same tab"
+        );
     }
 
     #[test]
