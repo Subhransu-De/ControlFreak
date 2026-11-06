@@ -82,7 +82,8 @@ yourself once you no longer need them.
 
 ## Your controls
 
-- Press **Esc** while the blue glow is visible to stop the agent's control session.
+- Press **Esc** while the "An agent is using this PC" tab is on screen to stop the agent's control
+  session.
 - Remove the `controlfreak` entry from a client's MCP configuration, or uninstall ControlFreak, to
   stop all access.
 - Delete `*.controlfreak-backup-*.bak` files next to your client configurations to remove the

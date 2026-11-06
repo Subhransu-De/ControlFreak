@@ -3,56 +3,59 @@
 use controlfreak_core::StopController;
 use std::{
     cell::{Cell, RefCell},
+    io,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
     thread,
+    time::{Duration, Instant},
 };
 use windows::{
     Win32::{
-        Foundation::{
-            COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_FAILED, WAIT_TIMEOUT,
-            WPARAM,
-        },
-        Graphics::Gdi::{
-            BeginPaint, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, CreateFontIndirectW, DC_BRUSH,
-            DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect,
-            GetMonitorInfoW, GetStockObject, GetSysColor, HBRUSH, HFONT, InvalidateRect, LOGFONTW,
-            MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, PAINTSTRUCT, SelectObject,
-            SetBkMode, SetDCBrushColor, SetTextColor, TRANSPARENT,
-        },
-        System::LibraryLoader::GetModuleHandleW,
+        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WAIT_FAILED, WAIT_TIMEOUT, WPARAM},
+        System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
         UI::{
-            Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
-            HiDpi::GetDpiForWindow,
+            Accessibility::NotifyWinEvent,
             Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE},
+            Shell::IVirtualDesktopManager,
             WindowsAndMessaging::{
-                CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-                GetClientRect, HHOOK, HTTRANSPARENT, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
-                LWA_ALPHA, MA_NOACTIVATE, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx,
-                PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassW, SPI_GETHIGHCONTRAST, SW_HIDE,
-                SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-                SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowPos,
-                SetWindowsHookExW, ShowWindow, SystemParametersInfoW, UnhookWindowsHookEx,
-                UnregisterClassW, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WM_CLOSE, WM_KEYDOWN,
-                WM_KEYUP, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WM_SETTINGCHANGE,
-                WM_SYSCOLORCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WNDCLASSW,
-                WS_DISABLED, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-                WS_EX_TRANSPARENT, WS_POPUP,
+                CHILDID_SELF, CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
+                DispatchMessageW, EVENT_OBJECT_NAMECHANGE, EVENT_SYSTEM_ALERT, GetForegroundWindow,
+                HHOOK, HTTRANSPARENT, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MA_NOACTIVATE,
+                MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, OBJID_WINDOW, PM_REMOVE,
+                PeekMessageW, PostThreadMessageW, QS_ALLINPUT, RegisterClassW, SW_HIDE,
+                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowDisplayAffinity,
+                SetWindowPos, SetWindowTextW, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx,
+                UnregisterClassW, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WM_APP, WM_CLOSE,
+                WM_DISPLAYCHANGE, WM_DPICHANGED, WM_KEYDOWN, WM_KEYUP, WM_MOUSEACTIVATE,
+                WM_NCHITTEST, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP,
+                WM_THEMECHANGED, WNDCLASSW, WS_DISABLED, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+                WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
             },
         },
     },
-    core::w,
+    core::{GUID, PCWSTR, w},
 };
 
-const BAR_TEXT: &str = "ControlFreak is controlling your system (Use Esc to stop)";
+use super::desktop::{ComApartment, virtual_desktop_manager};
+use super::indicator::{
+    Activity, FADE_IN, FADE_IN_FROM, Monitor, PaintedTab, Painter, Palette, StopStatus, TabInputs,
+    TabKind, TabModel, TabView, animations_enabled, enumerate_monitors, spoken, text_scale,
+};
+
 const CLASS_NAME: windows::core::PCWSTR = w!("ControlFreakUserStop");
-/// Longest the UI thread blocks while idle. It only bounds how soon a session start, status text
-/// change or shutdown is noticed; hook callbacks and window messages wake the wait immediately.
+/// Longest the UI thread blocks while idle. It bounds how soon a session start, a state change
+/// or shutdown is noticed; hook callbacks and window messages wake the wait immediately.
 const POLL_INTERVAL_MS: u32 = 100;
-const NAVY: COLORREF = COLORREF(0x0080_0000); // RGB #000080; COLORREF is BGR.
+/// Frame interval while a tab fades in or out.
+const FADE_FRAME_MS: u32 = 16;
+/// The tab fades in with the lamp, and fades out over the same short time.
+const TAB_FADE: Duration = FADE_IN;
+/// Display, contrast, text-size and animation settings are re-read at least this often, and at
+/// once when Windows announces a change.
+const SETTINGS_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EscapeState {
@@ -64,17 +67,77 @@ enum EscapeState {
 thread_local! {
     static CONTROLLER: RefCell<Option<StopController>> = const { RefCell::new(None) };
     static ESC_STATE: Cell<EscapeState> = const { Cell::new(EscapeState::Released) };
-    static BAR_FONT: Cell<HFONT> = const { Cell::new(HFONT(std::ptr::null_mut())) };
+    static SETTINGS_CHANGED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Independent native session bar and physical Esc monitor. Never calls a provider.
+/// What the desktop glow controller last had acknowledged, so the session tab can say whether
+/// the agent is acting right now. Written by the server's glow controller; read by the tab.
+pub struct SessionSignals {
+    activity: AtomicU8,
+    /// Counts acknowledged actions, so an action that starts and ends between two polls of the
+    /// tab still shows as working.
+    actions: AtomicU64,
+    /// The tab's UI thread, woken on every change so it does not wait for its next poll.
+    ui_thread: AtomicU32,
+    elevated: bool,
+}
+
+impl SessionSignals {
+    pub fn new(elevated: bool) -> Self {
+        Self {
+            activity: AtomicU8::new(0),
+            actions: AtomicU64::new(0),
+            ui_thread: AtomicU32::new(0),
+            elevated,
+        }
+    }
+
+    /// Records an acknowledged indicator level: `true` while an input action runs.
+    pub fn set_acting(&self, acting: bool) {
+        if acting {
+            self.actions.fetch_add(1, Ordering::AcqRel);
+        }
+        self.activity
+            .store(if acting { 2 } else { 1 }, Ordering::Release);
+        self.wake();
+    }
+
+    /// Records that the indicator was hidden at the end of a session.
+    pub fn clear(&self) {
+        self.activity.store(0, Ordering::Release);
+        self.wake();
+    }
+
+    fn activity(&self) -> Activity {
+        match self.activity.load(Ordering::Acquire) {
+            2 => Activity::Working,
+            1 => Activity::Waiting,
+            _ => Activity::Idle,
+        }
+    }
+
+    fn actions(&self) -> u64 {
+        self.actions.load(Ordering::Acquire)
+    }
+
+    fn wake(&self) {
+        let thread = self.ui_thread.load(Ordering::Acquire);
+        if thread != 0 {
+            // SAFETY: Posts a value-only message to a thread ID; a thread that has exited only
+            // makes the call fail, which is harmless because its next poll picks up the change.
+            let _ = unsafe { PostThreadMessageW(thread, WM_APP, WPARAM(0), LPARAM(0)) };
+        }
+    }
+}
+
+/// Independent native session tab and physical Esc monitor. Never calls a provider.
 pub struct UserStop {
     shutdown: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 impl UserStop {
-    pub fn start(controller: StopController) -> Result<Self, String> {
+    pub fn start(controller: StopController, signals: Arc<SessionSignals>) -> Result<Self, String> {
         super::ensure_dpi_awareness().map_err(|error| error.to_string())?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let exiting = Arc::clone(&shutdown);
@@ -83,7 +146,7 @@ impl UserStop {
             .name("controlfreak-user-stop".to_owned())
             .spawn(move || {
                 CONTROLLER.with(|slot| *slot.borrow_mut() = Some(controller.clone()));
-                if let Err(error) = run(&controller, &exiting, &sender) {
+                if let Err(error) = run(&controller, &signals, &exiting, &sender) {
                     controller.stop();
                     let _ = sender.send(Err(error.to_string()));
                 }
@@ -109,27 +172,26 @@ impl Drop for UserStop {
 }
 
 // Owned by the UI thread, including partially initialized failure paths.
-struct NativeBar {
-    window: HWND,
+struct NativeStop {
     hook: HHOOK,
-    font: HFONT,
     instance: HINSTANCE,
-    bounds: RECT,
-    font_height: i32,
+    tabs: Vec<TabWindow>,
 }
 
-impl NativeBar {
-    fn create() -> windows::core::Result<Self> {
+impl NativeStop {
+    fn create() -> io::Result<Self> {
         Self::create_with_hook(true)
     }
 
     /// Tests pass `false`: a low-level hook on a thread that never pumps messages would delay
     /// every keystroke on the machine.
-    fn create_with_hook(install_hook: bool) -> windows::core::Result<Self> {
-        // SAFETY: This UI thread owns the class, hidden window and hook. The guard
-        // releases every successfully created resource if a later call fails.
+    fn create_with_hook(install_hook: bool) -> io::Result<Self> {
+        // SAFETY: This UI thread owns the class and hook. The guard releases every successfully
+        // created resource if a later call fails.
         unsafe {
-            let instance: HINSTANCE = GetModuleHandleW(None)?.into();
+            let instance: HINSTANCE = GetModuleHandleW(None)
+                .map_err(|error| windows_error("GetModuleHandleW", &error))?
+                .into();
             let descriptor = WNDCLASSW {
                 lpfnWndProc: Some(window_proc),
                 hInstance: instance,
@@ -137,41 +199,16 @@ impl NativeBar {
                 ..Default::default()
             };
             if RegisterClassW(&raw const descriptor) == 0 {
-                return Err(windows::core::Error::from_thread());
+                return Err(windows_error(
+                    "RegisterClassW",
+                    &windows::core::Error::from_thread(),
+                ));
             }
-            let mut bar = Self {
-                window: HWND::default(),
+            let mut native = Self {
                 hook: HHOOK::default(),
-                font: HFONT::default(),
                 instance,
-                bounds: RECT::default(),
-                font_height: 0,
+                tabs: Vec::new(),
             };
-            bar.window = CreateWindowExW(
-                WS_EX_TOPMOST
-                    | WS_EX_TOOLWINDOW
-                    | WS_EX_NOACTIVATE
-                    | WS_EX_LAYERED
-                    | WS_EX_TRANSPARENT,
-                CLASS_NAME,
-                w!("ControlFreak session"),
-                // The bar is purely informational. WindowFromPoint skips disabled windows, so
-                // point-integrity checks resolve the application beneath the bar instead of
-                // this process, and physical clicks pass through the transparent layered window.
-                WS_POPUP | WS_DISABLED,
-                0,
-                0,
-                600,
-                48,
-                None,
-                None,
-                Some(instance),
-                None,
-            )?;
-            // A layered window paints nothing until its attributes are set; fully opaque
-            // alpha keeps the normal WM_PAINT rendering while input passes through.
-            SetLayeredWindowAttributes(bar.window, COLORREF(0), 255, LWA_ALPHA)?;
-            SetWindowDisplayAffinity(bar.window, WDA_EXCLUDEFROMCAPTURE)?;
             // A key already held before monitoring must retain its matching release.
             ESC_STATE.with(|state| {
                 state.set(if GetAsyncKeyState(i32::from(VK_ESCAPE.0)) < 0 {
@@ -181,158 +218,541 @@ impl NativeBar {
                 });
             });
             if install_hook {
-                bar.hook =
-                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), Some(instance), 0)?;
+                native.hook =
+                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), Some(instance), 0)
+                        .map_err(|error| windows_error("SetWindowsHookExW", &error))?;
             }
-            Ok(bar)
+            Ok(native)
         }
     }
 
-    fn update_layout(&mut self) -> windows::core::Result<()> {
-        // SAFETY: The window and font belong to this UI thread. Monitor info uses
-        // a correctly sized writable struct; no GDI objects remain selected here.
-        unsafe {
-            let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
-            let mut info = MONITORINFO {
-                cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>()).unwrap_or(0),
-                ..Default::default()
-            };
-            GetMonitorInfoW(monitor, &raw mut info).ok()?;
-            let bounds = bar_bounds(info.rcMonitor, GetDpiForWindow(self.window).max(96));
-            if bounds != self.bounds {
-                SetWindowPos(
-                    self.window,
-                    Some(HWND_TOPMOST),
-                    bounds.left,
-                    bounds.top,
-                    bounds.right - bounds.left,
-                    bounds.bottom - bounds.top,
-                    SWP_NOACTIVATE,
-                )?;
-                self.bounds = bounds;
-            }
-            // Scale text down with the bar on narrow or highly scaled displays.
-            let height = ((bounds.right - bounds.left) * 16 / 600).max(1);
-            if height != self.font_height {
-                let mut font = LOGFONTW {
-                    lfHeight: -height,
-                    ..Default::default()
-                };
-                for (slot, value) in font.lfFaceName.iter_mut().zip("Segoe UI".encode_utf16()) {
-                    *slot = value;
-                }
-                let new_font = CreateFontIndirectW(&raw const font);
-                if new_font.is_invalid() {
-                    return Err(windows::core::Error::from_thread());
-                }
-                BAR_FONT.with(|font| font.set(new_font));
-                if !self.font.is_invalid() {
-                    let _ = DeleteObject(self.font.into());
-                }
-                self.font = new_font;
-                self.font_height = height;
-                let _ = InvalidateRect(Some(self.window), None, false);
-            }
+    /// Keeps one tab window per display, rebuilding them when displays or their DPI change.
+    fn sync_monitors(&mut self, monitors: &[Monitor]) -> io::Result<bool> {
+        let current: Vec<Monitor> = self.tabs.iter().map(|tab| tab.monitor).collect();
+        if current == monitors {
+            return Ok(false);
         }
-        Ok(())
+        self.tabs.clear();
+        for monitor in monitors.iter().copied() {
+            self.tabs.push(TabWindow::create(self.instance, monitor)?);
+        }
+        Ok(true)
     }
 }
 
-impl Drop for NativeBar {
+impl Drop for NativeStop {
     fn drop(&mut self) {
+        // Remove the callback before destroying the windows and their class.
+        self.tabs.clear();
         // SAFETY: These handles were created on this thread and are released once.
-        // Remove the callback before destroying its window and thread-local font.
         unsafe {
             if !self.hook.is_invalid() {
                 let _ = UnhookWindowsHookEx(self.hook);
-            }
-            if !self.window.is_invalid() {
-                let _ = DestroyWindow(self.window);
-            }
-            BAR_FONT.with(|font| font.set(HFONT::default()));
-            if !self.font.is_invalid() {
-                let _ = DeleteObject(self.font.into());
             }
             let _ = UnregisterClassW(CLASS_NAME, Some(self.instance));
         }
     }
 }
 
-fn bar_bounds(monitor: RECT, dpi: u32) -> RECT {
-    let scale = |value: i32| value.saturating_mul(i32::try_from(dpi).unwrap_or(96)) / 96;
-    let available = (monitor.right - monitor.left).max(1);
-    let width = scale(600).min((available - scale(32)).max(1));
-    let left = monitor.left + (available - width) / 2;
-    let top = monitor.top + scale(16);
-    RECT {
-        left,
-        top,
-        right: left + width,
-        bottom: top + scale(48),
+/// The tab on one display: a click-through, capture-excluded layered window centred on the
+/// display's top edge, hanging from the lamp the glow helper draws there.
+struct TabWindow {
+    hwnd: HWND,
+    monitor: Monitor,
+    tab: Option<PaintedTab>,
+    origin: POINT,
+    visible: bool,
+    /// The accessible name last given to the window.
+    name: String,
+}
+
+impl TabWindow {
+    fn create(instance: HINSTANCE, monitor: Monitor) -> io::Result<Self> {
+        // SAFETY: The registered class, module and constant strings remain valid; Windows owns the
+        // returned HWND until Drop destroys it.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT,
+                CLASS_NAME,
+                w!("ControlFreak session"),
+                // The tab is purely informational. WindowFromPoint skips disabled windows, so
+                // point-integrity checks resolve the application beneath the tab instead of this
+                // process, and physical clicks pass through the transparent layered window.
+                WS_POPUP | WS_DISABLED,
+                monitor.left,
+                monitor.top,
+                1,
+                1,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .map_err(|error| windows_error("CreateWindowExW", &error))?;
+        // SAFETY: This thread owns `hwnd`; capture affinity stores no Rust pointers.
+        if let Err(error) = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } {
+            // SAFETY: Window creation succeeded and ownership has not escaped this function.
+            let _ = unsafe { DestroyWindow(hwnd) };
+            return Err(windows_error("SetWindowDisplayAffinity", &error));
+        }
+        Ok(Self {
+            hwnd,
+            monitor,
+            tab: None,
+            origin: POINT {
+                x: monitor.left,
+                y: monitor.top,
+            },
+            visible: false,
+            name: String::new(),
+        })
+    }
+
+    /// Paints `view` for this display and names the window with its words, so a window rebuilt
+    /// after a display change is named as soon as it has something to show.
+    fn paint(
+        &mut self,
+        painter: &Painter,
+        view: TabView,
+        settings: &Settings,
+        with_lamp: bool,
+    ) -> io::Result<()> {
+        let tab = painter.paint_with_lamp(
+            view,
+            &settings.palette,
+            self.monitor.dpi,
+            self.monitor.tab_space(),
+            settings.text_scale,
+            with_lamp,
+        )?;
+        // Name the window with the words actually painted, which a narrow display or a large
+        // text size can change. A possibly held key keeps every recovery step in its name.
+        let name = if view.kind == TabKind::InputHeld {
+            spoken(view)
+        } else {
+            tab.spoken.clone()
+        };
+        self.origin = tab_origin(self.monitor, tab.width);
+        self.tab = Some(tab);
+        self.set_name(&name);
+        Ok(())
+    }
+
+    /// Names the window with the tab's message, so screen readers that read windows through UI
+    /// Automation or MSAA get the words the tab shows, and tells them when the name changes.
+    fn set_name(&mut self, text: &str) {
+        if self.name == text {
+            return;
+        }
+        text.clone_into(&mut self.name);
+        let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: `wide` is a NUL-terminated buffer that outlives this synchronous call, and this
+        // thread owns the window.
+        let _ = unsafe { SetWindowTextW(self.hwnd, PCWSTR(wide.as_ptr())) };
+        // SAFETY: Value-only notification about a window this thread owns.
+        unsafe {
+            NotifyWinEvent(
+                EVENT_OBJECT_NAMECHANGE,
+                self.hwnd,
+                OBJID_WINDOW.0,
+                i32::try_from(CHILDID_SELF).unwrap_or(0),
+            );
+        }
+    }
+
+    /// Raises a system alert for the window, which screen readers announce without the window
+    /// taking focus.
+    fn alert(&self) {
+        // SAFETY: Value-only notification about a window this thread owns.
+        unsafe {
+            NotifyWinEvent(
+                EVENT_SYSTEM_ALERT,
+                self.hwnd,
+                OBJID_WINDOW.0,
+                i32::try_from(CHILDID_SELF).unwrap_or(0),
+            );
+        }
+    }
+
+    /// Keeps a visible tab above windows that became topmost after it.
+    fn raise(&self) {
+        if self.visible {
+            // SAFETY: This thread owns the HWND; the call changes only z-order, without
+            // activating the window or changing its size or position.
+            let _ = unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                )
+            };
+        }
+    }
+
+    fn present(&mut self, alpha: u8) -> io::Result<()> {
+        let Some(tab) = self.tab.as_ref() else {
+            return Ok(());
+        };
+        tab.surface.present(self.hwnd, self.origin, alpha)?;
+        if !self.visible {
+            // SAFETY: This thread owns the HWND; the call shows it above other topmost windows
+            // without activating it and keeps the size and position UpdateLayeredWindow set.
+            unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                )
+            }
+            .map_err(|error| windows_error("SetWindowPos", &error))?;
+            self.visible = true;
+        }
+        Ok(())
+    }
+
+    fn hide(&mut self) {
+        if self.visible {
+            // SAFETY: Hiding a window owned by this thread retains no pointers.
+            let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+            self.visible = false;
+        }
     }
 }
 
-const WHITE: COLORREF = COLORREF(0x00ff_ffff);
-
-/// Navy on white normally; the system highlight pair when High Contrast is on.
-fn choose_palette(
-    high_contrast: bool,
-    highlight: COLORREF,
-    highlight_text: COLORREF,
-) -> (COLORREF, COLORREF) {
-    if high_contrast {
-        (highlight, highlight_text)
-    } else {
-        (NAVY, WHITE)
+impl Drop for TabWindow {
+    fn drop(&mut self) {
+        // SAFETY: `hwnd` is owned by this value and is destroyed exactly once.
+        let _ = unsafe { DestroyWindow(self.hwnd) };
     }
 }
 
-fn high_contrast_enabled() -> bool {
-    let mut contrast = HIGHCONTRASTW {
-        cbSize: u32::try_from(std::mem::size_of::<HIGHCONTRASTW>()).unwrap_or(0),
-        ..Default::default()
-    };
-    // SAFETY: For SPI_GETHIGHCONTRAST, pvParam is a writable HIGHCONTRASTW whose cbSize matches
-    // uiParam; it outlives this synchronous call and is not retained.
-    let result = unsafe {
-        SystemParametersInfoW(
-            SPI_GETHIGHCONTRAST,
-            contrast.cbSize,
-            Some((&raw mut contrast).cast()),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        )
-    };
-    result.is_ok() && contrast.dwFlags.contains(HCF_HIGHCONTRASTON)
+/// Centred on the display's top edge, in signed virtual-desktop pixels.
+fn tab_origin(monitor: Monitor, width: i32) -> POINT {
+    POINT {
+        x: monitor.left + (monitor.width() - width) / 2,
+        y: monitor.top,
+    }
 }
 
-fn bar_palette() -> (COLORREF, COLORREF) {
-    // SAFETY: GetSysColor takes a constant index and returns a value; no pointers are involved.
-    let (highlight, text) = unsafe {
-        (
-            COLORREF(GetSysColor(COLOR_HIGHLIGHT)),
-            COLORREF(GetSysColor(COLOR_HIGHLIGHTTEXT)),
-        )
-    };
-    choose_palette(high_contrast_enabled(), highlight, text)
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Settings {
+    palette: Palette,
+    text_scale: f32,
+    animated: bool,
 }
 
-fn bar_text(controller: &StopController) -> &'static str {
-    match controller.status() {
-        "cleanup_failed" => "ControlFreak stopped. Input cleanup needs attention.",
-        "draining" | "stopped" => "ControlFreak stopped. Finishing input cleanup...",
-        _ => BAR_TEXT,
+impl Settings {
+    fn read() -> Self {
+        Self {
+            palette: Palette::system(),
+            text_scale: text_scale(),
+            animated: animations_enabled(),
+        }
+    }
+}
+
+/// A whole-window fade, answered to a session starting or ending.
+#[derive(Clone, Copy)]
+struct Fade {
+    started: Instant,
+    from: f32,
+    to: f32,
+    duration: Duration,
+}
+
+impl Fade {
+    fn alpha(self, now: Instant, animated: bool) -> f32 {
+        let progress = (now.saturating_duration_since(self.started).as_secs_f32()
+            / self.duration.as_secs_f32())
+        .clamp(0.0, 1.0);
+        // A finished fade lands exactly on its target, which the alert waits for.
+        if !animated || progress >= 1.0 {
+            return self.to;
+        }
+        // The same smoothstep easing the helper uses for the lamp.
+        let eased = progress * progress * (3.0 - 2.0 * progress);
+        self.from + (self.to - self.from) * eased
+    }
+
+    fn done(self, now: Instant, animated: bool) -> bool {
+        !animated || now.saturating_duration_since(self.started) >= self.duration
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn alpha_byte(alpha: f32) -> u8 {
+    // Clamped to 0..=255 first, so the conversion is exact.
+    (alpha.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// What the tab windows are doing between two views.
+#[derive(Clone, Copy)]
+enum Phase {
+    Steady,
+    FadingIn(Fade),
+    FadingOut(Fade),
+}
+
+/// Paints and presents the tab on every display. Every change of message, including between two
+/// lines and one row, is painted at once at full strength. Only appearing and disappearing fade,
+/// over [`TAB_FADE`], and only with Windows animations on. While a fade runs the tab leaves its
+/// lamp rows clear, so its copy of the lamp never doubles the helper's lamp.
+struct Presenter {
+    painter: Painter,
+    shown: Option<TabView>,
+    requested: Option<TabView>,
+    phase: Phase,
+    alpha: f32,
+    /// A screen-reader alert waiting until the tab is fully on screen.
+    alert_pending: bool,
+    #[cfg(test)]
+    alerts: usize,
+}
+
+impl Presenter {
+    fn new(painter: Painter) -> Self {
+        Self {
+            painter,
+            shown: None,
+            requested: None,
+            phase: Phase::Steady,
+            alpha: 0.0,
+            alert_pending: false,
+            #[cfg(test)]
+            alerts: 0,
+        }
+    }
+
+    fn fading(&self) -> bool {
+        !matches!(self.phase, Phase::Steady)
+    }
+
+    fn paint(
+        &self,
+        tabs: &mut [TabWindow],
+        view: TabView,
+        settings: &Settings,
+        with_lamp: bool,
+    ) -> io::Result<()> {
+        for tab in tabs {
+            tab.paint(&self.painter, view, settings, with_lamp)?;
+        }
+        Ok(())
+    }
+
+    fn present(&self, tabs: &mut [TabWindow]) -> io::Result<()> {
+        for tab in tabs {
+            tab.present(alpha_byte(self.alpha))?;
+        }
+        Ok(())
+    }
+
+    fn update(
+        &mut self,
+        tabs: &mut [TabWindow],
+        view: Option<TabView>,
+        settings: &Settings,
+        repaint: bool,
+        now: Instant,
+    ) -> io::Result<()> {
+        let animated = settings.animated;
+        if view != self.requested {
+            self.alert_pending |= view.is_some_and(|next| announces(self.requested, next));
+            self.requested = view;
+            let fade = |from, to| Fade {
+                started: now,
+                from,
+                to,
+                duration: TAB_FADE,
+            };
+            match view {
+                None => {
+                    self.alert_pending = false;
+                    if let Some(shown) = self.shown {
+                        self.paint(tabs, shown, settings, !animated)?;
+                        self.phase = Phase::FadingOut(fade(self.alpha, 0.0));
+                    }
+                }
+                // Stopping and a possibly held key show at once at full strength, cancelling any
+                // fade in progress; with animations off, everything does.
+                Some(next) if urgent(next) || !animated => {
+                    self.paint(tabs, next, settings, true)?;
+                    self.shown = Some(next);
+                    self.alpha = 1.0;
+                    self.phase = Phase::Steady;
+                }
+                Some(next) if self.shown.is_none() || matches!(self.phase, Phase::FadingOut(_)) => {
+                    self.paint(tabs, next, settings, false)?;
+                    self.shown = Some(next);
+                    // The first frame presented is already at the lamp's starting opacity.
+                    self.alpha = self.alpha.max(FADE_IN_FROM);
+                    self.phase = Phase::FadingIn(fade(self.alpha, 1.0));
+                }
+                // A new message replaces the old one at once, at the current strength.
+                Some(next) => {
+                    let steady = matches!(self.phase, Phase::Steady);
+                    self.paint(tabs, next, settings, steady)?;
+                    self.shown = Some(next);
+                }
+            }
+            self.present(tabs)?;
+        } else if repaint && let Some(shown) = self.shown {
+            self.paint(tabs, shown, settings, !self.fading())?;
+            self.present(tabs)?;
+        }
+        match self.phase {
+            Phase::Steady => {}
+            Phase::FadingIn(fade) => {
+                self.alpha = fade.alpha(now, animated);
+                if fade.done(now, animated) {
+                    self.phase = Phase::Steady;
+                    if let Some(shown) = self.shown {
+                        self.paint(tabs, shown, settings, true)?;
+                    }
+                }
+                self.present(tabs)?;
+            }
+            Phase::FadingOut(fade) => {
+                self.alpha = fade.alpha(now, animated);
+                self.present(tabs)?;
+                if fade.done(now, animated) {
+                    self.shown = None;
+                    self.phase = Phase::Steady;
+                    tabs.iter_mut().for_each(TabWindow::hide);
+                }
+            }
+        }
+        // Announce only once the tab is fully on screen, carrying its new name.
+        if self.alert_pending
+            && self.shown.is_some()
+            && matches!(self.phase, Phase::Steady)
+            && self.alpha >= 1.0
+        {
+            self.alert_pending = false;
+            if let Some(first) = tabs.first() {
+                first.alert();
+                #[cfg(test)]
+                {
+                    self.alerts += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Stopping and a possibly held key never wait behind a fade.
+fn urgent(view: TabView) -> bool {
+    matches!(view.kind, TabKind::Stopping | TabKind::InputHeld)
+}
+
+/// Whether a change of view is worth a screen-reader announcement: a session starting, stopping,
+/// a possible held key, or control handed back. Working and waiting, and the switch between two
+/// lines and one row, change only the window name.
+fn announces(previous: Option<TabView>, next: TabView) -> bool {
+    let previous = previous.map(|view| view.kind);
+    match next.kind {
+        // A session announces itself only when it also introduces itself on screen, so a run of
+        // one-shot actions within a minute of each other is not announced again and again.
+        TabKind::Working | TabKind::Waiting => {
+            next.expanded && matches!(previous, None | Some(TabKind::HandedBack { .. }))
+        }
+        TabKind::Stopping => previous != Some(TabKind::Stopping),
+        TabKind::InputHeld => previous != Some(TabKind::InputHeld),
+        // A normal end is a quiet rename; the handback after a stop is announced.
+        TabKind::HandedBack { after_stop } => {
+            after_stop && !matches!(previous, Some(TabKind::HandedBack { .. }))
+        }
+    }
+}
+
+/// Moves the tab windows to the virtual desktop of the foreground window, as the glow helper does
+/// for the lamp, so a desktop switch never leaves the lamp without its stop instruction.
+fn follow_foreground_desktop(
+    manager: &IVirtualDesktopManager,
+    current: &mut Option<GUID>,
+    tabs: &[TabWindow],
+) {
+    // SAFETY: Takes no pointers and returns a Windows-owned handle or null.
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_invalid() {
+        return;
+    }
+    // SAFETY: COM is initialized on this thread and `foreground` is a Windows-owned handle; a
+    // window that closed in between only makes the call fail.
+    let Ok(desktop) = (unsafe { manager.GetWindowDesktopId(foreground) }) else {
+        return;
+    };
+    if *current == Some(desktop) || desktop == GUID::zeroed() {
+        return;
+    }
+    let mut moved = true;
+    for tab in tabs {
+        // SAFETY: The manager is live and `tab.hwnd` is owned by this thread and process.
+        moved &= unsafe { manager.MoveWindowToDesktop(tab.hwnd, &raw const desktop) }.is_ok();
+    }
+    // Remember the desktop only once every tab is on it, so a failed move is retried.
+    if moved {
+        *current = Some(desktop);
     }
 }
 
 fn run(
     controller: &StopController,
+    signals: &SessionSignals,
     exiting: &AtomicBool,
     ready: &mpsc::SyncSender<Result<(), String>>,
-) -> windows::core::Result<()> {
-    let mut bar = NativeBar::create()?;
+) -> io::Result<()> {
+    let _com = ComApartment::initialize().map_err(|error| io::Error::other(error.to_string()))?;
+    // Without the shell's manager the tab still works; it just cannot follow desktop switches.
+    let desktops = virtual_desktop_manager().ok();
+    let presenter = Presenter::new(Painter::new()?);
+    let mut native = NativeStop::create()?;
+    native.sync_monitors(&enumerate_monitors()?)?;
+    // Indicator changes post to this thread so the tab answers them at once, not at its next poll.
+    // SAFETY: Takes no arguments and returns this thread's ID.
+    signals
+        .ui_thread
+        .store(unsafe { GetCurrentThreadId() }, Ordering::Release);
     let _ = ready.send(Ok(()));
-    let mut visible = false;
-    let mut previous_text = "";
+    let result = tab_loop(
+        controller,
+        signals,
+        exiting,
+        native,
+        presenter,
+        desktops.as_ref(),
+    );
+    signals.ui_thread.store(0, Ordering::Release);
+    result
+}
+
+fn tab_loop(
+    controller: &StopController,
+    signals: &SessionSignals,
+    exiting: &AtomicBool,
+    mut native: NativeStop,
+    mut presenter: Presenter,
+    desktops: Option<&IVirtualDesktopManager>,
+) -> io::Result<()> {
+    let mut desktop = None;
+    let mut model = TabModel::default();
+    let mut settings = Settings::read();
+    let mut next_settings = Instant::now() + SETTINGS_INTERVAL;
+    let mut was_shown = false;
     while !exiting.load(Ordering::Acquire) {
         // SAFETY: Dispatch only messages retrieved for this dedicated UI thread.
         unsafe {
@@ -344,26 +764,47 @@ fn run(
                 DispatchMessageW(&raw const message);
             }
         }
-        let active = controller.session_active();
-        if active {
-            bar.update_layout()?;
-            let text = bar_text(controller);
-            if text != previous_text || !visible {
-                // SAFETY: The owned window remains live throughout this loop.
-                unsafe {
-                    let _ = InvalidateRect(Some(bar.window), None, false);
-                }
-                previous_text = text;
+        let now = Instant::now();
+        let mut repaint = false;
+        if now >= next_settings || SETTINGS_CHANGED.with(|flag| flag.replace(false)) {
+            let fresh = Settings::read();
+            repaint |= fresh != settings;
+            settings = fresh;
+            if native.sync_monitors(&enumerate_monitors()?)? {
+                repaint = true;
+                desktop = None;
             }
-        }
-        if active != visible {
-            // SAFETY: Show or hide our owned window without taking foreground focus.
-            unsafe {
-                let _ = ShowWindow(bar.window, if active { SW_SHOWNOACTIVATE } else { SW_HIDE });
+            if let Some(manager) = desktops {
+                follow_foreground_desktop(manager, &mut desktop, &native.tabs);
             }
-            visible = active;
+            native.tabs.iter().for_each(TabWindow::raise);
+            next_settings = now + SETTINGS_INTERVAL;
         }
-        wait_for_input(POLL_INTERVAL_MS)?;
+        let view = model.view(
+            now,
+            TabInputs {
+                session_active: controller.session_active(),
+                stop: StopStatus::parse(controller.status()),
+                activity: signals.activity(),
+                actions: signals.actions(),
+                elevated: signals.elevated,
+            },
+        );
+        // A tab about to appear first moves to the desktop the user is looking at.
+        if view.is_some()
+            && !was_shown
+            && let Some(manager) = desktops
+        {
+            follow_foreground_desktop(manager, &mut desktop, &native.tabs);
+        }
+        was_shown = view.is_some();
+        presenter.update(&mut native.tabs, view, &settings, repaint, now)?;
+        wait_for_input(if presenter.fading() {
+            FADE_FRAME_MS
+        } else {
+            POLL_INTERVAL_MS
+        })
+        .map_err(|error| windows_error("MsgWaitForMultipleObjectsEx", &error))?;
     }
     Ok(())
 }
@@ -381,7 +822,7 @@ enum WaitOutcome {
 /// calls arrive as sent messages and run inside this wait, so keystrokes are answered at once
 /// instead of after a sleep. `MWMO_INPUTAVAILABLE` also returns for messages that an earlier
 /// peek already saw but did not remove, which a plain wait would sleep through. The timeout is
-/// only for the session and status polling, so an idle thread wakes `1000 / timeout_ms` times
+/// only for session, state and fade polling, so an idle thread wakes `1000 / timeout_ms` times
 /// per second.
 fn wait_for_input(timeout_ms: u32) -> windows::core::Result<WaitOutcome> {
     // SAFETY: No handles are passed; the call only waits on this thread's message queue.
@@ -456,44 +897,11 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if message == WM_PAINT {
-        // SAFETY: WM_PAINT is for this live window; pair BeginPaint/EndPaint and
-        // restore the selected font before the owning thread can delete it.
-        unsafe {
-            let mut paint = PAINTSTRUCT::default();
-            let dc = BeginPaint(window, &raw mut paint);
-            let mut rect = RECT::default();
-            let _ = GetClientRect(window, &raw mut rect);
-            let (background, foreground) = bar_palette();
-            SetDCBrushColor(dc, background);
-            FillRect(dc, &raw const rect, HBRUSH(GetStockObject(DC_BRUSH).0));
-            SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, foreground);
-            let old = BAR_FONT.with(|font| SelectObject(dc, font.get().into()));
-            let mut text: Vec<u16> = CONTROLLER
-                .with(|slot| slot.borrow().as_ref().map_or(BAR_TEXT, bar_text))
-                .encode_utf16()
-                .collect();
-            DrawTextW(
-                dc,
-                &mut text,
-                &raw mut rect,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-            );
-            SelectObject(dc, old);
-            let _ = EndPaint(window, &raw const paint);
-        }
-        return LRESULT(0);
-    }
     match message {
         WM_CLOSE => return LRESULT(0),
-        // The palette is read at paint time, so repaint when Windows changes its colors.
-        WM_SETTINGCHANGE | WM_SYSCOLORCHANGE | WM_THEMECHANGED => {
-            // SAFETY: The message is for this live window; invalidation retains no pointers.
-            unsafe {
-                let _ = InvalidateRect(Some(window), None, false);
-            }
-        }
+        // Colours, text size and displays are read on the UI loop; ask it to re-read them now.
+        WM_SETTINGCHANGE | WM_SYSCOLORCHANGE | WM_THEMECHANGED | WM_DISPLAYCHANGE
+        | WM_DPICHANGED => SETTINGS_CHANGED.with(|flag| flag.set(true)),
         WM_NCHITTEST => return LRESULT(isize::try_from(HTTRANSPARENT).unwrap_or(-1)),
         WM_MOUSEACTIVATE => return LRESULT(isize::try_from(MA_NOACTIVATE).unwrap_or(3)),
         _ => {}
@@ -502,30 +910,258 @@ unsafe extern "system" fn window_proc(
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
 
+fn windows_error(context: &str, error: &windows::core::Error) -> io::Error {
+    io::Error::other(format!("{context} failed: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::indicator::{TabKind, TabView};
     use super::*;
     use windows::Win32::{
         System::Threading::GetCurrentThreadId,
         UI::WindowsAndMessaging::{
-            GetWindowRect, PM_NOREMOVE, PostThreadMessageW, SendMessageW, WM_APP, WindowFromPoint,
+            GetWindowDisplayAffinity, GetWindowRect, PM_NOREMOVE, PostThreadMessageW, SendMessageW,
+            WM_APP, WindowFromPoint,
         },
     };
 
+    /// Tests that create the tab windows register their window class, which a process can hold
+    /// only once at a time; the server never creates two.
+    fn window_class_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
-    fn bar_is_centered_with_scaled_top_gap_even_at_negative_origins() {
-        for dpi in [96, 144, 192] {
-            let monitor = RECT {
-                left: -1920,
+    fn tab_is_centred_on_each_display_even_at_negative_origins() {
+        for (left, right) in [(-1920, 0), (0, 2560), (-3840, -1920)] {
+            let monitor = Monitor {
+                left,
                 top: -1080,
-                right: 0,
+                right,
                 bottom: 0,
+                dpi: 144,
             };
-            let bounds = bar_bounds(monitor, dpi);
-            assert_eq!(bounds.left + bounds.right, monitor.left + monitor.right);
-            assert_eq!(bounds.top - monitor.top, i32::try_from(dpi).unwrap() / 6);
-            assert!(bounds.left >= monitor.left && bounds.right <= monitor.right);
+            let origin = tab_origin(monitor, 600);
+            assert_eq!(origin.x * 2 + 600, monitor.left + monitor.right);
+            assert_eq!(origin.y, monitor.top, "the tab hangs from the top edge");
         }
+    }
+
+    #[test]
+    fn session_signals_report_the_last_acknowledged_level() {
+        let signals = SessionSignals::new(true);
+        assert_eq!(signals.activity(), Activity::Idle);
+        signals.set_acting(true);
+        assert_eq!(signals.activity(), Activity::Working);
+        signals.set_acting(false);
+        assert_eq!(signals.activity(), Activity::Waiting);
+        signals.clear();
+        assert_eq!(signals.activity(), Activity::Idle);
+        assert!(signals.elevated);
+    }
+
+    #[test]
+    fn screen_readers_hear_starts_stops_and_warnings_but_not_every_action() {
+        let view = |kind, expanded| TabView {
+            kind,
+            admin: false,
+            expanded,
+        };
+        let working = view(TabKind::Working, true);
+        let waiting = view(TabKind::Waiting, false);
+        assert!(announces(None, working), "a session starting");
+        assert!(!announces(Some(working), waiting), "working and waiting");
+        assert!(!announces(Some(waiting), view(TabKind::Working, false)));
+        assert!(
+            !announces(Some(working), view(TabKind::Working, false)),
+            "one row"
+        );
+        assert!(announces(Some(waiting), view(TabKind::Stopping, true)));
+        assert!(!announces(
+            Some(view(TabKind::Stopping, true)),
+            view(TabKind::Stopping, true)
+        ));
+        assert!(announces(
+            Some(view(TabKind::Stopping, true)),
+            view(TabKind::InputHeld, true)
+        ));
+        assert!(!announces(
+            Some(view(TabKind::InputHeld, true)),
+            view(TabKind::InputHeld, false)
+        ));
+        let back = view(TabKind::HandedBack { after_stop: false }, false);
+        assert!(
+            !announces(Some(waiting), back),
+            "a normal end is a quiet rename"
+        );
+        let stopped_back = view(TabKind::HandedBack { after_stop: true }, true);
+        assert!(announces(Some(view(TabKind::Stopping, true)), stopped_back));
+        assert!(
+            !announces(Some(back), view(TabKind::Working, false)),
+            "a one-shot run within a minute is not announced again"
+        );
+        assert!(
+            announces(Some(back), working),
+            "a new session after a handback"
+        );
+    }
+
+    #[test]
+    fn messages_change_in_place_and_safety_messages_show_at_once_at_full_strength() {
+        let _windows = window_class_lock();
+        super::super::ensure_dpi_awareness().unwrap();
+        let mut native = NativeStop::create_with_hook(false).unwrap();
+        native
+            .sync_monitors(&[enumerate_monitors().unwrap().remove(0)])
+            .unwrap();
+        let mut presenter = Presenter::new(Painter::new().unwrap());
+        let settings = Settings {
+            palette: Palette::STANDARD,
+            text_scale: 1.0,
+            animated: true,
+        };
+        let view = |kind, expanded| TabView {
+            kind,
+            admin: false,
+            expanded,
+        };
+        let start = Instant::now();
+        let mut update = |presenter: &mut Presenter, view, at| {
+            presenter
+                .update(&mut native.tabs, Some(view), &settings, false, at)
+                .unwrap();
+        };
+        update(&mut presenter, view(TabKind::Working, true), start);
+        assert!(presenter.fading(), "a new tab fades in");
+        assert!(
+            (presenter.alpha - FADE_IN_FROM).abs() < f32::EPSILON,
+            "from the lamp's starting opacity, so they arrive together"
+        );
+        assert!(
+            presenter.alert_pending,
+            "and is announced only once fully shown"
+        );
+
+        let midway = start + TAB_FADE / 2;
+        update(&mut presenter, view(TabKind::Working, false), midway);
+        assert!(
+            matches!(presenter.phase, Phase::FadingIn(_)),
+            "one row replaces two lines in place, without a dip"
+        );
+
+        update(&mut presenter, view(TabKind::Stopping, true), midway);
+        assert!(!presenter.fading(), "stopping cancels the fade");
+        assert!(
+            (presenter.alpha - 1.0).abs() < f32::EPSILON,
+            "at full strength"
+        );
+        assert!(
+            !presenter.alert_pending,
+            "announced as soon as it is fully shown"
+        );
+        assert!(native.tabs[0].name.starts_with("Stopping desktop control"));
+        assert!(urgent(view(TabKind::InputHeld, false)));
+        assert!(!urgent(view(TabKind::Waiting, false)));
+    }
+
+    #[test]
+    fn a_new_session_fades_in_fully_and_is_announced_exactly_once() {
+        let _windows = window_class_lock();
+        super::super::ensure_dpi_awareness().unwrap();
+        let mut native = NativeStop::create_with_hook(false).unwrap();
+        native
+            .sync_monitors(&[enumerate_monitors().unwrap().remove(0)])
+            .unwrap();
+        let mut presenter = Presenter::new(Painter::new().unwrap());
+        let settings = Settings {
+            palette: Palette::STANDARD,
+            text_scale: 1.0,
+            animated: true,
+        };
+        let view = |kind, expanded| TabView {
+            kind,
+            admin: false,
+            expanded,
+        };
+        let start = Instant::now();
+        let mut update = |presenter: &mut Presenter, view, millis| {
+            presenter
+                .update(
+                    &mut native.tabs,
+                    Some(view),
+                    &settings,
+                    false,
+                    start + Duration::from_millis(millis),
+                )
+                .unwrap();
+        };
+        let introduced = view(TabKind::Working, true);
+        update(&mut presenter, introduced, 0);
+        update(&mut presenter, introduced, 75);
+        assert!(presenter.fading());
+        assert_eq!(presenter.alerts, 0, "not announced while fading in");
+        update(&mut presenter, introduced, 150);
+        assert!(!presenter.fading(), "the fade ends on time");
+        assert!((presenter.alpha - 1.0).abs() < f32::EPSILON);
+        assert_eq!(presenter.alerts, 1, "announced once fully shown");
+        update(&mut presenter, view(TabKind::Working, false), 3_000);
+        update(&mut presenter, view(TabKind::Waiting, false), 4_000);
+        update(&mut presenter, view(TabKind::Working, false), 4_100);
+        assert_eq!(
+            presenter.alerts, 1,
+            "settling into one row and working or waiting only rename the window"
+        );
+        assert!(presenter.alpha >= 1.0, "and never fade the tab");
+    }
+
+    #[test]
+    fn short_actions_and_session_changes_wake_the_tab_thread() {
+        let signals = SessionSignals::new(false);
+        // SAFETY: Takes no arguments and returns this thread's ID.
+        signals
+            .ui_thread
+            .store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+        let mut message = MSG::default();
+        // SAFETY: `message` is writable and this test thread owns its queue.
+        while unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }.as_bool() {}
+        signals.set_acting(true);
+        signals.set_acting(false);
+        assert_eq!(
+            signals.actions(),
+            1,
+            "the action is counted even though it ended"
+        );
+        assert_eq!(signals.activity(), Activity::Waiting);
+        let started = Instant::now();
+        assert_eq!(wait_for_input(5_000).unwrap(), WaitOutcome::Input);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "woken, not polled"
+        );
+        // SAFETY: Remove the wake-up messages so the queue is left empty.
+        while unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }.as_bool() {}
+        signals.ui_thread.store(0, Ordering::Release);
+    }
+
+    #[test]
+    fn fades_finish_at_once_when_animations_are_off() {
+        let started = Instant::now();
+        let fade = Fade {
+            started,
+            from: 0.0,
+            to: 1.0,
+            duration: TAB_FADE,
+        };
+        assert!((fade.alpha(started, false) - 1.0).abs() < f32::EPSILON);
+        assert!(fade.done(started, false));
+        assert!(fade.alpha(started, true) < 0.01);
+        assert!(!fade.done(started, true));
+        assert!((fade.alpha(started + TAB_FADE, true) - 1.0).abs() < f32::EPSILON);
+        assert_eq!(alpha_byte(2.0), 255);
+        assert_eq!(alpha_byte(-1.0), 0);
     }
 
     #[test]
@@ -553,25 +1189,47 @@ mod tests {
     }
 
     #[test]
-    fn high_contrast_uses_the_system_highlight_pair() {
-        let highlight = COLORREF(0x0012_3456);
-        let text = COLORREF(0x00ab_cdef);
-        assert_eq!(choose_palette(true, highlight, text), (highlight, text));
-        assert_eq!(choose_palette(false, highlight, text), (NAVY, WHITE));
-    }
-
-    #[test]
-    fn point_targeting_skips_the_disabled_control_bar() {
+    fn point_targeting_skips_the_disabled_session_tab() {
+        let _windows = window_class_lock();
         super::super::ensure_dpi_awareness().unwrap();
-        let bar = NativeBar::create_with_hook(false).unwrap();
-        // SAFETY: The bar owns this live window; showing it without activation retains no pointers.
-        let _ = unsafe { ShowWindow(bar.window, SW_SHOWNOACTIVATE) };
-        let mut rect = RECT::default();
+        let mut native = NativeStop::create_with_hook(false).unwrap();
+        let monitor = enumerate_monitors().unwrap().remove(0);
+        native.sync_monitors(&[monitor]).unwrap();
+        let painter = Painter::new().unwrap();
+        let tab = &mut native.tabs[0];
+        tab.paint(
+            &painter,
+            TabView {
+                kind: TabKind::Working,
+                admin: false,
+                expanded: true,
+            },
+            &Settings {
+                palette: Palette::STANDARD,
+                text_scale: 1.0,
+                animated: false,
+            },
+            true,
+        )
+        .unwrap();
+        tab.present(255).unwrap();
+        let mut rect = windows::Win32::Foundation::RECT::default();
         // SAFETY: `rect` is writable for the synchronous call and the window is live.
-        unsafe { GetWindowRect(bar.window, &raw mut rect) }.unwrap();
+        unsafe { GetWindowRect(tab.hwnd, &raw mut rect) }.unwrap();
+        assert_eq!(
+            rect.top, monitor.top,
+            "the tab hangs from the display's top edge"
+        );
+        let mut affinity = 0_u32;
+        // SAFETY: `affinity` is writable for the synchronous call and the window is live.
+        unsafe { GetWindowDisplayAffinity(tab.hwnd, &raw mut affinity) }.unwrap();
+        assert_eq!(
+            affinity, WDA_EXCLUDEFROMCAPTURE.0,
+            "screenshots never show the tab"
+        );
         for point in [
             POINT {
-                x: rect.left + 1,
+                x: i32::midpoint(rect.left, rect.right),
                 y: rect.top + 1,
             },
             POINT {
@@ -581,11 +1239,11 @@ mod tests {
         ] {
             // SAFETY: `point` is a plain value and the returned HWND is only compared.
             let target = unsafe { WindowFromPoint(point) };
-            assert_ne!(target, bar.window);
-            // SAFETY: Same value-only hit test; the bar must also answer as transparent.
+            assert_ne!(target, tab.hwnd);
+            // SAFETY: Same value-only hit test; the tab must also answer as transparent.
             let hit = unsafe {
                 SendMessageW(
-                    bar.window,
+                    tab.hwnd,
                     WM_NCHITTEST,
                     Some(WPARAM(0)),
                     Some(LPARAM(
@@ -596,15 +1254,9 @@ mod tests {
             };
             assert_eq!(hit.0, isize::try_from(HTTRANSPARENT).unwrap());
         }
-        // SAFETY: Same live window; MA_NOACTIVATE keeps a physical click from focusing the bar.
-        let activate = unsafe {
-            SendMessageW(
-                bar.window,
-                WM_MOUSEACTIVATE,
-                Some(WPARAM(0)),
-                Some(LPARAM(0)),
-            )
-        };
+        // SAFETY: Same live window; MA_NOACTIVATE keeps a physical click from focusing the tab.
+        let activate =
+            unsafe { SendMessageW(tab.hwnd, WM_MOUSEACTIVATE, Some(WPARAM(0)), Some(LPARAM(0))) };
         assert_eq!(activate.0, isize::try_from(MA_NOACTIVATE).unwrap());
     }
 

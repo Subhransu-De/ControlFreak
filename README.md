@@ -52,7 +52,8 @@ See all 27 tools in the [tool reference](https://github.com/Subhransu-De/Control
 | Check the app it just built | Clicks through the app's window and takes a screenshot of each step. |
 | Work across monitors and desktops | Finds windows on every display and switches virtual desktops. |
 
-A blue glow around the screen shows when an agent is working.
+While an agent is in control, a turquoise line runs along the top of every display with a tab
+that says "An agent is using this PC". Press Esc to stop it.
 
 ## Install
 

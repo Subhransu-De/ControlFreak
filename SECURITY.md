@@ -72,9 +72,10 @@ Batched actions validate every step's arguments before the first step and rechec
 each step exactly as separate calls would.
 
 `get_server_status` and `--print-capabilities` report `server_elevated`, the Windows integrity level,
-and whether elevated operation was explicitly allowed. Elevated mutation sessions replace the
-standard blue glow and its bright core with red counterparts; all other indicator behavior and
-styling remains unchanged. The capture-excluded indicator runs as a native Rust helper
+and whether elevated operation was explicitly allowed. Elevated mutation sessions turn the
+turquoise lamp red and label the session tab "Administrator" in every state, including stopping
+and cleanup failure; in High Contrast the lamp is thicker instead of red. All other indicator
+behavior is unchanged. The capture-excluded lamp runs as a native Rust helper
 mode of the same executable, without launching PowerShell or materializing executable scripts. A
 per-helper Windows job object contains it when one can be created; if that fails the helper still
 starts with cooperative cleanup only, and `get_server_status` reports whether containment is active.
@@ -90,9 +91,13 @@ indicator helper lifecycle, helper stderr, and error text. That log carries no d
 
 ## User stop and cancellation
 
-A native navy session bar and physical Esc latch stop independently of MCP
-transport and provider progress. The bar is visible only while this server owns
-the desktop, including cleanup. A dedicated keyboard hook examines key identity
+A native session tab on every display and a physical Esc latch stop independently
+of MCP transport and provider progress. The tab is visible while this server owns
+the desktop, including cleanup, then says for 2.5 seconds that control was handed
+back. After a cleanup failure it stays, unchanged and with recovery steps,
+until the server exits. It never takes focus or receives clicks, follows
+the foreground virtual desktop, and is excluded from screen capture like the
+lamp. A dedicated keyboard hook examines key identity
 and injection flags only to recognize physical Esc. It retains no typed values
 or keyboard history, ignores injected Esc, and consumes the stop key's press and
 release. Esc outside an owned session is passed through. A user-stop notification

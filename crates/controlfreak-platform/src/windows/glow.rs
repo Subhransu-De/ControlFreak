@@ -1,10 +1,11 @@
 #![allow(unsafe_code)]
 
+//! The native helper that draws the control lamp: a steady line along the top edge of every
+//! display while a client owns the desktop. The server process draws the tab that hangs from it;
+//! both take their geometry and colour from [`super::indicator`].
+
 use std::{
-    ffi::c_void,
     io::{self, BufRead, BufWriter, Write},
-    mem::size_of,
-    ptr::NonNull,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -13,14 +14,7 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{
-            COLORREF, E_ACCESSDENIED, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT,
-            RPC_E_CHANGED_MODE, SIZE, WPARAM,
-        },
-        Graphics::Gdi::{
-            AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-            CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject,
-            EnumDisplayMonitors, GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFO,
-            SelectObject,
+            E_ACCESSDENIED, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RPC_E_CHANGED_MODE, WPARAM,
         },
         System::{
             Com::{
@@ -35,34 +29,28 @@ use windows::{
             WindowsAndMessaging::{
                 CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
                 DispatchMessageW, GetForegroundWindow, HTTRANSPARENT, HWND_TOPMOST, MA_NOACTIVATE,
-                MSG, PM_REMOVE, PeekMessageW, RegisterClassW, SPI_GETCLIENTAREAANIMATION, SW_HIDE,
-                SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowDisplayAffinity, SetWindowPos,
-                ShowWindow, SystemParametersInfoW, TranslateMessage, ULW_ALPHA,
-                UpdateLayeredWindow, WDA_EXCLUDEFROMCAPTURE, WM_MOUSEACTIVATE, WM_NCHITTEST,
+                MSG, PM_REMOVE, PeekMessageW, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
+                SWP_NOACTIVATE, SWP_SHOWWINDOW, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
+                TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WM_MOUSEACTIVATE, WM_NCHITTEST,
                 WNDCLASSW, WS_DISABLED, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
                 WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
             },
         },
     },
-    core::{BOOL, Error as WindowsError, GUID, w},
+    core::{Error as WindowsError, GUID, w},
+};
+
+use super::indicator::{
+    DibSurface, FADE_IN, FADE_IN_FROM, LampGeometry, LampTone, Monitor, Palette, Rgb,
+    animations_enabled, enumerate_monitors, lamp_color, lamp_geometry, warning_geometry,
 };
 
 const PROTOCOL_PREFIX: &str = "CFP/1";
-// Physical pixels: this helper is per-monitor DPI aware.
-const BAND_THICKNESS: i32 = 230;
-const GLOW_OPACITY: f64 = 0.42;
-const CORE_WIDTH: f64 = 0.39;
-const CORE_OPACITY: f64 = 0.26;
-const BREATHING_AMOUNT: f64 = 0.18;
-const BREATHING_SECONDS: f64 = 4.7;
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const TOPOLOGY_INTERVAL: Duration = Duration::from_millis(500);
 const MINIMUM_VISIBLE: Duration = Duration::from_millis(800);
-const FADE_IN: Duration = Duration::from_millis(250);
-const LEVEL_TRANSITION: Duration = Duration::from_millis(180);
-const FADE_OUT: Duration = Duration::from_millis(600);
-const INITIAL_VISIBLE_OPACITY: f64 = 0.18;
+const FADE_OUT: Duration = Duration::from_millis(250);
+const INITIAL_VISIBLE_OPACITY: f64 = FADE_IN_FROM as f64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HelperConfig {
@@ -115,7 +103,6 @@ pub(crate) fn run(config: HelperConfig) -> io::Result<()> {
     write_state(&mut output, config.generation, 0, "HIDDEN")?;
 
     let mut visual = VisualState::new();
-    let started = Instant::now();
     let mut next_frame = Instant::now();
     let mut next_topology = Instant::now() + TOPOLOGY_INTERVAL;
     let mut early = None;
@@ -136,7 +123,6 @@ pub(crate) fn run(config: HelperConfig) -> io::Result<()> {
                         &mut output,
                         &mut visual,
                         &mut renderer,
-                        started.elapsed().as_secs_f64(),
                     )? {
                         return Ok(());
                     }
@@ -168,11 +154,7 @@ pub(crate) fn run(config: HelperConfig) -> io::Result<()> {
         }
 
         if visual.visible && now >= next_frame {
-            renderer.render(
-                started.elapsed().as_secs_f64(),
-                visual.level,
-                visual.opacity(now),
-            )?;
+            renderer.render(visual.level, visual.opacity(now, renderer.animated))?;
             next_frame = now + FRAME_INTERVAL;
         }
 
@@ -248,19 +230,37 @@ impl Level {
     const fn elevated(self) -> bool {
         matches!(self, Self::ElevatedArmed | Self::ElevatedActing)
     }
+}
 
-    const fn acting(self) -> bool {
-        matches!(self, Self::Acting | Self::ElevatedActing)
+/// The lamp's message beyond the session itself. `Warning` is sent once the server knows input
+/// may still be held, and turns the lamp amber until the helper exits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tone {
+    Normal,
+    Warning,
+}
+
+impl Tone {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "NORMAL" => Some(Self::Normal),
+            "WARNING" => Some(Self::Warning),
+            _ => None,
+        }
     }
 
-    const fn target_opacity(self) -> f64 {
-        if self.acting() { 1.0 } else { 0.48 }
+    const fn state(self) -> &'static str {
+        match self {
+            Self::Normal => "TONE_NORMAL",
+            Self::Warning => "TONE_WARNING",
+        }
     }
 }
 
 #[derive(Clone, Copy)]
 enum ProtocolCommand {
     Level { sequence: u64, level: Level },
+    Tone { sequence: u64, tone: Tone },
     Ping { sequence: u64 },
     Hide { sequence: u64, shutdown: bool },
 }
@@ -287,6 +287,11 @@ fn parse_command(line: &str, expected_generation: u64) -> io::Result<Option<Prot
             level: Level::parse(fields[4]).ok_or_else(|| {
                 protocol_error("LEVEL requires a supported standard or elevated state")
             })?,
+        },
+        "TONE" if fields.len() == 5 => ProtocolCommand::Tone {
+            sequence,
+            tone: Tone::parse(fields[4])
+                .ok_or_else(|| protocol_error("TONE requires NORMAL or WARNING"))?,
         },
         "PING" if fields.len() == 4 => ProtocolCommand::Ping { sequence },
         "HIDE" if fields.len() == 4 => ProtocolCommand::Hide {
@@ -316,14 +321,24 @@ fn handle_command(
     output: &mut impl Write,
     visual: &mut VisualState,
     renderer: &mut Renderer,
-    seconds: f64,
 ) -> io::Result<bool> {
     match command {
         ProtocolCommand::Level { sequence, level } => {
             let now = Instant::now();
             visual.set_level(level, now);
-            renderer.present_level(seconds, level, visual.opacity(now))?;
+            renderer.present_level(level, visual.opacity(now, renderer.animated))?;
             write_state(output, generation, sequence, level.state())?;
+            Ok(false)
+        }
+        ProtocolCommand::Tone { sequence, tone } => {
+            renderer.tone = tone;
+            if visual.visible {
+                renderer.render(
+                    visual.level,
+                    visual.opacity(Instant::now(), renderer.animated),
+                )?;
+            }
+            write_state(output, generation, sequence, tone.state())?;
             Ok(false)
         }
         ProtocolCommand::Ping { sequence } => {
@@ -378,24 +393,28 @@ impl VisualState {
     }
 
     fn set_level(&mut self, level: Level, now: Instant) {
-        let current = self
-            .opacity(now)
-            .max(INITIAL_VISIBLE_OPACITY.min(level.target_opacity()));
-        let duration = if self.visible {
-            LEVEL_TRANSITION
-        } else {
+        // The lamp is equally strong while acting and while waiting; only the first level of a
+        // session fades it in.
+        let current = self.transition.value(now).max(INITIAL_VISIBLE_OPACITY);
+        if !self.visible {
             self.visible = true;
             self.visible_since = now;
-            FADE_IN
-        };
+            self.transition = Transition {
+                started: now,
+                duration: FADE_IN,
+                from: current,
+                to: 1.0,
+            };
+        } else if self.pending_hide.is_some() {
+            self.transition = Transition {
+                started: now,
+                duration: FADE_IN,
+                from: self.opacity(now, true).max(INITIAL_VISIBLE_OPACITY),
+                to: 1.0,
+            };
+        }
         self.level = level;
         self.pending_hide = None;
-        self.transition = Transition {
-            started: now,
-            duration,
-            from: current,
-            to: level.target_opacity(),
-        };
     }
 
     fn begin_hide(&mut self, sequence: u64, shutdown: bool, now: Instant) {
@@ -411,14 +430,23 @@ impl VisualState {
         });
     }
 
-    fn opacity(&self, now: Instant) -> f64 {
+    /// Lamp opacity. With Windows animations off, fades are skipped: the lamp is either fully on
+    /// or, once a hide has begun, off.
+    fn opacity(&self, now: Instant, animated: bool) -> f64 {
         if let Some(hide) = self.pending_hide.as_ref()
             && now >= hide.fade_start
         {
+            if !animated {
+                return 0.0;
+            }
             let progress = duration_fraction(now - hide.fade_start, FADE_OUT);
             return hide.from * (1.0 - smooth(progress));
         }
-        self.transition.value(now)
+        if animated {
+            self.transition.value(now)
+        } else {
+            self.transition.to
+        }
     }
 
     fn take_completed_hide(&mut self, now: Instant) -> Option<HideCompletion> {
@@ -491,11 +519,13 @@ fn smooth(value: f64) -> f64 {
 struct Renderer {
     manager: IVirtualDesktopManager,
     desktop_id: Option<GUID>,
-    monitors: Vec<MonitorRect>,
-    windows: Vec<LayerWindow>,
+    monitors: Vec<Monitor>,
+    windows: Vec<LampWindow>,
     visible: bool,
     /// Mirrors the Windows "Show animations" setting; re-read on every topology poll.
     animated: bool,
+    palette: Palette,
+    tone: Tone,
 }
 
 impl Renderer {
@@ -506,27 +536,35 @@ impl Renderer {
             monitors: Vec::new(),
             windows: Vec::new(),
             visible: false,
-            animated: client_area_animation_enabled(),
+            animated: animations_enabled(),
+            palette: Palette::system(),
+            tone: Tone::Normal,
         };
         renderer.sync_topology(false)?;
         Ok(renderer)
     }
 
     fn sync_topology(&mut self, require_foreground: bool) -> io::Result<()> {
-        self.animated = client_area_animation_enabled();
+        self.animated = animations_enabled();
+        self.palette = Palette::system();
         let monitors = enumerate_monitors()?;
         if monitors != self.monitors {
-            let mut replacement = Vec::with_capacity(monitors.len() * 4);
+            let mut replacement = Vec::with_capacity(monitors.len());
             for monitor in monitors.iter().copied() {
-                for side in Side::ALL {
-                    replacement.push(LayerWindow::create(monitor, side)?);
-                }
+                replacement.push(LampWindow::create(monitor)?);
             }
             self.windows = replacement;
             self.monitors = monitors;
             self.desktop_id = None;
         }
-        if self.follow_foreground_desktop()? || !require_foreground {
+        let followed = self.follow_foreground_desktop()?;
+        // Keep a visible lamp above windows that became topmost after it.
+        if self.visible {
+            for window in &self.windows {
+                window.position(true)?;
+            }
+        }
+        if followed || !require_foreground {
             Ok(())
         } else {
             Err(io::Error::new(
@@ -565,7 +603,7 @@ impl Renderer {
 
     fn set_visible(&mut self, visible: bool) -> io::Result<()> {
         self.visible = visible;
-        for window in &self.windows {
+        for window in &mut self.windows {
             if visible {
                 window.position(true)?;
                 // SAFETY: The helper owns this HWND and requests a non-activating visibility change.
@@ -573,102 +611,113 @@ impl Renderer {
             } else {
                 // SAFETY: The helper owns this HWND and hiding it retains no Rust references.
                 let _ = unsafe { ShowWindow(window.hwnd, SW_HIDE) };
+                window.shown = None;
             }
         }
         Ok(())
     }
 
-    fn present_level(&mut self, seconds: f64, level: Level, opacity: f64) -> io::Result<()> {
+    fn present_level(&mut self, level: Level, opacity: f64) -> io::Result<()> {
         // A LEVEL acknowledgement authorizes the parent to mutate input, so first make sure the
-        // overlay is on the current foreground desktop and has a non-transparent rendered frame.
+        // lamp is on the current foreground desktop and has a non-transparent rendered frame.
         self.sync_topology(true)?;
-        self.render(seconds, level, opacity)?;
+        self.render(level, opacity)?;
         self.set_visible(true)
     }
 
-    fn render(&mut self, seconds: f64, level: Level, opacity: f64) -> io::Result<()> {
-        let opacity = (opacity * breathing_opacity(seconds, self.animated)).clamp(0.0, 1.0);
+    fn render(&mut self, level: Level, opacity: f64) -> io::Result<()> {
+        let tone = match self.tone {
+            Tone::Warning => LampTone::Warning,
+            Tone::Normal => LampTone::Session {
+                admin: level.elevated(),
+            },
+        };
+        let frame = LampFrame {
+            color: lamp_color(tone, &self.palette),
+            surface: self.palette.surface,
+            alpha: opacity_byte(opacity),
+            high_contrast: self.palette.high_contrast,
+            admin: level.elevated(),
+            warning: self.tone == Tone::Warning,
+        };
         for window in &mut self.windows {
-            window.render(level, opacity)?;
+            window.render(frame)?;
         }
         Ok(())
     }
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn opacity_byte(opacity: f64) -> u8 {
+    // Clamped to 0..=255 first, so the conversion is exact.
+    (opacity.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// Everything one lamp frame depends on; a window repaints only when this changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct MonitorRect {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
+struct LampFrame {
+    color: Rgb,
+    surface: Rgb,
+    alpha: u8,
+    high_contrast: bool,
+    admin: bool,
+    warning: bool,
 }
 
-impl MonitorRect {
-    const fn width(self) -> i32 {
-        self.right - self.left
-    }
-
-    const fn height(self) -> i32 {
-        self.bottom - self.top
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Side {
-    Left,
-    Right,
-    Top,
-    Bottom,
-}
-
-impl Side {
-    const ALL: [Self; 4] = [Self::Left, Self::Right, Self::Top, Self::Bottom];
-
-    const fn band_rect(self, monitor: MonitorRect) -> MonitorRect {
-        let thickness = if matches!(self, Self::Left | Self::Right) {
-            if monitor.width() < BAND_THICKNESS {
-                monitor.width()
-            } else {
-                BAND_THICKNESS
-            }
-        } else if monitor.height() < BAND_THICKNESS {
-            monitor.height()
+impl LampFrame {
+    /// The shared geometry for this frame: the double warning rule, or the session lamp.
+    fn geometry(self, dpi: u32) -> LampGeometry {
+        if self.warning {
+            warning_geometry(dpi)
         } else {
-            BAND_THICKNESS
-        };
-        match self {
-            Self::Left => MonitorRect {
-                right: monitor.left + thickness,
-                ..monitor
-            },
-            Self::Right => MonitorRect {
-                left: monitor.right - thickness,
-                ..monitor
-            },
-            Self::Top => MonitorRect {
-                bottom: monitor.top + thickness,
-                ..monitor
-            },
-            Self::Bottom => MonitorRect {
-                top: monitor.bottom - thickness,
-                ..monitor
-            },
+            lamp_geometry(dpi, self.high_contrast, self.admin)
         }
     }
 }
 
-struct LayerWindow {
-    hwnd: HWND,
-    bounds: MonitorRect,
-    side: Side,
-    surface: DibSurface,
+/// Bounds of a monitor's lamp: the full width of its top edge, as tall as the shared geometry.
+fn lamp_bounds(monitor: Monitor, geometry: LampGeometry) -> (POINT, i32, i32) {
+    let height = geometry.height().min(monitor.height());
+    (
+        POINT {
+            x: monitor.left,
+            y: monitor.top,
+        },
+        monitor.width(),
+        height,
+    )
 }
 
-impl LayerWindow {
-    fn create(monitor: MonitorRect, side: Side) -> io::Result<Self> {
-        let bounds = side.band_rect(monitor);
-        let width = bounds.width();
-        let height = bounds.height();
+/// Fills a lamp raster: lit lamp rows in the lamp colour, unlit rows and the keyline below in the
+/// opaque surface colour, all scaled by `alpha` and premultiplied.
+fn render_lamp(pixels: &mut [u32], width: usize, geometry: LampGeometry, frame: LampFrame) {
+    for (row, line) in pixels.chunks_exact_mut(width).enumerate() {
+        let color = if geometry.lit(i32::try_from(row).unwrap_or(i32::MAX)) {
+            frame.color
+        } else {
+            frame.surface
+        };
+        line.fill(premultiplied(color, frame.alpha));
+    }
+}
+
+fn premultiplied(color: Rgb, alpha: u8) -> u32 {
+    let scale = |channel: u8| (u32::from(channel) * u32::from(alpha) + 127) / 255;
+    (u32::from(alpha) << 24) | (scale(color.0) << 16) | (scale(color.1) << 8) | scale(color.2)
+}
+
+struct LampWindow {
+    hwnd: HWND,
+    monitor: Monitor,
+    geometry: Option<LampGeometry>,
+    surface: Option<DibSurface>,
+    shown: Option<LampFrame>,
+}
+
+impl LampWindow {
+    fn create(monitor: Monitor) -> io::Result<Self> {
+        let geometry = lamp_geometry(monitor.dpi, false, false);
+        let (origin, width, height) = lamp_bounds(monitor, geometry);
         // SAFETY: A null module name requests the current process module without borrowed pointers.
         let module = unsafe { GetModuleHandleW(None) }
             .map_err(|error| windows_error("GetModuleHandleW", &error))?;
@@ -687,8 +736,8 @@ impl LayerWindow {
                 // overlay disabled ensures point-integrity checks resolve the application beneath
                 // it instead of this same-integrity helper process.
                 WS_POPUP | WS_DISABLED,
-                bounds.left,
-                bounds.top,
+                origin.x,
+                origin.y,
                 width,
                 height,
                 None,
@@ -704,22 +753,23 @@ impl LayerWindow {
             let _ = unsafe { DestroyWindow(hwnd) };
             return Err(windows_error("SetWindowDisplayAffinity", &error));
         }
-        let surface = match DibSurface::create(width, height) {
-            Ok(surface) => surface,
-            Err(error) => {
-                // SAFETY: Window creation succeeded and ownership has not escaped this function.
-                let _ = unsafe { DestroyWindow(hwnd) };
-                return Err(error);
-            }
-        };
         let window = Self {
             hwnd,
-            bounds,
-            side,
-            surface,
+            monitor,
+            geometry: None,
+            surface: None,
+            shown: None,
         };
         window.position(false)?;
         Ok(window)
+    }
+
+    fn bounds(&self) -> (POINT, i32, i32) {
+        lamp_bounds(
+            self.monitor,
+            self.geometry
+                .unwrap_or_else(|| lamp_geometry(self.monitor.dpi, false, false)),
+        )
     }
 
     fn position(&self, show: bool) -> io::Result<()> {
@@ -728,408 +778,50 @@ impl LayerWindow {
         } else {
             SWP_NOACTIVATE
         };
+        let (origin, width, height) = self.bounds();
         // SAFETY: This helper owns `hwnd`; all dimensions are validated monitor bounds.
         unsafe {
             SetWindowPos(
                 self.hwnd,
                 Some(HWND_TOPMOST),
-                self.bounds.left,
-                self.bounds.top,
-                self.bounds.width(),
-                self.bounds.height(),
+                origin.x,
+                origin.y,
+                width,
+                height,
                 flags,
             )
         }
         .map_err(|error| windows_error("SetWindowPos", &error))
     }
 
-    fn render(&mut self, level: Level, opacity: f64) -> io::Result<()> {
-        let width = self.surface.width;
-        let height = self.surface.height;
-        render_glow(
-            self.surface.pixels(),
-            width,
-            height,
-            self.side,
-            level,
-            opacity,
-        );
-        self.surface.present(self.hwnd, self.bounds)
+    fn render(&mut self, frame: LampFrame) -> io::Result<()> {
+        if self.shown == Some(frame) {
+            return Ok(());
+        }
+        let geometry = frame.geometry(self.monitor.dpi);
+        if self.geometry != Some(geometry) || self.surface.is_none() {
+            let (_, width, height) = lamp_bounds(self.monitor, geometry);
+            self.surface = Some(DibSurface::create(width, height)?);
+            self.geometry = Some(geometry);
+        }
+        let surface = self
+            .surface
+            .as_mut()
+            .ok_or_else(|| io::Error::other("lamp surface was not created"))?;
+        let width = surface.width;
+        render_lamp(surface.pixels(), width, geometry, frame);
+        let (origin, _, _) = lamp_bounds(self.monitor, geometry);
+        surface.present(self.hwnd, origin, 255)?;
+        self.shown = Some(frame);
+        Ok(())
     }
 }
 
-impl Drop for LayerWindow {
+impl Drop for LampWindow {
     fn drop(&mut self) {
         // SAFETY: `hwnd` is owned by this value and is destroyed exactly once during Drop.
         let _ = unsafe { DestroyWindow(self.hwnd) };
     }
-}
-
-struct DibSurface {
-    dc: HDC,
-    bitmap: HBITMAP,
-    previous: HGDIOBJ,
-    bits: NonNull<u32>,
-    width: usize,
-    height: usize,
-}
-
-impl DibSurface {
-    fn create(width: i32, height: i32) -> io::Result<Self> {
-        if width <= 0 || height <= 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "desktop glow window dimensions must be positive",
-            ));
-        }
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: u32::try_from(size_of::<BITMAPINFOHEADER>()).unwrap_or(u32::MAX),
-                biWidth: width,
-                biHeight: -height,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut raw_bits = std::ptr::null_mut::<c_void>();
-        // SAFETY: `info` and the writable pixel-pointer output remain valid for this synchronous
-        // call. The returned bitmap and its storage are owned by this surface.
-        let bitmap = unsafe {
-            CreateDIBSection(
-                None,
-                &raw const info,
-                DIB_RGB_COLORS,
-                &raw mut raw_bits,
-                None,
-                0,
-            )
-        }
-        .map_err(|error| windows_error("CreateDIBSection", &error))?;
-        let bits = NonNull::new(raw_bits.cast::<u32>()).ok_or_else(|| {
-            // SAFETY: CreateDIBSection returned this owned bitmap, but no pixel storage, so it has
-            // not been selected and can be released immediately.
-            let _ = unsafe { DeleteObject(bitmap.into()) };
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "CreateDIBSection returned no pixel storage",
-            )
-        })?;
-        // SAFETY: A null compatible DC creates a process-owned memory DC.
-        let dc = unsafe { CreateCompatibleDC(None) };
-        if dc.is_invalid() {
-            // SAFETY: `bitmap` is owned here and was never selected into a DC.
-            let _ = unsafe { DeleteObject(bitmap.into()) };
-            return Err(last_windows_error("CreateCompatibleDC"));
-        }
-        // SAFETY: Both the memory DC and compatible bitmap are live and owned here.
-        let previous = unsafe { SelectObject(dc, bitmap.into()) };
-        if previous.is_invalid() {
-            // SAFETY: Selection failed, so both independently owned GDI resources can be deleted.
-            unsafe {
-                let _ = DeleteDC(dc);
-                let _ = DeleteObject(bitmap.into());
-            }
-            return Err(last_windows_error("SelectObject"));
-        }
-        Ok(Self {
-            dc,
-            bitmap,
-            previous,
-            bits,
-            width: usize::try_from(width).unwrap_or(0),
-            height: usize::try_from(height).unwrap_or(0),
-        })
-    }
-
-    fn pixels(&mut self) -> &mut [u32] {
-        let len = self.width.saturating_mul(self.height);
-        // SAFETY: CreateDIBSection allocated exactly width*height 32-bit pixels. The mutable borrow
-        // of the surface guarantees exclusive access for the returned slice lifetime.
-        unsafe { std::slice::from_raw_parts_mut(self.bits.as_ptr(), len) }
-    }
-
-    fn present(&self, hwnd: HWND, bounds: MonitorRect) -> io::Result<()> {
-        let destination = POINT {
-            x: bounds.left,
-            y: bounds.top,
-        };
-        let size = SIZE {
-            cx: bounds.width(),
-            cy: bounds.height(),
-        };
-        let source = POINT::default();
-        let blend = BLENDFUNCTION {
-            BlendOp: u8::try_from(AC_SRC_OVER).unwrap_or(0),
-            BlendFlags: 0,
-            SourceConstantAlpha: 255,
-            AlphaFormat: u8::try_from(AC_SRC_ALPHA).unwrap_or(1),
-        };
-        // SAFETY: The helper owns the HWND, memory DC, selected DIB, and all parameter structures;
-        // the synchronous call retains none of their pointers.
-        unsafe {
-            UpdateLayeredWindow(
-                hwnd,
-                None,
-                Some(&raw const destination),
-                Some(&raw const size),
-                Some(self.dc),
-                Some(&raw const source),
-                COLORREF(0),
-                Some(&raw const blend),
-                ULW_ALPHA,
-            )
-        }
-        .map_err(|error| windows_error("UpdateLayeredWindow", &error))
-    }
-}
-
-impl Drop for DibSurface {
-    fn drop(&mut self) {
-        // SAFETY: These resources are owned by this surface. Restoring the previous selection
-        // makes the bitmap deletable before the memory DC is released, each exactly once.
-        unsafe {
-            SelectObject(self.dc, self.previous);
-            let _ = DeleteObject(self.bitmap.into());
-            let _ = DeleteDC(self.dc);
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Color {
-    red: u8,
-    green: u8,
-    blue: u8,
-}
-
-impl Color {
-    const fn new(red: u8, green: u8, blue: u8) -> Self {
-        Self { red, green, blue }
-    }
-}
-
-const BLUE_GLOW: Color = Color::new(0x26, 0x7d, 0xff);
-const BLUE_CORE: Color = Color::new(0x9a, 0xdb, 0xff);
-const RED_GLOW: Color = Color::new(0xee, 0x30, 0x41);
-const RED_CORE: Color = Color::new(0xff, 0xa9, 0xa3);
-
-// Linear stop interpolation matches the continuous edge fade, without particles or a hard line.
-const GLOW_STOPS: [(f64, f64); 7] = [
-    (0.0, 0.98),
-    (0.10, 0.96),
-    (0.25, 0.86),
-    (0.45, 0.60),
-    (0.65, 0.30),
-    (0.82, 0.09),
-    (1.0, 0.0),
-];
-const CORE_STOPS: [(f64, f64); 3] = [
-    (0.0, CORE_OPACITY),
-    (0.35, CORE_OPACITY * (0.26 / 0.72)),
-    (1.0, 0.0),
-];
-
-/// Glow strength at `seconds`. With Windows animation effects off the glow holds the midpoint of
-/// its breathing range instead of oscillating; level changes still fade through `VisualState`.
-fn breathing_opacity(seconds: f64, animated: bool) -> f64 {
-    if !animated {
-        return GLOW_OPACITY * (1.0 - BREATHING_AMOUNT);
-    }
-    GLOW_OPACITY
-        * (1.0 - BREATHING_AMOUNT
-            + BREATHING_AMOUNT * (seconds * std::f64::consts::TAU / BREATHING_SECONDS).sin())
-}
-
-/// Reads the per-user "Show animations in Windows" setting. Keeps the animated default if the
-/// query fails, so an unreadable setting never changes the indicator unexpectedly.
-fn client_area_animation_enabled() -> bool {
-    let mut enabled = BOOL(1);
-    // SAFETY: For SPI_GETCLIENTAREAANIMATION, pvParam must point to a writable BOOL that outlives
-    // this synchronous call; `enabled` is such a local and is not retained.
-    let result = unsafe {
-        SystemParametersInfoW(
-            SPI_GETCLIENTAREAANIMATION,
-            0,
-            Some((&raw mut enabled).cast::<c_void>()),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        )
-    };
-    result.is_err() || enabled.as_bool()
-}
-
-fn gradient_alpha(position: f64, stops: &[(f64, f64)]) -> f64 {
-    for pair in stops.windows(2) {
-        let [(start, from), (end, to)] = [pair[0], pair[1]];
-        if position <= end {
-            let progress = ((position - start) / (end - start)).clamp(0.0, 1.0);
-            return from + (to - from) * progress;
-        }
-    }
-    0.0
-}
-
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn glow_pixel(distance: f64, level: Level, opacity: f64) -> u32 {
-    let (glow, core) = if level.elevated() {
-        (RED_GLOW, RED_CORE)
-    } else {
-        (BLUE_GLOW, BLUE_CORE)
-    };
-    let position = distance / f64::from(BAND_THICKNESS);
-    let mut pixel = 0;
-    for (color, alpha) in [
-        (glow, gradient_alpha(position, &GLOW_STOPS)),
-        (core, gradient_alpha(position / CORE_WIDTH, &CORE_STOPS)),
-    ] {
-        // Rounded, bounded alpha is the only float-to-integer conversion in the renderer.
-        let alpha = (alpha * opacity * 255.0).round().clamp(0.0, 255.0) as u8;
-        blend_pixel(&mut pixel, color, alpha);
-    }
-    pixel
-}
-
-fn render_glow(
-    pixels: &mut [u32],
-    width: usize,
-    height: usize,
-    side: Side,
-    level: Level,
-    opacity: f64,
-) {
-    // The gradient is uniform along each edge. Compute at most 230 colors per frame, then
-    // copy/fill rows instead of evaluating a gradient for every display pixel. No frame allocation.
-    let mut ramp = [0_u32; BAND_THICKNESS as usize];
-    let thickness = if matches!(side, Side::Left | Side::Right) {
-        width
-    } else {
-        height
-    };
-    for (index, pixel) in ramp[..thickness].iter_mut().enumerate() {
-        let distance = if matches!(side, Side::Right | Side::Bottom) {
-            thickness - 1 - index
-        } else {
-            index
-        };
-        *pixel = glow_pixel(
-            f64::from(u32::try_from(distance).unwrap_or(u32::MAX)) + 0.5,
-            level,
-            opacity,
-        );
-    }
-    for (y, row) in pixels.chunks_exact_mut(width).enumerate() {
-        if matches!(side, Side::Left | Side::Right) {
-            row.copy_from_slice(&ramp[..width]);
-        } else {
-            row.fill(ramp[y]);
-        }
-    }
-}
-
-fn blend_pixel(destination: &mut u32, color: Color, alpha: u8) {
-    let source_alpha = u32::from(alpha);
-    let inverse = 255 - source_alpha;
-    let destination_alpha = (*destination >> 24) & 0xff;
-    let destination_red = (*destination >> 16) & 0xff;
-    let destination_green = (*destination >> 8) & 0xff;
-    let destination_blue = *destination & 0xff;
-    let source_red = u32::from(color.red) * source_alpha / 255;
-    let source_green = u32::from(color.green) * source_alpha / 255;
-    let source_blue = u32::from(color.blue) * source_alpha / 255;
-    let output_alpha = source_alpha + destination_alpha * inverse / 255;
-    let output_red = source_red + destination_red * inverse / 255;
-    let output_green = source_green + destination_green * inverse / 255;
-    let output_blue = source_blue + destination_blue * inverse / 255;
-    *destination = (output_alpha << 24) | (output_red << 16) | (output_green << 8) | output_blue;
-}
-
-#[derive(Default)]
-struct MonitorEnumeration {
-    monitors: Vec<MonitorRect>,
-    error: Option<String>,
-}
-
-unsafe extern "system" fn monitor_callback(
-    monitor: HMONITOR,
-    _dc: HDC,
-    _rect: *mut RECT,
-    data: LPARAM,
-) -> BOOL {
-    // SAFETY: `data` points to the uniquely borrowed enumeration supplied to the synchronous
-    // EnumDisplayMonitors call and remains live throughout this callback.
-    let enumeration = unsafe { &mut *(data.0 as *mut MonitorEnumeration) };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| monitor_rect(monitor)));
-    match result {
-        Ok(Ok(rect)) => {
-            enumeration.monitors.push(rect);
-            BOOL(1)
-        }
-        Ok(Err(error)) => {
-            enumeration.error = Some(error.to_string());
-            BOOL(0)
-        }
-        Err(_) => {
-            enumeration.error = Some("monitor enumeration callback panicked".to_owned());
-            BOOL(0)
-        }
-    }
-}
-
-fn enumerate_monitors() -> io::Result<Vec<MonitorRect>> {
-    let mut enumeration = MonitorEnumeration::default();
-    // SAFETY: The LPARAM points to `enumeration`, which is uniquely borrowed and remains alive for
-    // the complete synchronous enumeration; the callback catches panics across the FFI boundary.
-    let succeeded = unsafe {
-        EnumDisplayMonitors(
-            None,
-            None,
-            Some(monitor_callback),
-            LPARAM((&raw mut enumeration).cast::<c_void>() as isize),
-        )
-    };
-    if !succeeded.as_bool() {
-        return Err(io::Error::other(
-            enumeration
-                .error
-                .unwrap_or_else(|| WindowsError::from_thread().to_string()),
-        ));
-    }
-    if enumeration.monitors.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "Windows reported no active monitors for the desktop glow",
-        ));
-    }
-    enumeration
-        .monitors
-        .sort_by_key(|monitor| (monitor.left, monitor.top, monitor.right, monitor.bottom));
-    Ok(enumeration.monitors)
-}
-
-fn monitor_rect(monitor: HMONITOR) -> io::Result<MonitorRect> {
-    let mut info = MONITORINFO {
-        cbSize: u32::try_from(size_of::<MONITORINFO>()).unwrap_or(u32::MAX),
-        ..Default::default()
-    };
-    // SAFETY: `info` is correctly sized writable storage and `monitor` came from enumeration.
-    if !unsafe { GetMonitorInfoW(monitor, &raw mut info) }.as_bool() {
-        return Err(last_windows_error("GetMonitorInfoW"));
-    }
-    let rect = MonitorRect {
-        left: info.rcMonitor.left,
-        top: info.rcMonitor.top,
-        right: info.rcMonitor.right,
-        bottom: info.rcMonitor.bottom,
-    };
-    if rect.width() <= 0 || rect.height() <= 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Windows reported invalid monitor bounds for the desktop glow",
-        ));
-    }
-    Ok(rect)
 }
 
 fn ensure_dpi_awareness() -> io::Result<()> {
@@ -1229,8 +921,20 @@ fn last_windows_error(context: &str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use super::super::indicator::{ADMIN_RED, AMBER, Painter, TURQUOISE, TabKind, TabView};
     use super::*;
-    use windows::Win32::UI::WindowsAndMessaging::WindowFromPoint;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowDisplayAffinity, WindowFromPoint};
+
+    fn frame(color: Rgb, alpha: u8, admin: bool) -> LampFrame {
+        LampFrame {
+            color,
+            surface: Palette::STANDARD.surface,
+            alpha,
+            high_contrast: false,
+            admin,
+            warning: false,
+        }
+    }
 
     #[test]
     fn private_helper_arguments_are_correlated() {
@@ -1256,189 +960,120 @@ mod tests {
                 ..
             })
         ));
+        assert!(matches!(
+            parse_command("CFP/1 42 2 TONE WARNING", 42).unwrap(),
+            Some(ProtocolCommand::Tone {
+                tone: Tone::Warning,
+                ..
+            })
+        ));
+        assert!(parse_command("CFP/1 42 3 TONE LOUD", 42).is_err());
         assert!(parse_command("CFP/1 42 1 EXPLODE", 42).is_err());
     }
 
     #[test]
-    fn premultiplied_blending_preserves_transparency() {
-        let mut pixel = 0_u32;
-        blend_pixel(&mut pixel, Color::new(200, 40, 40), 128);
-        assert_eq!(pixel >> 24, 128);
-        assert_eq!((pixel >> 16) & 0xff, 100);
-    }
-
-    #[test]
-    fn glow_fades_smoothly_to_transparent_without_a_hard_inner_edge() {
-        for level in [Level::Acting, Level::ElevatedActing] {
-            let alpha: Vec<_> = (0..=230)
-                .map(|distance| glow_pixel(f64::from(distance), level, 0.42) >> 24)
-                .collect();
-            assert!(alpha[0] > 100, "outer edge remains visible");
-            assert!(alpha[90] > alpha[180]);
-            assert!(alpha.windows(2).all(|pair| pair[0] >= pair[1]));
-            assert!(alpha.windows(2).all(|pair| pair[0] - pair[1] <= 3));
-            assert_eq!(alpha[230], 0);
-            assert_eq!(glow_pixel(300.0, level, 0.42), 0);
-            assert_eq!(glow_pixel(0.0, level, 0.0), 0);
+    fn lamp_raster_is_opaque_lamp_rows_over_a_surface_keyline() {
+        let geometry = lamp_geometry(144, false, false);
+        let width = 7;
+        let mut pixels = vec![0_u32; width * usize::try_from(geometry.height()).unwrap()];
+        render_lamp(&mut pixels, width, geometry, frame(TURQUOISE, 255, false));
+        let rows: Vec<&[u32]> = pixels.chunks_exact(width).collect();
+        assert_eq!(rows.len(), 8, "6 lamp rows and a 2 pixel keyline at 150%");
+        for (index, row) in rows.iter().enumerate() {
+            assert!(row.iter().all(|pixel| *pixel == row[0]), "uniform row");
+            let expected = if index < 6 { 0xff38_d6c4 } else { 0xff20_2123 };
+            assert_eq!(row[0], expected, "row {index}");
         }
     }
 
     #[test]
-    fn glow_layers_match_reference_source_over_colors() {
-        // Independently calculated float source-over reference for the two outer-edge layers:
-        // base alpha .98*.42, core alpha .26*.42, then premultiply. Integer blending may round.
-        for (level, expected) in [
-            (Level::Acting, [121_u32, 31, 70, 121]),
-            (Level::ElevatedActing, [121_u32, 115, 36, 42]),
+    fn the_warning_lamp_is_a_double_rule_at_every_scale() {
+        for (dpi, expected) in [
+            (96, "###..###"),
+            (120, "####..####"),
+            (144, "#####..#####"),
+            (192, "######....######"),
         ] {
-            let pixel = glow_pixel(0.0, level, 0.42);
-            for (shift, expected) in [24, 16, 8, 0].into_iter().zip(expected) {
-                assert!(((pixel >> shift) & 255).abs_diff(expected) <= 2);
+            let geometry = warning_geometry(dpi);
+            let pattern: String = (0..geometry.lamp)
+                .map(|row| if geometry.lit(row) { '#' } else { '.' })
+                .collect();
+            assert_eq!(pattern, expected, "{dpi} DPI");
+            assert!(!geometry.lit(geometry.lamp), "the keyline is never lit");
+        }
+        let solid = lamp_geometry(96, false, false);
+        assert!((0..solid.lamp).all(|row| solid.lit(row)));
+    }
+
+    #[test]
+    fn faded_lamp_stays_premultiplied_and_clears_completely() {
+        for color in [TURQUOISE, ADMIN_RED, AMBER] {
+            let pixel = premultiplied(color, 128);
+            assert_eq!(pixel >> 24, 128);
+            for shift in [16, 8, 0] {
+                assert!((pixel >> shift) & 0xff <= 128);
             }
-            for distance in 0..230 {
-                let pixel = glow_pixel(f64::from(distance), level, 0.42);
-                let alpha = pixel >> 24;
-                for shift in [16, 8, 0] {
-                    assert!((pixel >> shift) & 255 <= alpha);
-                }
-            }
+            assert_eq!(premultiplied(color, 0), 0);
         }
     }
 
     #[test]
-    fn breathing_and_armed_strength_match_the_profile() {
-        let peak = breathing_opacity(4.7 / 4.0, true);
-        let trough = breathing_opacity(4.7 * 3.0 / 4.0, true);
-        assert!((peak - 0.42).abs() < 1e-12);
-        assert!((trough - 0.42 * 0.64).abs() < 1e-12);
-        assert!((breathing_opacity(4.7, true) - breathing_opacity(0.0, true)).abs() < 1e-12);
-        for level in [Level::Armed, Level::ElevatedArmed] {
-            assert!((level.target_opacity() - 0.48).abs() < 1e-12);
-            let pixel = glow_pixel(0.0, level, peak * level.target_opacity());
-            assert!(pixel >> 24 > 0);
-            assert!(pixel >> 24 < glow_pixel(0.0, Level::Acting, peak) >> 24);
-        }
-    }
-
-    #[test]
-    fn disabled_animation_holds_a_steady_midpoint_opacity() {
-        let steady = breathing_opacity(0.0, false);
-        assert!((steady - 0.42 * (1.0 - 0.18)).abs() < 1e-12);
-        for step in 0..=94 {
-            let seconds = f64::from(step) / 20.0;
-            assert!((breathing_opacity(seconds, false) - steady).abs() < 1e-12);
-        }
-        assert!(steady > breathing_opacity(4.7 * 3.0 / 4.0, true));
-        assert!(steady < breathing_opacity(4.7 / 4.0, true));
-    }
-
-    #[test]
-    fn level_changes_still_fade_when_animation_is_off() {
-        let mut visual = VisualState::new();
-        let started = Instant::now();
-        visual.set_level(Level::Armed, started);
-        let settled = started + FADE_IN;
-        visual.set_level(Level::Acting, settled);
-        let before = visual.opacity(settled);
-        let during = visual.opacity(settled + LEVEL_TRANSITION / 2);
-        let after = visual.opacity(settled + LEVEL_TRANSITION);
-        assert!(before < during && during < after);
-        assert!((after - Level::Acting.target_opacity()).abs() < 1e-12);
-    }
-
-    #[test]
-    fn edge_rasters_are_uniform_and_mirrored_in_physical_pixels() {
-        for (width, height) in [(230, 480), (230, 2160), (1, 1), (17, 40)] {
-            let mut left = vec![0; width * height];
-            let mut right = left.clone();
-            render_glow(&mut left, width, height, Side::Left, Level::Acting, 0.42);
-            render_glow(&mut right, width, height, Side::Right, Level::Acting, 0.42);
-            for (a, b) in left.chunks_exact(width).zip(right.chunks_exact(width)) {
-                assert_eq!(a, &left[..width]);
-                assert!(a.iter().eq(b.iter().rev()));
-            }
-        }
-        for (width, height) in [(1920, 230), (3840, 230), (1, 1), (40, 17)] {
-            let mut top = vec![0; width * height];
-            let mut bottom = top.clone();
-            render_glow(&mut top, width, height, Side::Top, Level::Acting, 0.42);
-            render_glow(
-                &mut bottom,
-                width,
-                height,
-                Side::Bottom,
-                Level::Acting,
-                0.42,
-            );
-            for (a, b) in top
-                .chunks_exact(width)
-                .zip(bottom.chunks_exact(width).rev())
-            {
-                assert!(a.iter().all(|pixel| *pixel == a[0]));
-                assert_eq!(a, b);
-            }
-            render_glow(&mut top, width, height, Side::Top, Level::Armed, 0.0);
-            assert!(
-                top.iter().all(|pixel| *pixel == 0),
-                "no stale glow after fade"
-            );
-        }
-    }
-
-    #[test]
-    fn bands_stay_on_negative_origin_and_small_displays() {
-        let monitor = MonitorRect {
+    fn lamps_cover_each_top_edge_at_negative_origins_and_small_displays() {
+        let monitor = Monitor {
             left: -1920,
             top: -300,
             right: 0,
             bottom: 780,
+            dpi: 120,
         };
-        assert_eq!(Side::Left.band_rect(monitor).right, -1690);
-        assert_eq!(Side::Right.band_rect(monitor).left, -230);
-        assert_eq!(Side::Top.band_rect(monitor).bottom, -70);
-        assert_eq!(Side::Bottom.band_rect(monitor).top, 550);
-        let tiny = MonitorRect {
+        let (origin, width, height) = lamp_bounds(monitor, lamp_geometry(120, false, false));
+        assert_eq!((origin.x, origin.y, width, height), (-1920, -300, 1920, 6));
+        let tiny = Monitor {
             left: -30,
             top: -10,
             right: 50,
-            bottom: 90,
+            bottom: -6,
+            dpi: 96,
         };
-        for side in Side::ALL {
-            assert_eq!(side.band_rect(tiny), tiny);
-        }
+        let (_, width, height) = lamp_bounds(tiny, lamp_geometry(96, false, false));
+        assert_eq!((width, height), (80, 4), "never taller than the display");
     }
 
     #[test]
-    #[ignore = "synthetic CPU raster timing; excludes native window presentation"]
-    fn benchmark_two_4k_display_glow_rasters() {
-        let mut frames: Vec<_> = (0..2)
-            .flat_map(|_| Side::ALL)
-            .map(|side| {
-                let (width, height) = if matches!(side, Side::Left | Side::Right) {
-                    (230, 2160)
-                } else {
-                    (3840, 230)
-                };
-                (side, width, height, vec![0_u32; width * height])
-            })
-            .collect();
+    fn lamp_is_equally_strong_while_acting_and_waiting() {
+        let mut visual = VisualState::new();
         let started = Instant::now();
-        for frame in 0..120 {
-            for (side, width, height, pixels) in &mut frames {
-                render_glow(
-                    pixels,
-                    *width,
-                    *height,
-                    *side,
-                    Level::Acting,
-                    breathing_opacity(f64::from(frame) / 30.0, true),
-                );
-                std::hint::black_box(&*pixels);
-            }
-        }
-        eprintln!(
-            "two synthetic 4K displays: {:.3} ms/frame CPU raster (120 frames)",
-            started.elapsed().as_secs_f64() * 1000.0 / 120.0
+        visual.set_level(Level::Acting, started);
+        let settled = started + FADE_IN;
+        assert!((visual.opacity(settled, true) - 1.0).abs() < 1e-12);
+        visual.set_level(Level::Armed, settled);
+        assert!((visual.opacity(settled + Duration::from_millis(50), true) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn disabled_animation_skips_fades_but_keeps_the_minimum_visible_time() {
+        let mut visual = VisualState::new();
+        let started = Instant::now();
+        visual.set_level(Level::Acting, started);
+        assert!(
+            (visual.opacity(started, false) - 1.0).abs() < 1e-12,
+            "no fade in"
+        );
+        visual.begin_hide(1, false, started);
+        assert!(
+            (visual.opacity(started + MINIMUM_VISIBLE / 2, false) - 1.0).abs() < 1e-12,
+            "a short session still shows for the minimum time"
+        );
+        assert!(visual.opacity(started + MINIMUM_VISIBLE, false).abs() < 1e-12);
+        assert!(
+            visual
+                .take_completed_hide(started + MINIMUM_VISIBLE)
+                .is_none()
+        );
+        assert!(
+            visual
+                .take_completed_hide(started + MINIMUM_VISIBLE + FADE_OUT)
+                .is_some()
         );
     }
 
@@ -1447,31 +1082,204 @@ mod tests {
         let mut visual = VisualState::new();
         let started = Instant::now();
         visual.set_level(Level::Acting, started);
-        assert!(visual.opacity(started) >= INITIAL_VISIBLE_OPACITY);
+        assert!(visual.opacity(started, true) >= INITIAL_VISIBLE_OPACITY);
 
         visual.begin_hide(1, false, started);
         let nearly_hidden = started + MINIMUM_VISIBLE + FADE_OUT;
         visual.set_level(Level::ElevatedActing, nearly_hidden);
-        assert!(visual.opacity(nearly_hidden) >= INITIAL_VISIBLE_OPACITY);
+        assert!(visual.opacity(nearly_hidden, true) >= INITIAL_VISIBLE_OPACITY);
         assert!(visual.pending_hide.is_none());
     }
 
     #[test]
-    fn point_targeting_skips_the_disabled_glow_overlay() {
+    fn point_targeting_skips_the_disabled_lamp() {
         ensure_dpi_awareness().unwrap();
         register_window_class().unwrap();
         let monitor = enumerate_monitors().unwrap().remove(0);
-        let window = LayerWindow::create(monitor, Side::Left).unwrap();
+        let mut window = LampWindow::create(monitor).unwrap();
+        window.render(frame(TURQUOISE, 255, false)).unwrap();
         window.position(true).unwrap();
         let point = POINT {
-            x: window.bounds.left + 1,
-            y: window.bounds.top + window.bounds.height() / 2,
+            x: monitor.left + monitor.width() / 2,
+            y: monitor.top + 1,
         };
 
-        // SAFETY: `point` is a value inside the visible overlay bounds and the returned HWND is
+        // SAFETY: `point` is a value inside the visible lamp bounds and the returned HWND is
         // borrowed only for this equality check.
         let target = unsafe { WindowFromPoint(point) };
 
         assert_ne!(target, window.hwnd);
+        let mut affinity = 0_u32;
+        // SAFETY: `affinity` is writable for the synchronous call and the window is live.
+        unsafe { GetWindowDisplayAffinity(window.hwnd, &raw mut affinity) }.unwrap();
+        assert_eq!(
+            affinity, WDA_EXCLUDEFROMCAPTURE.0,
+            "screenshots never show the lamp"
+        );
+    }
+
+    fn lamp_rows(dpi: u32, admin: bool, tone: LampTone) -> (LampGeometry, Vec<u32>) {
+        let geometry = if tone == LampTone::Warning {
+            warning_geometry(dpi)
+        } else {
+            lamp_geometry(dpi, false, admin)
+        };
+        let color = lamp_color(tone, &Palette::STANDARD);
+        let rows = usize::try_from(geometry.height()).unwrap();
+        let mut pixels = vec![0_u32; rows];
+        render_lamp(&mut pixels, 1, geometry, frame(color, 255, admin));
+        (geometry, pixels)
+    }
+
+    #[test]
+    fn the_tab_lamp_segment_matches_the_helper_lamp_at_every_scale() {
+        let painter = Painter::new().unwrap();
+        for dpi in [96, 120, 144, 168, 192] {
+            for (kind, admin, tone) in [
+                (TabKind::Working, false, LampTone::Session { admin: false }),
+                (TabKind::Waiting, true, LampTone::Session { admin: true }),
+                (TabKind::Stopping, true, LampTone::Session { admin: true }),
+                (TabKind::InputHeld, false, LampTone::Warning),
+            ] {
+                let (geometry, lamp) = lamp_rows(dpi, admin, tone);
+                let view = TabView {
+                    kind,
+                    admin,
+                    expanded: true,
+                };
+                let mut tab = painter
+                    .paint(view, &Palette::STANDARD, dpi, 3840, 1.0)
+                    .unwrap();
+                let width = tab.surface.width;
+                let pixels = tab.surface.pixels();
+                for (row, expected) in lamp.iter().enumerate() {
+                    assert!(
+                        pixels[row * width..(row + 1) * width]
+                            .iter()
+                            .all(|pixel| pixel == expected),
+                        "{view:?} at {dpi} DPI, row {row} differs from the helper's lamp"
+                    );
+                }
+                let below = usize::try_from(geometry.height()).unwrap() * width;
+                assert_eq!(
+                    pixels[below] >> 24,
+                    0,
+                    "outside the shoulders the tab is transparent below the lamp"
+                );
+            }
+        }
+    }
+
+    /// Composites the helper's lamp and the server's tab over synthetic applications, the way
+    /// they meet on screen. Set `CONTROLFREAK_INDICATOR_RENDERS` to a folder.
+    #[test]
+    #[ignore = "writes PNG composites for design review"]
+    fn render_review_composites() {
+        let Some(folder) = std::env::var_os("CONTROLFREAK_INDICATOR_RENDERS") else {
+            return;
+        };
+        let folder = std::path::PathBuf::from(folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let painter = Painter::new().unwrap();
+        for dpi in [96, 120, 144, 168] {
+            for (scene, kind, admin) in [
+                ("light-working", TabKind::Working, false),
+                ("dark-waiting-admin", TabKind::Waiting, true),
+                ("light-compact", TabKind::Working, false),
+                ("dark-held", TabKind::InputHeld, false),
+            ] {
+                let s = f64::from(dpi) / 96.0;
+                let px = |dip: f64| -> usize {
+                    // Scene sizes are small positive DIP values.
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let value = (dip * s).round() as usize;
+                    value
+                };
+                // Tall enough for the whole input-held warning and its shadow.
+                let tall = kind == TabKind::InputHeld;
+                let (width, height) = (px(960.0), px(if tall { 200.0 } else { 150.0 }));
+                let dark = scene.starts_with("dark");
+                let mut scene_pixels = vec![0_u32; width * height];
+                for (row, line) in scene_pixels.chunks_exact_mut(width).enumerate() {
+                    let color = match (dark, row) {
+                        (false, row) if row < px(34.0) => 0x00f3_f3f3,
+                        (false, row) if row < px(76.0) => 0x00fa_fafa,
+                        (false, _) => 0x00ff_ffff,
+                        (true, row) if row < px(34.0) => 0x0025_2526,
+                        (true, _) => 0x001e_1e1e,
+                    };
+                    line.fill(color);
+                }
+                let tone = if kind == TabKind::InputHeld {
+                    LampTone::Warning
+                } else {
+                    LampTone::Session { admin }
+                };
+                let (_, lamp) = lamp_rows(dpi, admin, tone);
+                for (row, pixel) in lamp.iter().enumerate() {
+                    for x in 0..width {
+                        blend(&mut scene_pixels[row * width + x], *pixel);
+                    }
+                }
+                let view = TabView {
+                    kind,
+                    admin,
+                    expanded: scene != "light-compact",
+                };
+                let mut tab = painter
+                    .paint(
+                        view,
+                        &Palette::STANDARD,
+                        dpi,
+                        i32::try_from(width).unwrap(),
+                        1.0,
+                    )
+                    .unwrap();
+                let tab_width = tab.surface.width;
+                let left = (width - tab_width) / 2;
+                for (row, line) in tab.surface.pixels().chunks_exact(tab_width).enumerate() {
+                    if row >= height {
+                        break;
+                    }
+                    for (x, pixel) in line.iter().enumerate() {
+                        blend(&mut scene_pixels[row * width + left + x], *pixel);
+                    }
+                }
+                let rgb: Vec<u8> = scene_pixels
+                    .iter()
+                    .flat_map(|pixel| {
+                        let [blue, green, red, _] = pixel.to_le_bytes();
+                        [red, green, blue]
+                    })
+                    .collect();
+                let file =
+                    std::fs::File::create(folder.join(format!("composite-{scene}-{dpi}.png")))
+                        .unwrap();
+                let mut encoder = png::Encoder::new(
+                    std::io::BufWriter::new(file),
+                    u32::try_from(width).unwrap(),
+                    u32::try_from(height).unwrap(),
+                );
+                encoder.set_color(png::ColorType::Rgb);
+                encoder.set_depth(png::BitDepth::Eight);
+                encoder
+                    .write_header()
+                    .unwrap()
+                    .write_image_data(&rgb)
+                    .unwrap();
+            }
+        }
+    }
+
+    /// Premultiplied source-over onto an opaque pixel.
+    fn blend(destination: &mut u32, source: u32) {
+        let alpha = source >> 24;
+        let inverse = 255 - alpha;
+        let channel = |shift: u32| {
+            let over = (source >> shift) & 0xff;
+            let under = (*destination >> shift) & 0xff;
+            (over + under * inverse / 255).min(255) << shift
+        };
+        *destination = channel(16) | channel(8) | channel(0);
     }
 }

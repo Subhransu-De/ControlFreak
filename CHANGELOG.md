@@ -12,6 +12,18 @@ versioned section and uses that section for the corresponding GitHub Release not
 ### Changed
 
 - Apps & Features and `winget list` now show the app as `ControlFreak` instead of `ControlFreak version <version>`. The version stays in its own column.
+- The control indicator is redesigned. The 230-pixel blue glow around every display and the navy
+  bar are replaced by a steady 4-pixel turquoise lamp along the top of every display, and a tab
+  hanging from it on every display that reads "An agent is using this PC", names ControlFreak
+  and shows "Press Esc to stop". The tab says whether the agent is working or waiting, keeps an
+  "Administrator" label for elevated servers, says when keys are being released, and confirms
+  "This PC is yours again" when a session ends. After a cleanup failure the lamp turns into a
+  double amber line, which High Contrast and colour-blind users can tell apart by shape, and
+  the tab explains how to release a held key or mouse button. Unlike the old bar, the tab follows
+  virtual desktop switches, and screen readers can read its message from the window name, with
+  system alerts when a session starts, stops or ends. The tab uses the Inter typeface, embedded
+  in the executable; its license is in THIRD-PARTY-NOTICES.md, which is now installed with
+  ControlFreak. The glow helper protocol gains a `TONE` command for the amber lamp.
 
 ### Fixed
 

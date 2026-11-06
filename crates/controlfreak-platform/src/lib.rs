@@ -35,7 +35,7 @@ pub mod packaging_tests;
 use windows as implementation;
 
 #[cfg(target_os = "windows")]
-pub use implementation::{DesktopArbitrator, ManagedChild, UserStop};
+pub use implementation::{DesktopArbitrator, ManagedChild, SessionSignals, UserStop};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OcrHelperCommand {

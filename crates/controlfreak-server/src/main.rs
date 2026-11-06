@@ -181,11 +181,16 @@ async fn run_server(allow_elevated: bool) -> Result<(), Box<dyn Error + Send + S
             controlfreak_platform::desktop_arbitrator()?,
         ));
         let stop = controlfreak_core::StopController::default();
-        let _user_stop = controlfreak_platform::UserStop::start(stop.clone())?;
+        let signals = Arc::new(controlfreak_platform::SessionSignals::new(elevated));
+        let _user_stop =
+            controlfreak_platform::UserStop::start(stop.clone(), Arc::clone(&signals))?;
+        let glow_stop = stop.clone();
         controlfreak_mcp::serve_stdio_with_indicator_and_arbitrator(
             platform_backend(security_context)?,
             safety_indicator,
-            move || desktop_glow::DesktopGlow::start(elevated),
+            move || {
+                desktop_glow::DesktopGlow::start(elevated, glow_stop.clone(), Arc::clone(&signals))
+            },
             arbitrator,
             stop,
         )
