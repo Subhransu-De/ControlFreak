@@ -436,11 +436,18 @@ pub(super) fn tool_execution_error(error: &ErrorData) -> CallToolResult {
     } else {
         "tool_execution_failed"
     };
+    // A detail that says whether repeating helps (the indicator's `starting` or `failed` states
+    // are transient) is the envelope's answer too, so the two never disagree.
+    let retryable = error
+        .data
+        .as_ref()
+        .and_then(|data| data["retryable"].as_bool())
+        .unwrap_or(false);
     CallToolResult::structured_error(json!({
         "error": {
             "code": code,
             "message": error.message,
-            "retryable": false,
+            "retryable": retryable,
             "details": error.data,
         }
     }))

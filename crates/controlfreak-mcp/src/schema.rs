@@ -458,7 +458,7 @@ fn list_windows_tool() -> Tool {
         LIST_WINDOWS,
         "List windows",
         Kind::Observe { idempotent: true },
-        "List visible titled top-level windows, foreground first, then by title. Each id is a target_ref for begin_control_session, focus_window and capture_window. Returns at most 200; truncated=true means more exist, so use wait_for_window with title_contains, class_name or process_id to reach them. Refresh ids after windows open, close or change owner.",
+        "List visible titled top-level windows, foreground first, then by title. Dialogs and other owned windows are listed too, with an owner field naming the window they belong to. Each id is a target_ref for begin_control_session, focus_window and capture_window. Returns at most 200; truncated=true means more exist, so use wait_for_window with title_contains, class_name or process_id to reach them. Refresh ids after windows open, close or change owner.",
         object_schema(JsonObject::new(), &[]),
         output_schema(
             vec![json!({

@@ -188,13 +188,38 @@ async fn run_server(allow_elevated: bool) -> Result<(), Box<dyn Error + Send + S
         ));
         let stop = controlfreak_core::StopController::default();
         let signals = Arc::new(controlfreak_platform::SessionSignals::new(elevated));
-        // The session tab, its Stop button and the Esc monitor start with the first session, not
-        // with the server. A failure to start them is a refused session with a reason, never a
-        // server that does not start: read-only tools keep working. The next session retries.
-        let session_tab: Mutex<Option<controlfreak_platform::UserStop>> = Mutex::new(None);
+        // The session tab and its Stop button start with the first screen read or the first
+        // session, not with the server; the Esc monitor starts with the first session only. A
+        // failure to start is a refused session with a reason, never a server that does not
+        // start: read-only tools keep working and ignore a tab that cannot start. The next
+        // observation or session retries.
+        let session_tab: Arc<Mutex<Option<controlfreak_platform::UserStop>>> =
+            Arc::new(Mutex::new(None));
         let tab_stop = stop.clone();
         let tab_signals = Arc::clone(&signals);
         let tab_indicator = safety_indicator.clone();
+        let start_tab = {
+            let session_tab = Arc::clone(&session_tab);
+            let tab_stop = tab_stop.clone();
+            move || {
+                ensure_started(&session_tab, || {
+                    let indicator = tab_indicator.clone();
+                    controlfreak_platform::UserStop::start_tab(
+                        &tab_stop,
+                        Arc::clone(&tab_signals),
+                        move |reason| indicator.report_failure(reason),
+                    )
+                })
+            }
+        };
+        if !desktop_glow::disabled_for_tests() {
+            let announce = Arc::clone(&signals);
+            let start_tab = start_tab.clone();
+            start_tab_on_first_observation(&stop, move || {
+                announce.announce_latest_read();
+                start_tab()
+            });
+        }
         let glow_stop = stop.clone();
         controlfreak_mcp::serve_stdio_with_indicator_and_arbitrator(
             platform_backend(security_context)?,
@@ -209,24 +234,25 @@ async fn run_server(allow_elevated: bool) -> Result<(), Box<dyn Error + Send + S
                         Arc::clone(&signals),
                     );
                 }
-                ensure_started(&session_tab, || {
-                    let indicator = tab_indicator.clone();
-                    controlfreak_platform::UserStop::start(
-                        &tab_stop,
-                        Arc::clone(&tab_signals),
-                        move |reason| indicator.report_failure(reason),
-                    )
-                })
-                .map_err(|reason| {
-                    eprintln!(
-                        "{}",
-                        serde_json::json!({
-                            "event": "session_tab_unavailable",
-                            "reason": reason,
-                        })
-                    );
-                    format!("the session tab and Stop button could not start: {reason}")
-                })?;
+                start_tab()
+                    .and_then(|()| {
+                        // Only a session installs the Esc keyboard hook.
+                        session_tab
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .as_mut()
+                            .map_or(Ok(()), |tab| tab.attach_session_monitor(&tab_stop))
+                    })
+                    .map_err(|reason| {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "event": "session_tab_unavailable",
+                                "reason": reason,
+                            })
+                        );
+                        format!("the session tab and Stop button could not start: {reason}")
+                    })?;
                 desktop_glow::DesktopGlow::start(elevated, glow_stop.clone(), Arc::clone(&signals))
             },
             arbitrator,
@@ -237,6 +263,55 @@ async fn run_server(allow_elevated: bool) -> Result<(), Box<dyn Error + Send + S
 
     #[cfg(not(target_os = "windows"))]
     controlfreak_mcp::serve_stdio(controlfreak_platform::backend()).await
+}
+
+/// Starts the tab, off the caller's thread, the first time an observation tool reads the screen
+/// before any session has started it, so a client that only captures and reads text still sees
+/// the "reading the screen" state. It claims no session and installs no keyboard hook, and a
+/// failure is logged and tolerated: read-only tools never depend on the indicator. At most one
+/// start runs at a time, and a failed start is retried by the next observation only.
+fn start_tab_on_first_observation(
+    stop: &controlfreak_core::StopController,
+    start: impl Fn() -> Result<(), String> + Send + Sync + 'static,
+) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let start = Arc::new(start);
+    let started = Arc::new(AtomicBool::new(false));
+    let in_flight = Arc::new(AtomicBool::new(false));
+    let attempted = Arc::new(AtomicU64::new(0));
+    let counter = stop.clone();
+    stop.subscribe(move || {
+        let count = counter.observation_count();
+        if count > attempted.fetch_max(count, Ordering::AcqRel)
+            && !started.load(Ordering::Acquire)
+            && !in_flight.swap(true, Ordering::AcqRel)
+        {
+            let (start, started, in_flight) =
+                (start.clone(), Arc::clone(&started), Arc::clone(&in_flight));
+            let spawned = std::thread::Builder::new()
+                .name("controlfreak-reading-tab".to_owned())
+                .spawn({
+                    let in_flight = Arc::clone(&in_flight);
+                    move || {
+                        match start() {
+                            Ok(()) => started.store(true, Ordering::Release),
+                            Err(reason) => eprintln!(
+                                "{}",
+                                serde_json::json!({
+                                    "event": "reading_tab_unavailable",
+                                    "reason": reason,
+                                })
+                            ),
+                        }
+                        in_flight.store(false, Ordering::Release);
+                    }
+                });
+            if spawned.is_err() {
+                in_flight.store(false, Ordering::Release);
+            }
+        }
+        true
+    });
 }
 
 /// Starts `value` into `slot` if it is not there yet. A failure leaves the slot empty, so the
@@ -334,6 +409,66 @@ mod tests {
             },
             elevated_operation_allowed: allowed,
         }
+    }
+
+    /// The first screen read starts the tab on its own thread and claims nothing; a failed start
+    /// is tolerated and retried only by a later observation, never by session changes.
+    #[test]
+    fn the_first_observation_starts_the_tab_without_a_session_and_tolerates_failure() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let stop = controlfreak_core::StopController::default();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sender = Mutex::new(sender);
+        let counted = Arc::clone(&attempts);
+        start_tab_on_first_observation(&stop, move || {
+            let attempt = counted.fetch_add(1, Ordering::SeqCst) + 1;
+            sender.lock().unwrap().send(attempt).unwrap();
+            if attempt == 1 {
+                Err("Direct2D is unavailable".to_owned())
+            } else {
+                Ok(())
+            }
+        });
+        let wait = || receiver.recv_timeout(std::time::Duration::from_secs(10));
+
+        // Nothing starts for stop-controller changes that are not screen reads.
+        stop.set_session_active(true);
+        stop.set_session_active(false);
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+
+        // The first read asks for the tab. It claims no session; the failure breaks nothing.
+        stop.note_observation();
+        assert_eq!(wait().unwrap(), 1);
+        assert!(
+            !stop.session_active(),
+            "an observation never claims a session"
+        );
+        assert!(!stop.is_stopped());
+
+        // Session changes do not retry a failed start; the next read does, and then it is done.
+        stop.set_session_active(true);
+        stop.set_session_active(false);
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        stop.note_observation();
+        assert_eq!(wait().unwrap(), 2);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        stop.note_observation();
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err()
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[test]

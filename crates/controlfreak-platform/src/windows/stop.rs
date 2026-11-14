@@ -106,6 +106,8 @@ pub struct SessionSignals {
     actions: AtomicU64,
     /// The tab's UI thread, woken on every change so it does not wait for its next poll.
     ui_thread: AtomicU32,
+    /// The tab about to start was started by a screen read, which it should show.
+    announce_read: AtomicBool,
     elevated: bool,
 }
 
@@ -115,8 +117,15 @@ impl SessionSignals {
             activity: AtomicU8::new(0),
             actions: AtomicU64::new(0),
             ui_thread: AtomicU32::new(0),
+            announce_read: AtomicBool::new(false),
             elevated,
         }
+    }
+
+    /// Asks the next tab to start with the screen read that caused it still to be shown, instead
+    /// of treating every read so far as already seen. Used when a read starts the tab.
+    pub fn announce_latest_read(&self) {
+        self.announce_read.store(true, Ordering::Release);
     }
 
     /// Records an acknowledged indicator level: `true` while an input action runs.
@@ -157,7 +166,7 @@ impl SessionSignals {
     }
 }
 
-/// Independent native session tab, Stop button and physical Esc monitor. Never calls a provider.
+/// Independent native session tab, Stop button and (for sessions) physical Esc monitor. Never calls a provider.
 pub struct UserStop {
     shutdown: Arc<AtomicBool>,
     signals: Arc<SessionSignals>,
@@ -167,24 +176,20 @@ pub struct UserStop {
 }
 
 impl UserStop {
-    /// Starts the tab and the Esc monitor. A failure to start is returned and stops nothing: the
-    /// server keeps running and the caller refuses sessions with the reason. After a successful
+    /// Starts the tab and its Stop button, without the Esc monitor, so it can show the brief
+    /// "reading the screen" state for observation tools. It claims no session and installs no
+    /// keyboard hook; [`UserStop::attach_session_monitor`] adds the Esc monitor for sessions.
+    ///
+    /// A failure to start is returned and stops nothing: the server keeps running and the caller
+    /// tolerates it (observation) or refuses the session with the reason. After a successful
     /// start, a failure of the tab thread closes admission with its reason (see
     /// [`StopController::stop_with_failure`]) and calls `report` with the same text.
-    pub fn start(
+    pub fn start_tab(
         controller: &StopController,
         signals: Arc<SessionSignals>,
         report: impl Fn(String) + Send + 'static,
     ) -> Result<Self, String> {
         super::ensure_dpi_awareness().map_err(|error| error.to_string())?;
-        // Every session, stop and observation change wakes the tab thread at once.
-        let waker: Weak<SessionSignals> = Arc::downgrade(&signals);
-        controller.subscribe(move || {
-            waker.upgrade().is_some_and(|signals| {
-                signals.wake();
-                true
-            })
-        });
         let shutdown = Arc::new(AtomicBool::new(false));
         let exiting = Arc::clone(&shutdown);
         let thread_signals = Arc::clone(&signals);
@@ -206,19 +211,35 @@ impl UserStop {
                 CONTROLLER.with(|slot| *slot.borrow_mut() = None);
             })
             .map_err(|error| error.to_string())?;
-        let mut guard = Self {
+        let guard = Self {
             shutdown,
             signals,
             worker: Some(worker),
             escape: None,
         };
         receiver.recv().map_err(|error| error.to_string())??;
-        // The hook belongs to a thread of its own and is installed only while a session is owned.
-        guard.escape = Some(
-            EscapeMonitor::start(controller, || Box::new(SystemHook::default()))
-                .map_err(|error| format!("the Esc monitor could not start: {error}"))?,
-        );
+        // Every session, stop and observation change wakes the tab thread at once. The listener
+        // is added only now, so a start that failed leaves nothing behind for a retry to pile on.
+        let waker: Weak<SessionSignals> = Arc::downgrade(&guard.signals);
+        controller.subscribe(move || {
+            waker.upgrade().is_some_and(|signals| {
+                signals.wake();
+                true
+            })
+        });
         Ok(guard)
+    }
+
+    /// Starts the Esc monitor if it is not running. Its keyboard hook belongs to a thread of its
+    /// own and exists only while a session is owned. Calling it again changes nothing.
+    pub fn attach_session_monitor(&mut self, controller: &StopController) -> Result<(), String> {
+        if self.escape.is_none() {
+            self.escape = Some(
+                EscapeMonitor::start(controller, || Box::new(SystemHook::default()))
+                    .map_err(|error| format!("the Esc monitor could not start: {error}"))?,
+            );
+        }
+        Ok(())
     }
 }
 
@@ -408,8 +429,9 @@ fn escape_loop(
                 }
             }
         }
-        // Hook callbacks arrive as sent messages and run inside this wait. A session change, or
-        // shutdown, posts a message that ends it.
+        // The wait dispatches nothing itself. It returns when any message is queued for this
+        // thread, including a pending hook call, and `drain_messages` at the top of the loop
+        // answers it. A session change, or shutdown, posts a message that ends the wait too.
         if wait_for_input(u32::MAX).is_err() {
             break;
         }
@@ -1367,7 +1389,10 @@ fn tab_loop(
     let mut settings = Settings::read();
     let mut next_settings = Instant::now() + IDLE_SETTINGS_INTERVAL;
     let mut was_shown = false;
-    let mut seen_observations = controller.observation_count();
+    // A tab started by a screen read shows that read; any other start ignores older reads.
+    let mut seen_observations = controller.observation_count().saturating_sub(u64::from(
+        signals.announce_read.swap(false, Ordering::AcqRel),
+    ));
     let mut reading_until: Option<Instant> = None;
     while !exiting.load(Ordering::Acquire) {
         drain_messages();

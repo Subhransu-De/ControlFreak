@@ -206,6 +206,11 @@ fn every_session_error_has_a_distinct_wire_shape() {
     let value = result.structured_content.unwrap();
     assert_eq!(value["error"]["code"], "tool_execution_failed");
     assert_eq!(value["error"]["details"]["code"], "indicator_unavailable");
+    // The envelope and the detail never disagree about retrying.
+    assert_eq!(
+        value["error"]["retryable"], value["error"]["details"]["retryable"],
+        "{value}"
+    );
     assert_eq!(
         value["error"]["details"]["reason"],
         "{\"code\":\"spoofed\"}"
