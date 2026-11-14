@@ -18,6 +18,8 @@ const DEFAULT_SESSION_HOLD: Duration = Duration::from_secs(45);
 const DEFAULT_MAX_HOLD: Duration = Duration::from_mins(2);
 const MIN_SESSION_HOLD: Duration = Duration::from_secs(20);
 const MAX_INDICATOR_RESTARTS: u8 = 2;
+/// Longest a session waits for the Esc keyboard hook to be confirmed before it is refused.
+const ESC_HOOK_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct SafetyIndicator {
@@ -849,7 +851,7 @@ impl IndicatorRuntime {
                 }
             });
             match result {
-                Ok(()) => return Ok(()),
+                Ok(()) => return self.confirm_escape_hook(),
                 Err(reason) => {
                     let (retired, can_restart) = self.retire_failed_control(&reason);
                     if let Some(mut retired) = retired
@@ -873,6 +875,26 @@ impl IndicatorRuntime {
                 }
             }
         }
+    }
+
+    /// A session is admitted only once a physical Esc can stop it: the hook is installed
+    /// asynchronously, so an Esc in the first milliseconds would otherwise be missed. Without an
+    /// Esc monitor (no indicator process) there is nothing to wait for.
+    fn confirm_escape_hook(&self) -> Result<(), String> {
+        let reason = match self.stop.wait_for_esc_hook(ESC_HOOK_WAIT) {
+            controlfreak_core::EscHook::Installed | controlfreak_core::EscHook::NotMonitored => {
+                return Ok(());
+            }
+            controlfreak_core::EscHook::Failed(reason) => format!(
+                "the Esc stop key could not be armed ({reason}), so no control session is allowed"
+            ),
+            controlfreak_core::EscHook::TimedOut => format!(
+                "the Esc stop key was not armed within {} seconds, so no control session is allowed",
+                ESC_HOOK_WAIT.as_secs()
+            ),
+        };
+        let _ = self.close_session_locked("esc_unavailable", false);
+        Err(reason)
     }
 
     fn retire_failed_control(&self, reason: &str) -> (Option<IndicatorControl>, bool) {

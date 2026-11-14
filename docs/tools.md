@@ -16,7 +16,7 @@ desktop and run inside a [control session](sessions.md).
 | `list_displays` | Observe | Active displays with IDs, primary flag and bounds in physical pixels. |
 | `capture_display` | Observe | Screenshot of a display. |
 | `capture_region` | Observe | Screenshot of a rectangle, 1280 px wide unless `max_width` or `native` is set. |
-| `capture_window` | Observe | Screenshot of a window's visible frame, without focusing it. The window renders itself (`capture_method` `windows_print_window`), so windows covering it do not appear; if it cannot, the screen is copied (`windows_gdi`). |
+| `capture_window` | Observe | Screenshot of a window's visible frame, without focusing it. The window renders itself (`capture_method` `windows_print_window`), so windows covering it do not appear; if it cannot, the screen is copied (`windows_gdi`). Every screenshot result reports `capture_method` as one of `windows_print_window` or `windows_gdi`; display and region captures always report `windows_gdi`. |
 | `list_windows` | Observe | Visible titled windows, including owned dialogs (with an `owner` field), foreground first. At most 200. |
 | `wait_for_window` | Observe | Wait for a window that matches title, class or process. |
 | `list_virtual_desktops` | Observe | Windows grouped by virtual desktop, with the current one marked. |

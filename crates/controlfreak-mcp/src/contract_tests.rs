@@ -43,6 +43,7 @@ fn window(id: &str) -> WindowInfo {
         display_id: "main".into(),
         is_foreground: id == "w1",
         is_minimized: false,
+        owner: None,
     }
 }
 
@@ -263,6 +264,7 @@ impl WindowBackend for ContractBackend {
             image_height: 300,
             downscale_factor: 1,
             cursor_marker: false,
+            capture_method: "windows_print_window",
         })
     }
     fn focus_window_controlled(
@@ -966,17 +968,28 @@ fn unknown_key_errors_suggest_a_name_and_advertised_keys_parse() {
     })))
     .unwrap_err();
     assert!(
-        error.message.contains("Did you mean 'ctrl'?"),
+        error.message.contains("did you mean 'ctrl'?"),
         "{}",
         error.message
     );
-    assert!(error.message.contains("page_down"), "{}", error.message);
+    assert_eq!(
+        error.message.matches("unknown key").count(),
+        1,
+        "{}",
+        error.message
+    );
     let far = parse_arguments::<PressKeysInput>(Some(rmcp::object!({
         "target_ref": "w1", "keys": ["launch_browser"]
     })))
     .unwrap_err();
-    assert!(!far.message.contains("Did you mean"), "{}", far.message);
-    assert!(far.message.contains("Valid key names:"));
+    assert!(!far.message.contains("did you mean"), "{}", far.message);
+    assert!(far.message.contains("valid names:") && far.message.contains("page_down"));
+    assert_eq!(
+        far.message.matches("unknown key").count(),
+        1,
+        "{}",
+        far.message
+    );
     for name in schema::all_key_names() {
         assert!(
             serde_json::from_value::<controlfreak_core::Key>(json!(name)).is_ok(),
@@ -987,7 +1000,17 @@ fn unknown_key_errors_suggest_a_name_and_advertised_keys_parse() {
         .as_str()
         .unwrap()
         .to_owned();
-    for name in ["ctrl", "page_up", "arrow_left", "f1-f12", "a-z"] {
+    for name in [
+        "ctrl",
+        "page_up",
+        "arrow_left",
+        "f1-f12",
+        "a-z",
+        "comma",
+        "numpad_0",
+        "volume_up",
+        "print_screen",
+    ] {
         assert!(description.contains(name), "{description}");
     }
 }

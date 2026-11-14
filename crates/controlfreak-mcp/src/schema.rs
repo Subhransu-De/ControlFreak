@@ -148,7 +148,7 @@ fn begin_control_session_tool() -> Tool {
         BEGIN_CONTROL_SESSION,
         "Begin control session",
         Kind::Session,
-        "Start here before any input. Reserves desktop control for ONE window (target_ref from list_windows or a screenshot) and shows the user the control indicator. Input tools work only while that window is in the foreground, so call focus_window next if it is not. Dialogs and menus of the same application are accepted. A window from another process needs end_control_session and a new session. Error desktop_in_use is retryable: another ControlFreak server owns the desktop.",
+        "Start here before any input. Reserves desktop control for ONE window (target_ref from list_windows or a screenshot) and shows the user the control indicator. Input tools work only while that window is in the foreground, so call focus_window next if it is not. Dialogs and menus of the same application are accepted (for File Explorer, only its own dialogs and menus, not the taskbar or other folder windows). A window from another process needs end_control_session and a new session. Error desktop_in_use is retryable: another ControlFreak server owns the desktop.",
         object_schema(properties, &[]),
         session_change_output_schema("armed"),
     )
@@ -646,33 +646,25 @@ fn scroll_mouse_tool() -> Tool {
     )
 }
 
-/// Canonical names of the non-alphanumeric keys. Letters, digits and F-keys are listed by range.
-const NAMED_KEYS: [&str; 19] = [
-    "ctrl",
-    "alt",
-    "shift",
-    "win",
-    "enter",
-    "tab",
-    "escape",
-    "space",
-    "backspace",
-    "delete",
-    "insert",
-    "home",
-    "end",
-    "page_up",
-    "page_down",
-    "arrow_up",
-    "arrow_down",
-    "arrow_left",
-    "arrow_right",
-];
+/// Every canonical key name `press_keys` accepts, straight from the core key table.
+pub(super) fn all_key_names() -> Vec<String> {
+    controlfreak_core::Key::ALL
+        .iter()
+        .map(|key| key.canonical_name().to_owned())
+        .collect()
+}
 
 fn key_names_description() -> String {
+    // Letters, digits and F-keys are summarised by range to keep tools/list small.
+    let named: Vec<String> = all_key_names()
+        .into_iter()
+        .filter(|name| {
+            name.len() > 1 && !(name.starts_with('f') && name[1..].parse::<u8>().is_ok())
+        })
+        .collect();
     format!(
-        "One chord pressed together and released in reverse order. Case-insensitive names: {}, a-z, 0-9, f1-f12. Use type_text for text.",
-        NAMED_KEYS.join(", ")
+        "One chord pressed together and released in reverse order. Case-insensitive names: {}, a-z, 0-9, f1-f12. Common aliases (esc, del, return, up, down, left, right) and the symbols themselves also work. Use type_text for text.",
+        named.join(", ")
     )
 }
 
@@ -1103,7 +1095,7 @@ fn image_metadata_schema(subject: Vec<(&str, Value, bool)>) -> Value {
     let mut properties = json!({
         "mime_type": { "const": "image/png" },
         "byte_length": { "type": "integer", "minimum": 1 },
-        "capture_method": { "type": "string" },
+        "capture_method": { "type": "string", "enum": ["windows_print_window", "windows_gdi"] },
         "image_width": { "type": "integer", "minimum": 1 },
         "image_height": { "type": "integer", "minimum": 1 },
         "downscale_factor": { "type": "integer", "minimum": 1 },
@@ -1472,18 +1464,9 @@ fn window_schema() -> Value {
             "display_id": { "type": "string" },
             "is_foreground": { "type": "boolean" },
             "is_minimized": { "type": "boolean" },
-            "owner": { "type": ["string", "null"] }
+            "owner": { "type": "string" }
         },
         "required": ["id", "title", "class_name", "process_id", "bounds", "display_id", "is_foreground", "is_minimized"],
         "additionalProperties": false
     })
-}
-
-/// Every key name `press_keys` advertises, also used to suggest a name for an unknown key.
-pub(super) fn all_key_names() -> Vec<String> {
-    let mut names: Vec<String> = NAMED_KEYS.iter().map(|name| (*name).to_owned()).collect();
-    names.extend(('a'..='z').map(String::from));
-    names.extend(('0'..='9').map(String::from));
-    names.extend((1..=12).map(|number| format!("f{number}")));
-    names
 }

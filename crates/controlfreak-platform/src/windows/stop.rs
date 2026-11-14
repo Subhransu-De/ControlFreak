@@ -306,6 +306,7 @@ struct EscapeMonitor {
     exiting: Arc<AtomicBool>,
     thread_id: Arc<AtomicU32>,
     worker: Option<thread::JoinHandle<()>>,
+    controller: StopController,
 }
 
 impl EscapeMonitor {
@@ -329,10 +330,12 @@ impl EscapeMonitor {
                 .name("controlfreak-escape-hook".to_owned())
                 .spawn(move || escape_loop(&controller, make_hook(), &thread_id, &exiting))?
         };
+        controller.set_esc_monitor_attached(true);
         Ok(Self {
             exiting,
             thread_id,
             worker: Some(worker),
+            controller: controller.clone(),
         })
     }
 }
@@ -344,6 +347,7 @@ impl Drop for EscapeMonitor {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        self.controller.set_esc_monitor_attached(false);
     }
 }
 
@@ -368,10 +372,11 @@ fn escape_loop(
     // SAFETY: Takes no arguments and returns this thread's ID.
     thread_id.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
     let mut installed = false;
-    // One failed install per session is reported; retrying on every wake-up would spam.
-    let mut failed = false;
     while !exiting.load(Ordering::Acquire) {
         drain_messages();
+        // One failed install per session is reported; the controller forgets the failure when the
+        // next session starts, so retrying on every wake-up would only spam.
+        let failed = controller.esc_install_failed();
         match hook_action(controller.session_active(), installed, failed) {
             HookAction::Install => match hook.install() {
                 Ok(()) => {
@@ -379,7 +384,7 @@ fn escape_loop(
                     controller.set_esc_stop_available(true);
                 }
                 Err(error) => {
-                    failed = true;
+                    controller.set_esc_install_failed(error.to_string());
                     eprintln!(
                         "{}",
                         serde_json::json!({
@@ -394,7 +399,6 @@ fn escape_loop(
                 hook.uninstall();
                 installed = false;
             }
-            HookAction::EndSession => failed = false,
             HookAction::Wait => {}
         }
         // Hook callbacks arrive as sent messages and run inside this wait. A session change, or
@@ -415,8 +419,6 @@ fn escape_loop(
 enum HookAction {
     Install,
     Uninstall,
-    /// The session ended after a failed install: forget the failure so the next one retries.
-    EndSession,
     Wait,
 }
 
@@ -424,7 +426,6 @@ fn hook_action(session_owned: bool, installed: bool, failed: bool) -> HookAction
     match (session_owned, installed, failed) {
         (true, false, false) => HookAction::Install,
         (false, true, _) => HookAction::Uninstall,
-        (false, false, true) => HookAction::EndSession,
         _ => HookAction::Wait,
     }
 }
@@ -1572,6 +1573,7 @@ fn windows_error(context: &str, error: &windows::core::Error) -> io::Error {
 mod tests {
     use super::super::indicator::{TabKind, TabView};
     use super::*;
+    use controlfreak_core::EscHook;
     use windows::Win32::{
         System::Threading::GetCurrentThreadId,
         UI::WindowsAndMessaging::{
@@ -2040,14 +2042,47 @@ mod tests {
     }
 
     #[test]
+    fn admission_can_wait_for_the_monitor_to_confirm_the_hook() {
+        let controller = StopController::default();
+        let counts = HookCounts::default();
+        let monitor = EscapeMonitor::start(&controller, {
+            let counts = counts.clone();
+            move || Box::new(FakeHook(counts))
+        })
+        .unwrap();
+        controller.set_session_active(true);
+        let wait = Duration::from_secs(5);
+        assert_eq!(controller.wait_for_esc_hook(wait), EscHook::Installed);
+        assert_eq!(counts.installs.load(Ordering::SeqCst), 1);
+
+        // A refused install is a verdict for the session, not a timeout.
+        controller.set_session_active(false);
+        eventually("the hook to be removed", || {
+            !controller.esc_stop_available()
+        });
+        counts.fail.store(true, Ordering::SeqCst);
+        controller.set_session_active(true);
+        assert_eq!(
+            controller.wait_for_esc_hook(wait),
+            EscHook::Failed("hook refused".into())
+        );
+        drop(monitor);
+        assert_eq!(
+            controller.wait_for_esc_hook(wait),
+            EscHook::NotMonitored,
+            "a stopped monitor leaves nothing to wait for"
+        );
+    }
+
+    #[test]
     fn the_hook_decision_covers_every_state() {
-        use HookAction::{EndSession, Install, Uninstall, Wait};
+        use HookAction::{Install, Uninstall, Wait};
         for (owned, installed, failed, expected) in [
             (true, false, false, Install),
             (true, true, false, Wait),
             (true, false, true, Wait),
             (false, true, false, Uninstall),
-            (false, false, true, EndSession),
+            (false, false, true, Wait),
             (false, false, false, Wait),
         ] {
             assert_eq!(

@@ -18,6 +18,7 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ### Changed
 
+- A control session is admitted only after the Esc keyboard hook is confirmed installed (bounded wait of 2 seconds). If the hook cannot be installed the session is refused with the reason, instead of running without a working Esc stop.
 - A window of the approved target's own process (its dialogs, popup menus and drop-downs) may hold the foreground and receive pointer input, with the integrity check applied to that window. A window of another process is still refused. For `explorer.exe` targets only the target's own dialogs and popup menus count.
 - A foreground or pointer destination in another process now refuses only that action. The reference and the session target are kept, and the next action checks the live foreground again. Changes to the window itself still end the session's approval.
 - `type_text` presses Enter for `\n`, `\r\n` and `\r` and Tab for `\t`, instead of sending them as Unicode characters.

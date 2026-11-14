@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc, Mutex, MutexGuard,
+    Arc, Condvar, Mutex, MutexGuard,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
@@ -20,6 +20,8 @@ struct Inner {
     listeners: Mutex<Vec<Listener>>,
     observations: AtomicU64,
     esc_stop: AtomicBool,
+    /// Wakes `wait_for_esc_hook`; paired with `state`.
+    esc_changed: Condvar,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -34,9 +36,26 @@ struct State {
     /// Why the server closed admission itself, such as a failed indicator. Kept for diagnosis.
     failure: Option<String>,
     session_active: bool,
+    /// An Esc monitor exists and will try to install the keyboard hook for each session.
+    esc_monitor_attached: bool,
+    /// Why the monitor could not install the hook for the current session.
+    esc_install_failure: Option<String>,
     cleanup_failed: bool,
     next_id: u64,
     active: Vec<(u64, MutationControl)>,
+}
+
+/// Outcome of `StopController::wait_for_esc_hook`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EscHook {
+    /// The hook is installed; Esc stops the session.
+    Installed,
+    /// The monitor reported why it cannot install the hook.
+    Failed(String),
+    /// The monitor did not confirm the hook in time.
+    TimedOut,
+    /// No Esc monitor exists, so no hook is expected.
+    NotMonitored,
 }
 
 impl StopController {
@@ -69,7 +88,12 @@ impl StopController {
 
     /// Desktop ownership includes draining cleanup, not observation-only requests.
     pub fn set_session_active(&self, active: bool) {
-        self.state().session_active = active;
+        {
+            let mut state = self.state();
+            state.session_active = active;
+            // Each session gets its own install attempt and its own verdict.
+            state.esc_install_failure = None;
+        }
         self.notify();
     }
 
@@ -91,8 +115,61 @@ impl StopController {
     /// Whether a physical Esc is currently being watched for. It is `true` only while a session
     /// is owned and the keyboard hook is confirmed installed.
     pub fn set_esc_stop_available(&self, available: bool) {
-        self.0.esc_stop.store(available, Ordering::Release);
+        {
+            // Stored under the state lock so a waiter cannot miss the change.
+            let _state = self.state();
+            self.0.esc_stop.store(available, Ordering::Release);
+        }
+        self.0.esc_changed.notify_all();
         self.notify();
+    }
+
+    /// Declares that an Esc monitor will install the keyboard hook whenever a session is owned.
+    /// Without one, `wait_for_esc_hook` has nothing to wait for.
+    pub fn set_esc_monitor_attached(&self, attached: bool) {
+        self.state().esc_monitor_attached = attached;
+        self.0.esc_changed.notify_all();
+        self.notify();
+    }
+
+    /// Records that the monitor could not install the hook for the current session.
+    pub fn set_esc_install_failed(&self, reason: impl Into<String>) {
+        self.state().esc_install_failure = Some(reason.into());
+        self.0.esc_changed.notify_all();
+        self.notify();
+    }
+
+    /// Whether the monitor already gave up on the current session's hook.
+    pub fn esc_install_failed(&self) -> bool {
+        self.state().esc_install_failure.is_some()
+    }
+
+    /// Blocks for at most `timeout` until the keyboard hook is confirmed installed for the
+    /// current session, so a physical Esc is caught from the first action on. Returns at once
+    /// when no monitor exists.
+    pub fn wait_for_esc_hook(&self, timeout: Duration) -> EscHook {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self.state();
+        loop {
+            if !state.esc_monitor_attached {
+                return EscHook::NotMonitored;
+            }
+            if self.esc_stop_available() {
+                return EscHook::Installed;
+            }
+            if let Some(reason) = &state.esc_install_failure {
+                return EscHook::Failed(reason.clone());
+            }
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return EscHook::TimedOut;
+            };
+            state = self
+                .0
+                .esc_changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
     }
 
     pub fn esc_stop_available(&self) -> bool {
@@ -449,5 +526,36 @@ mod tests {
         assert!(!stop.session_active());
         assert!(!stop.stop_by_user(), "reading the screen is not ownership");
         assert!(!stop.esc_stop_available());
+    }
+
+    #[test]
+    fn waiting_for_the_esc_hook_reports_every_outcome() {
+        let stop = StopController::default();
+        let short = Duration::from_millis(30);
+        assert_eq!(stop.wait_for_esc_hook(short), EscHook::NotMonitored);
+
+        stop.set_esc_monitor_attached(true);
+        assert_eq!(stop.wait_for_esc_hook(short), EscHook::TimedOut);
+
+        stop.set_esc_install_failed("hook refused");
+        assert_eq!(
+            stop.wait_for_esc_hook(short),
+            EscHook::Failed("hook refused".into())
+        );
+        // A new session gets a fresh attempt and a fresh verdict.
+        stop.set_session_active(true);
+        assert!(!stop.esc_install_failed());
+
+        let installer = stop.clone();
+        let installing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            installer.set_esc_stop_available(true);
+        });
+        assert_eq!(
+            stop.wait_for_esc_hook(Duration::from_secs(5)),
+            EscHook::Installed,
+            "the wait ends when the hook is confirmed, not at the timeout"
+        );
+        installing.join().unwrap();
     }
 }

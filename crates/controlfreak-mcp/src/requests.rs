@@ -668,47 +668,12 @@ where
     T: for<'de> Deserialize<'de>,
 {
     serde_json::from_value(Value::Object(arguments.unwrap_or_default())).map_err(|error| {
-        let reason = describe_argument_error(&error.to_string());
+        let reason = error.to_string();
         ErrorData::invalid_params(
             format!("invalid tool arguments: {reason}"),
             Some(json!({ "reason": reason })),
         )
     })
-}
-
-/// Adds the nearest key name and the valid names to an unknown-key parse error.
-fn describe_argument_error(error: &str) -> String {
-    const MARKER: &str = "unknown key '";
-    let Some(start) = error.find(MARKER).map(|index| index + MARKER.len()) else {
-        return error.to_owned();
-    };
-    let Some(length) = error[start..].find('\'') else {
-        return error.to_owned();
-    };
-    let names = super::schema::all_key_names();
-    let unknown = error[start..start + length].to_lowercase();
-    let nearest = names
-        .iter()
-        .map(|name| (edit_distance(&unknown, name), name))
-        .filter(|(distance, _)| *distance <= 2)
-        .min_by_key(|(distance, _)| *distance);
-    let hint = nearest.map_or_else(String::new, |(_, name)| format!(" Did you mean '{name}'?"));
-    format!("{error}.{hint} Valid key names: {}", names.join(", "))
-}
-
-fn edit_distance(left: &str, right: &str) -> usize {
-    let right: Vec<char> = right.chars().collect();
-    let mut row: Vec<usize> = (0..=right.len()).collect();
-    for (index, left_char) in left.chars().enumerate() {
-        let mut diagonal = row[0];
-        row[0] = index + 1;
-        for (column, right_char) in right.iter().enumerate() {
-            let substituted = diagonal + usize::from(left_char != *right_char);
-            diagonal = row[column + 1];
-            row[column + 1] = substituted.min(row[column] + 1).min(row[column + 1] + 1);
-        }
-    }
-    row[right.len()]
 }
 
 const fn default_focus_timeout_ms() -> u32 {
