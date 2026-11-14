@@ -9,6 +9,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+## [0.2.0] - 2026-11-14
+
 ### Added
 
 - Every tool has a `title`, and annotations are consistent: every input tool is `destructiveHint: true` and `openWorldHint: true`. `stop_desktop_work` is now annotated destructive, because it closes input permanently, and is listed last. Its description tells the model to use `end_control_session` to finish normally.
