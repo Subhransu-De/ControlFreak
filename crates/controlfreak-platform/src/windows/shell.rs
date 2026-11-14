@@ -14,6 +14,7 @@
 pub(super) const ALL_DESKTOPS: &str = "shell:all-desktops";
 
 const EXPLORER: &str = "explorer.exe";
+const APP_FRAME_HOST: [&str; 2] = ["system32", "applicationframehost.exe"];
 const EXPLORER_CLASSES: [&str; 4] = [
     "Shell_TrayWnd",
     "Shell_SecondaryTrayWnd",
@@ -69,6 +70,14 @@ pub(super) fn is_shell_host_image(image: &str, windows_directory: &str) -> bool 
     below_windows(image, windows_directory).is_some_and(|rest| rest == [EXPLORER])
 }
 
+/// Whether `image` runs a host that owns windows of many unrelated applications: the shell
+/// (`explorer.exe`) or the frame host of packaged apps (`System32\ApplicationFrameHost.exe`).
+/// For these, a shared process does not make two windows one application.
+pub(super) fn is_shared_host_image(image: &str, windows_directory: &str) -> bool {
+    is_shell_host_image(image, windows_directory)
+        || below_windows(image, windows_directory).is_some_and(|rest| rest == APP_FRAME_HOST)
+}
+
 /// Whether a window with this class, owned by a process running `image`, is a shell surface.
 pub(super) fn is_shell_surface(class: &str, image: &str, windows_directory: &str) -> bool {
     if EXPLORER_CLASSES.contains(&class) {
@@ -108,6 +117,31 @@ mod tests {
             ));
             assert!(is_shell_surface(class, "C:/Windows/explorer.exe", WINDOWS));
         }
+    }
+
+    #[test]
+    fn shared_hosts_are_the_shell_and_the_packaged_app_frame_host_from_the_windows_directory() {
+        for image in [
+            r"C:\Windows\explorer.exe",
+            r"c:\windows\system32\ApplicationFrameHost.exe",
+        ] {
+            assert!(is_shared_host_image(image, WINDOWS), "{image}");
+        }
+        for image in [
+            r"C:\Windows\notepad.exe",
+            r"C:\Windows\ApplicationFrameHost.exe",
+            r"C:\Users\someone\System32\ApplicationFrameHost.exe",
+            r"C:\Windows\System32\ApplicationFrameHost.exe.exe",
+            "",
+        ] {
+            assert!(!is_shared_host_image(image, WINDOWS), "{image}");
+        }
+        // The frame host is not a shell surface: only explorer.exe gets the desktop exemption.
+        assert!(!is_shell_surface(
+            "Shell_TrayWnd",
+            r"C:\Windows\System32\ApplicationFrameHost.exe",
+            WINDOWS
+        ));
     }
 
     #[test]

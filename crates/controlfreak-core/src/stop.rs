@@ -310,10 +310,11 @@ impl StopController {
     pub fn register(&self, control: MutationControl) -> Result<StopRegistration, PlatformError> {
         let mut state = self.state();
         if let Some(reason) = refusal(state.stop_reason, state.failure.as_deref()) {
-            return Err(PlatformError::OperationFailed {
-                operation: "admission".to_owned(),
+            return Err(PlatformError::failed(
+                crate::FailureCause::DesktopWorkStopped,
+                "admission",
                 reason,
-            });
+            ));
         }
         let id = state.next_id;
         state.next_id = state.next_id.wrapping_add(1);

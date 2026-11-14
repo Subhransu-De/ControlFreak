@@ -30,7 +30,7 @@ pub use display::{
     PointerActionResult, VisualBaseline, VisualBaselineRequest, VisualChangeResult,
     WaitForChangeSinceRequest, WaitForVisualChangeRequest,
 };
-pub use error::PlatformError;
+pub use error::{FailureCause, PlatformError, RefusalCause};
 pub use keyboard::{Key, KeyChordRequest, KeyboardActionResult, TextInputRequest};
 pub use mutation::MutationControl;
 pub use ocr::{

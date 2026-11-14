@@ -459,11 +459,11 @@ fn ensure_cursor_at(
     if current == validated {
         Ok(())
     } else {
-        Err(PlatformError::OperationFailed {
-            operation: operation.to_owned(),
-            reason: "the pointer moved after target validation; observe again before retrying"
-                .to_owned(),
-        })
+        Err(PlatformError::failed(
+            controlfreak_core::FailureCause::PointerMoved,
+            operation,
+            "the pointer moved after target validation; observe again before retrying",
+        ))
     }
 }
 
@@ -476,10 +476,11 @@ fn ensure_input_generation(
     if expected.is_none_or(|expected| expected == current) {
         Ok(())
     } else {
-        Err(PlatformError::OperationFailed {
-            operation: operation.to_owned(),
-            reason: "another input action ran during text recognition; find the text again before clicking".to_owned(),
-        })
+        Err(PlatformError::failed(
+            controlfreak_core::FailureCause::InputInterleaved,
+            operation,
+            "another input action ran during text recognition; find the text again before clicking",
+        ))
     }
 }
 

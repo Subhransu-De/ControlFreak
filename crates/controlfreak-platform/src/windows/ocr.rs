@@ -75,10 +75,11 @@ fn record_helper_stages(stages: &[(String, u64)]) {
 }
 
 fn helper_error(reason: impl Into<String>) -> PlatformError {
-    PlatformError::OperationFailed {
-        operation: "windows_ocr_helper".to_owned(),
-        reason: reason.into(),
-    }
+    PlatformError::failed(
+        controlfreak_core::FailureCause::OcrUnavailable,
+        "windows_ocr_helper",
+        reason,
+    )
 }
 
 /// The backend's warm helper and request numbering.

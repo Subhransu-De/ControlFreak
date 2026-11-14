@@ -150,10 +150,11 @@ where
         if control.progress().input_outcome == InputOutcome::NotStarted {
             control.dispatch_started();
         }
-        Err(PlatformError::OperationFailed {
-            operation: "mutation_worker".to_owned(),
-            reason: "mutation worker failed; observe the desktop before recovery".to_owned(),
-        })
+        Err(PlatformError::failed(
+            controlfreak_core::FailureCause::WorkerFailed,
+            "mutation_worker",
+            "mutation worker failed; observe the desktop before recovery",
+        ))
     });
     (result, control.progress())
 }
@@ -711,9 +712,14 @@ pub(super) async fn call_focus_window(
         window_id,
         observation: input.observation.into(),
     };
+    // Inside a session the approved window stays bound, and the backend decides whether the
+    // requested window may be focused: the approved window itself or a dialog of its process.
+    let approved = operation_lease
+        .as_ref()
+        .and_then(|lease| lease.mutation_control().approved_target());
     let (result, progress) = run_encoded_mutation(
         operation_lease,
-        Some(request.window_id.clone()),
+        Some(approved.unwrap_or_else(|| request.window_id.clone())),
         Arc::clone(&backend),
         move |control| {
             let mut request = request;

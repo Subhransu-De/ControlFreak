@@ -393,6 +393,9 @@ fn all_platform_errors() -> Vec<PlatformError> {
             operation: "x".into(),
             reason: "the pointer moved after target validation".into(),
         },
+        PlatformError::failed(controlfreak_core::FailureCause::KeyHeld, "x", "held"),
+        PlatformError::refused(controlfreak_core::RefusalCause::NotForeground, "x"),
+        PlatformError::refused(controlfreak_core::RefusalCause::OwnIndicator, "x"),
         PlatformError::Unavailable { reason: "r".into() },
     ]
 }
@@ -512,10 +515,11 @@ async fn real_error_results_over_the_transport_validate_for_all_tools() {
 #[tokio::test]
 async fn platform_failures_carry_retryable_and_a_stable_reason() {
     let backend = ContractBackend::new();
-    *backend.click_error.lock().unwrap() = Some(PlatformError::OperationFailed {
-        operation: "click_mouse".into(),
-        reason: "the pointer moved after target validation; observe again".into(),
-    });
+    *backend.click_error.lock().unwrap() = Some(PlatformError::failed(
+        controlfreak_core::FailureCause::PointerMoved,
+        "click_mouse",
+        "the pointer moved after target validation; observe again",
+    ));
     let mut harness = harness(backend).await;
     let result = call(
         &mut harness,

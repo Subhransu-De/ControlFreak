@@ -638,11 +638,11 @@ fn send_with_button_dwell_if_idle(
 ) -> Result<(), PlatformError> {
     control.check(operation)?;
     if any_requested_input_held(inputs, is_down) {
-        return Err(PlatformError::OperationFailed {
-            operation: operation.to_owned(),
-            reason: "a requested key or mouse button is already held; release it before retrying"
-                .to_owned(),
-        });
+        return Err(PlatformError::failed(
+            controlfreak_core::FailureCause::KeyHeld,
+            operation,
+            "a requested key or mouse button is already held; release it before retrying",
+        ));
     }
     send_with_button_dwell(operation, inputs, control, validate, send, dwell)
 }
@@ -820,10 +820,11 @@ fn ensure_pointer_idle_with(
     mut is_down: impl FnMut(i32) -> bool,
 ) -> Result<(), PlatformError> {
     if [1, 2, 4, 5, 6].into_iter().any(&mut is_down) {
-        return Err(PlatformError::OperationFailed {
-            operation: operation.to_owned(),
-            reason: "a mouse button is already held; refusing to move the user's drag".to_owned(),
-        });
+        return Err(PlatformError::failed(
+            controlfreak_core::FailureCause::KeyHeld,
+            operation,
+            "a mouse button is already held; refusing to move the user's drag",
+        ));
     }
     Ok(())
 }
@@ -855,11 +856,11 @@ fn send_releasing_if_idle(
 ) -> Result<(), PlatformError> {
     control.check(operation)?;
     if any_requested_input_held(inputs, is_down) {
-        return Err(PlatformError::OperationFailed {
-            operation: operation.to_owned(),
-            reason: "a requested key or mouse button is already held; release it before retrying"
-                .to_owned(),
-        });
+        return Err(PlatformError::failed(
+            controlfreak_core::FailureCause::KeyHeld,
+            operation,
+            "a requested key or mouse button is already held; release it before retrying",
+        ));
     }
     send_releasing(operation, inputs, control, send)
 }
@@ -1008,12 +1009,13 @@ fn send_cleanup(
 }
 
 fn incomplete_input_error(operation: &str, inserted: usize, requested: usize) -> PlatformError {
-    PlatformError::OperationFailed {
-        operation: operation.to_owned(),
-        reason: format!(
+    PlatformError::failed(
+        controlfreak_core::FailureCause::InputBlocked,
+        operation,
+        format!(
             "SendInput inserted {inserted} of {requested} events; Windows may block input targeting a higher-integrity application"
         ),
-    }
+    )
 }
 
 pub(super) fn post_action_error(operation: &str, reason: String) -> PlatformError {

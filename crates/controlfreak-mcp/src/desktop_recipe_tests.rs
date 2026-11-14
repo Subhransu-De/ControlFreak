@@ -111,10 +111,12 @@ async fn a_foreign_foreground_is_refused_and_focus_window_recovers_the_session()
     begin(&mut harness, &target).await;
 
     desktop.open("Chat notification", 20);
-    assert_eq!(
-        refused_code(&click(&mut harness, &target).await),
-        "target_invalidated"
-    );
+    let refused = click(&mut harness, &target).await;
+    assert_eq!(refused_code(&refused), "target_invalidated");
+    // The agent can tell this recoverable refusal from a fatal change without reading prose.
+    let error = &refused["structuredContent"]["error"];
+    assert_eq!(error["reason"], "not_foreground", "{refused}");
+    assert_eq!(error["retryable"], true, "{refused}");
     assert!(desktop.received().is_empty(), "nothing reached any window");
 
     // The refusal did not poison the session: focusing the target makes the next action work.
@@ -131,6 +133,70 @@ async fn a_foreign_foreground_is_refused_and_focus_window_recovers_the_session()
         desktop.received(),
         [Received::Focus { window: app }, clicked(app)]
     );
+    harness.finish().await;
+}
+
+#[tokio::test]
+async fn a_refused_focus_is_retryable_and_does_not_poison_the_session() {
+    let desktop = FakeDesktop::new();
+    let app = desktop.open("Editor", 10);
+    let target = desktop.id(app);
+    let mut harness = start(&desktop).await;
+    begin(&mut harness, &target).await;
+    desktop.open("Chat notification", 20);
+    desktop.refuse_focus(1);
+
+    let focus = || json!({"window_id": target, "observation": {"mode": "none"}});
+    let refused = call(&mut harness, FOCUS_WINDOW, focus()).await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    let error = &refused["structuredContent"]["error"];
+    assert_eq!(error["code"], "activation_refused", "{refused}");
+    assert_eq!(error["retryable"], true, "{refused}");
+
+    // The retry the error asks for works in the same session, and so does input afterwards.
+    accepted(&call(&mut harness, FOCUS_WINDOW, focus()).await);
+    accepted(&click(&mut harness, &target).await);
+    assert_eq!(
+        desktop.received(),
+        [Received::Focus { window: app }, clicked(app)]
+    );
+    harness.finish().await;
+}
+
+#[tokio::test]
+async fn focus_window_can_bring_back_a_dialog_of_the_approved_application() {
+    let desktop = FakeDesktop::new();
+    let app = desktop.open("Editor", 10);
+    let target = desktop.id(app);
+    let mut harness = start(&desktop).await;
+    begin(&mut harness, &target).await;
+    let dialog = desktop.open_owned(app, "Save as");
+    desktop.open("Chat notification", 20);
+
+    // The session stays on the editor; the dialog of the same process can be focused in it.
+    accepted(
+        &call(
+            &mut harness,
+            FOCUS_WINDOW,
+            json!({"window_id": desktop.id(dialog), "observation": {"mode": "none"}}),
+        )
+        .await,
+    );
+    accepted(&click(&mut harness, &target).await);
+    assert_eq!(
+        desktop.received(),
+        [Received::Focus { window: dialog }, clicked(dialog)]
+    );
+
+    // A window of another process still needs its own session.
+    let stranger = desktop.open("Other app", 30);
+    let refused = call(
+        &mut harness,
+        FOCUS_WINDOW,
+        json!({"window_id": desktop.id(stranger), "observation": {"mode": "none"}}),
+    )
+    .await;
+    assert_eq!(refused["isError"], true, "{refused}");
     harness.finish().await;
 }
 

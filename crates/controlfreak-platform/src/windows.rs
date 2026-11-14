@@ -182,6 +182,9 @@ pub struct Backend {
 }
 
 struct NativeActivation<'a> {
+    /// The session's approved target. The window being activated is `window_id`, which is the
+    /// target itself or a window of the same process (a dialog of the approved application).
+    approved_id: &'a str,
     window_id: &'a str,
     hwnd: HWND,
     initial_foreground: String,
@@ -197,18 +200,42 @@ impl activation::Activation for NativeActivation<'_> {
             .activation_progress(self.attempts, self.elapsed_ms());
         self.control.check_target()?;
         self.control.check("focus_window")?;
-        find_window(self.window_id).map_err(|_| PlatformError::TargetInvalidated {
-            reason: "the approved window no longer exists".into(),
+        find_window(self.window_id).map_err(|_| {
+            if self.window_id == self.approved_id {
+                PlatformError::TargetInvalidated {
+                    reason: "the approved window no longer exists".into(),
+                }
+            } else {
+                PlatformError::InvalidArgument {
+                    argument: "window_id".into(),
+                    reason: "the window no longer exists".into(),
+                }
+            }
         })?;
         Backend::ensure_window_input_target("focus_window", self.hwnd)?;
         let foreground = foreground_window_handle();
-        Backend::ensure_window_input_target("focus_window", foreground)?;
-        if foreground != self.hwnd && foreground != target::resolve(&self.initial_foreground)?.0 {
-            return Err(PlatformError::TargetInvalidated {
-                reason: "foreground ownership changed during activation".into(),
-            });
+        if foreground.is_invalid() {
+            // Windows briefly has no foreground window while it hands activation over.
+            return Ok(false);
         }
-        Ok(foreground == self.hwnd)
+        Backend::ensure_window_input_target("focus_window", foreground)?;
+        if foreground == self.hwnd {
+            return Ok(true);
+        }
+        // Another window of the approved application (it opened a dialog, or Windows handed it
+        // activation) is not a change of owner; only another process taking the foreground is.
+        let initial = target::resolve(&self.initial_foreground)
+            .ok()
+            .map(|found| found.0);
+        if Some(foreground) != initial
+            && !target::window_serves_target(self.approved_id, foreground)
+        {
+            return Err(PlatformError::refused(
+                controlfreak_core::RefusalCause::ForegroundChanged,
+                "another process took the foreground during activation; try again, or ask the user to click the target window",
+            ));
+        }
+        Ok(false)
     }
 
     fn activate(&mut self) -> Result<bool, PlatformError> {
@@ -235,7 +262,7 @@ impl activation::Activation for NativeActivation<'_> {
         let accepted = activate_window(self.hwnd);
         if accepted {
             self.control.dispatch_accepted(0);
-            target::arm_if_foreground(self.window_id)?;
+            target::arm_if_foreground(self.approved_id)?;
         } else {
             self.control.dispatch_rejected(previous);
         }
@@ -835,16 +862,22 @@ impl WindowBackend for Backend {
         let _guard = self.lock_input(control)?;
         ensure_interactive_input_desktop("focus_window")?;
         control.check("focus_window")?;
-        if control.approved_target().as_deref() != Some(request.window_id.as_str()) {
-            return Err(target::invalid(
-                "focus target differs from the approved session target",
-            ));
-        }
+        let approved = control
+            .approved_target()
+            .ok_or_else(|| target::invalid("an approved target reference is required"))?;
         let window = find_window(&request.window_id)?;
         let (hwnd, _) = resolve_window_reference(&request.window_id)?;
+        // The approved window, or a window of its own process (one of its dialogs), by the same
+        // rule as the foreground and pointer checks; anything else needs a new session.
+        if approved != request.window_id && !target::window_serves_target(&approved, hwnd) {
+            return Err(target::invalid(
+                "focus target differs from the approved session target; focus_window accepts the approved window or a dialog of the same application",
+            ));
+        }
         Self::ensure_window_input_target("focus_window", hwnd)?;
 
         let mut driver = NativeActivation {
+            approved_id: &approved,
             attempts: 0,
             window_id: &request.window_id,
             hwnd,
@@ -856,13 +889,15 @@ impl WindowBackend for Backend {
         let activation = controlfreak_core::timing::time("activate", || {
             activation::focus(&mut driver, request.timeout_ms)
         });
-        if activation.is_err() {
+        // A refused or timed-out activation leaves the target as it was, and its error says
+        // the request is retryable, so only a change of the target itself ends the session.
+        if matches!(activation, Err(PlatformError::TargetInvalidated { .. })) {
             control.invalidate_target();
         }
         let (_, elapsed_ms) = activation?;
         let attempts = driver.attempts;
         control.activation_progress(attempts, elapsed_ms);
-        target::arm_if_foreground(&request.window_id)?;
+        target::arm_if_foreground(&approved)?;
         control.input_complete();
         target::evidence(control);
 

@@ -330,7 +330,9 @@ pub(super) fn tool_error(error: &PlatformError) -> CallToolResult {
                 "retry_action": false,
             }));
         }
-        PlatformError::TargetInvalidated { .. } => "target_invalidated",
+        PlatformError::TargetInvalidated { .. } | PlatformError::TargetRefused { .. } => {
+            "target_invalidated"
+        }
         PlatformError::ActivationFailed { reason, .. } => reason.as_str(),
         PlatformError::OcrNoMatch { .. } => "ocr_no_match",
         PlatformError::OcrAmbiguousMatch { .. } => "ocr_ambiguous_match",
@@ -339,9 +341,9 @@ pub(super) fn tool_error(error: &PlatformError) -> CallToolResult {
         PlatformError::HigherIntegrityTarget { .. } => "higher_integrity_target",
         PlatformError::TargetIntegrityUnavailable { .. } => "target_integrity_unavailable",
         PlatformError::InvalidArgument { .. } => "invalid_argument",
-        PlatformError::OperationFailed { .. } | PlatformError::Unavailable { .. } => {
-            "platform_operation_failed"
-        }
+        PlatformError::OperationFailed { .. }
+        | PlatformError::Failed { .. }
+        | PlatformError::Unavailable { .. } => "platform_operation_failed",
     };
     let mut value = json!({"error": {
         "code": code,

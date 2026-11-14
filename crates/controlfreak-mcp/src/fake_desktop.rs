@@ -47,6 +47,8 @@ struct State {
     windows: Vec<FakeWindow>,
     foreground: Option<u32>,
     received: Vec<Received>,
+    /// How many upcoming `focus_window` calls Windows refuses to activate.
+    focus_refusals: u32,
 }
 
 #[derive(Default)]
@@ -203,6 +205,11 @@ impl FakeDesktop {
         reference(state.window(key).expect("window is open"))
     }
 
+    /// Makes the next `count` focus requests fail like Windows refusing a background activation.
+    pub(super) fn refuse_focus(&self, count: u32) {
+        self.state().focus_refusals = count;
+    }
+
     pub(super) fn received(&self) -> Vec<Received> {
         self.state().received.clone()
     }
@@ -230,8 +237,11 @@ impl FakeDesktop {
             .and_then(|key| state.window(key))
             .filter(|window| window.process_id == target.process_id)
             .map(|window| window.key)
-            .ok_or_else(|| PlatformError::TargetInvalidated {
-                reason: "another process holds the foreground".into(),
+            .ok_or_else(|| {
+                PlatformError::refused(
+                    controlfreak_core::RefusalCause::NotForeground,
+                    "another process holds the foreground",
+                )
             })
     }
 
@@ -339,18 +349,35 @@ impl WindowBackend for FakeDesktop {
     ) -> Result<WindowFocusResult, PlatformError> {
         control.check("focus_window")?;
         control.check_target()?;
-        if control.approved_target().as_deref() != Some(request.window_id.as_str()) {
-            return Err(PlatformError::TargetInvalidated {
-                reason: "focus target differs from the approved session target".into(),
-            });
-        }
+        let approved = control.approved_target().unwrap_or_default();
         let mut state = self.state();
         let Some(window) = state.resolve(&request.window_id).cloned() else {
-            control.invalidate_target();
+            if approved == request.window_id {
+                control.invalidate_target();
+            }
             return Err(PlatformError::TargetInvalidated {
                 reason: "window, process lifetime, owner, or desktop changed".into(),
             });
         };
+        // The approved window or a window of its process, as in the Windows backend.
+        let serves = approved == request.window_id
+            || state
+                .resolve(&approved)
+                .is_some_and(|target| target.process_id == window.process_id);
+        if !serves {
+            return Err(PlatformError::TargetInvalidated {
+                reason: "focus target differs from the approved session target".into(),
+            });
+        }
+        if state.focus_refusals > 0 {
+            state.focus_refusals -= 1;
+            // A refused activation leaves the target alone, like the Windows backend.
+            return Err(PlatformError::ActivationFailed {
+                reason: "activation_refused".into(),
+                attempts: 3,
+                elapsed_ms: 400,
+            });
+        }
         state.foreground = Some(window.key);
         state.received.push(Received::Focus { window: window.key });
         Self::deliver(control, 1);

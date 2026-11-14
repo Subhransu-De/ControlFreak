@@ -6,8 +6,14 @@ use crate::IntegrityLevel;
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlatformError {
+    /// The target changed identity, geometry or desktop, or the session is poisoned. The
+    /// session cannot continue; end it and observe again.
     #[error("approved target invalidated: {reason}")]
     TargetInvalidated { reason: String },
+    /// This action was refused, but the target is unchanged and the session keeps it. The next
+    /// action checks again, so the agent can recover (for example with `focus_window`).
+    #[error("approved target cannot take this action right now: {reason}")]
+    TargetRefused { cause: RefusalCause, reason: String },
     #[error(
         "foreground activation failed: {reason} after {attempts} attempts and {elapsed_ms} ms; Windows can refuse focus changes requested by a background process, so ask the user to click the target window, then try again"
     )]
@@ -41,6 +47,14 @@ pub enum PlatformError {
     InvalidArgument { argument: String, reason: String },
     #[error("operation '{operation}' failed: {reason}")]
     OperationFailed { operation: String, reason: String },
+    /// A failure the agent can act on, with its cause as data rather than inferred from text.
+    /// It has the same wire code as `OperationFailed`.
+    #[error("operation '{operation}' failed: {reason}")]
+    Failed {
+        cause: FailureCause,
+        operation: String,
+        reason: String,
+    },
     #[error(
         "operation '{operation}' completed, but post-action observation failed: {reason}; do not repeat the action solely because its screenshot failed"
     )]
@@ -49,7 +63,102 @@ pub enum PlatformError {
     Unavailable { reason: String },
 }
 
+/// Why an action was refused while the session's target stayed valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalCause {
+    /// The target (or a window of its process) is not in the foreground. `focus_window` fixes it.
+    NotForeground,
+    /// The foreground changed while the action was being validated.
+    ForegroundChanged,
+    /// The point or keyboard focus is in a window of another process.
+    ForeignDestination,
+    /// The point is under the server's own indicator or Stop button.
+    OwnIndicator,
+    /// The window that would receive the input cannot be identified.
+    DestinationUnidentified,
+}
+
+impl RefusalCause {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NotForeground => "not_foreground",
+            Self::ForegroundChanged => "foreground_changed",
+            Self::ForeignDestination => "foreign_destination",
+            Self::OwnIndicator => "own_indicator",
+            Self::DestinationUnidentified => "destination_unidentified",
+        }
+    }
+
+    /// Whether the same request can succeed after the recovery its message names. Pointing at
+    /// The server's own Stop button is never retryable: the request itself must change.
+    #[must_use]
+    pub const fn retryable(self) -> bool {
+        !matches!(self, Self::OwnIndicator)
+    }
+}
+
+/// The actionable causes of a `platform_operation_failed` result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCause {
+    Cancelled,
+    PointerMoved,
+    KeyHeld,
+    InputInterleaved,
+    OcrUnavailable,
+    DesktopWorkStopped,
+    WorkerFailed,
+    InputBlocked,
+}
+
+impl FailureCause {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::PointerMoved => "pointer_moved",
+            Self::KeyHeld => "key_held",
+            Self::InputInterleaved => "input_interleaved",
+            Self::OcrUnavailable => "ocr_unavailable",
+            Self::DesktopWorkStopped => "desktop_work_stopped",
+            Self::WorkerFailed => "worker_failed",
+            Self::InputBlocked => "input_blocked",
+        }
+    }
+
+    #[must_use]
+    pub const fn retryable(self) -> bool {
+        matches!(
+            self,
+            Self::PointerMoved | Self::KeyHeld | Self::InputInterleaved
+        )
+    }
+}
+
 impl PlatformError {
+    /// An actionable failure; see [`FailureCause`].
+    pub fn failed(
+        cause: FailureCause,
+        operation: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::Failed {
+            cause,
+            operation: operation.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// A refusal that leaves the session's target valid; see [`RefusalCause`].
+    pub fn refused(cause: RefusalCause, reason: impl Into<String>) -> Self {
+        Self::TargetRefused {
+            cause,
+            reason: reason.into(),
+        }
+    }
+
     /// Whether repeating the same request can succeed once the stated recovery is done.
     ///
     /// This is advice about the failure, not permission to repeat input: a result that carries
@@ -58,45 +167,23 @@ impl PlatformError {
     pub fn retryable(&self) -> bool {
         match self {
             Self::ActivationFailed { .. } => true,
-            Self::OperationFailed { .. } => matches!(
-                self.reason_code(),
-                Some("pointer_moved" | "key_held" | "input_interleaved")
-            ),
+            Self::TargetRefused { cause, .. } => cause.retryable(),
+            Self::Failed { cause, .. } => cause.retryable(),
             _ => false,
         }
     }
 
-    /// A stable sub-code that tells apart the failures that share the wire code
-    /// `platform_operation_failed`. Other errors already have their own wire code.
-    ///
-    /// Platform failures are free text, so this matches the phrases the backends use for the
-    /// failures an agent can act on. Each phrase is covered by a test, and an unmatched failure
-    /// reports `os_call_failed`.
+    /// A stable sub-code for the errors whose wire code does not say enough: the causes of
+    /// `platform_operation_failed` and of `target_invalidated`. Other errors have their own wire
+    /// code. The code comes from data set where the error is built, never from its message.
     #[must_use]
     pub fn reason_code(&self) -> Option<&'static str> {
         match self {
             Self::Unavailable { .. } => Some("backend_unavailable"),
-            Self::OperationFailed { operation, reason } => {
-                Some(if reason.contains("was cancelled") {
-                    "cancelled"
-                } else if reason.contains("pointer moved") {
-                    "pointer_moved"
-                } else if reason.contains("already held") {
-                    "key_held"
-                } else if reason.contains("another input action ran") {
-                    "input_interleaved"
-                } else if operation == "windows_ocr_helper" {
-                    "ocr_unavailable"
-                } else if operation == "admission" {
-                    "desktop_work_stopped"
-                } else if operation == "mutation_worker" && reason.contains("worker failed") {
-                    "worker_failed"
-                } else if reason.contains("SendInput inserted") {
-                    "input_blocked"
-                } else {
-                    "os_call_failed"
-                })
-            }
+            Self::OperationFailed { .. } => Some("os_call_failed"),
+            Self::Failed { cause, .. } => Some(cause.code()),
+            Self::TargetRefused { cause, .. } => Some(cause.code()),
+            Self::TargetInvalidated { .. } => Some("target_changed"),
             _ => None,
         }
     }
@@ -111,7 +198,7 @@ impl PlatformError {
 
 #[cfg(test)]
 mod tests {
-    use super::PlatformError;
+    use super::{FailureCause, PlatformError, RefusalCause};
     use crate::MutationControl;
 
     fn failed(operation: &str, reason: &str) -> PlatformError {
@@ -126,52 +213,47 @@ mod tests {
         let control = MutationControl::default();
         control.cancel();
         let cancelled = control.check("op").unwrap_err();
+        // Wording never changes the reason: only the typed cause does.
         let cases = [
             (cancelled, "cancelled", false),
             (
-                failed(
-                    "op",
-                    "the pointer moved after target validation; observe again",
-                ),
+                PlatformError::failed(FailureCause::PointerMoved, "op", "x"),
                 "pointer_moved",
                 true,
             ),
             (
-                failed(
-                    "op",
-                    "a requested key or mouse button is already held; release it",
-                ),
+                PlatformError::failed(FailureCause::KeyHeld, "op", "x"),
                 "key_held",
                 true,
             ),
             (
-                failed("op", "a mouse button is already held; refusing to move"),
-                "key_held",
-                true,
-            ),
-            (
-                failed("op", "another input action ran during text recognition"),
+                PlatformError::failed(FailureCause::InputInterleaved, "op", "x"),
                 "input_interleaved",
                 true,
             ),
             (
-                failed("windows_ocr_helper", "the helper exited"),
+                PlatformError::failed(FailureCause::OcrUnavailable, "windows_ocr_helper", "x"),
                 "ocr_unavailable",
                 false,
             ),
             (
-                failed("admission", "desktop work is stopped"),
+                PlatformError::failed(FailureCause::DesktopWorkStopped, "admission", "x"),
                 "desktop_work_stopped",
                 false,
             ),
             (
-                failed("mutation_worker", "mutation worker failed; observe"),
+                PlatformError::failed(FailureCause::WorkerFailed, "mutation_worker", "x"),
                 "worker_failed",
                 false,
             ),
             (
-                failed("SendInput", "SendInput inserted 1 of 4 events"),
+                PlatformError::failed(FailureCause::InputBlocked, "SendInput", "x"),
                 "input_blocked",
+                false,
+            ),
+            (
+                failed("op", "the pointer moved after target validation"),
+                "os_call_failed",
                 false,
             ),
             (failed("BitBlt", "access denied"), "os_call_failed", false),
@@ -180,6 +262,38 @@ mod tests {
                     reason: "no backend".to_owned(),
                 },
                 "backend_unavailable",
+                false,
+            ),
+            (
+                PlatformError::TargetInvalidated {
+                    reason: "gone".to_owned(),
+                },
+                "target_changed",
+                false,
+            ),
+            (
+                PlatformError::refused(RefusalCause::NotForeground, "x"),
+                "not_foreground",
+                true,
+            ),
+            (
+                PlatformError::refused(RefusalCause::ForegroundChanged, "x"),
+                "foreground_changed",
+                true,
+            ),
+            (
+                PlatformError::refused(RefusalCause::ForeignDestination, "x"),
+                "foreign_destination",
+                true,
+            ),
+            (
+                PlatformError::refused(RefusalCause::DestinationUnidentified, "x"),
+                "destination_unidentified",
+                true,
+            ),
+            (
+                PlatformError::refused(RefusalCause::OwnIndicator, "x"),
+                "own_indicator",
                 false,
             ),
         ];

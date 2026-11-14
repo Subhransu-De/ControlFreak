@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 
 use super::{desktop, environment::ensure_interactive_input_desktop, privilege, shell};
-use controlfreak_core::{DisplayInfo, MutationControl, PlatformError};
+use controlfreak_core::{DisplayInfo, MutationControl, PlatformError, RefusalCause};
 use std::{
     cell::RefCell,
     collections::VecDeque,
@@ -49,7 +49,8 @@ struct Identity {
     class: String,
     /// The virtual desktop, or `shell::ALL_DESKTOPS` for a verified shell surface.
     desktop: String,
-    /// The owning process is the Windows shell host (`explorer.exe` in the Windows directory).
+    /// The owning process hosts unrelated applications (see `shell::is_shared_host_image`), or
+    /// its image cannot be read, so "same process" does not mean "same application".
     shell_host: bool,
 }
 
@@ -84,10 +85,12 @@ const POPUP_MENU_CLASS: &str = "#32768";
 /// never may, whatever its window looks like. The checks on the actual window (integrity, and
 /// for pointer input the destination point) run separately and are unchanged.
 ///
-/// The shell process is the exception to "same process is the same application": `explorer.exe`
-/// owns the taskbar, the desktop and every File Explorer window. For a shell-hosted target, only
-/// windows in the target's owner chain and popup menus count as part of it, so approving one
-/// File Explorer window does not approve the taskbar or another folder window.
+/// Some processes are an exception to "same process is the same application": `explorer.exe`
+/// owns the taskbar, the desktop and every File Explorer window, and `ApplicationFrameHost.exe`
+/// owns the frame of every packaged app. For a target in such a shared host, and for a target
+/// whose process image cannot be read, only windows in the target's owner chain and popup menus
+/// count as part of it, so approving one File Explorer window does not approve the taskbar or
+/// another folder window, and approving one packaged app does not approve another's frame.
 fn accepts_same_process(target: &WindowFacts, shell_host: bool, window: &WindowFacts) -> bool {
     if window.hwnd == target.hwnd {
         return true;
@@ -105,10 +108,13 @@ fn accepts_same_process(target: &WindowFacts, shell_host: bool, window: &WindowF
 /// foreground or destination that is wrong right now only refuses this action.
 #[derive(Debug)]
 enum Failure {
-    /// The target changed identity, geometry or desktop, or its integrity cannot be verified.
+    /// The target changed identity, geometry or desktop, or its own integrity cannot be
+    /// verified, or the input desktop is not usable.
     Fatal(PlatformError),
-    /// Another process holds the foreground or would receive the input. The next action checks
-    /// again, so a window that comes back is usable without a new session.
+    /// The foreground window, the keyboard focus or the pointer destination is wrong. The target
+    /// is unchanged and the next action checks again, so a window that comes back is usable
+    /// without a new session. The error keeps its own code (a higher-integrity foreground is
+    /// still `higher_integrity_target`); it just does not end the session.
     Recoverable(PlatformError),
 }
 
@@ -116,6 +122,11 @@ impl From<PlatformError> for Failure {
     fn from(error: PlatformError) -> Self {
         Self::Fatal(error)
     }
+}
+
+/// Marks a failure about a window other than the target as one that only refuses this action.
+fn recoverable<T>(result: Result<T, PlatformError>) -> Result<T, Failure> {
+    result.map_err(Failure::Recoverable)
 }
 
 /// The window that would receive a pointer event: the root of the window under the point, and
@@ -147,16 +158,16 @@ impl Reference {
         }
         let shell_host = current.shell_host;
         if !accepts_same_process(target, shell_host, foreground) {
-            return Err(Failure::Recoverable(invalid(
+            return Err(Failure::Recoverable(refused(
+                RefusalCause::NotForeground,
                 "approved target is no longer foreground; call focus_window to bring it back, or a window of another process now owns the foreground",
             )));
         }
-        if hit.is_some_and(|hit| {
-            hit.window_pid != current.pid || !accepts_same_process(target, shell_host, &hit.root)
-        }) {
-            return Err(Failure::Recoverable(invalid(
-                "input destination belongs to a window of a different process; only the approved window and windows of its own process (its dialogs and popups) receive input",
-            )));
+        if let Some(hit) = hit
+            && (hit.window_pid != current.pid
+                || !accepts_same_process(target, shell_host, &hit.root))
+        {
+            return Err(Failure::Recoverable(destination_refusal(hit)));
         }
         Ok(())
     }
@@ -170,6 +181,26 @@ pub(super) fn invalid(reason: &str) -> PlatformError {
     PlatformError::TargetInvalidated {
         reason: reason.into(),
     }
+}
+
+pub(super) fn refused(cause: RefusalCause, reason: &str) -> PlatformError {
+    PlatformError::refused(cause, reason)
+}
+
+/// Why a pointer or keyboard destination in another process is refused. A window of this very
+/// process is the server's own indicator, which screenshots never show, so the message says
+/// so instead of blaming an unnamed other process.
+fn destination_refusal(hit: &Hit) -> PlatformError {
+    if hit.window_pid == std::process::id() {
+        return refused(
+            RefusalCause::OwnIndicator,
+            "this point is under ControlFreak's own indicator tab or Stop button, which screenshots do not show; choose another point or use the keyboard",
+        );
+    }
+    refused(
+        RefusalCause::ForeignDestination,
+        "input destination belongs to a window of a different process; only the approved window and windows of its own process (its dialogs and popups) receive input",
+    )
 }
 
 fn unavailable(reason: impl std::fmt::Display) -> PlatformError {
@@ -222,10 +253,8 @@ fn identity(hwnd: HWND) -> Result<Identity, PlatformError> {
     let class = String::from_utf16_lossy(&class[..length]);
     let image = process_image(process);
     let windows_directory = windows_directory();
-    let shell_host = matches!(
-        (&image, &windows_directory),
-        (Some(image), Some(directory)) if shell::is_shell_host_image(image, directory)
-    );
+    // Failing to read the image must narrow the same-process rule, never widen it.
+    let shell_host = is_shared_host(image.as_deref(), windows_directory.as_deref());
     let desktop = controlfreak_core::timing::time("identity_desktop", || {
         desktop::with_virtual_desktop_manager(|manager| desktop::window_desktop_id(manager, hwnd))
     })
@@ -255,6 +284,16 @@ fn identity(hwnd: HWND) -> Result<Identity, PlatformError> {
         desktop,
         shell_host,
     })
+}
+
+/// Whether the target's process hosts unrelated applications. A process whose image or whose
+/// Windows directory cannot be read counts as one: failing to know narrows the same-process
+/// rule to the owner chain instead of widening it to everything the process owns.
+fn is_shared_host(image: Option<&str>, windows_directory: Option<&str>) -> bool {
+    match (image, windows_directory) {
+        (Some(image), Some(directory)) => shell::is_shared_host_image(image, directory),
+        _ => true,
+    }
 }
 
 /// The Win32 path of the executable a process runs, or `None` if it cannot be read, in which
@@ -581,6 +620,20 @@ pub(super) fn arm_if_foreground(id: &str) -> Result<(), PlatformError> {
     Ok(())
 }
 
+/// Whether `window` is the approved target of reference `approved_id` or a window of its own
+/// process that may stand in for it (an owned dialog, a popup), by the same rule as the
+/// foreground and pointer checks. An unreadable window or reference is not.
+pub(super) fn window_serves_target(approved_id: &str, window: HWND) -> bool {
+    let Ok(reference) = lookup(approved_id) else {
+        return false;
+    };
+    let target = HWND(reference.identity.hwnd as *mut std::ffi::c_void);
+    let (Ok(target), Ok(window)) = (window_facts(target), window_facts(window)) else {
+        return false;
+    };
+    accepts_same_process(&target, reference.identity.shell_host, &window)
+}
+
 /// Whether the live foreground window is the target or a same-process window that may stand in
 /// for it. An unreadable foreground or target is not.
 fn foreground_serves(identity: &Identity) -> bool {
@@ -658,9 +711,17 @@ fn validate_reference(
     let foreground = desktop::foreground_window_handle();
     // Integrity is checked on the actual windows involved: the foreground window, which may be
     // a dialog or popup of the target's process rather than the target, and the target itself.
+    // A problem with the foreground window only refuses this action (the target is unchanged and
+    // the foreground can come back); a problem with the target itself ends the session.
+    if foreground.is_invalid() {
+        return Err(Failure::Recoverable(refused(
+            RefusalCause::NotForeground,
+            "no window holds the foreground right now; call focus_window to bring the target back",
+        )));
+    }
     controlfreak_core::timing::time("check_integrity", || {
-        cached_integrity(operation, foreground)?;
-        cached_integrity(operation, hwnd)
+        recoverable(cached_integrity(operation, foreground))?;
+        cached_integrity(operation, hwnd).map_err(Failure::Fatal)
     })?;
     // A shell surface is on every virtual desktop and has no desktop query result to compare.
     if reference.identity.desktop != shell::ALL_DESKTOPS {
@@ -680,11 +741,16 @@ fn validate_reference(
     let displays =
         controlfreak_core::timing::time("enumerate_displays", desktop::enumerate_displays)?;
     let target = window_facts(hwnd)?;
-    let foreground_facts = window_facts(foreground)?;
+    let foreground_facts = recoverable(window_facts(foreground).map_err(|_| {
+        refused(
+            RefusalCause::NotForeground,
+            "the foreground window cannot be identified; call focus_window to bring the target back",
+        )
+    }))?;
     let hit = if let Some(point) = point {
         // SAFETY: These APIs inspect value coordinates and return borrowed window handles.
         let hit = unsafe { WindowFromPoint(point) };
-        privilege::ensure_point_integrity(operation, point)?;
+        recoverable(privilege::ensure_point_integrity(operation, point))?;
         Some(hit_facts(hit)?)
     } else if matches!(
         operation,
@@ -696,9 +762,13 @@ fn validate_reference(
             ..Default::default()
         };
         // SAFETY: gui is a correctly sized writable record; zero queries the foreground thread.
-        unsafe { GetGUIThreadInfo(0, &raw mut gui) }
-            .map_err(|_| invalid("keyboard focus cannot be verified"))?;
-        privilege::ensure_window_integrity(operation, gui.hwndFocus)?;
+        unsafe { GetGUIThreadInfo(0, &raw mut gui) }.map_err(|_| {
+            Failure::Recoverable(refused(
+                RefusalCause::DestinationUnidentified,
+                "keyboard focus cannot be verified; observe again",
+            ))
+        })?;
+        recoverable(privilege::ensure_window_integrity(operation, gui.hwndFocus))?;
         Some(hit_facts(gui.hwndFocus)?)
     } else {
         None
@@ -715,10 +785,16 @@ fn validate_reference(
     // appeared in between, it must pass the same integrity and process checks as the first.
     let after = desktop::foreground_window_handle();
     if after != foreground {
-        cached_integrity(operation, after)?;
-        let after_facts = window_facts(after)?;
+        recoverable(cached_integrity(operation, after))?;
+        let after_facts = recoverable(window_facts(after).map_err(|_| {
+            refused(
+                RefusalCause::ForegroundChanged,
+                "foreground changed during target validation",
+            )
+        }))?;
         if !accepts_same_process(&target, reference.identity.shell_host, &after_facts) {
-            return Err(Failure::Recoverable(invalid(
+            return Err(Failure::Recoverable(refused(
+                RefusalCause::ForegroundChanged,
                 "foreground changed during target validation",
             )));
         }
@@ -730,7 +806,8 @@ fn validate_reference(
 /// A window that cannot be read is treated as belonging to a different process.
 fn hit_facts(window: HWND) -> Result<Hit, Failure> {
     let unreadable = || {
-        Failure::Recoverable(invalid(
+        Failure::Recoverable(refused(
+            RefusalCause::DestinationUnidentified,
             "the input destination window cannot be identified; observe again",
         ))
     };
@@ -1195,6 +1272,71 @@ mod tests {
             ),
             "no longer foreground",
         );
+    }
+
+    fn assert_refused_with(result: Result<(), Failure>, expected: RefusalCause) {
+        match result {
+            Err(Failure::Recoverable(PlatformError::TargetRefused { cause, .. })) => {
+                assert_eq!(cause, expected);
+                assert_eq!(
+                    PlatformError::refused(cause, "").retryable(),
+                    expected != RefusalCause::OwnIndicator
+                );
+            }
+            other => panic!("expected a typed refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recoverable_refusals_say_why_as_data() {
+        let target = target_facts();
+        assert_refused_with(
+            check(&facts(99, 3, "fixture", 99), None),
+            RefusalCause::NotForeground,
+        );
+        assert_refused_with(
+            check(&target, Some(&hit(facts(99, 3, "fixture", 99), 3))),
+            RefusalCause::ForeignDestination,
+        );
+        // A point under ControlFreak's own Stop button is named as such.
+        let own = std::process::id();
+        assert_refused_with(
+            check(&target, Some(&hit(facts(77, own, "Stop", 77), own))),
+            RefusalCause::OwnIndicator,
+        );
+    }
+
+    #[test]
+    fn an_unreadable_image_is_treated_as_a_shared_host() {
+        let windows = Some(r"C:\Windows");
+        assert!(is_shared_host(None, windows));
+        assert!(is_shared_host(Some(r"C:\Windows\explorer.exe"), None));
+        assert!(is_shared_host(
+            Some(r"C:\Windows\System32\ApplicationFrameHost.exe"),
+            windows
+        ));
+        assert!(!is_shared_host(Some(r"C:\Tools\app.exe"), windows));
+    }
+
+    #[test]
+    fn a_shared_host_target_does_not_accept_another_window_of_the_host_process() {
+        // Two packaged-app frames of one host process: only the owner chain is the same app.
+        let target = target_facts();
+        assert!(accepts_same_process(
+            &target,
+            false,
+            &facts(5, 2, "Frame", 5)
+        ));
+        assert!(!accepts_same_process(
+            &target,
+            true,
+            &facts(5, 2, "Frame", 5)
+        ));
+        assert!(accepts_same_process(
+            &target,
+            true,
+            &facts(6, 2, "#32770", 1)
+        ));
     }
 
     #[test]
