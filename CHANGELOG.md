@@ -54,6 +54,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 - Clients that validate `structuredContent` against `outputSchema`, such as the official TypeScript SDK, no longer throw on an error result.
 - The lamp helper no longer exits when the foreground window has no virtual desktop, such as the taskbar, the desktop or Start. It stays on its current desktop, so shell windows in front no longer cancel input or block new sessions.
 - GitHub release notes no longer break each changelog entry mid-sentence. Wrapped entries are joined into single lines when the notes are generated.
+- A session can no longer be admitted on an Esc hook that belongs to the previous session and is about to be removed. The hook is confirmed per session.
+- An `observation_id` for a window image is checked against that window directly, so a window missing from the 200-entry `list_windows` cap is no longer treated as closed.
 
 ### Known limitations
 
