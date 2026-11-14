@@ -478,7 +478,9 @@ fn begin_clamps_expected_seconds_and_end_hides_immediately() {
     assert!(runtime.begin_session(Some(99), "").is_err());
     assert_eq!(runtime.status()["owns_arbitration"], false);
     assert!(events.lock().unwrap().is_empty());
-    runtime.begin_session(Some(99), "synthetic").unwrap();
+    runtime
+        .begin_session(Some(99), "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
     assert_eq!(runtime.status()["hold_ms"], 2_000);
     assert_eq!(runtime.status()["state"], "armed");
     let snapshot = || {
@@ -515,7 +517,9 @@ fn begin_clamps_expected_seconds_and_end_hides_immediately() {
     assert_eq!(*events.lock().unwrap(), ["armed"]);
     runtime.end_session().unwrap();
 
-    runtime.begin_session(Some(1), "synthetic").unwrap();
+    runtime
+        .begin_session(Some(1), "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
     assert_eq!(runtime.status()["hold_ms"], 1_000);
     runtime.end_session().unwrap();
     assert_eq!(*events.lock().unwrap(), ["armed", "hide", "armed", "hide"]);
@@ -571,7 +575,9 @@ async fn explicit_session_hold_survives_the_first_mutation() {
     ));
     let _timeouts = manual_timeouts(&runtime);
 
-    runtime.begin_session(Some(2), "synthetic").unwrap();
+    runtime
+        .begin_session(Some(2), "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
     drop(runtime.acquire().await.unwrap());
 
     assert_eq!(runtime.status()["state"], "armed");
