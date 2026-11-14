@@ -225,8 +225,10 @@ fn stdio_capture_display_returns_png_image_content() {
     assert_eq!(metadata["image_width"], expected_width);
     assert!(matches!(
         metadata["resize_method"].as_str(),
-        Some("native" | "bilinear")
+        Some("native" | "area_average")
     ));
+    // Display captures copy the screen; only window captures can report `windows_print_window`.
+    assert_eq!(metadata["capture_method"], "windows_gdi");
 
     assert_region_tools(&mut child, &mut reader, &display_id);
     assert_argument_errors_are_structured(&mut child, &mut reader, &display_id);

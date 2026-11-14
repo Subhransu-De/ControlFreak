@@ -2,6 +2,7 @@
 members = [
     "crates/controlfreak-core",
     "crates/controlfreak-installer",
+    "crates/controlfreak-live-tests",
     "crates/controlfreak-mcp",
     "crates/controlfreak-platform",
     "crates/controlfreak-server",

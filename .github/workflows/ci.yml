@@ -65,6 +65,33 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 
+  live-desktop:
+    name: Live desktop tests
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Build the server under test
+        run: cargo build -p controlfreak-server --locked
+
+      # The hosted runner is a disposable interactive desktop. The tests inject real input there
+      # and refuse to run anywhere else without this variable.
+      - name: Run live tests against the fixture window
+        env:
+          CONTROLFREAK_LIVE_DESKTOP: "1"
+        run: cargo test -p controlfreak-live-tests --test live --locked -- --ignored --test-threads=1
+
   windows-build:
     name: Release build
     runs-on: windows-latest
