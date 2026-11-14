@@ -64,6 +64,9 @@ struct ContractBackend {
     recorded: Mutex<Recorded>,
     windows: Mutex<Vec<WindowInfo>>,
     click_error: Mutex<Option<PlatformError>>,
+    /// Truncates `list_windows` like the real backend's cap, without hiding windows from
+    /// `wait_for_window`.
+    list_cap: Mutex<Option<usize>>,
 }
 
 impl ContractBackend {
@@ -75,6 +78,7 @@ impl ContractBackend {
                 window("target-00000000-0000-0000-0000-000000000002"),
             ]),
             click_error: Mutex::new(None),
+            list_cap: Mutex::new(None),
         })
     }
 
@@ -240,9 +244,30 @@ impl KeyboardBackend for ContractBackend {
 
 impl WindowBackend for ContractBackend {
     fn list_windows(&self) -> Result<controlfreak_core::WindowList, PlatformError> {
-        Ok(controlfreak_core::WindowList {
-            windows: self.windows.lock().unwrap().clone(),
-            truncated: false,
+        let mut windows = self.windows.lock().unwrap().clone();
+        let cap = *self.list_cap.lock().unwrap();
+        let truncated = cap.is_some_and(|cap| windows.len() > cap);
+        if let Some(cap) = cap {
+            windows.truncate(cap);
+        }
+        Ok(controlfreak_core::WindowList { windows, truncated })
+    }
+    fn wait_for_window(
+        &self,
+        request: &controlfreak_core::WaitForWindowRequest,
+    ) -> Result<controlfreak_core::WindowWaitResult, PlatformError> {
+        let window = self
+            .windows
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|window| request.window_id.as_ref().is_none_or(|id| *id == window.id))
+            .cloned();
+        Ok(controlfreak_core::WindowWaitResult {
+            matched: window.is_some(),
+            timed_out: window.is_none(),
+            elapsed_ms: 0,
+            window,
         })
     }
     fn capture_window(
@@ -645,7 +670,11 @@ async fn target_ref_is_an_alias_of_window_id() {
         json!({"target_ref": "target-00000000-0000-0000-0000-000000000002"}),
     )
     .await;
-    assert_eq!(waited["isError"], true, "{waited}");
+    assert_ne!(waited["isError"], true, "{waited}");
+    assert_eq!(
+        waited["structuredContent"]["window"]["id"],
+        "target-00000000-0000-0000-0000-000000000002"
+    );
     harness.finish().await;
 }
 
@@ -996,6 +1025,26 @@ async fn a_window_image_stops_mapping_points_once_its_window_changed() {
     );
     assert_eq!(stale["structuredContent"]["status"], "not_started");
     assert_eq!(backend.recorded(|r| r.clicks.len()), 1);
+    harness.finish().await;
+}
+
+/// The window check does not depend on the capped `list_windows`.
+#[tokio::test]
+async fn a_window_image_is_checked_without_the_capped_window_list() {
+    let backend = ContractBackend::new();
+    *backend.list_cap.lock().unwrap() = Some(0);
+    let mut harness = harness(backend.clone()).await;
+    let target = "target-00000000-0000-0000-0000-000000000001";
+    call(
+        &mut harness,
+        BEGIN_CONTROL_SESSION,
+        json!({"target_ref": target}),
+    )
+    .await;
+    let capture = call(&mut harness, CAPTURE_WINDOW, json!({"window_id": target})).await;
+    let click = json!({"target_ref": target, "observation_id": capture["structuredContent"]["observation_id"], "image_x": 10, "image_y": 10});
+    let result = call(&mut harness, CLICK_MOUSE, click).await;
+    assert_ne!(result["isError"], true, "{result}");
     harness.finish().await;
 }
 

@@ -9,7 +9,9 @@
 //! when the window moves, resizes or closes, so a stale image is refused instead of mapped onto
 //! whatever now lies under the old rectangle.
 
-use controlfreak_core::{DisplayBounds, ObservationOptions, PlatformBackend, PlatformError};
+use controlfreak_core::{
+    DisplayBounds, ObservationOptions, PlatformBackend, PlatformError, WaitForWindowRequest,
+};
 use std::{
     collections::VecDeque,
     sync::{
@@ -254,17 +256,26 @@ impl PointerTarget {
             } => (observation_id, *image_x, *image_y),
         };
         let (mapping, window_id) = lookup(observation_id)?;
-        if let Some(window_id) = window_id
-            && !backend
-                .list_windows()?
-                .windows
-                .iter()
-                .any(|window| window.id == window_id)
-        {
-            return Err(invalid(
-                "observation_id",
-                "the window in this image moved, resized or closed since the capture; capture it again",
-            ));
+        // Ask for this one window's reference directly: `list_windows` is capped, so a window
+        // missing from that list would otherwise look closed.
+        if let Some(window_id) = window_id {
+            let unchanged = backend
+                .wait_for_window(&WaitForWindowRequest {
+                    window_id: Some(window_id.clone()),
+                    title_contains: None,
+                    class_name: None,
+                    process_id: None,
+                    is_foreground: None,
+                    timeout_ms: 0,
+                })?
+                .window
+                .is_some_and(|window| window.id == window_id);
+            if !unchanged {
+                return Err(invalid(
+                    "observation_id",
+                    "the window in this image moved, resized or closed since the capture; capture it again",
+                ));
+            }
         }
         let (x, y) = to_virtual(mapping, image_x, image_y)?;
         let display = backend
