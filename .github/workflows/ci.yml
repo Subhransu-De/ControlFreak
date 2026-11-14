@@ -90,7 +90,7 @@ jobs:
       - name: Run live tests against the fixture window
         env:
           CONTROLFREAK_LIVE_DESKTOP: "1"
-        run: cargo test -p controlfreak-live-tests --test live --locked -- --ignored --test-threads=1
+        run: cargo test -p controlfreak-live-tests --test live --locked -- --ignored --test-threads=1 --nocapture
 
   windows-build:
     name: Release build
