@@ -27,10 +27,10 @@ use windows::Win32::{
     UI::{
         Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
         WindowsAndMessaging::{
-            EVENT_OBJECT_DESTROY, EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_FOREGROUND, GA_ROOT,
-            GA_ROOTOWNER, GW_OWNER, GetAncestor, GetClassNameW, GetMessageW, GetWindow,
-            GetWindowRect, GetWindowThreadProcessId, IsWindow, MSG, OBJID_WINDOW,
-            WINEVENT_OUTOFCONTEXT, WindowFromPoint,
+            EVENT_OBJECT_DESTROY, EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_FOREGROUND,
+            FindWindowExW, GA_ROOT, GA_ROOTOWNER, GW_OWNER, GetAncestor, GetClassNameW,
+            GetMessageW, GetWindow, GetWindowRect, GetWindowThreadProcessId, IsWindow, MSG,
+            OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WindowFromPoint,
         },
     },
 };
@@ -52,6 +52,9 @@ struct Identity {
     /// The owning process hosts unrelated applications (see `shell::is_shared_host_image`), or
     /// its image cannot be read, so "same process" does not mean "same application".
     shell_host: bool,
+    /// The owning process is `ApplicationFrameHost.exe`, so this window is the frame of a
+    /// packaged app whose content window belongs to the app's own process.
+    app_frame_host: bool,
 }
 
 #[derive(Clone)]
@@ -134,6 +137,23 @@ fn recoverable<T>(result: Result<T, PlatformError>) -> Result<T, Failure> {
 struct Hit {
     root: WindowFacts,
     window_pid: u32,
+    /// For a packaged-app frame target: the process of the content window hosted inside the
+    /// target's own frame, read when the check runs. `None` for every other target.
+    hosted_pid: Option<u32>,
+}
+
+impl Hit {
+    /// Whether the window that would get the input belongs to the target's application. Its
+    /// process is the target's, or it is the content window of the packaged app that the
+    /// target's `ApplicationFrameHost.exe` frame displays: the frame and the content are one
+    /// application even though they run in two processes. Only a window inside that very frame
+    /// qualifies, and the integrity of the window actually hit is checked separately.
+    fn belongs_to(&self, target: &Identity, target_window: &WindowFacts) -> bool {
+        self.window_pid == target.pid
+            || (target.app_frame_host
+                && self.hosted_pid == Some(self.window_pid)
+                && self.root.hwnd == target_window.hwnd)
+    }
 }
 
 impl Reference {
@@ -164,7 +184,7 @@ impl Reference {
             )));
         }
         if let Some(hit) = hit
-            && (hit.window_pid != current.pid
+            && (!hit.belongs_to(current, target)
                 || !accepts_same_process(target, shell_host, &hit.root))
         {
             return Err(Failure::Recoverable(destination_refusal(hit)));
@@ -255,6 +275,10 @@ fn identity(hwnd: HWND) -> Result<Identity, PlatformError> {
     let windows_directory = windows_directory();
     // Failing to read the image must narrow the same-process rule, never widen it.
     let shell_host = is_shared_host(image.as_deref(), windows_directory.as_deref());
+    let app_frame_host = matches!(
+        (&image, &windows_directory),
+        (Some(image), Some(directory)) if shell::is_app_frame_host_image(image, directory)
+    );
     let desktop = controlfreak_core::timing::time("identity_desktop", || {
         desktop::with_virtual_desktop_manager(|manager| desktop::window_desktop_id(manager, hwnd))
     })
@@ -283,6 +307,7 @@ fn identity(hwnd: HWND) -> Result<Identity, PlatformError> {
         class,
         desktop,
         shell_host,
+        app_frame_host,
     })
 }
 
@@ -747,32 +772,12 @@ fn validate_reference(
             "the foreground window cannot be identified; call focus_window to bring the target back",
         )
     }))?;
-    let hit = if let Some(point) = point {
-        // SAFETY: These APIs inspect value coordinates and return borrowed window handles.
-        let hit = unsafe { WindowFromPoint(point) };
-        recoverable(privilege::ensure_point_integrity(operation, point))?;
-        Some(hit_facts(hit)?)
-    } else if matches!(
-        operation,
-        "press_keys" | "type_text" | "switch_virtual_desktop"
-    ) {
-        let mut gui = GUITHREADINFO {
-            cbSize: u32::try_from(std::mem::size_of::<GUITHREADINFO>())
-                .map_err(|_| invalid("GUI thread record size is unavailable"))?,
-            ..Default::default()
-        };
-        // SAFETY: gui is a correctly sized writable record; zero queries the foreground thread.
-        unsafe { GetGUIThreadInfo(0, &raw mut gui) }.map_err(|_| {
-            Failure::Recoverable(refused(
-                RefusalCause::DestinationUnidentified,
-                "keyboard focus cannot be verified; observe again",
-            ))
-        })?;
-        recoverable(privilege::ensure_window_integrity(operation, gui.hwndFocus))?;
-        Some(hit_facts(gui.hwndFocus)?)
-    } else {
-        None
-    };
+    let mut hit = destination_hit(operation, point)?;
+    if let Some(hit) = &mut hit
+        && reference.identity.app_frame_host
+    {
+        hit.hosted_pid = hosted_content_pid(hwnd);
+    }
     reference.validate_snapshot(
         &current_identity,
         current_bounds,
@@ -802,6 +807,41 @@ fn validate_reference(
     Ok(arm_if_foreground(id)?)
 }
 
+/// The window that would receive this action's input: the one under the pointer, or the one
+/// with keyboard focus for keyboard operations, after its integrity check. `None` for operations
+/// that deliver no input to a destination.
+fn destination_hit(
+    operation: &str,
+    point: Option<windows::Win32::Foundation::POINT>,
+) -> Result<Option<Hit>, Failure> {
+    Ok(if let Some(point) = point {
+        // SAFETY: These APIs inspect value coordinates and return borrowed window handles.
+        let hit = unsafe { WindowFromPoint(point) };
+        recoverable(privilege::ensure_point_integrity(operation, point))?;
+        Some(hit_facts(hit)?)
+    } else if matches!(
+        operation,
+        "press_keys" | "type_text" | "switch_virtual_desktop"
+    ) {
+        let mut gui = GUITHREADINFO {
+            cbSize: u32::try_from(std::mem::size_of::<GUITHREADINFO>())
+                .map_err(|_| invalid("GUI thread record size is unavailable"))?,
+            ..Default::default()
+        };
+        // SAFETY: gui is a correctly sized writable record; zero queries the foreground thread.
+        unsafe { GetGUIThreadInfo(0, &raw mut gui) }.map_err(|_| {
+            Failure::Recoverable(refused(
+                RefusalCause::DestinationUnidentified,
+                "keyboard focus cannot be verified; observe again",
+            ))
+        })?;
+        recoverable(privilege::ensure_window_integrity(operation, gui.hwndFocus))?;
+        Some(hit_facts(gui.hwndFocus)?)
+    } else {
+        None
+    })
+}
+
 /// The window an input event would reach, as the root window and the process of the window itself.
 /// A window that cannot be read is treated as belonging to a different process.
 fn hit_facts(window: HWND) -> Result<Hit, Failure> {
@@ -822,7 +862,20 @@ fn hit_facts(window: HWND) -> Result<Hit, Failure> {
     Ok(Hit {
         root,
         window_pid: window.pid,
+        hosted_pid: None,
     })
+}
+
+/// The process of the content window a packaged app hosts inside `frame`, if it has one.
+fn hosted_content_pid(frame: HWND) -> Option<u32> {
+    let class = windows::core::HSTRING::from(shell::core_window_class());
+    // SAFETY: FindWindowExW only reads window metadata; `frame` is a handle value, a stale one
+    // simply finds nothing, and `class` outlives the synchronous call.
+    let content = unsafe { FindWindowExW(Some(frame), None, &class, None) }.ok()?;
+    let mut pid = 0;
+    // SAFETY: `pid` is writable for the synchronous call.
+    unsafe { GetWindowThreadProcessId(content, Some(&raw mut pid)) };
+    (pid != 0).then_some(pid)
 }
 
 /// Identity and integrity facts that cannot change within one input lock's scope in a way the
@@ -1062,6 +1115,7 @@ mod tests {
                 class: "fixture".into(),
                 desktop: "desktop-a".into(),
                 shell_host: false,
+                app_frame_host: false,
             },
             bounds: [-1920, -200, -920, 800],
             displays: vec![],
@@ -1190,7 +1244,11 @@ mod tests {
     }
 
     fn hit(root: WindowFacts, window_pid: u32) -> Hit {
-        Hit { root, window_pid }
+        Hit {
+            root,
+            window_pid,
+            hosted_pid: None,
+        }
     }
 
     fn check(foreground: &WindowFacts, point: Option<&Hit>) -> Result<(), Failure> {
@@ -1360,6 +1418,51 @@ mod tests {
             ),
             Err(Failure::Fatal(_))
         ));
+    }
+
+    #[test]
+    fn a_packaged_app_frame_accepts_its_own_hosted_content_window_and_nothing_else() {
+        // Frame window 1 runs in ApplicationFrameHost (process 2); its content window belongs to
+        // the app (process 9). Another app's content (process 8) sits in another frame.
+        let mut frame = reference();
+        frame.identity.shell_host = true;
+        frame.identity.app_frame_host = true;
+        let target = facts(1, 2, "ApplicationFrameWindow", 1);
+        let run = |frame_host: bool, point: Hit| {
+            let mut frame = frame.clone();
+            frame.identity.app_frame_host = frame_host;
+            frame.validate_snapshot(
+                &frame.identity,
+                frame.bounds,
+                &[],
+                &target,
+                &target,
+                Some(&point),
+            )
+        };
+        let content = |window_pid: u32, root: &WindowFacts, hosted: Option<u32>| Hit {
+            root: root.clone(),
+            window_pid,
+            hosted_pid: hosted,
+        };
+        // The frame's own content window, and the frame itself, receive input.
+        run(true, content(9, &target, Some(9))).unwrap();
+        run(true, content(2, &target, Some(9))).unwrap();
+        // A process that is not the hosted app's is refused, as is a hosted pid for a window in
+        // another frame, and a frame whose hosted content cannot be found.
+        let other_frame = facts(60, 2, "ApplicationFrameWindow", 60);
+        assert_recoverable(run(true, content(8, &target, Some(9))), "different process");
+        assert_recoverable(
+            run(true, content(9, &other_frame, Some(9))),
+            "different process",
+        );
+        assert_recoverable(run(true, content(9, &target, None)), "different process");
+        // Without the frame-host identity the same facts are refused: a hosted pid alone never
+        // widens the rule for an ordinary target.
+        assert_recoverable(
+            run(false, content(9, &target, Some(9))),
+            "different process",
+        );
     }
 
     #[test]

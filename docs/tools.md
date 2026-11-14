@@ -60,8 +60,10 @@ desktop and run inside a [control session](sessions.md).
   hold the foreground and receive pointer input without a new session. A window of another
   process never does. For `explorer.exe` targets (File Explorer, the taskbar, the desktop) only
   the target's own dialogs and popup menus count, not the rest of the shell.
-- If the foreground, the keyboard focus or the pointer destination is wrong (another process, a higher-integrity window, a window that cannot be identified, or no foreground window at that instant), that action is refused and the session keeps its target. Bring the target back with `focus_window` and try again; nothing else needs to be observed. The error is `target_invalidated` with a `reason` that tells it from a fatal change (see Errors).
+- If the foreground, the keyboard focus or the pointer destination belongs to another process, cannot be identified, or does not exist at that instant, that action is refused and the session keeps its target. The error is `target_invalidated` with a `reason` that tells it from a fatal change (see Errors). Bring the target back with `focus_window` and try again; nothing else needs to be observed.
+- If that window runs at a higher integrity level, or its integrity cannot be read, the action is refused with `higher_integrity_target` or `target_integrity_unavailable`, there is no `reason`, `retryable` is false, and the session keeps its target. `focus_window` is refused for such a window too, so it cannot take the foreground back; the user has to close or leave that window first.
 - A point under the ControlFreak session tab's **Stop agent** button is refused with reason `own_indicator`. Screenshots do not show the button, which sits under the tab at the top centre of every display (104 by 32 device-independent pixels, a small gap below the tab). Pick another point, or use the keyboard.
+- A packaged app's content window belongs to the app, not to the `ApplicationFrameHost.exe` frame that holds it. For a target that is such a frame, the content window hosted inside that very frame counts as the target for pointer and keyboard destinations. Its integrity is checked like any other window's. No other window of the app's process is accepted this way.
 - `explorer.exe`, `ApplicationFrameHost.exe` (the frame of every packaged app) and any process whose program file cannot be read host unrelated windows, so for those targets only the target's own dialogs and popup menus count as the same application.
 - If the window itself changes (a different window or process, a move or resize, another virtual
   desktop, destruction), the action is refused and the session target is cleared. Observe again
@@ -218,6 +220,8 @@ Every error also has `error.retryable`. It says whether repeating the same reque
 | `destination_unidentified` | The window that would get the input cannot be identified. The session is kept. | Yes |
 | `own_indicator` | The point is under ControlFreak's own Stop button. Choose another point. The session is kept. | No |
 | `target_changed` | The target changed (window, process, bounds, display layout or desktop), or an earlier change ended the approval. End the session and observe again. | No |
+
+`higher_integrity_target` and `target_integrity_unavailable` have no `reason`, are not retryable and keep the session. Retrying cannot help until the user changes which window is in front.
 
 A failed foreground activation (`focus_window`) is retryable and keeps the session. Ask the user to click the window first, because Windows can refuse focus changes from a background process.
 

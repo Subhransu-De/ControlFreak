@@ -310,7 +310,8 @@ fn start_tab_on_first_observation(
                 in_flight.store(false, Ordering::Release);
             }
         }
-        true
+        // Once the tab is up this listener has nothing left to do, so it removes itself.
+        !started.load(Ordering::Acquire)
     });
 }
 

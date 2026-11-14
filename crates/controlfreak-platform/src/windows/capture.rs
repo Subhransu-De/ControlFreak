@@ -544,6 +544,15 @@ pub(super) const PRINT_WINDOW_DEADLINE: Duration = Duration::from_secs(2);
 static RENDER_OUTSTANDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Marks the single outstanding render finished when dropped, on success, failure or unwinding.
+struct OutstandingRender(&'static std::sync::atomic::AtomicBool);
+
+impl Drop for OutstandingRender {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Runs `render` on a worker thread and waits at most `deadline` for its answer. `None` means
 /// the render failed, took too long, or was not attempted because `outstanding` says an earlier
 /// render still has not returned. The worker owns everything it creates and clears `outstanding`
@@ -562,8 +571,11 @@ fn render_within<T: Send + 'static>(
     let spawned = std::thread::Builder::new()
         .name("controlfreak-print-window".to_owned())
         .spawn(move || {
+            // Clears the flag even if `render` panics, so one failed render never turns every
+            // later window capture into a screen copy.
+            let slot = OutstandingRender(outstanding);
             let rendered = render();
-            outstanding.store(false, Ordering::Release);
+            drop(slot);
             // The receiver is gone after a timeout; the result is then dropped here.
             let _ = sender.send(rendered);
         });
@@ -819,41 +831,43 @@ fn changed_pixels(left: &[u8], right: &[u8], limit: usize) -> usize {
         .count()
 }
 
-/// Tells whether a screen region has changed since the previous check, comparing every pixel.
-/// The GDI objects and both pixel buffers are created once and reused for every check.
+/// Reads a screen region and fingerprints its pixels, reusing the GDI objects and pixel buffer
+/// for every read. `wait_for_text` compares this with the fingerprint of the exact frame that
+/// recognition read (`recognize_text_fingerprinted`), so a result is reused only for pixels it was
+/// really computed from.
 pub(super) struct RegionChange {
     grabber: FrameGrabber,
-    previous: Vec<u8>,
-    have_previous: bool,
 }
 
 impl RegionChange {
     pub(super) fn new(bounds: DisplayBounds) -> Result<Self, PlatformError> {
-        let grabber = FrameGrabber::new(bounds)?;
-        let previous = vec![0_u8; grabber.buffer.len()];
         Ok(Self {
-            grabber,
-            previous,
-            have_previous: false,
+            grabber: FrameGrabber::new(bounds)?,
         })
     }
 
-    /// Reads the region and reports whether it is identical to the previous read. The first
-    /// read has nothing to match and always reports a change.
-    pub(super) fn unchanged_since_last(&mut self) -> Result<bool, PlatformError> {
+    pub(super) fn fingerprint(&mut self) -> Result<u64, PlatformError> {
         self.grabber.grab()?;
-        let unchanged = self.have_previous && frames_match(&self.grabber.buffer, &self.previous);
-        if !unchanged {
-            std::mem::swap(&mut self.previous, &mut self.grabber.buffer);
-            self.have_previous = true;
-        }
-        Ok(unchanged)
+        Ok(pixel_fingerprint(&self.grabber.buffer, false))
     }
 }
 
-/// Whether two frames hold the same colours; see `changed_pixels` for the ignored byte.
-fn frames_match(left: &[u8], right: &[u8]) -> bool {
-    changed_pixels(left, right, 1) == 0
+/// Hashes the three colour bytes of every pixel and ignores the fourth, which a screen read
+/// leaves unspecified. `red_first` selects RGBA input; otherwise the frame is BGRA, so both
+/// layouts of the same pixels give the same value.
+pub(super) fn pixel_fingerprint(frame: &[u8], red_first: bool) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for pixel in frame.chunks_exact(4) {
+        let (blue, red) = if red_first {
+            (pixel[2], pixel[0])
+        } else {
+            (pixel[0], pixel[2])
+        };
+        let colour = u64::from(blue) | u64::from(pixel[1]) << 8 | u64::from(red) << 16;
+        hash = (hash ^ colour).wrapping_mul(PRIME);
+    }
+    hash ^ (frame.len() as u64)
 }
 
 pub(super) fn capture_comparison_frame(bounds: DisplayBounds) -> Result<Vec<u8>, PlatformError> {
@@ -941,10 +955,11 @@ pub(super) fn wait_for_change(
     })
 }
 
-pub(super) fn recognize_text(
+/// Recognizes text and also returns the fingerprint of the exact frame that was recognized.
+pub(super) fn recognize_text_fingerprinted(
     request: &OcrRegionRequest,
     control: &controlfreak_core::MutationControl,
-) -> Result<OcrResult, PlatformError> {
+) -> Result<(OcrResult, u64), PlatformError> {
     control.check("windows_ocr")?;
     let _timer = timing::start("ocr_recognize");
     ensure_dpi_awareness()?;
@@ -967,6 +982,7 @@ pub(super) fn recognize_text(
         });
     }
     let rgba = timing::time("capture_gdi", || capture_rgba(source_bounds))?;
+    let fingerprint = pixel_fingerprint(&rgba, true);
     let writer = DataWriter::new().map_err(ocr_error)?;
     writer.WriteBytes(&rgba).map_err(ocr_error)?;
     let buffer = writer.DetachBuffer().map_err(ocr_error)?;
@@ -1030,14 +1046,17 @@ pub(super) fn recognize_text(
             words,
         });
     }
-    Ok(OcrResult {
-        target_ref: None,
-        display,
-        source_bounds,
-        language,
-        text: recognized.Text().map_err(ocr_error)?.to_string(),
-        lines,
-    })
+    Ok((
+        OcrResult {
+            target_ref: None,
+            display,
+            source_bounds,
+            language,
+            text: recognized.Text().map_err(ocr_error)?.to_string(),
+            lines,
+        },
+        fingerprint,
+    ))
 }
 
 fn ocr_engine(language: Option<&str>) -> Result<OcrEngine, PlatformError> {
@@ -1824,6 +1843,27 @@ mod window_capture_tests {
     }
 
     #[test]
+    fn a_render_that_panics_still_frees_the_render_slot() {
+        static OUTSTANDING: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let panicked = render_within::<u8>(Duration::from_secs(5), &OUTSTANDING, || {
+            panic!("synthetic render failure")
+        });
+        assert_eq!(panicked, None);
+        // The worker clears the slot while unwinding; allow it a moment to finish doing so.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while OUTSTANDING.load(std::sync::atomic::Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            render_within(Duration::from_secs(5), &OUTSTANDING, || Some(9_u8)),
+            Some(9)
+        );
+    }
+
+    #[test]
     fn only_a_fully_black_render_counts_as_a_failed_print() {
         assert!(is_blank_frame(&[0, 0, 0, 255, 0, 0, 0, 0]));
         assert!(!is_blank_frame(&[0, 0, 0, 255, 0, 1, 0, 255]));
@@ -1850,14 +1890,29 @@ mod window_capture_tests {
     }
 
     #[test]
-    fn frames_match_ignores_the_unspecified_fourth_byte_but_not_any_colour() {
-        let mut left = vec![10, 20, 30, 0, 40, 50, 60, 0];
-        let mut right = vec![10, 20, 30, 255, 40, 50, 60, 7];
-        assert!(frames_match(&left, &right));
-        right[5] = 51;
-        assert!(!frames_match(&left, &right));
-        left.pop();
-        assert!(!frames_match(&left, &right), "different sizes never match");
+    fn pixel_fingerprints_ignore_the_fourth_byte_and_the_channel_layout_but_not_any_colour() {
+        let bgra = vec![30, 20, 10, 0, 60, 50, 40, 0];
+        let same = vec![30, 20, 10, 255, 60, 50, 40, 7];
+        let rgba = vec![10, 20, 30, 255, 40, 50, 60, 255];
+        assert_eq!(
+            pixel_fingerprint(&bgra, false),
+            pixel_fingerprint(&same, false)
+        );
+        assert_eq!(
+            pixel_fingerprint(&bgra, false),
+            pixel_fingerprint(&rgba, true)
+        );
+        let mut other = same.clone();
+        other[5] = 51;
+        assert_ne!(
+            pixel_fingerprint(&bgra, false),
+            pixel_fingerprint(&other, false)
+        );
+        assert_ne!(
+            pixel_fingerprint(&bgra, false),
+            pixel_fingerprint(&bgra[..7], false),
+            "different sizes never match"
+        );
     }
 
     #[test]

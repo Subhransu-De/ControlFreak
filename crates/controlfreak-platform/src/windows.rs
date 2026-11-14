@@ -62,7 +62,7 @@ mod activation;
 mod ocr;
 mod target;
 pub(crate) use ocr::serve_ocr_helper;
-use ocr::{OcrHelperPool, recognize_text_with_helper};
+use ocr::{OcrHelperPool, recognize_text_with_helper_fingerprinted};
 mod arbitration;
 mod capture;
 mod desktop;
@@ -104,8 +104,8 @@ use capture::{
     baseline_process_nonce, capture_comparison_frame, capture_display_bounds,
     capture_display_image, capture_window_bounds, display_bounds_from_window,
     display_region_bounds, frame_fingerprint, observe_display, observe_foreground,
-    recognize_text as recognize_text_in_process, validate_max_width, validate_visual_wait,
-    validate_wait_values, wait_for_change,
+    recognize_text_fingerprinted as recognize_text_in_process, validate_max_width,
+    validate_visual_wait, validate_wait_values, wait_for_change,
 };
 use desktop::{
     activate_window, current_cursor_position, current_virtual_desktop_id, ensure_dpi_awareness,
@@ -187,7 +187,9 @@ struct NativeActivation<'a> {
     approved_id: &'a str,
     window_id: &'a str,
     hwnd: HWND,
-    initial_foreground: String,
+    /// The window in front when activation began, kept as a plain handle: that window may be one
+    /// that cannot be given a target reference, and the refusal below needs only its identity.
+    initial_foreground: HWND,
     minimized: bool,
     control: &'a MutationControl,
     started: Instant,
@@ -224,10 +226,7 @@ impl activation::Activation for NativeActivation<'_> {
         }
         // Another window of the approved application (it opened a dialog, or Windows handed it
         // activation) is not a change of owner; only another process taking the foreground is.
-        let initial = target::resolve(&self.initial_foreground)
-            .ok()
-            .map(|found| found.0);
-        if Some(foreground) != initial
+        if foreground != self.initial_foreground
             && !target::window_serves_target(self.approved_id, foreground)
         {
             return Err(PlatformError::refused(
@@ -324,13 +323,71 @@ impl Backend {
         request: &OcrRegionRequest,
         control: &MutationControl,
     ) -> Result<OcrResult, PlatformError> {
+        self.recognize_text_fingerprinted(request, control)
+            .map(|(result, _)| result)
+    }
+
+    /// Recognizes text and returns the fingerprint of the exact frame that was recognized, if
+    /// the recognizer reported one.
+    fn recognize_text_fingerprinted(
+        &self,
+        request: &OcrRegionRequest,
+        control: &MutationControl,
+    ) -> Result<(OcrResult, Option<u64>), PlatformError> {
         let target_before = target::observe();
-        let mut result = self.ocr_helper.as_ref().map_or_else(
-            || recognize_text_in_process(request, control),
-            |command| recognize_text_with_helper(command, &self.ocr_helpers, request, control),
+        let (mut result, fingerprint) = self.ocr_helper.as_ref().map_or_else(
+            || {
+                recognize_text_in_process(request, control)
+                    .map(|(result, fingerprint)| (result, Some(fingerprint)))
+            },
+            |command| {
+                recognize_text_with_helper_fingerprinted(
+                    command,
+                    &self.ocr_helpers,
+                    request,
+                    control,
+                )
+            },
         )?;
         result.target_ref = target::finish_observation(target_before);
-        Ok(result)
+        Ok((result, fingerprint))
+    }
+
+    fn find_text_fingerprinted(
+        &self,
+        request: &FindTextRequest,
+        control: &MutationControl,
+    ) -> Result<(FindTextResult, Option<u64>), PlatformError> {
+        control.check("find_text_on_screen")?;
+        controlfreak_core::validate_text_discovery(
+            &request.query,
+            request.match_mode,
+            request.ocr_confusions,
+            request.max_results,
+        )?;
+        let (ocr, fingerprint) = self.recognize_text_fingerprinted(&request.region, control)?;
+        let details = controlfreak_core::discover_text(
+            &ocr.lines,
+            &request.region,
+            &request.query,
+            request.case_sensitive,
+            request.match_mode,
+            request.ocr_confusions,
+            request.max_results,
+        )?;
+        let matches = details.candidates.clone();
+        Ok((
+            FindTextResult {
+                target_ref: ocr.target_ref,
+                query: request.query.clone(),
+                display: ocr.display,
+                source_bounds: ocr.source_bounds,
+                language: ocr.language,
+                matches,
+                details,
+            },
+            fingerprint,
+        ))
     }
 }
 
@@ -572,15 +629,42 @@ impl DisplayBackend for Backend {
     }
 }
 
-/// Whether the text found by the previous `wait_for_text` pass is still the answer: every pixel
-/// of the region is the same and the foreground, window set and desktop have not changed since
-/// that pass was taken.
-const fn previous_pass_still_valid(
-    region_unchanged: bool,
-    observed_generation: u64,
-    current_generation: u64,
-) -> bool {
-    region_unchanged && observed_generation == current_generation
+/// The result of the previous `wait_for_text` pass, tied to the fingerprint of the exact frame
+/// that recognition read and to the foreground, window set and desktop it was taken under.
+struct PassCache<T> {
+    last: Option<(T, u64, u64)>,
+}
+
+impl<T> Default for PassCache<T> {
+    fn default() -> Self {
+        Self { last: None }
+    }
+}
+
+impl<T: Clone> PassCache<T> {
+    /// Runs one pass. `frame` is the fingerprint of a fresh read of the region, or `None` if it
+    /// could not be read. The previous result stands only if that read matches the frame the
+    /// previous result was recognized from and the generation is unchanged, so nothing on
+    /// screen could have changed the text. Otherwise `recognize` runs, and its result is kept
+    /// only if the recognizer reported the fingerprint of the frame it read. A comparison read
+    /// is never the key for a result computed from another read.
+    fn pass(
+        &mut self,
+        frame: Option<u64>,
+        generation: u64,
+        recognize: impl FnOnce() -> Result<(T, Option<u64>), PlatformError>,
+    ) -> Result<T, PlatformError> {
+        if let (Some((result, recognized, observed)), Some(frame)) = (&self.last, frame)
+            && *recognized == frame
+            && *observed == generation
+        {
+            return Ok(result.clone());
+        }
+        self.last = None;
+        let (result, recognized) = recognize()?;
+        self.last = recognized.map(|recognized| (result.clone(), recognized, generation));
+        Ok(result)
+    }
 }
 
 /// A pixel watch over an OCR region, or `None` if the region cannot be watched, in which case
@@ -637,33 +721,8 @@ impl OcrBackend for Backend {
         request: &FindTextRequest,
         control: &MutationControl,
     ) -> Result<FindTextResult, PlatformError> {
-        control.check("find_text_on_screen")?;
-        controlfreak_core::validate_text_discovery(
-            &request.query,
-            request.match_mode,
-            request.ocr_confusions,
-            request.max_results,
-        )?;
-        let ocr = self.recognize_text(&request.region, control)?;
-        let details = controlfreak_core::discover_text(
-            &ocr.lines,
-            &request.region,
-            &request.query,
-            request.case_sensitive,
-            request.match_mode,
-            request.ocr_confusions,
-            request.max_results,
-        )?;
-        let matches = details.candidates.clone();
-        Ok(FindTextResult {
-            target_ref: ocr.target_ref,
-            query: request.query.clone(),
-            display: ocr.display,
-            source_bounds: ocr.source_bounds,
-            language: ocr.language,
-            matches,
-            details,
-        })
+        self.find_text_fingerprinted(request, control)
+            .map(|(result, _)| result)
     }
 
     /// Waits for text with a pixel check in front of each recognition pass. If every pixel of
@@ -676,20 +735,13 @@ impl OcrBackend for Backend {
         control: &MutationControl,
     ) -> Result<WaitForTextResult, PlatformError> {
         let mut watch = region_change_watch(&request.find.region);
-        let mut last: Option<(FindTextResult, u64)> = None;
+        let mut cache = PassCache::default();
         controlfreak_core::wait_for_text_with(request, control, || {
             let generation = target::observation_generation();
-            let unchanged = watch
-                .as_mut()
-                .is_some_and(|watch| watch.unchanged_since_last().unwrap_or(false));
-            if let Some((result, observed)) = &last
-                && previous_pass_still_valid(unchanged, *observed, generation)
-            {
-                return Ok(result.clone());
-            }
-            let result = self.find_text_on_screen_controlled(&request.find, control)?;
-            last = Some((result.clone(), generation));
-            Ok(result)
+            let frame = watch.as_mut().and_then(|watch| watch.fingerprint().ok());
+            cache.pass(frame, generation, || {
+                self.find_text_fingerprinted(&request.find, control)
+            })
         })
     }
 
@@ -881,7 +933,7 @@ impl WindowBackend for Backend {
             attempts: 0,
             window_id: &request.window_id,
             hwnd,
-            initial_foreground: target::issue(foreground_window_handle())?,
+            initial_foreground: foreground_window_handle(),
             minimized: window.is_minimized,
             control,
             started: Instant::now(),
@@ -1064,13 +1116,93 @@ mod tests {
         window_matches,
     };
 
+    /// Drives `PassCache` with synthetic frames. Each pass reads a comparison frame, then (when it
+    /// recognizes) the recognizer reads its own frame. Returns what each pass answered.
+    fn run_passes(
+        passes: &[(Option<u64>, u64)],
+        recognizer_frames: &[Option<u64>],
+    ) -> (Vec<String>, usize) {
+        let mut cache = super::PassCache::<String>::default();
+        let mut recognitions = 0;
+        let answers = passes
+            .iter()
+            .map(|(frame, generation)| {
+                cache
+                    .pass(*frame, *generation, || {
+                        let seen = recognizer_frames[recognitions];
+                        recognitions += 1;
+                        Ok((format!("text of frame {seen:?}"), seen))
+                    })
+                    .unwrap()
+            })
+            .collect();
+        (answers, recognitions)
+    }
+
     #[test]
-    fn a_text_wait_reuses_its_previous_pass_only_when_nothing_could_have_changed() {
-        use super::previous_pass_still_valid as valid;
-        assert!(valid(true, 7, 7));
-        assert!(!valid(false, 7, 7), "a pixel changed");
-        assert!(!valid(true, 7, 8), "the foreground or window set changed");
-        assert!(!valid(false, 7, 8));
+    fn a_text_wait_reuses_its_previous_pass_only_for_the_frame_it_recognized() {
+        let (answers, recognitions) = run_passes(
+            &[(Some(1), 7), (Some(1), 7), (Some(1), 7)],
+            &[Some(1), Some(1), Some(1)],
+        );
+        assert_eq!(recognitions, 1);
+        assert!(
+            answers
+                .iter()
+                .all(|answer| answer == "text of frame Some(1)")
+        );
+    }
+
+    #[test]
+    fn a_result_recognized_from_a_different_frame_than_the_comparison_is_never_reused() {
+        // Comparison frames are A, A, A (1) but the first recognition read a transient frame B
+        // (2). The second pass must recognize again and get the answer for A.
+        let (answers, recognitions) = run_passes(
+            &[(Some(1), 7), (Some(1), 7), (Some(1), 7)],
+            &[Some(2), Some(1), Some(1)],
+        );
+        assert_eq!(recognitions, 2);
+        assert_eq!(answers[0], "text of frame Some(2)");
+        assert_eq!(answers[1], "text of frame Some(1)");
+        assert_eq!(answers[2], "text of frame Some(1)");
+    }
+
+    #[test]
+    fn a_changed_frame_a_changed_generation_or_an_unreadable_comparison_recognizes_again() {
+        for passes in [
+            [(Some(1), 7), (Some(2), 7)],
+            [(Some(1), 7), (Some(1), 8)],
+            [(Some(1), 7), (None, 7)],
+        ] {
+            let (_, recognitions) = run_passes(&passes, &[Some(1), Some(1)]);
+            assert_eq!(recognitions, 2, "{passes:?}");
+        }
+        // A recognizer that cannot say which frame it read is never cached.
+        let (_, recognitions) = run_passes(&[(Some(1), 7), (Some(1), 7)], &[None, None]);
+        assert_eq!(recognitions, 2);
+    }
+
+    #[test]
+    fn a_failed_recognition_drops_the_cached_result() {
+        let mut cache = super::PassCache::<u8>::default();
+        cache.pass(Some(1), 7, || Ok((1, Some(1)))).unwrap();
+        let failed = cache.pass(Some(2), 7, || {
+            Err(PlatformError::Unavailable {
+                reason: "synthetic".into(),
+            })
+        });
+        assert!(failed.is_err());
+        let mut recognized = false;
+        cache
+            .pass(Some(1), 7, || {
+                recognized = true;
+                Ok((2, Some(1)))
+            })
+            .unwrap();
+        assert!(
+            recognized,
+            "the earlier result must not survive a failed pass"
+        );
     }
 
     #[test]

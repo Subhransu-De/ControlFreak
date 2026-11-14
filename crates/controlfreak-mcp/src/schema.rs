@@ -488,7 +488,7 @@ fn focus_window_tool() -> Tool {
         FOCUS_WINDOW,
         "Focus window",
         Kind::Input { idempotent: true },
-        "Bring the session's approved window to the foreground, restoring it if minimized, and verify it. Call it right after begin_control_session, and again whenever a window from another process took the foreground. It never sends keys or clicks to get focus: if Windows refuses, ask the user to click the window. window_id (or its alias target_ref) must be the approved window.",
+        "Bring the session's approved window to the foreground, restoring it if minimized, and verify it. Call it right after begin_control_session, and again whenever a window from another process took the foreground. It never sends keys or clicks to get focus: if Windows refuses, ask the user to click the window. window_id (or its alias target_ref) is the approved window or, inside a session, a dialog of the same application.",
         object_schema(properties, &[]),
         action_output_schema(false),
     )

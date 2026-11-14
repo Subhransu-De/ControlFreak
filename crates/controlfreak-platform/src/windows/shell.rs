@@ -75,7 +75,18 @@ pub(super) fn is_shell_host_image(image: &str, windows_directory: &str) -> bool 
 /// For these, a shared process does not make two windows one application.
 pub(super) fn is_shared_host_image(image: &str, windows_directory: &str) -> bool {
     is_shell_host_image(image, windows_directory)
-        || below_windows(image, windows_directory).is_some_and(|rest| rest == APP_FRAME_HOST)
+        || is_app_frame_host_image(image, windows_directory)
+}
+
+/// Whether `image` is `System32\ApplicationFrameHost.exe`, which owns the frame window of every
+/// packaged (UWP) app while the app's own process owns the content window hosted inside it.
+pub(super) fn is_app_frame_host_image(image: &str, windows_directory: &str) -> bool {
+    below_windows(image, windows_directory).is_some_and(|rest| rest == APP_FRAME_HOST)
+}
+
+/// Class of the content window a packaged app hosts inside its frame.
+pub(super) const fn core_window_class() -> &'static str {
+    CORE_WINDOW_CLASS
 }
 
 /// Whether a window with this class, owned by a process running `image`, is a shell surface.
@@ -234,6 +245,22 @@ mod tests {
                 !is_shell_surface("Progman", r"C:\Windows\explorer.exe", bad),
                 "{bad}"
             );
+        }
+    }
+
+    #[test]
+    fn only_the_system32_frame_host_is_the_app_frame_host() {
+        assert!(is_app_frame_host_image(
+            r"C:\Windows\System32\ApplicationFrameHost.exe",
+            WINDOWS
+        ));
+        for image in [
+            r"C:\Windows\explorer.exe",
+            r"C:\Windows\ApplicationFrameHost.exe",
+            r"C:\Users\someone\System32\ApplicationFrameHost.exe",
+            r"C:\Windows\System32\ApplicationFrameHost.exe.exe",
+        ] {
+            assert!(!is_app_frame_host_image(image, WINDOWS), "{image}");
         }
     }
 

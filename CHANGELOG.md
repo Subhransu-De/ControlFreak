@@ -43,6 +43,13 @@ versioned section and uses that section for the corresponding GitHub Release not
 - Double and triple clicks validate the target again before every press, not only before the first.
 - `capture_window` renders on a watchdog thread with a 2-second deadline, skips windows that are flagged as hung and falls back to the screen copy (`windows_gdi`), so a hung window cannot block a capture.
 - `list_windows` says in its description that owned dialogs are listed.
+- `press_keys` and `type_text` handle held keys the same way: an Enter or Tab segment of `type_text` is refused with `key_held` if the person already holds that key, before anything of that segment is sent. Text sent earlier stays sent and is reported.
+- `wait_for_text` reuses the previous pass only when a fresh read of the region matches a fingerprint of the exact frame that recognition read, and the foreground, window set and desktop are unchanged. Recognition reports that fingerprint, so a transient frame can no longer leave a stale answer in place until the timeout, and an unreadable comparison always recognizes again.
+- `focus_window` no longer reports a fatal-looking `target_changed` when the window in front cannot be given a target reference (for example a shell surface or no foreground at that instant). It keeps the raw handle of that window and carries on.
+- The `focus_window` description says it accepts the approved window or, inside a session, a dialog of the same application. `docs/tools.md` now separates the retryable foreground refusals (`target_invalidated` with a `reason`, recover with `focus_window`) from the higher-integrity ones (`higher_integrity_target`, `target_integrity_unavailable`, no `reason`, `focus_window` cannot recover them).
+- A click batch that only releases the button and modifiers is no longer validated, so a pointer nudge or foreground change during the 20 ms hold cannot turn a completed press into an error. Every batch that presses is still validated.
+- A packaged (UWP) app target, whose frame belongs to `ApplicationFrameHost.exe` and whose content window belongs to the app, now accepts input to the content window hosted inside its own frame. The integrity check still runs on the window that is actually hit or focused, and a hosted pid never widens the rule for another kind of target.
+- A render that panics no longer leaves the single `capture_window` render slot taken, which would have made every later window capture copy the screen. The chord form of the layout refusal tells the agent to name the layout's own key combination, and the first-read listener removes itself once the tab is up.
 - `type_text` presses Enter for `\n`, `\r\n` and `\r` and Tab for `\t`, instead of sending them as Unicode characters.
 - `click_text` matches words inside OCR lines and clicks the centre of the matched words instead of the centre of the whole line. `find_text_on_screen` reports the matched-word box. Two matches in one line are ambiguous.
 - `capture_window` renders the window itself, so a covered window is captured as itself, and falls back to a screen copy.
@@ -71,6 +78,7 @@ versioned section and uses that section for the corresponding GitHub Release not
 - There is no human approval step before a session starts. Run ControlFreak only for MCP clients you trust.
 - Same-process binding is by process, not by window: any window of the approved application's process counts while a session lasts.
 - Shared host processes other than `explorer.exe` and `ApplicationFrameHost.exe` are not narrowed.
+- Input to packaged (UWP) apps relies on the frame's hosted `Windows.UI.Core.CoreWindow` content window. It is covered by synthetic facts only and has not been tried against a real packaged app.
 - `PrintWindow` cannot be cancelled once started. After a timeout one abandoned render stays parked until the program answers, and window captures copy the screen meanwhile.
 - The new input, capture, key mapping and Stop button behavior is covered by fakes and synthetic fixtures. It is not yet verified on a real desktop with several displays, mixed DPI, non-US keyboard layouts or physical touch and pen input.
 

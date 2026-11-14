@@ -340,6 +340,7 @@ impl EscapeMonitor {
         let thread_id = Arc::new(AtomicU32::new(0));
         let wake_id = Arc::clone(&thread_id);
         let wake_exiting = Arc::clone(&exiting);
+        let wake_exiting_on_failure = Arc::clone(&exiting);
         controller.subscribe(move || {
             post_wake(wake_id.load(Ordering::Acquire));
             !wake_exiting.load(Ordering::Acquire)
@@ -350,7 +351,10 @@ impl EscapeMonitor {
             let exiting = Arc::clone(&exiting);
             thread::Builder::new()
                 .name("controlfreak-escape-hook".to_owned())
-                .spawn(move || escape_loop(&controller, make_hook(), &thread_id, &exiting))?
+                .spawn(move || escape_loop(&controller, make_hook(), &thread_id, &exiting))
+                // The listener above is already subscribed; mark it finished so it removes
+                // itself on the next notification instead of lingering.
+                .inspect_err(|_| wake_exiting_on_failure.store(true, Ordering::Release))?
         };
         controller.set_esc_monitor_attached(true);
         Ok(Self {
@@ -616,8 +620,9 @@ fn current_input_is_from_a_person() -> bool {
 }
 
 /// A real, native push button on its own small window, owned by the tab. Being a standard
-/// `BUTTON` it exposes the Invoke pattern to UI Automation, so on-screen keyboards, voice control
-/// and switch access can press it. It is enabled and not transparent, so hit-testing resolves to
+/// `BUTTON` it exposes the Invoke pattern to UI Automation, so voice control and switch access
+/// can press it, as can a mouse, finger or pen; an on-screen keyboard sends keys, which the
+/// button drops. It is enabled and not transparent, so hit-testing resolves to
 /// it, and its process is not the target's, which the pointer checks refuse; its subclass also
 /// drops injected input. It never takes focus.
 struct StopButton {
@@ -1498,8 +1503,8 @@ enum WaitOutcome {
 }
 
 /// Blocks until this thread has queue input or `timeout_ms` elapses. Low-level keyboard hook
-/// calls arrive as sent messages and run inside this wait, so keystrokes are answered at once
-/// instead of after a sleep. `MWMO_INPUTAVAILABLE` also returns for messages that an earlier
+/// calls are delivered to this thread as sent messages, so the wait returns when one is pending
+/// and `drain_messages` answers it at once instead of after a sleep. `MWMO_INPUTAVAILABLE` also returns for messages that an earlier
 /// peek already saw but did not remove, which a plain wait would sleep through. The timeout is
 /// only for session, state and fade polling, so an idle thread wakes `1000 / timeout_ms` times
 /// per second.
