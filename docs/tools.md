@@ -16,7 +16,7 @@ desktop and run inside a [control session](sessions.md).
 | `list_displays` | Observe | Active displays with IDs, primary flag and bounds in physical pixels. |
 | `capture_display` | Observe | Screenshot of a display. |
 | `capture_region` | Observe | Screenshot of a rectangle, 1280 px wide unless `max_width` or `native` is set. |
-| `capture_window` | Observe | Screenshot of a window's visible frame, without focusing it. The window renders itself (`capture_method` `windows_print_window`), so windows covering it do not appear; if it cannot, the screen is copied (`windows_gdi`). Every screenshot result reports `capture_method` as one of `windows_print_window` or `windows_gdi`; display and region captures always report `windows_gdi`. |
+| `capture_window` | Observe | Screenshot of a window's visible frame, without focusing it. The window renders itself (`capture_method` `windows_print_window`), so windows covering it do not appear. The render is bounded: a window that Windows flags as hung is not asked, and one that does not answer within 2 seconds is given up on. The screen rectangle is then copied (`windows_gdi`), which shows whatever covers the window, so `capture_method` says which one you got. Only one abandoned render can exist at a time; while it is outstanding, further window captures copy the screen. Every screenshot result reports `capture_method` as one of `windows_print_window` or `windows_gdi`; display and region captures always report `windows_gdi`. |
 | `list_windows` | Observe | Visible titled windows, including owned dialogs (with an `owner` field), foreground first. At most 200. |
 | `wait_for_window` | Observe | Wait for a window that matches title, class or process. |
 | `list_virtual_desktops` | Observe | Windows grouped by virtual desktop, with the current one marked. |
@@ -60,9 +60,9 @@ desktop and run inside a [control session](sessions.md).
   hold the foreground and receive pointer input without a new session. A window of another
   process never does. For `explorer.exe` targets (File Explorer, the taskbar, the desktop) only
   the target's own dialogs and popup menus count, not the rest of the shell.
-- If the foreground or the pointer destination belongs to another process, that action is
-  refused and the session keeps its target. Bring the target back with `focus_window` and try
-  again; nothing else needs to be observed.
+- If the foreground, the keyboard focus or the pointer destination is wrong (another process, a higher-integrity window, a window that cannot be identified, or no foreground window at that instant), that action is refused and the session keeps its target. Bring the target back with `focus_window` and try again; nothing else needs to be observed. The error is `target_invalidated` with a `reason` that tells it from a fatal change (see Errors).
+- A point under the ControlFreak session tab's **Stop agent** button is refused with reason `own_indicator`. Screenshots do not show the button, which sits under the tab at the top centre of every display (104 by 32 device-independent pixels, a small gap below the tab). Pick another point, or use the keyboard.
+- `explorer.exe`, `ApplicationFrameHost.exe` (the frame of every packaged app) and any process whose program file cannot be read host unrelated windows, so for those targets only the target's own dialogs and popup menus count as the same application.
 - If the window itself changes (a different window or process, a move or resize, another virtual
   desktop, destruction), the action is refused and the session target is cleared. Observe again
   and approve the new target. Do not repeat the input on your own.
@@ -79,6 +79,8 @@ desktop and run inside a [control session](sessions.md).
 `focus_window`:
 
 - Call it after `begin_control_session`, and again when a window from another process took the foreground.
+- Inside a session it accepts the approved window or a window of the same process, such as one of its dialogs. Anything else needs a new session.
+- A refused or timed-out activation (`activation_refused`, `settle_timeout`) leaves the session intact and is retryable, as its `retryable` says. Only a change of the approved window itself ends the session.
 - `timeout_ms` defaults to 1000 and accepts 100 to 5000.
 - It never sends keyboard or mouse input to get focus.
 - Errors: `activation_refused`, `settle_timeout`, `target_invalidated`, and the integrity errors.
@@ -144,11 +146,7 @@ OCR text and checkbox glyphs do not prove the state of a control.
 `press_keys` names are case-insensitive, and `-`, `_` and spaces are ignored (`Page-Up` is
 `page_up`). Common aliases work: `esc`, `del`, `return`, `up`, `down`, `left`, `right`, `pgup`.
 
-- Punctuation: `comma`, `period`, `slash`, `semicolon`, `quote`, `left_bracket`, `right_bracket`,
-  `backslash`, `minus`, `equals`, `backtick`, or the character itself (`,` `.` `/` `;` `'` `[` `]`
-  `\` `-` `=` and the backtick). These name the key that types that character without Shift. The
-  active keyboard layout of the foreground window decides which key that is; on a layout that
-  needs Shift or AltGr for it, the US key position is used.
+- Punctuation: `comma`, `period`, `slash`, `semicolon`, `quote`, `left_bracket`, `right_bracket`, `backslash`, `minus`, `equals`, `backtick`, or the character itself (`,` `.` `/` `;` `'` `[` `]` `\` `-` `=` and the backtick). `comma`, `period`, `minus` and `equals` are the fixed OEM keys (`VK_OEM_COMMA`, `VK_OEM_PERIOD`, `VK_OEM_MINUS`, `VK_OEM_PLUS`) on every layout. The others name the key that types that character without Shift on the foreground window's keyboard layout. If that layout types the character only with Shift or AltGr, the action is refused before any input with an error that suggests `type_text`; if the layout cannot say, the US key position is used.
 - Numpad: `numpad_0` to `numpad_9`, `numpad_add`, `numpad_subtract`, `numpad_multiply`,
   `numpad_divide`, `numpad_decimal`, `num_lock`.
 - System: `print_screen`, `caps_lock`, `scroll_lock`, `pause`, `menu` (also `apps`).
@@ -210,7 +208,20 @@ Every error also has `error.retryable`. It says whether repeating the same reque
 | `os_call_failed` | Any other Windows call failure. | No |
 | `backend_unavailable` | The platform backend is missing. | No |
 
-A failed foreground activation (`focus_window`) is retryable. Ask the user to click the window first, because Windows can refuse focus changes from a background process.
+`target_invalidated` also has a `reason`, so an agent can tell a recoverable refusal from a fatal change without reading the message:
+
+| `reason` | Meaning | `retryable` |
+| --- | --- | --- |
+| `not_foreground` | The target (or a window of its process) is not in front, or nothing is. Call `focus_window`. The session is kept. | Yes |
+| `foreground_changed` | The foreground changed while the action was checked. The session is kept. | Yes |
+| `foreign_destination` | The point or the keyboard focus is in a window of another process. The session is kept. | Yes |
+| `destination_unidentified` | The window that would get the input cannot be identified. The session is kept. | Yes |
+| `own_indicator` | The point is under ControlFreak's own Stop button. Choose another point. The session is kept. | No |
+| `target_changed` | The target changed (window, process, bounds, display layout or desktop), or an earlier change ended the approval. End the session and observe again. | No |
+
+A failed foreground activation (`focus_window`) is retryable and keeps the session. Ask the user to click the window first, because Windows can refuse focus changes from a background process.
+
+The reason for `platform_operation_failed` is set by the code that detects the failure, not read from the message text, so rewording a message never changes it.
 
 - Partial and uncertain delivery are not errors. Read `status`, not only `isError`.
 - Accepted input does not prove the application did what was asked. Check the screenshot.

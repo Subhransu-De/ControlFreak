@@ -57,24 +57,13 @@ A bounded five-minute cache and Windows destroy-event watcher prevent raw HWND/P
 and retire destroyed-window references, including same-process handle reuse. Watcher failure
 refuses target resolution. Desktop-switch events retire existing references.
 
-The approved target stands in for its own process, not for the desktop. The foreground window,
-the keyboard-focus window and the window that would receive a pointer event are each accepted if
-they are the target itself or belong to the target's process, so the dialogs, popup menus and
-drop-downs that an approved application opens keep working. A window of any other process is
-refused, however it is classed or owned. Integrity is checked on the actual window that holds the
-foreground or receives the event, not only on the target, and a pointer destination must also be a
-window of the target's process at the child level, so a foreign window embedded in the target's
-window is refused. A multi-window application's other top-level windows are part of the same
-process and are accepted. `explorer.exe` hosts the taskbar, the desktop and every File Explorer
-window, so a shell-hosted target accepts only windows in its own owner chain and popup menus, not
-the taskbar or another folder window.
+The approved target stands in for its own process, not for the desktop. The foreground window, the keyboard-focus window and the window that would receive a pointer event are each accepted if they are the target itself or belong to the target's process, so the dialogs, popup menus and drop-downs that an approved application opens keep working. A window of any other process is refused, however it is classed or owned. Integrity is checked on the actual window that holds the foreground or receives the event, not only on the target, and a pointer destination must also be a window of the target's process at the child level, so a foreign window embedded in the target's window is refused. A multi-window application's other top-level windows are part of the same process and are accepted. `explorer.exe` hosts the taskbar, the desktop and every File Explorer window, and `ApplicationFrameHost.exe` in System32 hosts the frame of every packaged app, so a target in either accepts only windows in its own owner chain and popup menus, not the taskbar, another folder window or another app's frame. A target whose program file cannot be read is treated the same way: failing to know narrows the rule and never widens it.
 
-A foreground or destination that belongs to another process refuses that one action. It does not
-retire the reference and does not end the session, because every action reads the live foreground
-again; a window that gives the foreground back is usable at once. Changes that cannot heal still
-end the session's approval: a different window, process, owner or desktop, changed bounds or
-display layout, a destroyed window, an unverifiable integrity level, or a locked or non-default
-input desktop.
+A foreground window, keyboard-focus window or pointer destination that is wrong refuses that one action. This covers another process, a window of higher integrity, a window whose integrity or identity cannot be read, and a moment with no foreground window. It does not retire the reference and does not end the session, because every action reads the live foreground again; a window that gives the foreground back is usable at once. The refusal is still a refusal: nothing is sent, and a higher-integrity window is still reported as `higher_integrity_target`. The error carries a `reason` and `retryable` so the agent need not parse text. Changes to the target itself still end the session's approval: a different window, process, owner or desktop, changed bounds or display layout, a destroyed window, an unverifiable integrity level of the target, or a locked or non-default input desktop. A failed `focus_window` (refused or timed out) leaves the target as it was and does not end the session.
+
+A double or triple click is sent as separate batches with a 20 ms dwell after each press. The target, foreground, input desktop, integrity, hit window and cursor position are validated again immediately before every batch that carries new input, and a refusal releases only the input that the system acknowledged; cleanup never sends a new press.
+
+Window capture renders the window itself with `PrintWindow`. That call can wait for the target program, so it runs on a watchdog thread with a 2-second deadline, is skipped for windows that Windows flags as hung, and allows one abandoned render at a time; after a timeout the screen is copied and `capture_method` says `windows_gdi`.
 
 The taskbar, secondary taskbars, the desktop and the Start and Search surfaces can be approved as
 targets. Windows does not report a virtual desktop for them because they are on every desktop, so
@@ -125,7 +114,7 @@ the desktop, including cleanup, then says briefly that control was handed
 back. After a cleanup failure it stays, unchanged and with recovery steps,
 until the server exits. The tab itself never takes focus or receives clicks, follows
 the foreground virtual desktop, and is excluded from screen capture like the
-lamp. Only the Stop button takes clicks. It is a standard native button on its own window, so a mouse, touch, pen and accessibility tools (UI Automation Invoke) can press it. The agent cannot: its input tools are injected input, and the button's window procedure drops mouse and key messages whose origin is injected before the button sees them (if the system cannot be asked, the message counts as injected). A pointer action over the button is also refused, because the window under the point belongs to ControlFreak and not to the approved target. A press is a user stop with the same effects as Esc. The button appears only while the tab says an agent is working or waiting.
+lamp. Only the Stop button takes clicks. It is a standard native button on its own window, so a mouse, touch, pen and accessibility tools (UI Automation Invoke) can press it. The agent cannot: its input tools are injected input, and the button's window procedure accepts mouse and key messages only when their origin is input hardware (`IMO_HARDWARE`): injected input, messages posted by another process and messages whose origin cannot be read are dropped before the button sees them. An accessibility tool that invokes the button through UI Automation sends a click message that needs no origin. A pointer action over the button is also refused, with reason `own_indicator`, because the window under the point belongs to ControlFreak and not to the approved target. The button is invisible in screenshots, so an agent can aim at that spot; the refusal says what it hit. A press is a user stop with the same effects as Esc. The button appears only while the tab says an agent is working or waiting.
 
 The keyboard hook exists only while this server owns a session. It runs on a dedicated thread that does nothing but wait for session changes and service the hook, is installed when a session begins and removed when it ends, and a server that never starts a session never installs one. The tab says "Press Esc to stop" only after the hook is confirmed installed; session admission waits, for at most 2 seconds, until the hook is confirmed, and a session whose hook cannot be installed is refused with the reason (also logged to standard error) instead of running without the Esc stop. The hook examines key identity
 and injection flags only to recognize physical Esc. It retains no typed values
@@ -133,9 +122,9 @@ or keyboard history, ignores injected Esc, and consumes the stop key's press and
 release. Esc outside an owned session is passed through. A user-stop notification
 is sent over MCP and its reason remains available in status and refused actions.
 
-The tab and Stop button start with the first session. If they cannot start, sessions are refused with the reason and read-only tools keep working. If the tab fails after it started, the server fails closed: admission closes for the rest of the server's life and the reason is kept in refusals, in `get_server_status` (`safety_indicator.reason`) and on standard error.
+The tab and Stop button start with the first screen read or the first session; the Esc keyboard hook only with a session. If they cannot start, sessions are refused with the reason and read-only tools keep working. If the tab fails after it started, the server fails closed: admission closes for the rest of the server's life and the reason is kept in refusals, in `get_server_status` (`safety_indicator.reason`) and on standard error.
 
-Observation tools that read the screen show a brief "reading the screen" state on the tab. It claims no session, takes no keys and offers no stop control, because there is nothing to stop.
+Observation tools that read the screen show a brief "reading the screen" state on the tab, which the first screen read starts if no session has. It claims no session, installs no keyboard hook, takes no keys and offers no stop control, because there is nothing to stop. If the tab cannot start for a read, the read still works and the failure is logged to standard error.
 Clients may also stop all desktop work or cancel
 one request. No MCP call clears the stop latch. User-controlled server restart is
 the re-arming procedure, after draining and resolving any cleanup failure.
