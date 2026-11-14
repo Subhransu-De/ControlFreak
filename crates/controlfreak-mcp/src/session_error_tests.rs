@@ -7,19 +7,35 @@ use tokio::io::{AsyncWriteExt, BufReader};
 
 pub(super) struct Harness {
     pub(super) client: BufReader<tokio::io::DuplexStream>,
-    runtime: Arc<IndicatorRuntime>,
+    runtime: Arc<SessionRuntime>,
     serving: tokio::task::JoinHandle<()>,
 }
 
+/// A short hold, for tests that are about a session expiring.
 async fn harness(owned: Arc<AtomicBool>) -> Harness {
-    harness_with_backend(Arc::new(WaitingBackend::idle()), owned).await
+    harness_with_hold(
+        Arc::new(WaitingBackend::idle()),
+        owned,
+        Duration::from_millis(20),
+    )
+    .await
 }
 
+/// A hold that cannot expire inside a test, however loaded the machine is, for tests that make
+/// several calls and expect the session to still be there between them.
 pub(super) async fn harness_with_backend(
     backend: Arc<dyn PlatformBackend>,
     owned: Arc<AtomicBool>,
 ) -> Harness {
-    let runtime = Arc::new(IndicatorRuntime::new_with_timing(
+    harness_with_hold(backend, owned, Duration::from_secs(30)).await
+}
+
+async fn harness_with_hold(
+    backend: Arc<dyn PlatformBackend>,
+    owned: Arc<AtomicBool>,
+    hold: Duration,
+) -> Harness {
+    let runtime = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         || {
             Ok(RecordingIndicator {
@@ -29,9 +45,9 @@ pub(super) async fn harness_with_backend(
         },
         Arc::new(ExclusiveArbitrator { owned }),
         GlowTiming {
-            short_hold: Duration::from_millis(20),
-            session_hold: Duration::from_millis(20),
-            max_hold: Duration::from_secs(5),
+            short_hold: hold,
+            session_hold: hold,
+            max_hold: hold.max(Duration::from_secs(5)),
         },
     ));
     let server = ControlFreakServer::with_indicator(
@@ -77,14 +93,14 @@ pub(super) async fn call(harness: &mut Harness, name: &str, arguments: Value) ->
 fn begin() -> (&'static str, Value) {
     (
         BEGIN_CONTROL_SESSION,
-        json!({"target_ref": "fixture", "expected_seconds": 5}),
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000003", "expected_seconds": 5}),
     )
 }
 
 fn mutate() -> (&'static str, Value) {
     (
         MOVE_MOUSE,
-        json!({"display_id":"synthetic","x":0,"y":0,"target_ref":"fixture"}),
+        json!({"display_id":"synthetic","x":0,"y":0,"target_ref": "target-00000000-0000-0000-0000-000000000003"}),
     )
 }
 
@@ -206,6 +222,11 @@ fn every_session_error_has_a_distinct_wire_shape() {
     let value = result.structured_content.unwrap();
     assert_eq!(value["error"]["code"], "tool_execution_failed");
     assert_eq!(value["error"]["details"]["code"], "indicator_unavailable");
+    // The envelope and the detail never disagree about retrying.
+    assert_eq!(
+        value["error"]["retryable"], value["error"]["details"]["retryable"],
+        "{value}"
+    );
     assert_eq!(
         value["error"]["details"]["reason"],
         "{\"code\":\"spoofed\"}"
@@ -275,4 +296,74 @@ async fn shutdown_is_not_reported_as_a_user_stop() {
         ));
         harness.finish().await;
     }
+}
+
+/// Stands in for the Esc monitor thread: reacts to session ownership like the real one, with a
+/// delay, then confirms or refuses the hook.
+fn fake_escape_monitor(stop: controlfreak_core::StopController, install: Result<(), &'static str>) {
+    stop.set_esc_monitor_attached(true);
+    std::thread::spawn(move || {
+        while !stop.session_active() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(60));
+        match install {
+            Ok(()) => stop.set_esc_stop_available(true),
+            Err(reason) => stop.set_esc_install_failed(reason),
+        }
+    });
+}
+
+fn escape_runtime(owned: Arc<AtomicBool>) -> Arc<SessionRuntime> {
+    Arc::new(SessionRuntime::new_with_timing(
+        SafetyIndicator::dormant(),
+        || {
+            Ok(RecordingIndicator {
+                events: Arc::new(Mutex::new(Vec::new())),
+                fail_hide: false,
+            })
+        },
+        Arc::new(ExclusiveArbitrator { owned }),
+        GlowTiming {
+            short_hold: Duration::from_secs(5),
+            session_hold: Duration::from_secs(5),
+            max_hold: Duration::from_secs(5),
+        },
+    ))
+}
+
+#[test]
+fn a_session_is_admitted_only_after_the_esc_hook_is_confirmed() {
+    let owned = Arc::new(AtomicBool::new(false));
+    let runtime = escape_runtime(Arc::clone(&owned));
+    fake_escape_monitor(runtime.stop.clone(), Ok(()));
+    let started = Instant::now();
+    runtime
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(50),
+        "admission waited for the hook"
+    );
+    assert!(runtime.stop.esc_stop_available());
+    runtime.close_session("shutdown", true).unwrap();
+}
+
+#[test]
+fn a_session_is_refused_with_the_reason_when_the_esc_hook_cannot_be_installed() {
+    let owned = Arc::new(AtomicBool::new(false));
+    let runtime = escape_runtime(Arc::clone(&owned));
+    fake_escape_monitor(runtime.stop.clone(), Err("hook refused"));
+    let error = runtime
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap_err();
+    let message = format!("{error:?}");
+    assert!(message.contains("hook refused"), "{message}");
+    assert!(message.contains("Esc"), "{message}");
+    assert!(
+        !owned.load(Ordering::Acquire),
+        "desktop ownership is released"
+    );
+    assert!(!runtime.stop.session_active());
+    assert!(!runtime.stop.is_stopped(), "a later session may retry");
 }

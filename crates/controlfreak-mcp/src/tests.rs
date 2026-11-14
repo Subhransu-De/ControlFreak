@@ -15,8 +15,8 @@ use controlfreak_core::{
 
 use super::{
     ActivityArbitrator, ActivityIndicator, ArbitrationBusy, ArbitrationError, BeginSessionError,
-    CaptureDisplayInput, FocusWindowInput, GlowTiming, IndicatorHealth, IndicatorRuntime,
-    PressKeysInput, SafetyIndicator, handlers::run_platform_operation, parse_arguments,
+    CaptureDisplayInput, FocusWindowInput, GlowTiming, IndicatorHealth, PressKeysInput,
+    SafetyIndicator, SessionRuntime, handlers::run_platform_operation, parse_arguments,
     pointer_result, tool_error, tool_execution_error, tools,
 };
 
@@ -41,7 +41,7 @@ async fn wait_for_status(indicator: &SafetyIndicator, expected: &str) {
 
 // Keep scheduled deadlines queued so tests can deliver timeout callbacks in
 // an exact order, without racing the OS clock or changing production timing.
-fn manual_timeouts(runtime: &IndicatorRuntime) -> mpsc::Receiver<super::IdleCommand> {
+fn manual_timeouts(runtime: &SessionRuntime) -> mpsc::Receiver<super::IdleCommand> {
     let (sender, receiver) = mpsc::channel();
     *runtime.idle_worker.lock().unwrap() = Some(super::IdleWorker {
         sender,
@@ -50,7 +50,7 @@ fn manual_timeouts(runtime: &IndicatorRuntime) -> mpsc::Receiver<super::IdleComm
     receiver
 }
 
-fn expire_current_timeout(runtime: &IndicatorRuntime) {
+fn expire_current_timeout(runtime: &SessionRuntime) {
     let generation = runtime.state.lock().unwrap().generation;
     runtime.close_if_idle(generation);
 }
@@ -123,7 +123,7 @@ impl ActivityArbitrator for BrokenArbitrator {
 #[test]
 fn failed_arbitration_is_not_reported_as_a_busy_desktop() {
     let starts = Arc::new(AtomicUsize::new(0));
-    let runtime = Arc::new(IndicatorRuntime::new_with_timing(
+    let runtime = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         {
             let starts = Arc::clone(&starts);
@@ -142,7 +142,9 @@ fn failed_arbitration_is_not_reported_as_a_busy_desktop() {
             max_hold: Duration::from_secs(1),
         },
     ));
-    let Err(BeginSessionError::Session(error)) = runtime.begin_session(None, "synthetic") else {
+    let Err(BeginSessionError::Session(error)) =
+        runtime.begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+    else {
         panic!("broken arbitration must refuse the session");
     };
     let result = error.into_tool_result(&SafetyIndicator::dormant());
@@ -246,7 +248,7 @@ async fn operation_leases_start_once_and_hide_after_the_last_call() {
     let indicator = SafetyIndicator::dormant();
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         move || {
             starts_for_runtime.fetch_add(1, Ordering::Relaxed);
@@ -290,7 +292,7 @@ async fn final_mutation_preserves_the_helper_failure_reason() {
     let health = Arc::new(Mutex::new(IndicatorHealth::Healthy));
     let health_for_runtime = Arc::clone(&health);
     let indicator = SafetyIndicator::dormant();
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         move || {
             Ok(HealthControlledIndicator {
@@ -317,7 +319,7 @@ async fn a_new_operation_cancels_the_pending_hide() {
     let indicator = SafetyIndicator::dormant();
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         move || {
             Ok(RecordingIndicator {
@@ -355,7 +357,7 @@ async fn sequential_operations_reuse_one_idle_worker() {
     let indicator = SafetyIndicator::dormant();
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         move || {
             Ok(RecordingIndicator {
@@ -387,7 +389,7 @@ async fn a_hide_failure_shuts_down_the_helper_and_degrades_status() {
     let indicator = SafetyIndicator::dormant();
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         move || {
             Ok(RecordingIndicator {
@@ -411,7 +413,7 @@ async fn a_hide_failure_shuts_down_the_helper_and_degrades_status() {
 #[tokio::test]
 async fn overlapping_operations_revalidate_helper_visibility() {
     let indicator = SafetyIndicator::dormant();
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         || Ok(FailingSecondShowIndicator { shows: 0 }),
         Duration::from_millis(10),
@@ -433,7 +435,7 @@ async fn a_hide_failure_restarts_the_helper_on_the_next_mutation() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
     let indicator = SafetyIndicator::dormant();
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         move || {
             Ok(RecordingIndicator {
@@ -457,7 +459,7 @@ async fn a_hide_failure_restarts_the_helper_on_the_next_mutation() {
 fn begin_clamps_expected_seconds_and_end_hides_immediately() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_timing(
+    let runtime = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         move || {
             Ok(RecordingIndicator {
@@ -476,7 +478,9 @@ fn begin_clamps_expected_seconds_and_end_hides_immediately() {
     assert!(runtime.begin_session(Some(99), "").is_err());
     assert_eq!(runtime.status()["owns_arbitration"], false);
     assert!(events.lock().unwrap().is_empty());
-    runtime.begin_session(Some(99), "synthetic").unwrap();
+    runtime
+        .begin_session(Some(99), "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
     assert_eq!(runtime.status()["hold_ms"], 2_000);
     assert_eq!(runtime.status()["state"], "armed");
     let snapshot = || {
@@ -506,11 +510,16 @@ fn begin_clamps_expected_seconds_and_end_hides_immediately() {
         }
     });
     assert_eq!(snapshot(), before);
-    assert_eq!(runtime.status()["approved_target_ref"], "synthetic");
+    assert_eq!(
+        runtime.status()["approved_target_ref"],
+        "target-00000000-0000-0000-0000-000000000003"
+    );
     assert_eq!(*events.lock().unwrap(), ["armed"]);
     runtime.end_session().unwrap();
 
-    runtime.begin_session(Some(1), "synthetic").unwrap();
+    runtime
+        .begin_session(Some(1), "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
     assert_eq!(runtime.status()["hold_ms"], 1_000);
     runtime.end_session().unwrap();
     assert_eq!(*events.lock().unwrap(), ["armed", "hide", "armed", "hide"]);
@@ -520,7 +529,7 @@ fn begin_clamps_expected_seconds_and_end_hides_immediately() {
 async fn begin_keeps_acting_while_a_mutation_is_in_flight() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         SafetyIndicator::dormant(),
         move || {
             Ok(RecordingIndicator {
@@ -532,7 +541,9 @@ async fn begin_keeps_acting_while_a_mutation_is_in_flight() {
     ));
 
     let lease = runtime.acquire().await.unwrap();
-    runtime.begin_session(None, "synthetic").unwrap();
+    runtime
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
 
     assert_eq!(runtime.status()["state"], "acting");
     assert_eq!(runtime.status()["active_mutations"], 1);
@@ -547,7 +558,7 @@ async fn begin_keeps_acting_while_a_mutation_is_in_flight() {
 async fn explicit_session_hold_survives_the_first_mutation() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_timing(
+    let runtime = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         move || {
             Ok(RecordingIndicator {
@@ -564,7 +575,9 @@ async fn explicit_session_hold_survives_the_first_mutation() {
     ));
     let _timeouts = manual_timeouts(&runtime);
 
-    runtime.begin_session(Some(2), "synthetic").unwrap();
+    runtime
+        .begin_session(Some(2), "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
     drop(runtime.acquire().await.unwrap());
 
     assert_eq!(runtime.status()["state"], "armed");
@@ -585,7 +598,7 @@ fn refused_server_stays_dark_until_the_owner_ends() {
     let first_events = Arc::new(Mutex::new(Vec::new()));
     let second_events = Arc::new(Mutex::new(Vec::new()));
     let second_starts = Arc::new(AtomicUsize::new(0));
-    let first = Arc::new(IndicatorRuntime::new_with_timing(
+    let first = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         {
             let events = Arc::clone(&first_events);
@@ -605,7 +618,7 @@ fn refused_server_stays_dark_until_the_owner_ends() {
             max_hold: Duration::from_secs(1),
         },
     ));
-    let second = Arc::new(IndicatorRuntime::new_with_timing(
+    let second = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         {
             let events = Arc::clone(&second_events);
@@ -628,13 +641,21 @@ fn refused_server_stays_dark_until_the_owner_ends() {
         },
     ));
 
-    first.begin_session(None, "synthetic").unwrap();
-    assert!(second.begin_session(None, "synthetic").is_err());
+    first
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
+    assert!(
+        second
+            .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+            .is_err()
+    );
     assert_eq!(second_starts.load(Ordering::Relaxed), 0);
     assert!(second_events.lock().unwrap().is_empty());
 
     first.end_session().unwrap();
-    second.begin_session(None, "synthetic").unwrap();
+    second
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
     assert_eq!(*second_events.lock().unwrap(), ["armed"]);
     second.end_session().unwrap();
 }
@@ -643,7 +664,7 @@ fn refused_server_stays_dark_until_the_owner_ends() {
 fn failed_helper_start_releases_arbitration_for_the_next_server() {
     let owned = Arc::new(AtomicBool::new(false));
     let failed_starts = Arc::new(AtomicUsize::new(0));
-    let first = Arc::new(IndicatorRuntime::new_with_timing(
+    let first = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         {
             let failed_starts = Arc::clone(&failed_starts);
@@ -662,7 +683,7 @@ fn failed_helper_start_releases_arbitration_for_the_next_server() {
         },
     ));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let second = Arc::new(IndicatorRuntime::new_with_timing(
+    let second = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         {
             let events = Arc::clone(&events);
@@ -684,7 +705,7 @@ fn failed_helper_start_releases_arbitration_for_the_next_server() {
     ));
 
     assert!(matches!(
-        first.begin_session(None, "synthetic").unwrap_err(),
+        first.begin_session(None, "target-00000000-0000-0000-0000-000000000003").unwrap_err(),
         BeginSessionError::Session(super::SessionError::Indicator(reason))
             if reason == "native indicator initialization failed"
     ));
@@ -692,7 +713,9 @@ fn failed_helper_start_releases_arbitration_for_the_next_server() {
     assert_eq!(first.status()["owns_arbitration"], false);
     assert_eq!(first.status()["last_cleanup_reason"], "admission_failure");
 
-    second.begin_session(None, "synthetic").unwrap();
+    second
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
     second.end_session().unwrap();
     assert_eq!(*events.lock().unwrap(), ["armed", "hide"]);
 }
@@ -701,7 +724,7 @@ fn failed_helper_start_releases_arbitration_for_the_next_server() {
 async fn end_waits_for_the_outstanding_mutation_guard() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         SafetyIndicator::dormant(),
         move || {
             Ok(RecordingIndicator {
@@ -712,7 +735,9 @@ async fn end_waits_for_the_outstanding_mutation_guard() {
         Duration::from_secs(1),
     ));
 
-    runtime.begin_session(None, "synthetic").unwrap();
+    runtime
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
     let lease = runtime.acquire().await.unwrap();
     runtime.end_session().unwrap();
     assert_eq!(*events.lock().unwrap(), ["armed", "acting"]);
@@ -731,7 +756,7 @@ async fn cancelling_acquisition_releases_the_completed_worker_lease() {
     let started_for_worker = Arc::clone(&started);
     let (continue_tx, continue_rx) = mpsc::sync_channel(1);
     let continue_rx = Arc::new(Mutex::new(continue_rx));
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         move || {
             started_for_worker.notify_one();
@@ -765,7 +790,7 @@ async fn cancelling_a_request_keeps_the_glow_until_blocking_work_ends() {
     let indicator = SafetyIndicator::dormant();
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         move || {
             Ok(RecordingIndicator {
@@ -813,7 +838,6 @@ fn tool_surface_includes_windows_and_keyboard() {
     assert_eq!(
         names,
         [
-            "stop_desktop_work",
             "get_server_status",
             "begin_control_session",
             "end_control_session",
@@ -840,6 +864,7 @@ fn tool_surface_includes_windows_and_keyboard() {
             "press_keys",
             "type_text",
             "run_actions",
+            "stop_desktop_work",
         ]
     );
 }
@@ -852,6 +877,7 @@ fn improved_arguments_accept_bounded_capture_focus_observation_and_uppercase_key
         "include_cursor": false
     })))
     .unwrap();
+    let capture = capture.into_request().unwrap();
     assert_eq!(capture.max_width, Some(1600));
     assert!(!capture.include_cursor);
 
@@ -872,7 +898,7 @@ fn improved_arguments_accept_bounded_capture_focus_observation_and_uppercase_key
     assert_eq!(focus.observation.region.unwrap().width, 300);
 
     let chord = parse_arguments::<PressKeysInput>(Some(rmcp::object!({
-        "target_ref": "synthetic",
+        "target_ref": "target-00000000-0000-0000-0000-000000000003",
         "keys": ["CTRL", "L"]
     })))
     .unwrap();

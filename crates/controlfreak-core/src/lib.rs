@@ -5,6 +5,7 @@ mod desktop;
 mod display;
 mod error;
 mod keyboard;
+pub mod limits;
 mod mutation;
 mod ocr;
 mod outcome;
@@ -29,7 +30,7 @@ pub use display::{
     PointerActionResult, VisualBaseline, VisualBaselineRequest, VisualChangeResult,
     WaitForChangeSinceRequest, WaitForVisualChangeRequest,
 };
-pub use error::PlatformError;
+pub use error::{FailureCause, PlatformError, RefusalCause};
 pub use keyboard::{Key, KeyChordRequest, KeyboardActionResult, TextInputRequest};
 pub use mutation::MutationControl;
 pub use ocr::{
@@ -41,11 +42,11 @@ pub use outcome::{CleanupStatus, InputOutcome, MutationProgress};
 pub use permission::{PermissionDescriptor, PermissionId, PermissionState};
 pub use platform::{
     BackendIdentity, BackendMetadata, DisplayBackend, DisplayServer, KeyboardBackend, OcrBackend,
-    Platform, PlatformBackend, PointerBackend, WindowBackend,
+    Platform, PlatformBackend, PointerBackend, WindowBackend, wait_for_text_with,
 };
 pub use report::CapabilityReport;
 pub use security::{IntegrityLevel, SecurityContext};
-pub use stop::{StopController, StopRegistration};
+pub use stop::{Backoff, EscHook, StopController, StopRegistration, retry_with_backoff};
 pub use text_matching::{discover_text, select_text_candidate, validate_text_discovery};
 pub use window::{
     CaptureWindowRequest, FocusWindowRequest, WaitForWindowRequest, WindowBounds,

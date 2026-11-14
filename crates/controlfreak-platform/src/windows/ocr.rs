@@ -6,7 +6,7 @@
 //! request in progress and ends it. A helper is retired after an error, timeout, cancellation, or
 //! `MAX_REQUESTS_PER_HELPER` requests, and exits by itself when idle for `HELPER_IDLE_EXIT`.
 
-use super::recognize_text_in_process;
+use super::recognize_text_fingerprinted;
 use crate::OcrHelperCommand;
 use controlfreak_core::{MutationControl, OcrRegionRequest, OcrResult, PlatformError};
 use serde::{Deserialize, Serialize};
@@ -39,8 +39,15 @@ const MAX_SKIPPED_LINES: usize = 16;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum OcrHelperResponse {
-    Success { result: OcrResult },
-    Error { error: PlatformError },
+    Success {
+        result: OcrResult,
+        /// Fingerprint of the exact frame that was recognized; see `pixel_fingerprint`.
+        #[serde(default)]
+        frame_fingerprint: Option<u64>,
+    },
+    Error {
+        error: PlatformError,
+    },
 }
 
 /// One request line sent to a helper.
@@ -75,10 +82,11 @@ fn record_helper_stages(stages: &[(String, u64)]) {
 }
 
 fn helper_error(reason: impl Into<String>) -> PlatformError {
-    PlatformError::OperationFailed {
-        operation: "windows_ocr_helper".to_owned(),
-        reason: reason.into(),
-    }
+    PlatformError::failed(
+        controlfreak_core::FailureCause::OcrUnavailable,
+        "windows_ocr_helper",
+        reason,
+    )
 }
 
 /// The backend's warm helper and request numbering.
@@ -88,12 +96,24 @@ pub(super) struct OcrHelperPool {
     next_id: AtomicU64,
 }
 
-pub(super) fn recognize_text_with_helper(
+#[cfg(test)]
+fn recognize_text_with_helper(
     command: &OcrHelperCommand,
     pool: &OcrHelperPool,
     request: &OcrRegionRequest,
     control: &MutationControl,
 ) -> Result<OcrResult, PlatformError> {
+    recognize_text_with_helper_fingerprinted(command, pool, request, control)
+        .map(|(result, _)| result)
+}
+
+/// Recognizes text in a helper and returns the fingerprint of the frame the helper recognized.
+pub(super) fn recognize_text_with_helper_fingerprinted(
+    command: &OcrHelperCommand,
+    pool: &OcrHelperPool,
+    request: &OcrRegionRequest,
+    control: &MutationControl,
+) -> Result<(OcrResult, Option<u64>), PlatformError> {
     control.check("windows_ocr_helper")?;
     let id = pool.next_id.fetch_add(1, Ordering::Relaxed);
     let line = serde_json::to_vec(&OcrHelperRequest {
@@ -139,7 +159,10 @@ pub(super) fn recognize_text_with_helper(
     }
     record_helper_stages(&reply.stages_micros);
     match reply.response {
-        OcrHelperResponse::Success { result } => Ok(result),
+        OcrHelperResponse::Success {
+            result,
+            frame_fingerprint,
+        } => Ok((result, frame_fingerprint)),
         OcrHelperResponse::Error { error } => Err(error),
     }
 }
@@ -477,7 +500,15 @@ pub(crate) fn serve_ocr_helper(
     input: impl Read + Send + 'static,
     output: impl Write,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    serve_ocr_helper_with(input, output, recognize_text_in_process, HELPER_IDLE_EXIT)
+    serve_ocr_helper_with(
+        input,
+        output,
+        |request, control| {
+            recognize_text_fingerprinted(request, control)
+                .map(|(result, fingerprint)| (result, Some(fingerprint)))
+        },
+        HELPER_IDLE_EXIT,
+    )
 }
 
 /// Serves request lines until input ends or stays idle for `idle_exit`. Closing input also
@@ -485,7 +516,10 @@ pub(crate) fn serve_ocr_helper(
 fn serve_ocr_helper_with(
     input: impl Read + Send + 'static,
     mut output: impl Write,
-    recognize: impl Fn(&OcrRegionRequest, &MutationControl) -> Result<OcrResult, PlatformError>,
+    recognize: impl Fn(
+        &OcrRegionRequest,
+        &MutationControl,
+    ) -> Result<(OcrResult, Option<u64>), PlatformError>,
     idle_exit: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let current = Arc::new(Mutex::new(None::<MutationControl>));
@@ -525,7 +559,10 @@ fn serve_ocr_helper_with(
         }
         controlfreak_core::timing::reset();
         let response = match recognize(&request.request, &control) {
-            Ok(result) => OcrHelperResponse::Success { result },
+            Ok((result, frame_fingerprint)) => OcrHelperResponse::Success {
+                result,
+                frame_fingerprint,
+            },
             Err(error) => OcrHelperResponse::Error { error },
         };
         *current
@@ -617,7 +654,7 @@ mod tests {
             serve_ocr_helper_with(
                 input,
                 output,
-                |_, _| Ok(synthetic_result("en-US")),
+                |_, _| Ok((synthetic_result("en-US"), None)),
                 Duration::from_secs(5),
             )
             .unwrap();
@@ -665,7 +702,7 @@ mod tests {
         serve_ocr_helper_with(
             reader,
             Vec::new(),
-            |_, _| Ok(synthetic_result("en-US")),
+            |_, _| Ok((synthetic_result("en-US"), None)),
             Duration::from_millis(50),
         )
         .unwrap();
@@ -688,7 +725,12 @@ mod tests {
         serve_ocr_helper_with(
             std::io::stdin(),
             std::io::stdout().lock(),
-            |_, _| Ok(synthetic_result(&format!("pid-{}", std::process::id()))),
+            |_, _| {
+                Ok((
+                    synthetic_result(&format!("pid-{}", std::process::id())),
+                    None,
+                ))
+            },
             Duration::from_secs(20),
         )
         .unwrap();
@@ -734,7 +776,7 @@ mod tests {
             std::io::stdout().lock(),
             |_, control| {
                 control.wait("synthetic_ocr", Duration::from_mins(1))?;
-                Ok(synthetic_result("late"))
+                Ok((synthetic_result("late"), None))
             },
             Duration::from_mins(1),
         )
@@ -748,7 +790,7 @@ mod tests {
         serve_ocr_helper_with(
             std::io::stdin(),
             std::io::stdout().lock(),
-            |_, _| Ok(synthetic_result(&"x".repeat(256 * 1024))),
+            |_, _| Ok((synthetic_result(&"x".repeat(256 * 1024)), None)),
             Duration::from_secs(20),
         )
         .unwrap();

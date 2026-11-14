@@ -39,7 +39,7 @@ impl SyntheticBackend {
 
 impl BackendMetadata for SyntheticBackend {
     fn validate_target_reference(&self, target: &str) -> Result<(), PlatformError> {
-        if target == "synthetic" {
+        if target == "target-00000000-0000-0000-0000-000000000003" {
             Ok(())
         } else {
             Err(PlatformError::TargetInvalidated {
@@ -226,6 +226,7 @@ fn synthetic_window() -> controlfreak_core::WindowInfo {
         display_id: "synthetic".into(),
         is_foreground: true,
         is_minimized: false,
+        owner: None,
     }
 }
 
@@ -367,6 +368,10 @@ async fn assert_unapproved_actions_rejected(
 ) {
     for (name, arguments) in actions {
         for supplied in [None, Some("0X10:20"), Some("expired-target")] {
+            // Switching desktops defaults to the session's window when no target is given.
+            if supplied.is_none() && *name == SWITCH_VIRTUAL_DESKTOP {
+                continue;
+            }
             let mut arguments = arguments.clone();
             let field = if *name == FOCUS_WINDOW {
                 "window_id"
@@ -410,10 +415,10 @@ fn action_requests() -> [(&'static str, Value); 9] {
         ),
         (PRESS_KEYS, json!({"keys":["enter"]})),
         (TYPE_TEXT, json!({"text":"synthetic"})),
-        (FOCUS_WINDOW, json!({"window_id":"synthetic"})),
+        (FOCUS_WINDOW, json!({"window_id":"target-00000000-0000-0000-0000-000000000003"})),
         (SWITCH_VIRTUAL_DESKTOP, json!({"direction":"right"})),
     ].map(|(name, mut arguments)| {
-        if name != FOCUS_WINDOW { arguments["target_ref"] = json!("synthetic"); }
+        if name != FOCUS_WINDOW { arguments["target_ref"] = json!("target-00000000-0000-0000-0000-000000000003"); }
         (name, arguments)
     })
 }

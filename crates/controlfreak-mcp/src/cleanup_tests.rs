@@ -44,7 +44,7 @@ async fn cancelled_response_stays_draining_until_indicator_cleanup_returns() {
     let (finish, receiver) = mpsc::channel();
     let receiver = Arc::new(Mutex::new(receiver));
     let fixture = Arc::new(Fixture::default());
-    let runtime = Arc::new(IndicatorRuntime::new_with_timing(
+    let runtime = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         move || {
             Ok(BlockingHide {
@@ -65,7 +65,7 @@ async fn cancelled_response_stays_draining_until_indicator_cleanup_returns() {
     let task = tokio::spawn(stop::WORK.scope(work, async move {
         handlers::run_mutation_operation(
             Some(lease),
-            "fixture".into(),
+            Some("target-00000000-0000-0000-0000-000000000003".to_owned()),
             Arc::new(stop_tests::WaitingBackend::idle()),
             move |_| {
                 stopping.stop();
@@ -107,7 +107,7 @@ async fn stop_keeps_blocked_worker_ownership_until_cleanup_finishes() {
             let _cancel = stop::CancelOnDrop(control);
             handlers::run_mutation_operation(
                 Some(lease),
-                "fixture".into(),
+                Some("target-00000000-0000-0000-0000-000000000003".to_owned()),
                 Arc::new(stop_tests::WaitingBackend::idle()),
                 move |control| {
                     control.dispatch_accepted(1);
@@ -153,7 +153,11 @@ async fn stop_keeps_blocked_worker_ownership_until_cleanup_finishes() {
         assert_eq!(fixture.owned.load(Ordering::SeqCst), cleanup_failed);
         assert_eq!(runtime.stop.session_active(), cleanup_failed);
         assert!(runtime.stop.user_stopped());
-        assert!(runtime.begin_session(None, "fixture").is_err());
+        assert!(
+            runtime
+                .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+                .is_err()
+        );
     }
 }
 
@@ -236,9 +240,9 @@ impl ActivityIndicator for Indicator {
     }
 }
 impl Fixture {
-    fn runtime(self: &Arc<Self>) -> Arc<IndicatorRuntime> {
+    fn runtime(self: &Arc<Self>) -> Arc<SessionRuntime> {
         let fixture = Arc::clone(self);
-        let mut runtime = IndicatorRuntime::new_with_timing(
+        let mut runtime = SessionRuntime::new_with_timing(
             SafetyIndicator::dormant(),
             move || Ok(Indicator(Arc::clone(&fixture))),
             Arc::clone(self) as Arc<dyn ActivityArbitrator>,
@@ -286,7 +290,11 @@ fn concurrent_cleanup_waits_for_every_mutation_and_preserves_the_reason() {
         runtime.end_session().unwrap();
         assert_eq!(fixture.releases.load(Ordering::SeqCst), 1);
         if reason != "explicit_end" {
-            assert!(runtime.begin_session(None, "synthetic").is_err());
+            assert!(
+                runtime
+                    .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+                    .is_err()
+            );
         }
     }
 }
@@ -308,7 +316,11 @@ fn desktop_changes_cancel_active_work_and_refuse_new_admission() {
             thread::sleep(Duration::from_millis(1));
         }
         assert!(lease.mutation_control().is_cancelled());
-        assert!(runtime.begin_session(None, "synthetic").is_err());
+        assert!(
+            runtime
+                .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+                .is_err()
+        );
         assert!(runtime.acquire_mutation_blocking().is_err());
         assert_eq!(runtime.status()["draining"], true);
         drop(lease);
@@ -320,7 +332,9 @@ fn desktop_changes_cancel_active_work_and_refuse_new_admission() {
                 .contains(reason)
         );
         *fixture.environment.lock().unwrap() = None;
-        runtime.begin_session(None, "synthetic").unwrap();
+        runtime
+            .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+            .unwrap();
         runtime.close_session("shutdown", true).unwrap();
     }
 }
@@ -329,9 +343,13 @@ fn desktop_changes_cancel_active_work_and_refuse_new_admission() {
 fn stale_timeout_cannot_close_a_new_session() {
     let fixture = Arc::new(Fixture::default());
     let runtime = fixture.runtime();
-    runtime.begin_session(None, "synthetic").unwrap();
+    runtime
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
     let generation = runtime.state.lock().unwrap().generation;
-    runtime.begin_session(None, "synthetic").unwrap();
+    runtime
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
     runtime.close_if_idle(generation);
     assert!(fixture.owned.load(Ordering::SeqCst));
     let generation = runtime.state.lock().unwrap().generation;
@@ -344,7 +362,9 @@ fn stale_timeout_cannot_close_a_new_session() {
 fn failed_shutdown_keeps_arbitration_until_retry_is_safe() {
     let fixture = Arc::new(Fixture::default());
     let runtime = fixture.runtime();
-    runtime.begin_session(None, "synthetic").unwrap();
+    runtime
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
     fixture.shutdown_failed.store(true, Ordering::SeqCst);
     assert!(runtime.close_session("shutdown", true).is_err());
     assert_eq!(runtime.status()["draining"], true);
@@ -381,7 +401,11 @@ fn desktop_is_revalidated_after_indicator_startup() {
             Ok(Box::new(Indicator(Arc::clone(&fixture_for_start))))
         });
         if explicit {
-            assert!(runtime.begin_session(None, "synthetic").is_err());
+            assert!(
+                runtime
+                    .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+                    .is_err()
+            );
         } else {
             assert!(runtime.acquire_mutation_blocking().is_err());
         }
@@ -418,7 +442,9 @@ async fn eof_closes_admission_before_response_drain() {
 async fn persistent_shutdown_failure_has_a_bounded_wait_without_releasing_ownership() {
     let fixture = Arc::new(Fixture::default());
     let runtime = fixture.runtime();
-    runtime.begin_session(None, "synthetic").unwrap();
+    runtime
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
     fixture.shutdown_failed.store(true, Ordering::SeqCst);
     assert!(runtime.close_session("shutdown", true).is_err());
     let error = wait_for_cleanup(&runtime, Duration::from_millis(1))

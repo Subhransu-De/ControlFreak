@@ -5,7 +5,7 @@
 #![allow(unsafe_code)]
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ffi::c_void,
     io,
     mem::size_of,
@@ -13,9 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::win32::{visit_monitors, windows_error};
 use windows::{
     Win32::{
-        Foundation::{COLORREF, D2DERR_RECREATE_TARGET, HWND, LPARAM, POINT, RECT, SIZE},
+        Foundation::{COLORREF, D2DERR_RECREATE_TARGET, HWND, POINT, RECT, SIZE},
         Graphics::{
             Direct2D::{
                 Common::{
@@ -26,12 +27,13 @@ use windows::{
                 D2D1_ANTIALIAS_MODE_ALIASED, D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_SMALL,
                 D2D1_CAP_STYLE_ROUND, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
                 D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
-                D2D1_LINE_JOIN_ROUND, D2D1_RENDER_TARGET_PROPERTIES,
-                D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
-                D2D1_STROKE_STYLE_PROPERTIES, D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
-                D2D1CreateFactory, ID2D1Brush, ID2D1DCRenderTarget, ID2D1Factory,
-                ID2D1PathGeometry, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+                D2D1_LINE_JOIN_ROUND, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE,
+                D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+                D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES,
+                D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Brush,
+                ID2D1DCRenderTarget, ID2D1Factory, ID2D1PathGeometry, ID2D1SolidColorBrush,
+                ID2D1StrokeStyle,
             },
             DirectWrite::{
                 DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -45,8 +47,8 @@ use windows::{
                 AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
                 COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT,
                 CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject,
-                EnumDisplayMonitors, GetMonitorInfoW, GetSysColor, HBITMAP, HDC, HGDIOBJ, HMONITOR,
-                MONITORINFO, SelectObject,
+                GetMonitorInfoW, GetSysColor, HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFO,
+                SelectObject,
             },
         },
         System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
@@ -194,68 +196,22 @@ impl Monitor {
 /// Space kept clear on each side of a tab, in DIPs.
 const TAB_CLEARANCE_DIP: f32 = 16.0;
 
-#[derive(Default)]
-struct MonitorEnumeration {
-    monitors: Vec<Monitor>,
-    error: Option<String>,
-}
-
-unsafe extern "system" fn monitor_callback(
-    monitor: HMONITOR,
-    _dc: HDC,
-    _rect: *mut RECT,
-    data: LPARAM,
-) -> BOOL {
-    // SAFETY: `data` points to the uniquely borrowed enumeration supplied to the synchronous
-    // EnumDisplayMonitors call and remains live throughout this callback.
-    let enumeration = unsafe { &mut *(data.0 as *mut MonitorEnumeration) };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| monitor_info(monitor)));
-    match result {
-        Ok(Ok(monitor)) => {
-            enumeration.monitors.push(monitor);
-            BOOL(1)
-        }
-        Ok(Err(error)) => {
-            enumeration.error = Some(error.to_string());
-            BOOL(0)
-        }
-        Err(_) => {
-            enumeration.error = Some("monitor enumeration callback panicked".to_owned());
-            BOOL(0)
-        }
-    }
-}
-
 /// Active monitors sorted by position, so an unchanged layout compares equal between polls.
 pub(crate) fn enumerate_monitors() -> io::Result<Vec<Monitor>> {
-    let mut enumeration = MonitorEnumeration::default();
-    // SAFETY: The LPARAM points to `enumeration`, which is uniquely borrowed and remains alive for
-    // the complete synchronous enumeration; the callback catches panics across the FFI boundary.
-    let succeeded = unsafe {
-        EnumDisplayMonitors(
-            None,
-            None,
-            Some(monitor_callback),
-            LPARAM((&raw mut enumeration).cast::<c_void>() as isize),
-        )
-    };
-    if !succeeded.as_bool() {
-        return Err(io::Error::other(
-            enumeration
-                .error
-                .unwrap_or_else(|| WindowsError::from_thread().to_string()),
-        ));
-    }
-    if enumeration.monitors.is_empty() {
+    let mut monitors = Vec::new();
+    visit_monitors(|monitor| {
+        monitors.push(monitor_info(monitor).map_err(|error| error.to_string())?);
+        Ok(())
+    })
+    .map_err(io::Error::other)?;
+    if monitors.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "Windows reported no active monitors for the indicator",
         ));
     }
-    enumeration
-        .monitors
-        .sort_by_key(|monitor| (monitor.left, monitor.top, monitor.right, monitor.bottom));
-    Ok(enumeration.monitors)
+    monitors.sort_by_key(|monitor| (monitor.left, monitor.top, monitor.right, monitor.bottom));
+    Ok(monitors)
 }
 
 fn monitor_info(monitor: HMONITOR) -> io::Result<Monitor> {
@@ -499,7 +455,13 @@ const INTRO: Duration = Duration::from_secs(3);
 /// Waiting shows only after this long without an action, so quick actions never flicker.
 const WAITING_DELAY: Duration = Duration::from_secs(1);
 /// How long "This PC is yours again" stays, with or without animations.
-const HANDBACK: Duration = Duration::from_millis(2_500);
+const HANDBACK_AFTER_STOP: Duration = Duration::from_millis(2_500);
+/// A normal end of a session hands the PC back quietly and quickly, so the tab is dormant again
+/// soon after `end_control_session`.
+const HANDBACK: Duration = Duration::from_secs(1);
+/// How long "reading the screen" stays after the last observation, so a quick capture is still
+/// seen.
+pub(crate) const READING: Duration = Duration::from_millis(1_500);
 /// A session that starts this soon after the last one ended skips the two-line introduction, so
 /// an agent working through one-shot actions does not keep re-announcing itself.
 const RETURN_GRACE: Duration = Duration::from_mins(1);
@@ -537,7 +499,11 @@ pub(crate) enum TabKind {
     Waiting,
     Stopping,
     InputHeld,
-    HandedBack { after_stop: bool },
+    HandedBack {
+        after_stop: bool,
+    },
+    /// An observation tool is reading the screen. No session is owned and no input is sent.
+    Reading,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -556,12 +522,15 @@ pub(crate) struct TabInputs {
     /// that started and finished between two polls.
     pub(crate) actions: u64,
     pub(crate) elevated: bool,
+    /// An observation tool read the screen within [`READING`].
+    pub(crate) reading: bool,
 }
 
 /// Decides what the tab shows. Precedence, highest first: input may be held (until the server
 /// exits); stopping (at once on Esc or a client stop); working (at once when an action starts);
 /// waiting (only after [`WAITING_DELAY`] without an action); handed back (after a session ends,
-/// for [`HANDBACK`], cleared at once by a new session).
+/// for [`HANDBACK`], cleared at once by a new session); reading the screen (an observation with
+/// no session, for [`READING`]).
 #[derive(Debug, Default)]
 pub(crate) struct TabModel {
     session_started: Option<Instant>,
@@ -628,7 +597,13 @@ impl TabModel {
         if self.was_active {
             self.was_active = false;
             self.last_session_end = Some(now);
-            self.handback = Some((now + HANDBACK, input.stop != StopStatus::Ready));
+            let after_stop = input.stop != StopStatus::Ready;
+            let hold = if after_stop {
+                HANDBACK_AFTER_STOP
+            } else {
+                HANDBACK
+            };
+            self.handback = Some((now + hold, after_stop));
         }
         match self.handback {
             // A normal end is one quiet row; after a stop, the second line explains that
@@ -640,7 +615,11 @@ impl TabModel {
             }),
             _ => {
                 self.handback = None;
-                None
+                input.reading.then_some(TabView {
+                    kind: TabKind::Reading,
+                    admin: false,
+                    expanded: false,
+                })
             }
         }
     }
@@ -712,7 +691,9 @@ fn say(words: &Content, admin: bool, short_esc: bool) -> String {
 
 const TITLE_ACTIVE: &str = "An agent is using this PC";
 const WORKING_STATUS: &str = "ControlFreak is working";
-const WAITING_STATUS: &str = "ControlFreak is waiting";
+const WAITING_STATUS: &str = "ControlFreak is waiting for the next action";
+const READING_TITLE: &str = "ControlFreak is reading the screen";
+const READING_STATUS: &str = "It is not using the keyboard or mouse";
 const HELD_TITLE: &str = "A key or mouse button may still be held";
 const CHIP: &str = "Administrator";
 
@@ -763,6 +744,13 @@ fn content(view: TabView) -> Content {
             Badge::Check,
             false,
         ),
+        // No session, so no Esc: reading never swallows a key.
+        TabKind::Reading => plain(
+            READING_TITLE,
+            READING_STATUS,
+            Badge::Pointer { filled: false },
+            false,
+        ),
     }
 }
 
@@ -804,7 +792,8 @@ fn tones(view: TabView, palette: &Palette) -> Tones {
             AMBER_INK,
             AMBER.mix(palette.surface, 0.40),
         ),
-        TabKind::HandedBack { .. } => (
+        // Neither owns the PC: no lamp, and the neutral grey says nothing is being controlled.
+        TabKind::HandedBack { .. } | TabKind::Reading => (
             None,
             NEUTRAL_BADGE,
             palette.ink,
@@ -1010,12 +999,17 @@ pub(crate) struct Painter {
     family: PCWSTR,
     /// Replaced when Direct2D loses it, as after a display driver reset (see `Painter::draw`).
     target: RefCell<ID2D1DCRenderTarget>,
+    /// Whether tabs may say "Press Esc to stop". Cleared while no keyboard hook is confirmed
+    /// installed, so the tab never promises a stop key nothing is listening for.
+    esc_hint: Cell<bool>,
 }
 
 /// A painted tab: lamp segment, shoulders, body and shadow, in physical pixels.
 pub(crate) struct PaintedTab {
     pub(crate) surface: DibSurface,
     pub(crate) width: i32,
+    /// Where the tab body ends, from the top of the bitmap; a control hangs from here.
+    pub(crate) body_bottom: i32,
     /// The painted words as sentences, for the window name.
     pub(crate) spoken: String,
 }
@@ -1114,7 +1108,13 @@ impl Painter {
             fonts,
             family,
             target,
+            esc_hint: Cell::new(true),
         })
+    }
+
+    /// Sets whether tabs may offer Esc; returns `true` when that changes what they say.
+    pub(crate) fn set_esc_hint(&self, offered: bool) -> bool {
+        self.esc_hint.replace(offered) != offered
     }
 
     /// Whether the bundled Inter loaded; otherwise Segoe UI stands in.
@@ -1153,9 +1153,13 @@ impl Painter {
         layout.with_lamp = with_lamp;
         let mut surface = DibSurface::create(layout.width, layout.height)?;
         self.draw(&layout, &mut surface)?;
+        // The body is a few pixels inside the bitmap, so rounding up cannot leave it.
+        #[allow(clippy::cast_possible_truncation)]
+        let body_bottom = layout.body.3.ceil() as i32;
         Ok(PaintedTab {
             surface,
             width: layout.width,
+            body_bottom,
             spoken: layout.spoken,
         })
     }
@@ -1271,7 +1275,8 @@ impl Painter {
         // step, keeping the remedy and its escalation; only then does the type step down from the
         // Windows text size, never below 100%. A single step is the last resort. Every other
         // state has one form.
-        let full = content(view);
+        let mut full = content(view);
+        full.esc &= self.esc_hint.get();
         let short = Content { status: "", ..full };
         let forms: &[Content] = if view.kind == TabKind::InputHeld {
             &[
@@ -1781,9 +1786,18 @@ fn system_fonts(factory: &IDWriteFactory) -> io::Result<IDWriteFontCollection> {
     collection.ok_or_else(|| io::Error::other("Windows returned no system font collection"))
 }
 
+/// Unit tests draw on the CPU. Many painters are created and dropped on parallel test threads,
+/// and some GPU user-mode drivers crash when their devices are torn down concurrently. The tests
+/// compare text and geometry, which the rasterizer does not change; the server uses the default.
+const RENDER_TARGET_TYPE: D2D1_RENDER_TARGET_TYPE = if cfg!(test) {
+    D2D1_RENDER_TARGET_TYPE_SOFTWARE
+} else {
+    D2D1_RENDER_TARGET_TYPE_DEFAULT
+};
+
 fn create_target(d2d: &ID2D1Factory) -> io::Result<ID2D1DCRenderTarget> {
     let properties = D2D1_RENDER_TARGET_PROPERTIES {
-        r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        r#type: RENDER_TARGET_TYPE,
         pixelFormat: D2D1_PIXEL_FORMAT {
             format: DXGI_FORMAT_B8G8R8A8_UNORM,
             alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
@@ -2334,10 +2348,6 @@ impl Painter {
     }
 }
 
-fn windows_error(context: &str, error: &WindowsError) -> io::Error {
-    io::Error::other(format!("{context} failed: {error}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2353,16 +2363,18 @@ mod tests {
             activity,
             actions: 0,
             elevated: false,
+            reading: false,
         }
     }
 
-    const ALL_KINDS: [TabKind; 6] = [
+    const ALL_KINDS: [TabKind; 7] = [
         TabKind::Working,
         TabKind::Waiting,
         TabKind::Stopping,
         TabKind::InputHeld,
         TabKind::HandedBack { after_stop: false },
         TabKind::HandedBack { after_stop: true },
+        TabKind::Reading,
     ];
 
     #[test]
@@ -2525,7 +2537,7 @@ mod tests {
         assert!(
             model
                 .view(
-                    at(start, 2_500),
+                    at(start, 1_000),
                     input(false, StopStatus::Ready, Activity::Idle)
                 )
                 .is_some()
@@ -2533,10 +2545,11 @@ mod tests {
         assert!(
             model
                 .view(
-                    at(start, 2_700),
+                    at(start, 1_200),
                     input(false, StopStatus::Ready, Activity::Idle)
                 )
-                .is_none()
+                .is_none(),
+            "a normal end returns to dormant promptly"
         );
 
         model.view(
@@ -2874,6 +2887,86 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_keeps_its_handback_longer_than_a_normal_end() {
+        let start = Instant::now();
+        let mut model = TabModel::default();
+        model.view(start, input(true, StopStatus::Ready, Activity::Working));
+        let stopped = input(false, StopStatus::Stopped, Activity::Idle);
+        model.view(
+            at(start, 100),
+            input(true, StopStatus::Draining, Activity::Idle),
+        );
+        let back = model.view(at(start, 200), stopped).unwrap();
+        assert_eq!(back.kind, TabKind::HandedBack { after_stop: true });
+        assert!(model.view(at(start, 2_500), stopped).is_some());
+        assert!(model.view(at(start, 2_800), stopped).is_none());
+    }
+
+    #[test]
+    fn reading_the_screen_shows_briefly_without_a_session_and_yields_to_everything() {
+        let start = Instant::now();
+        let mut model = TabModel::default();
+        let reading = |active| TabInputs {
+            reading: true,
+            ..input(active, StopStatus::Ready, Activity::Idle)
+        };
+        let view = model.view(start, reading(false)).unwrap();
+        assert_eq!(view.kind, TabKind::Reading);
+        assert!(!view.admin);
+        assert!(!view.expanded, "one quiet row");
+        assert!(
+            model
+                .view(
+                    at(start, 10),
+                    input(false, StopStatus::Ready, Activity::Idle)
+                )
+                .is_none()
+        );
+
+        // An owned session outranks it, so reading never hides ownership or the Stop button.
+        let owned = model.view(at(start, 20), reading(true)).unwrap();
+        assert_eq!(owned.kind, TabKind::Waiting);
+        // A handback shows first, then reading resumes if the agent is still looking.
+        let back = model.view(at(start, 30), reading(false)).unwrap();
+        assert_eq!(back.kind, TabKind::HandedBack { after_stop: false });
+        let after = model.view(at(start, 1_100), reading(false)).unwrap();
+        assert_eq!(after.kind, TabKind::Reading);
+        // Input that may still be held outranks reading.
+        let held = model
+            .view(
+                at(start, 1_200),
+                TabInputs {
+                    reading: true,
+                    ..input(false, StopStatus::CleanupFailed, Activity::Idle)
+                },
+            )
+            .unwrap();
+        assert_eq!(held.kind, TabKind::InputHeld);
+    }
+
+    #[test]
+    fn reading_never_offers_esc_and_says_it_is_not_using_input() {
+        let words = content(TabView {
+            kind: TabKind::Reading,
+            admin: false,
+            expanded: false,
+        });
+        assert!(!words.esc);
+        assert!(words.title.contains("reading the screen"));
+        assert!(words.status.contains("not using the keyboard or mouse"));
+    }
+
+    #[test]
+    fn the_waiting_tab_says_what_it_waits_for() {
+        let waiting = content(TabView {
+            kind: TabKind::Waiting,
+            admin: false,
+            expanded: false,
+        });
+        assert!(waiting.status.contains("waiting for the next action"));
+    }
+
+    #[test]
     fn administrator_status_is_kept_while_the_session_holds_the_pc() {
         let start = Instant::now();
         let mut model = TabModel::default();
@@ -2883,6 +2976,7 @@ mod tests {
             activity: Activity::Working,
             actions: 0,
             elevated: true,
+            reading: false,
         };
         for (stop, kind) in [
             (StopStatus::Ready, TabKind::Working),
@@ -3044,7 +3138,7 @@ mod tests {
                         opaque > tab.surface.pixels().len() / 3,
                         "{view:?} paints an opaque body"
                     );
-                    if !matches!(kind, TabKind::HandedBack { .. }) {
+                    if !matches!(kind, TabKind::HandedBack { .. } | TabKind::Reading) {
                         // The tab's own lamp segment is opaque edge to edge, so it meets the
                         // helper's lamp without a seam.
                         let lamp = if kind == TabKind::InputHeld {

@@ -227,7 +227,7 @@ fn steps() -> Value {
 async fn steps_run_in_order_with_one_final_observation() {
     let (content, calls) = run(
         None,
-        json!({"target_ref": "fixture", "steps": steps(), "observation": {"mode": "metadata"}}),
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000003", "steps": steps(), "observation": {"mode": "metadata"}}),
     )
     .await;
     assert_eq!(content["status"], "completed", "{content}");
@@ -253,7 +253,11 @@ async fn steps_run_in_order_with_one_final_observation() {
 
 #[tokio::test]
 async fn a_failed_step_stops_the_batch_and_reports_partial_delivery() {
-    let (content, calls) = run(Some(2), json!({"target_ref": "fixture", "steps": steps()})).await;
+    let (content, calls) = run(
+        Some(2),
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000003", "steps": steps()}),
+    )
+    .await;
     assert_eq!(content["status"], "partially_sent", "{content}");
     assert_eq!(content["input"]["sent_events"], 4);
     assert_eq!(calls.len(), 3);
@@ -279,7 +283,11 @@ async fn invalid_later_steps_are_refused_before_any_input() {
     ] {
         let mut all = steps();
         all.as_array_mut().unwrap().push(bad.clone());
-        let (content, calls) = run(None, json!({"target_ref": "fixture", "steps": all})).await;
+        let (content, calls) = run(
+            None,
+            json!({"target_ref": "target-00000000-0000-0000-0000-000000000003", "steps": all}),
+        )
+        .await;
         assert_eq!(content["status"], "not_started", "{bad}: {content}");
         assert!(calls.is_empty(), "{bad}: {calls:?}");
     }
@@ -299,7 +307,7 @@ async fn observation_failures_report_steps_and_true_delivery() {
     let (content, calls) = run_scripted(
         None,
         Some(1),
-        json!({"target_ref": "fixture", "steps": steps()}),
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000003", "steps": steps()}),
     )
     .await;
     assert_eq!(content["status"], "partially_sent", "{content}");
@@ -312,7 +320,7 @@ async fn observation_failures_report_steps_and_true_delivery() {
     let (content, calls) = run_scripted(
         None,
         Some(3),
-        json!({"target_ref": "fixture", "steps": steps()}),
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000003", "steps": steps()}),
     )
     .await;
     assert_eq!(content["status"], "completed_unverified", "{content}");

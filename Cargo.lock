@@ -281,6 +281,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "controlfreak-live-tests"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "png",
+ "serde_json",
+ "windows",
+]
+
+[[package]]
 name = "controlfreak-mcp"
 version = "0.1.0"
 dependencies = [

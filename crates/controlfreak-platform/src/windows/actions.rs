@@ -1,4 +1,5 @@
 use super::capture::{SettleOutcome, SettleWatch};
+use super::input::BUTTON_DWELL;
 use super::{
     Backend, Duration, HWND, KeyChordRequest, KeyboardActionResult, KeyboardBackend,
     MAX_SCROLL_DELTA, MAX_TEXT_UTF16_UNITS, MouseClickRequest, MouseDragRequest, MouseMoveRequest,
@@ -13,10 +14,6 @@ use super::{
 };
 
 impl PointerBackend for Backend {
-    fn move_mouse(&self, request: &MouseMoveRequest) -> Result<PointerActionResult, PlatformError> {
-        self.move_mouse_controlled(request, &MutationControl::default())
-    }
-
     fn move_mouse_controlled(
         &self,
         request: &MouseMoveRequest,
@@ -37,23 +34,12 @@ impl PointerBackend for Backend {
         )
     }
 
-    fn click_mouse(
-        &self,
-        request: &MouseClickRequest,
-    ) -> Result<PointerActionResult, PlatformError> {
-        self.click_mouse_controlled(request, &MutationControl::default())
-    }
-
     fn click_mouse_controlled(
         &self,
         request: &MouseClickRequest,
         control: &MutationControl,
     ) -> Result<PointerActionResult, PlatformError> {
         self.click_mouse_at_generation(request, control, None)
-    }
-
-    fn drag_mouse(&self, request: &MouseDragRequest) -> Result<PointerActionResult, PlatformError> {
-        self.drag_mouse_controlled(request, &MutationControl::default())
     }
 
     fn drag_mouse_controlled(
@@ -97,17 +83,24 @@ impl PointerBackend for Backend {
             super::target::validate(control, "drag_mouse", Some(current_cursor_position()?))
         })?;
         control.cleanup_status(controlfreak_core::CleanupStatus::Unknown);
-        let movement = move_cursor(
-            "drag_mouse",
-            POINT {
-                x: start_x,
-                y: start_y,
-            },
-            POINT { x: end_x, y: end_y },
-            request.duration_ms,
-            control,
-            |point| super::target::validate(control, "drag_mouse", Some(point)),
-        );
+        // The button is held from here to the release below; a failure or cancellation in the
+        // dwell or the travel is reported after the release cleanup has run.
+        let movement = control
+            .wait("drag_mouse", BUTTON_DWELL)
+            .and_then(|()| {
+                move_cursor(
+                    "drag_mouse",
+                    POINT {
+                        x: start_x,
+                        y: start_y,
+                    },
+                    POINT { x: end_x, y: end_y },
+                    effective_drag_duration_ms(request.duration_ms),
+                    control,
+                    |point| super::target::validate(control, "drag_mouse", Some(point)),
+                )
+            })
+            .and_then(|()| control.wait("drag_mouse", BUTTON_DWELL));
         let release = send_drag_release(
             request.button,
             &request.modifiers,
@@ -121,13 +114,6 @@ impl PointerBackend for Backend {
         control.input_complete();
         super::target::evidence(control);
         Self::pointer_action_result("drag_mouse", foreground_before, &request.observation)
-    }
-
-    fn scroll_mouse(
-        &self,
-        request: &MouseScrollRequest,
-    ) -> Result<PointerActionResult, PlatformError> {
-        self.scroll_mouse_controlled(request, &MutationControl::default())
     }
 
     fn scroll_mouse_controlled(
@@ -179,10 +165,6 @@ impl PointerBackend for Backend {
 }
 
 impl KeyboardBackend for Backend {
-    fn press_keys(&self, request: &KeyChordRequest) -> Result<KeyboardActionResult, PlatformError> {
-        self.press_keys_controlled(request, &MutationControl::default())
-    }
-
     fn press_keys_controlled(
         &self,
         request: &KeyChordRequest,
@@ -204,10 +186,6 @@ impl KeyboardBackend for Backend {
             observation: observe_foreground(&request.observation)
                 .map_err(|error| post_action_error("press_keys", error.to_string()))?,
         })
-    }
-
-    fn type_text(&self, request: &TextInputRequest) -> Result<KeyboardActionResult, PlatformError> {
-        self.type_text_controlled(request, &MutationControl::default())
     }
 
     fn type_text_controlled(
@@ -251,6 +229,8 @@ impl KeyboardBackend for Backend {
 pub(super) struct InputGuard<'a> {
     _lock: std::sync::MutexGuard<'a, ()>,
     generation: &'a std::sync::atomic::AtomicU64,
+    /// Lets target validation reuse identity and integrity results while this lock is held.
+    _validation: super::target::ValidationScope,
 }
 
 impl Drop for InputGuard<'_> {
@@ -317,6 +297,7 @@ impl Backend {
             return Ok(InputGuard {
                 _lock: lock,
                 generation: &self.input_generation,
+                _validation: super::target::ValidationScope::enter(),
             });
         }
     }
@@ -431,6 +412,21 @@ impl Backend {
     }
 }
 
+/// Shortest time a drag spends travelling from press to release. Applications that start a drag
+/// only after the pointer has moved while the button is down need intermediate moves; a drag
+/// that jumps in one step is a click at a different place to them. The travel is stepped at
+/// `MOVE_FRAME_MS` intervals by `move_cursor`.
+const MIN_DRAG_DURATION_MS: u32 = 120;
+
+/// The travel time actually used for a requested `duration_ms`, which can be zero.
+const fn effective_drag_duration_ms(requested: u32) -> u32 {
+    if requested < MIN_DRAG_DURATION_MS {
+        MIN_DRAG_DURATION_MS
+    } else {
+        requested
+    }
+}
+
 /// Gives the target application time to process input before evidence is captured. With a
 /// watch, returns once the approved window has responded and stopped changing; otherwise, or if
 /// it never visibly responds, waits the full cap as before.
@@ -463,11 +459,11 @@ fn ensure_cursor_at(
     if current == validated {
         Ok(())
     } else {
-        Err(PlatformError::OperationFailed {
-            operation: operation.to_owned(),
-            reason: "the pointer moved after target validation; observe again before retrying"
-                .to_owned(),
-        })
+        Err(PlatformError::failed(
+            controlfreak_core::FailureCause::PointerMoved,
+            operation,
+            "the pointer moved after target validation; observe again before retrying",
+        ))
     }
 }
 
@@ -480,10 +476,11 @@ fn ensure_input_generation(
     if expected.is_none_or(|expected| expected == current) {
         Ok(())
     } else {
-        Err(PlatformError::OperationFailed {
-            operation: operation.to_owned(),
-            reason: "another input action ran during text recognition; find the text again before clicking".to_owned(),
-        })
+        Err(PlatformError::failed(
+            controlfreak_core::FailureCause::InputInterleaved,
+            operation,
+            "another input action ran during text recognition; find the text again before clicking",
+        ))
     }
 }
 
@@ -506,6 +503,19 @@ mod tests {
         assert!(ensure_input_generation("click_text", Some(before), after).is_err());
         assert!(ensure_input_generation("click_text", Some(after), after).is_ok());
         assert!(ensure_input_generation("click_mouse", None, after).is_ok());
+    }
+
+    #[test]
+    fn drags_always_travel_in_several_steps() {
+        assert_eq!(effective_drag_duration_ms(0), MIN_DRAG_DURATION_MS);
+        assert_eq!(effective_drag_duration_ms(1), MIN_DRAG_DURATION_MS);
+        assert_eq!(
+            effective_drag_duration_ms(MIN_DRAG_DURATION_MS),
+            MIN_DRAG_DURATION_MS
+        );
+        assert_eq!(effective_drag_duration_ms(2_000), 2_000);
+        // `move_cursor` makes one move per frame, so the default travel is a real path.
+        assert!(u64::from(MIN_DRAG_DURATION_MS).div_ceil(super::super::MOVE_FRAME_MS) >= 4);
     }
 
     #[test]

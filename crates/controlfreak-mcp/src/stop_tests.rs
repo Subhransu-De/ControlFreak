@@ -42,7 +42,7 @@ impl WaitingBackend {
 
 impl BackendMetadata for WaitingBackend {
     fn validate_target_reference(&self, target: &str) -> Result<(), PlatformError> {
-        assert_eq!(target, "fixture");
+        assert_eq!(target, "target-00000000-0000-0000-0000-000000000003");
         Ok(())
     }
 
@@ -221,6 +221,52 @@ async fn assert_human_stop_lifecycle(requested: ProtocolVersion) {
 }
 
 #[tokio::test]
+async fn screen_reading_tools_are_counted_for_the_indicator_without_claiming_a_session() {
+    let backend = Arc::new(WaitingBackend::idle());
+    let server = ControlFreakServer::with_indicator(backend, SafetyIndicator::dormant(), None);
+    let stop = server.stop.clone();
+    let (client_io, server_io) = tokio::io::duplex(65536);
+    let serving = tokio::spawn(async move {
+        server
+            .serve(server_io)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap()
+    });
+    let mut client = BufReader::new(client_io);
+    outcome_tests::exchange(&mut client, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"reading-test","version":"1"}
+    }})).await;
+    client
+        .get_mut()
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .unwrap();
+    let call = |id: u32, name: &'static str, arguments: Value| json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}});
+    // Listing displays and reading status read no pixels.
+    outcome_tests::exchange(&mut client, call(2, LIST_DISPLAYS, json!({}))).await;
+    outcome_tests::exchange(&mut client, call(3, GET_SERVER_STATUS, json!({}))).await;
+    assert_eq!(stop.observation_count(), 0);
+    outcome_tests::exchange(
+        &mut client,
+        call(4, CAPTURE_DISPLAY, json!({"display_id": "fixture"})),
+    )
+    .await;
+    assert_eq!(stop.observation_count(), 1, "a capture reads the screen");
+    assert!(
+        !stop.session_active(),
+        "reading the screen never claims a session"
+    );
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(5), serving)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn transport_stop_and_client_cancellation_reach_every_worker_kind() {
     for cancellation_mode in ["request", "tool", "human"] {
         let user_stop = cancellation_mode != "request";
@@ -355,7 +401,7 @@ async fn assert_observation_contract(client: &mut BufReader<tokio::io::DuplexStr
             "invalid_arguments"
         );
     }
-    let listed = outcome_tests::exchange(
+    let mut listed = outcome_tests::exchange(
         client,
         json!({
             "jsonrpc":"2.0", "id":6, "method":"tools/call",
@@ -363,7 +409,20 @@ async fn assert_observation_contract(client: &mut BufReader<tokio::io::DuplexStr
         }),
     )
     .await;
-    assert_eq!(listed["result"]["structuredContent"]["count"], 0);
+    // A cancelled call can still answer late; skip anything that is not this request's reply.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while listed["id"] != 6 {
+            let mut line = String::new();
+            assert_ne!(client.read_line(&mut line).await.unwrap(), 0);
+            listed = serde_json::from_str(&line).unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        listed["result"]["structuredContent"]["count"], 0,
+        "{listed}"
+    );
 }
 
 #[tokio::test]
@@ -399,15 +458,15 @@ fn worker_requests() -> [(&'static str, Value); 7] {
     [
         (
             MOVE_MOUSE,
-            json!({"target_ref":"fixture","display_id":"fixture","x":0,"y":0}),
+            json!({"target_ref": "target-00000000-0000-0000-0000-000000000003","display_id":"fixture","x":0,"y":0}),
         ),
         (
             TYPE_TEXT,
-            json!({"target_ref":"fixture","text":"synthetic"}),
+            json!({"target_ref": "target-00000000-0000-0000-0000-000000000003","text":"synthetic"}),
         ),
         (
             RUN_ACTIONS,
-            json!({"target_ref":"fixture","steps":[{"action":"type_text","text":"synthetic"}]}),
+            json!({"target_ref": "target-00000000-0000-0000-0000-000000000003","steps":[{"action":"type_text","text":"synthetic"}]}),
         ),
         (
             WAIT_FOR_VISUAL_CHANGE,

@@ -7,11 +7,12 @@ and shows the user that an agent is in control.
 
 - The first input tool starts a session on its own. A one-shot action closes it after 8 seconds.
 - For a longer task, call `begin_control_session` with the `target_ref` before the first action,
-  and `end_control_session` after the last one. `expected_seconds` sets the hold, up to
-  `CONTROLFREAK_GLOW_MAX_HOLD_MS`.
-- The hold is a backstop. If a client forgets to end the session, it closes when the hold ends.
+  and `end_control_session` after the last one. `expected_seconds` sets the hold. It defaults to 45 seconds and is capped at 120 seconds, or at `CONTROLFREAK_GLOW_MAX_HOLD_MS` when the operator set it.
+- The hold is a backstop. If a client forgets to end the session, it closes when the hold ends. A session that starts on its own and keeps working holds for at least 20 seconds after its second action, and grows with the gaps between actions, within the same cap.
 - Only one ControlFreak server can own the desktop. A second server gets `desktop_in_use`.
-- Observation tools never start a session.
+- Observation tools never start a session. Tools that read the screen (captures, OCR and the waits) make the tab show "ControlFreak is reading the screen" for about 1.5 seconds. That state owns nothing: no lamp, no Esc, no Stop button, and it never hides an owned session or a warning.
+- The session tab and its Stop button start on the first screen read or the first session, whichever comes first, and the Esc monitor starts with the first session only. Neither starts with the server. If they cannot start, the server still runs and read-only tools work; the session is refused with `indicator_unavailable` and the reason, and the next session tries again.
+- If the tab fails after it started, admission closes for the rest of the server's life. The reason is kept: refused actions include it, `get_server_status` reports it in `safety_indicator.reason` with `status` `degraded`, and it is logged to standard error as `session_tab_failed`.
 
 ## Indicator
 
@@ -22,13 +23,14 @@ lamps that show an automated system is driving a car.
 | State | Lamp | Tab |
 | --- | --- | --- |
 | Working | Turquoise | "An agent is using this PC", "ControlFreak is working", "Press Esc to stop" |
-| Waiting | Turquoise | The same, with "ControlFreak is waiting" once no action has run for 1 second |
+| Waiting | Turquoise | The same, with "ControlFreak is waiting for the next action" once no action has run for 1 second |
+| Reading the screen | Off | "ControlFreak is reading the screen", "It is not using the keyboard or mouse", for about 1.5 seconds after a capture or OCR call, only when no session is owned |
 | Stopping | Unchanged | "Stopping desktop control", "ControlFreak is releasing held keys and mouse buttons" |
 | Cleanup failed | Amber double line | "A key or mouse button may still be held" and steps to release it |
-| Session ended | Off | "This PC is yours again" for 2.5 seconds |
+| Session ended | Off | "This PC is yours again" for 1 second after `end_control_session` or a hold ending, 2.5 seconds after a stop |
 
 - For the first 3 seconds of a session the tab shows two lines. It then shrinks to one row:
-  "An agent is using this PC", "ControlFreak is working" or "ControlFreak is waiting", and
+  "An agent is using this PC", "ControlFreak is working" or "ControlFreak is waiting for the next action", and
   "Esc to stop". A session that starts within a minute of the last one ending, such as a run of
   one-shot actions, starts as one row. Every change of message, including from two lines to one
   row, appears at once at full strength; only the tab appearing and disappearing fades.
@@ -55,7 +57,10 @@ lamps that show an automated system is driving a car.
   Windows text size until it does, never below 100%. A cleanup-failure warning first gives up
   its first sentence and last step, keeping the type size.
 - The lamp and the tab are excluded from screen capture, so screenshots never show them.
-- Both are click-through and never take the focus.
+- Both are click-through and never take the focus, except for the Stop button described below.
+- While the tab says "working" or "waiting", a **Stop agent** button hangs under it. It is a native push button, so a mouse, a finger, a pen and accessibility tools that invoke it through UI Automation can press it. A tool that works by injecting pointer or key input cannot, and an on-screen keyboard sends keys, which the button drops too. It never takes focus, follows the display's DPI and the Windows text size, uses the system colors in High Contrast, and is excluded from screen capture. It appears only with a steady tab and never during stopping, a held-key warning, a handback or reading.
+- The agent cannot press the button. Only mouse and key messages from input hardware are accepted: injected input (`SendInput` and its relatives), messages posted by another process and messages with an unreadable origin are dropped before the button sees them. A pointer action on the button is refused anyway, with reason `own_indicator`, because the window under the point belongs to ControlFreak, not to the approved target. Pressing it is a user stop, with the same effects as Esc.
+- The tab says "Press Esc to stop" only while the keyboard hook is confirmed installed. A session is admitted only after the monitor confirms the hook, waiting at most 2 seconds, so a physical Esc is caught from the first action. If the hook cannot be installed or is not confirmed in time, `begin_control_session` and input tools are refused with that reason, the session is released and the next session tries again.
 - Nothing pulses. With Windows animation effects off, the tab and lamp also appear and disappear
   without fading.
 - With a High Contrast theme on, both use the theme's colors, and an elevated server's lamp is
@@ -70,12 +75,17 @@ lamps that show an automated system is driving a car.
 | `CONTROLFREAK_GLOW_MAX_HOLD_MS` | Upper bound for every hold. |
 | `CONTROLFREAK_GLOW_ERROR_LOG` | Appends indicator errors to this file. Off by default. |
 
+The lamp follows the virtual desktop of the foreground window. Windows reports no desktop for the taskbar, the desktop and the Start surfaces, which belong to every desktop. The lamp helper and the tab then stay where they are instead of failing, so a shell window in front never ends the helper or blocks a session.
+
+The indicator is event driven. An idle server has no polling loop for it: the tab thread, the Esc monitor and the stop notification sleep until a session, stop, observation or Windows message wakes them, with a safety check that wakes them at least every 2 to 5 seconds. While a session is owned, the session worker looks at the lock state and the input desktop every 50 ms, because ending the session on a lock or desktop switch during a hold is a safety invariant. A helper that cannot be stopped is retried with a growing delay and abandoned after about a minute, with the reason on standard error.
+
 ## Stopping
 
 Control stops when:
 
 - the user presses the physical Esc key during a session. Injected Esc is ignored, and the key
-  press does not reach the application.
+  press does not reach the application. The keyboard hook exists only while a session is owned, on a thread of its own that does nothing else; it is removed when the session ends, and a server that never starts a session never installs one.
+- the user presses the **Stop agent** button on the tab with a mouse, touch or pen, or through an accessibility tool. Injected clicks are ignored.
 - a client calls `stop_desktop_work`.
 
 After a stop:

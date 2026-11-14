@@ -106,13 +106,24 @@ fn assert_target_arguments(tools: &Value) {
                     | "scroll_mouse"
                     | "press_keys"
                     | "type_text"
-                    | "switch_virtual_desktop"
+                    | "run_actions"
             )
         ) {
             assert!(
                 tool["inputSchema"]["required"]
                     .as_array()
                     .expect("targeted tool required array")
+                    .iter()
+                    .any(|field| field == "target_ref")
+            );
+        }
+        // Switching desktops defaults to the session's window, so its target is optional.
+        if tool["name"] == "switch_virtual_desktop" {
+            assert!(tool["inputSchema"]["properties"]["target_ref"].is_object());
+            assert!(
+                !tool["inputSchema"]["required"]
+                    .as_array()
+                    .expect("required array")
                     .iter()
                     .any(|field| field == "target_ref")
             );
@@ -214,8 +225,10 @@ fn stdio_capture_display_returns_png_image_content() {
     assert_eq!(metadata["image_width"], expected_width);
     assert!(matches!(
         metadata["resize_method"].as_str(),
-        Some("native" | "bilinear")
+        Some("native" | "area_average")
     ));
+    // Display captures copy the screen; only window captures can report `windows_print_window`.
+    assert_eq!(metadata["capture_method"], "windows_gdi");
 
     assert_region_tools(&mut child, &mut reader, &display_id);
     assert_argument_errors_are_structured(&mut child, &mut reader, &display_id);
@@ -580,7 +593,6 @@ fn assert_tool_names(tools: &Value) {
     assert_eq!(
         tool_names,
         [
-            "stop_desktop_work",
             "get_server_status",
             "begin_control_session",
             "end_control_session",
@@ -606,7 +618,8 @@ fn assert_tool_names(tools: &Value) {
             "scroll_mouse",
             "press_keys",
             "type_text",
-            "run_actions"
+            "run_actions",
+            "stop_desktop_work"
         ]
     );
 }
