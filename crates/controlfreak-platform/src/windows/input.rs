@@ -187,6 +187,7 @@ where
     F: FnMut() -> Result<(), PlatformError>,
 {
     control.check(operation)?;
+    ensure_keys_press_alone(keys, native_layout_answer)?;
     let inputs = key_chord_inputs(keys);
     validate_target()?;
     send_releasing_native(operation, &inputs, control)
@@ -319,7 +320,42 @@ fn unicode_batches(utf16: &[u16]) -> impl Iterator<Item = &[u16]> {
 
 /// The virtual key for `key` under the foreground window's keyboard layout.
 fn virtual_key(key: Key) -> (VIRTUAL_KEY, bool) {
-    virtual_key_with(key, native_layout_virtual_key)
+    virtual_key_with(key, native_layout_answer)
+}
+
+/// What the active keyboard layout says about typing one character with a single key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutAnswer {
+    /// This virtual key types it with no modifier.
+    Unshifted(u16),
+    /// The layout types it only with Shift, Ctrl or `AltGr` held, so no key on its own types it.
+    NeedsModifier,
+    /// The layout cannot say, or has no key for it.
+    Unavailable,
+}
+
+/// Refuses a chord with a named punctuation key that the active layout types only with Shift or
+/// `AltGr`. Sending the US virtual key instead would press a key that types another character
+/// (on a German layout, `slash` would send the key that types `-`), and a key press cannot carry
+/// the modifier without changing what the chord means. `type_text` types the character itself.
+fn ensure_keys_press_alone(
+    keys: &[Key],
+    layout: impl Fn(char) -> LayoutAnswer,
+) -> Result<(), PlatformError> {
+    for key in keys {
+        if let Some(character) = oem_character(*key)
+            && layout(character) == LayoutAnswer::NeedsModifier
+        {
+            return Err(PlatformError::InvalidArgument {
+                argument: "keys".to_owned(),
+                reason: format!(
+                    "the active keyboard layout types '{character}' only with Shift or AltGr held, so the key '{}' cannot be pressed on its own; use type_text to type it",
+                    key.canonical_name()
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The character a layout-dependent OEM key types without modifiers. Comma, period, minus and
@@ -386,10 +422,10 @@ const fn symbol_and_system_code(key: Key) -> u16 {
 
 /// Maps a key to a virtual key. `layout` answers which unshifted virtual key types a character on
 /// the active layout. A named punctuation key means "the key that types this character", so a
-/// layout that types it unshifted decides the code. A layout that cannot (it needs Shift or
-/// `AltGr`, or lacks the character) falls back to the US virtual key, which is the same physical
-/// key position, rather than sending a different symbol.
-fn virtual_key_with(key: Key, layout: impl FnOnce(char) -> Option<u16>) -> (VIRTUAL_KEY, bool) {
+/// layout that types it unshifted decides the code. When the layout cannot say, or has no key for
+/// the character, the US virtual key is used. A layout that needs Shift or `AltGr` for it never
+/// gets this far: `ensure_keys_press_alone` refuses such a chord first.
+fn virtual_key_with(key: Key, layout: impl FnOnce(char) -> LayoutAnswer) -> (VIRTUAL_KEY, bool) {
     let code = match key {
         Key::Backspace => 0x08,
         Key::Tab => 0x09,
@@ -460,7 +496,10 @@ fn virtual_key_with(key: Key, layout: impl FnOnce(char) -> Option<u16>) -> (VIRT
         Key::F12 => 0x7B,
         other => symbol_and_system_code(other),
     };
-    let code = oem_character(key).and_then(layout).unwrap_or(code);
+    let code = match oem_character(key).map(layout) {
+        Some(LayoutAnswer::Unshifted(moved)) => moved,
+        _ => code,
+    };
     let extended = matches!(
         key,
         Key::Win
@@ -482,28 +521,35 @@ fn virtual_key_with(key: Key, layout: impl FnOnce(char) -> Option<u16>) -> (VIRT
     (VIRTUAL_KEY(code), extended)
 }
 
-/// The unshifted virtual key that types `character` on the foreground thread's layout, or `None`
-/// if that layout needs a modifier for it or cannot type it.
-fn native_layout_virtual_key(character: char) -> Option<u16> {
+/// How the foreground thread's layout types `character`.
+fn native_layout_answer(character: char) -> LayoutAnswer {
     use windows::Win32::UI::{
         Input::KeyboardAndMouse::{GetKeyboardLayout, VkKeyScanExW},
         WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId},
     };
-    let unit = u16::try_from(u32::from(character)).ok()?;
+    let Ok(unit) = u16::try_from(u32::from(character)) else {
+        return LayoutAnswer::Unavailable;
+    };
     // SAFETY: These queries take a borrowed window handle and a value, and retain nothing. A null
     // foreground handle or a zero thread selects the calling thread's layout.
     let scan = unsafe {
         let thread = GetWindowThreadProcessId(GetForegroundWindow(), None);
         VkKeyScanExW(unit, GetKeyboardLayout(thread))
     };
-    unshifted_virtual_key(scan)
+    layout_answer(scan)
 }
 
 /// Decodes a `VkKeyScan` result: -1 means no key; the high byte holds the Shift, Ctrl and Alt
 /// state the character needs.
-fn unshifted_virtual_key(scan: i16) -> Option<u16> {
+fn layout_answer(scan: i16) -> LayoutAnswer {
     let [low, high] = scan.to_le_bytes();
-    (scan != -1 && high == 0).then_some(u16::from(low))
+    if scan == -1 {
+        LayoutAnswer::Unavailable
+    } else if high == 0 {
+        LayoutAnswer::Unshifted(u16::from(low))
+    } else {
+        LayoutAnswer::NeedsModifier
+    }
 }
 
 fn mouse_button_flags(button: MouseButton) -> (MOUSE_EVENT_FLAGS, MOUSE_EVENT_FLAGS) {
@@ -1406,11 +1452,14 @@ mod progress_tests {
             (Key::Quote, '\'', 0xDE),
         ] {
             // Without a layout answer the US key position is used.
-            assert_eq!(virtual_key_with(key, |_| None), (VIRTUAL_KEY(us), false));
+            assert_eq!(
+                virtual_key_with(key, |_| LayoutAnswer::Unavailable),
+                (VIRTUAL_KEY(us), false)
+            );
             // A layout that moves the character to another key wins.
             let (vk, extended) = virtual_key_with(key, |asked| {
                 assert_eq!(asked, character);
-                Some(0x41)
+                LayoutAnswer::Unshifted(0x41)
             });
             assert_eq!((vk.0, extended), (0x41, false));
         }
@@ -1429,11 +1478,38 @@ mod progress_tests {
     }
 
     #[test]
-    fn layout_answers_that_need_a_modifier_or_no_key_are_not_used() {
-        assert_eq!(unshifted_virtual_key(0x00BA), Some(0xBA));
-        assert_eq!(unshifted_virtual_key(0x01BA), None, "needs Shift");
-        assert_eq!(unshifted_virtual_key(0x06BA), None, "needs AltGr");
-        assert_eq!(unshifted_virtual_key(-1), None, "not on this layout");
+    fn layout_results_are_classified_by_the_modifiers_they_need() {
+        assert_eq!(layout_answer(0x00BA), LayoutAnswer::Unshifted(0xBA));
+        assert_eq!(layout_answer(0x01BA), LayoutAnswer::NeedsModifier);
+        assert_eq!(layout_answer(0x06BA), LayoutAnswer::NeedsModifier);
+        assert_eq!(layout_answer(-1), LayoutAnswer::Unavailable);
+    }
+
+    #[test]
+    fn a_punctuation_key_that_needs_shift_or_altgr_on_the_layout_is_refused_not_guessed() {
+        // A German-style layout: slash needs Shift, backslash needs AltGr, the rest are plain.
+        let german = |character: char| match character {
+            '/' | '\\' => LayoutAnswer::NeedsModifier,
+            ';' => LayoutAnswer::Unshifted(0xC0),
+            _ => LayoutAnswer::Unavailable,
+        };
+        for keys in [
+            vec![Key::Slash],
+            vec![Key::Ctrl, Key::Backslash],
+            vec![Key::Ctrl, Key::Semicolon, Key::Slash],
+        ] {
+            let error = ensure_keys_press_alone(&keys, german).unwrap_err();
+            assert!(
+                matches!(&error, PlatformError::InvalidArgument { argument, .. } if argument == "keys"),
+                "{error}"
+            );
+            assert!(error.to_string().contains("type_text"), "{error}");
+        }
+        // Keys that the layout types plainly, or cannot say anything about, are not refused, and
+        // neither are keys that are not layout-dependent punctuation.
+        ensure_keys_press_alone(&[Key::Ctrl, Key::Semicolon, Key::Quote, Key::A], german).unwrap();
+        ensure_keys_press_alone(&[Key::Comma, Key::Enter], |_| LayoutAnswer::NeedsModifier)
+            .unwrap();
     }
 
     #[test]
@@ -1472,7 +1548,7 @@ mod progress_tests {
     fn every_key_has_its_own_virtual_key() {
         let mut seen = std::collections::HashMap::new();
         for key in Key::ALL.iter().copied() {
-            let (vk, _) = virtual_key_with(key, |_| None);
+            let (vk, _) = virtual_key_with(key, |_| LayoutAnswer::Unavailable);
             assert_ne!(vk.0, 0, "{key:?}");
             if let Some(previous) = seen.insert(vk.0, key) {
                 panic!("{previous:?} and {key:?} share virtual key {:#x}", vk.0);

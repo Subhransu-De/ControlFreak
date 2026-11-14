@@ -2183,7 +2183,10 @@ mod tests {
             }))
         };
         assert!(from(IMO_HARDWARE), "mouse, touch and pen hardware");
-        assert!(!from(IMO_SYSTEM), "nothing that presses the button reports the system");
+        assert!(
+            !from(IMO_SYSTEM),
+            "nothing that presses the button reports the system"
+        );
         assert!(
             !from(IMO_UNAVAILABLE),
             "a posted message from another process reports no origin"
