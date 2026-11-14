@@ -401,7 +401,7 @@ async fn assert_observation_contract(client: &mut BufReader<tokio::io::DuplexStr
             "invalid_arguments"
         );
     }
-    let listed = outcome_tests::exchange(
+    let mut listed = outcome_tests::exchange(
         client,
         json!({
             "jsonrpc":"2.0", "id":6, "method":"tools/call",
@@ -409,7 +409,20 @@ async fn assert_observation_contract(client: &mut BufReader<tokio::io::DuplexStr
         }),
     )
     .await;
-    assert_eq!(listed["result"]["structuredContent"]["count"], 0);
+    // A cancelled call can still answer late; skip anything that is not this request's reply.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while listed["id"] != 6 {
+            let mut line = String::new();
+            assert_ne!(client.read_line(&mut line).await.unwrap(), 0);
+            listed = serde_json::from_str(&line).unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        listed["result"]["structuredContent"]["count"], 0,
+        "{listed}"
+    );
 }
 
 #[tokio::test]
