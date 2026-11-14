@@ -378,11 +378,12 @@ fn escape_loop(
         // One failed install per session is reported; the controller forgets the failure when the
         // next session starts, so retrying on every wake-up would only spam.
         let failed = controller.esc_install_failed();
-        match hook_action(controller.session_active(), installed, failed) {
+        let (session_owned, generation) = controller.session_snapshot();
+        match hook_action(session_owned, installed, failed) {
             HookAction::Install => match hook.install() {
                 Ok(()) => {
                     installed = true;
-                    controller.set_esc_stop_available(true);
+                    controller.confirm_esc_hook(generation);
                 }
                 Err(error) => {
                     controller.set_esc_install_failed(error.to_string());
@@ -400,7 +401,12 @@ fn escape_loop(
                 hook.uninstall();
                 installed = false;
             }
-            HookAction::Wait => {}
+            HookAction::Wait => {
+                // A hook kept from the previous session is confirmed again for this one.
+                if installed && session_owned {
+                    controller.confirm_esc_hook(generation);
+                }
+            }
         }
         // Hook callbacks arrive as sent messages and run inside this wait. A session change, or
         // shutdown, posts a message that ends it.

@@ -20,6 +20,11 @@ struct Inner {
     listeners: Mutex<Vec<Listener>>,
     observations: AtomicU64,
     esc_stop: AtomicBool,
+    /// The session generation the hook was last confirmed for. A confirmation for an earlier
+    /// session does not count, so a hook that is about to be removed cannot admit the next one.
+    esc_generation: AtomicU64,
+    /// Counts sessions; only changes under the state lock.
+    session_generation: AtomicU64,
     /// Wakes `wait_for_esc_hook`; paired with `state`.
     esc_changed: Condvar,
 }
@@ -90,11 +95,24 @@ impl StopController {
     pub fn set_session_active(&self, active: bool) {
         {
             let mut state = self.state();
+            if active && !state.session_active {
+                self.0.session_generation.fetch_add(1, Ordering::AcqRel);
+            }
             state.session_active = active;
             // Each session gets its own install attempt and its own verdict.
             state.esc_install_failure = None;
         }
         self.notify();
+    }
+
+    /// Whether a session is owned, with the generation that identifies it. The Esc monitor reads
+    /// both at once and confirms the hook for exactly that generation.
+    pub fn session_snapshot(&self) -> (bool, u64) {
+        let state = self.state();
+        (
+            state.session_active,
+            self.0.session_generation.load(Ordering::Acquire),
+        )
     }
 
     pub fn session_active(&self) -> bool {
@@ -113,15 +131,43 @@ impl StopController {
     }
 
     /// Whether a physical Esc is currently being watched for. It is `true` only while a session
-    /// is owned and the keyboard hook is confirmed installed.
+    /// is owned and the keyboard hook is confirmed installed for that session.
     pub fn set_esc_stop_available(&self, available: bool) {
         {
             // Stored under the state lock so a waiter cannot miss the change.
             let _state = self.state();
             self.0.esc_stop.store(available, Ordering::Release);
+            self.0.esc_generation.store(
+                self.0.session_generation.load(Ordering::Acquire),
+                Ordering::Release,
+            );
         }
         self.0.esc_changed.notify_all();
         self.notify();
+    }
+
+    /// Confirms the installed hook for session `generation`. Does nothing, and returns `false`,
+    /// when that session already ended or another began; the monitor then confirms again for the
+    /// new session. Repeating a confirmation that already holds changes nothing.
+    pub fn confirm_esc_hook(&self, generation: u64) -> bool {
+        {
+            let state = self.state();
+            if !state.session_active
+                || self.0.session_generation.load(Ordering::Acquire) != generation
+            {
+                return false;
+            }
+            if self.0.esc_stop.load(Ordering::Acquire)
+                && self.0.esc_generation.load(Ordering::Acquire) == generation
+            {
+                return true;
+            }
+            self.0.esc_stop.store(true, Ordering::Release);
+            self.0.esc_generation.store(generation, Ordering::Release);
+        }
+        self.0.esc_changed.notify_all();
+        self.notify();
+        true
     }
 
     /// Declares that an Esc monitor will install the keyboard hook whenever a session is owned.
@@ -174,6 +220,8 @@ impl StopController {
 
     pub fn esc_stop_available(&self) -> bool {
         self.0.esc_stop.load(Ordering::Acquire)
+            && self.0.esc_generation.load(Ordering::Acquire)
+                == self.0.session_generation.load(Ordering::Acquire)
     }
 
     /// Latch a human stop only while this server owns a control session.
@@ -557,5 +605,42 @@ mod tests {
             "the wait ends when the hook is confirmed, not at the timeout"
         );
         installing.join().unwrap();
+    }
+
+    #[test]
+    fn a_hook_confirmed_for_an_earlier_session_never_admits_the_next_one() {
+        let stop = StopController::default();
+        stop.set_esc_monitor_attached(true);
+        stop.set_session_active(true);
+        let (owned, first) = stop.session_snapshot();
+        assert!(owned);
+        assert!(stop.confirm_esc_hook(first));
+        assert!(stop.esc_stop_available());
+
+        // The session ends and the next begins before the monitor removes the hook.
+        stop.set_session_active(false);
+        stop.set_session_active(true);
+        let (_, second) = stop.session_snapshot();
+        assert_ne!(first, second);
+        assert!(!stop.esc_stop_available(), "the old confirmation is stale");
+        assert_eq!(
+            stop.wait_for_esc_hook(Duration::from_millis(30)),
+            EscHook::TimedOut
+        );
+
+        // A late confirmation for the ended session is refused; the current one is accepted.
+        assert!(!stop.confirm_esc_hook(first));
+        assert!(!stop.esc_stop_available());
+        assert!(stop.confirm_esc_hook(second));
+        assert!(stop.esc_stop_available());
+        // Confirming again changes nothing and must not wake listeners in a loop.
+        let wakes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = Arc::clone(&wakes);
+        stop.subscribe(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        assert!(stop.confirm_esc_hook(second));
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
     }
 }
