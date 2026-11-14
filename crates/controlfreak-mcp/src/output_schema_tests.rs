@@ -95,7 +95,7 @@ fn find_result(found: bool) -> controlfreak_core::FindTextResult {
     }
 }
 
-struct ObservationBackend;
+pub(super) struct ObservationBackend;
 
 impl BackendMetadata for ObservationBackend {
     fn validate_target_reference(&self, _: &str) -> Result<(), PlatformError> {

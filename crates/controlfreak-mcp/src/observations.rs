@@ -4,8 +4,12 @@
 //! virtual-desktop pixels and its image size. Pointer tools can then take a point in that image
 //! and the server maps it back, so clients never redo crop and scale arithmetic. Only geometry is
 //! kept, never pixels, in a small bounded map with a short lifetime.
+//!
+//! An image of one window maps points only while that window is unchanged: its reference changes
+//! when the window moves, resizes or closes, so a stale image is refused instead of mapped onto
+//! whatever now lies under the old rectangle.
 
-use controlfreak_core::{DisplayBounds, PlatformBackend, PlatformError};
+use controlfreak_core::{DisplayBounds, ObservationOptions, PlatformBackend, PlatformError};
 use std::{
     collections::VecDeque,
     sync::{
@@ -14,6 +18,9 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+/// The alias every `display_id` parameter accepts for the primary display.
+pub(super) const PRIMARY_DISPLAY: &str = "primary";
 
 const MAX_OBSERVATIONS: usize = 64;
 const OBSERVATION_TTL: Duration = Duration::from_mins(5);
@@ -29,6 +36,8 @@ struct Observation {
     id: String,
     created: Instant,
     mapping: ImageMapping,
+    /// The window this image shows, when it is an image of one window.
+    window_id: Option<String>,
 }
 
 static OBSERVATIONS: Mutex<VecDeque<Observation>> = Mutex::new(VecDeque::new());
@@ -45,7 +54,13 @@ fn process_nonce() -> u64 {
 }
 
 /// Records a returned image's geometry and returns the id clients pass back with image points.
-pub(super) fn register(source: DisplayBounds, image_width: u32, image_height: u32) -> String {
+/// `window_id` is set when the image shows one window.
+pub(super) fn register(
+    source: DisplayBounds,
+    image_width: u32,
+    image_height: u32,
+    window_id: Option<String>,
+) -> String {
     let id = format!(
         "obs-{:016x}-{:x}",
         process_nonce(),
@@ -66,6 +81,7 @@ pub(super) fn register(source: DisplayBounds, image_width: u32, image_height: u3
             image_width,
             image_height,
         },
+        window_id,
     });
     id
 }
@@ -77,19 +93,57 @@ fn invalid(argument: &str, reason: impl Into<String>) -> PlatformError {
     }
 }
 
-fn mapping(id: &str) -> Result<ImageMapping, PlatformError> {
+fn lookup(id: &str) -> Result<(ImageMapping, Option<String>), PlatformError> {
     OBSERVATIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
         .find(|observation| observation.id == id && observation.created.elapsed() < OBSERVATION_TTL)
-        .map(|observation| observation.mapping)
+        .map(|observation| (observation.mapping, observation.window_id.clone()))
         .ok_or_else(|| {
             invalid(
                 "observation_id",
                 "observation was not found or has expired; capture again and use the new observation_id",
             )
         })
+}
+
+#[cfg(test)]
+fn mapping(id: &str) -> Result<ImageMapping, PlatformError> {
+    lookup(id).map(|(mapping, _)| mapping)
+}
+
+/// Resolves the `"primary"` alias to the primary display's ID. Other IDs pass through for the
+/// backend to validate.
+pub(super) fn resolve_display(
+    backend: &dyn PlatformBackend,
+    display_id: &str,
+) -> Result<String, PlatformError> {
+    if !display_id.eq_ignore_ascii_case(PRIMARY_DISPLAY) {
+        return Ok(display_id.to_owned());
+    }
+    backend
+        .list_displays()?
+        .into_iter()
+        .find(|display| display.is_primary)
+        .map(|display| display.id)
+        .ok_or_else(|| {
+            invalid(
+                "display_id",
+                "no primary display was found; call list_displays and pass an ID",
+            )
+        })
+}
+
+/// Resolves the display alias in an observation's crop region.
+pub(super) fn resolve_observation(
+    backend: &dyn PlatformBackend,
+    options: &mut ObservationOptions,
+) -> Result<(), PlatformError> {
+    if let Some(region) = &mut options.region {
+        region.display_id = resolve_display(backend, &region.display_id)?;
+    }
+    Ok(())
 }
 
 /// Maps an image pixel to the first virtual-desktop pixel it covers, the same
@@ -145,6 +199,12 @@ impl PointerTarget {
             ((Some(display_id), Some(x), Some(y)), (None, None, None)) => {
                 Ok(Self::Display { display_id, x, y })
             }
+            // No display means the primary display.
+            ((None, Some(x), Some(y)), (None, None, None)) => Ok(Self::Display {
+                display_id: PRIMARY_DISPLAY.to_owned(),
+                x,
+                y,
+            }),
             ((None, None, None), (Some(observation_id), Some(image_x), Some(image_y))) => {
                 Ok(Self::Image {
                     observation_id: observation_id.to_owned(),
@@ -154,7 +214,7 @@ impl PointerTarget {
             }
             _ => Err(invalid(
                 names,
-                "provide either display_id with x and y, or observation_id with image_x and image_y",
+                "provide x and y (display_id is optional), or observation_id with image_x and image_y",
             )),
         }
     }
@@ -184,14 +244,29 @@ impl PointerTarget {
         backend: &dyn PlatformBackend,
     ) -> Result<(String, u32, u32), PlatformError> {
         let (observation_id, image_x, image_y) = match self {
-            Self::Display { display_id, x, y } => return Ok((display_id.clone(), *x, *y)),
+            Self::Display { display_id, x, y } => {
+                return Ok((resolve_display(backend, display_id)?, *x, *y));
+            }
             Self::Image {
                 observation_id,
                 image_x,
                 image_y,
             } => (observation_id, *image_x, *image_y),
         };
-        let (x, y) = to_virtual(mapping(observation_id)?, image_x, image_y)?;
+        let (mapping, window_id) = lookup(observation_id)?;
+        if let Some(window_id) = window_id
+            && !backend
+                .list_windows()?
+                .windows
+                .iter()
+                .any(|window| window.id == window_id)
+        {
+            return Err(invalid(
+                "observation_id",
+                "the window in this image moved, resized or closed since the capture; capture it again",
+            ));
+        }
+        let (x, y) = to_virtual(mapping, image_x, image_y)?;
         let display = backend
             .list_displays()?
             .into_iter()
@@ -256,10 +331,10 @@ mod tests {
 
     #[test]
     fn observations_are_bounded_and_unknown_ids_are_refused() {
-        let first = register(bounds(0, 0, 10, 10), 10, 10);
+        let first = register(bounds(0, 0, 10, 10), 10, 10, None);
         assert!(mapping(&first).is_ok());
         for _ in 0..MAX_OBSERVATIONS {
-            register(bounds(0, 0, 10, 10), 10, 10);
+            register(bounds(0, 0, 10, 10), 10, 10, None);
         }
         assert!(mapping(&first).is_err());
         assert!(mapping("obs-not-issued").is_err());
@@ -287,6 +362,16 @@ mod tests {
                 "x"
             )
             .is_err()
+        );
+        // A point with no display lies on the primary display.
+        assert_eq!(
+            PointerTarget::from_arguments((None, Some(1), Some(2)), (None, None, None), "x")
+                .unwrap(),
+            PointerTarget::Display {
+                display_id: PRIMARY_DISPLAY.to_owned(),
+                x: 1,
+                y: 2
+            }
         );
         assert!(PointerTarget::from_arguments(none, (None, None, None), "x").is_err());
     }

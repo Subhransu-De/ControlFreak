@@ -367,6 +367,10 @@ async fn assert_unapproved_actions_rejected(
 ) {
     for (name, arguments) in actions {
         for supplied in [None, Some("0X10:20"), Some("expired-target")] {
+            // Switching desktops defaults to the session's window when no target is given.
+            if supplied.is_none() && *name == SWITCH_VIRTUAL_DESKTOP {
+                continue;
+            }
             let mut arguments = arguments.clone();
             let field = if *name == FOCUS_WINDOW {
                 "window_id"

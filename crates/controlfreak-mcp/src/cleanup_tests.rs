@@ -65,7 +65,7 @@ async fn cancelled_response_stays_draining_until_indicator_cleanup_returns() {
     let task = tokio::spawn(stop::WORK.scope(work, async move {
         handlers::run_mutation_operation(
             Some(lease),
-            "fixture".into(),
+            Some("fixture".to_owned()),
             Arc::new(stop_tests::WaitingBackend::idle()),
             move |_| {
                 stopping.stop();
@@ -107,7 +107,7 @@ async fn stop_keeps_blocked_worker_ownership_until_cleanup_finishes() {
             let _cancel = stop::CancelOnDrop(control);
             handlers::run_mutation_operation(
                 Some(lease),
-                "fixture".into(),
+                Some("fixture".to_owned()),
                 Arc::new(stop_tests::WaitingBackend::idle()),
                 move |control| {
                     control.dispatch_accepted(1);

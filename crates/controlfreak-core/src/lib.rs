@@ -5,6 +5,7 @@ mod desktop;
 mod display;
 mod error;
 mod keyboard;
+pub mod limits;
 mod mutation;
 mod ocr;
 mod outcome;
