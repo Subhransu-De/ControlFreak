@@ -84,7 +84,7 @@ pub enum RefusalCause {
 
 impl RefusalCause {
     #[must_use]
-    pub(crate) const fn code(self) -> &'static str {
+    const fn code(self) -> &'static str {
         match self {
             Self::NotForeground => "not_foreground",
             Self::ForegroundChanged => "foreground_changed",
@@ -98,7 +98,7 @@ impl RefusalCause {
     /// Whether the same request can succeed after the recovery its message names. Pointing at
     /// The server's own Stop button is never retryable: the request itself must change.
     #[must_use]
-    pub(crate) const fn retryable(self) -> bool {
+    const fn retryable(self) -> bool {
         !matches!(self, Self::OwnIndicator)
     }
 }
@@ -119,7 +119,7 @@ pub enum FailureCause {
 
 impl FailureCause {
     #[must_use]
-    pub(crate) const fn code(self) -> &'static str {
+    const fn code(self) -> &'static str {
         match self {
             Self::Cancelled => "cancelled",
             Self::PointerMoved => "pointer_moved",
@@ -133,7 +133,7 @@ impl FailureCause {
     }
 
     #[must_use]
-    pub(crate) const fn retryable(self) -> bool {
+    const fn retryable(self) -> bool {
         matches!(
             self,
             Self::PointerMoved | Self::KeyHeld | Self::InputInterleaved

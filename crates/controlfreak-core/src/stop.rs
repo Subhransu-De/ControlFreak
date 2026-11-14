@@ -382,7 +382,7 @@ impl Backoff {
     };
 
     /// The pause after the `failed`-th failure, counting from one.
-    pub(crate) fn delay(self, failed: u32) -> Duration {
+    fn delay(self, failed: u32) -> Duration {
         let doublings = failed.saturating_sub(1).min(16);
         self.first.saturating_mul(1 << doublings).min(self.cap)
     }
