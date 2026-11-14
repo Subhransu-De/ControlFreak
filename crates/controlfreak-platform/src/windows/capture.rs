@@ -4,7 +4,7 @@ use controlfreak_core::timing;
 use windows::Win32::{
     Foundation::{HWND, RECT},
     Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow},
-    UI::WindowsAndMessaging::GetWindowRect,
+    UI::WindowsAndMessaging::{GetWindowRect, IsHungAppWindow},
 };
 
 use super::{
@@ -532,6 +532,62 @@ fn print_window_rgba(hwnd: HWND, visible: DisplayBounds) -> Option<Vec<u8>> {
     (!is_blank_frame(&rgba)).then_some(rgba)
 }
 
+/// How long a window may take to render itself. `PrintWindow` waits for the target application
+/// to handle `WM_PRINT`, and an application that stops pumping messages would hold the call
+/// forever. A window that is flagged as hung is not asked at all; for any other, the render runs
+/// on its own thread and the caller waits at most this long before copying the screen instead.
+pub(super) const PRINT_WINDOW_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Set while a render thread has not returned yet. At most one abandoned render can exist: while
+/// it is outstanding, new window captures skip `PrintWindow` and copy the screen, so a window
+/// that never answers costs one parked thread and its GDI objects rather than one per call.
+static RENDER_OUTSTANDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Runs `render` on a worker thread and waits at most `deadline` for its answer. `None` means
+/// the render failed, took too long, or was not attempted because `outstanding` says an earlier
+/// render still has not returned. The worker owns everything it creates and clears `outstanding`
+/// only when it really finishes, so an abandoned render cleans up after itself whenever the
+/// application finally answers.
+fn render_within<T: Send + 'static>(
+    deadline: Duration,
+    outstanding: &'static std::sync::atomic::AtomicBool,
+    render: impl FnOnce() -> Option<T> + Send + 'static,
+) -> Option<T> {
+    use std::sync::atomic::Ordering;
+    if outstanding.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("controlfreak-print-window".to_owned())
+        .spawn(move || {
+            let rendered = render();
+            outstanding.store(false, Ordering::Release);
+            // The receiver is gone after a timeout; the result is then dropped here.
+            let _ = sender.send(rendered);
+        });
+    if spawned.is_err() {
+        outstanding.store(false, Ordering::Release);
+        return None;
+    }
+    receiver.recv_timeout(deadline).ok().flatten()
+}
+
+/// `print_window_rgba` with the bounds described on [`PRINT_WINDOW_DEADLINE`].
+fn print_window_bounded(hwnd: HWND, visible: DisplayBounds) -> Option<Vec<u8>> {
+    // SAFETY: IsHungAppWindow only reads the window's responsiveness state for a handle value.
+    if unsafe { IsHungAppWindow(hwnd) }.as_bool() {
+        return None;
+    }
+    // A raw handle value crosses the thread boundary; the worker re-validates it through the
+    // window APIs, which fail for a handle that no longer exists.
+    let raw = hwnd.0 as isize;
+    render_within(PRINT_WINDOW_DEADLINE, &RENDER_OUTSTANDING, move || {
+        print_window_rgba(HWND(raw as *mut c_void), visible)
+    })
+}
+
 /// Picks the pixels for a window screenshot: the window's own rendering if there is one, else a
 /// copy of its screen rectangle.
 fn window_pixels(
@@ -563,7 +619,9 @@ pub(super) fn capture_window_bounds(
     max_width: Option<u32>,
     include_cursor_marker: bool,
 ) -> Result<WindowCapture, PlatformError> {
-    let printed = timing::time("capture_print_window", || print_window_rgba(hwnd, bounds));
+    let printed = timing::time("capture_print_window", || {
+        print_window_bounded(hwnd, bounds)
+    });
     let (rgba, capture_method) = window_pixels(printed, || {
         timing::time("capture_gdi", || capture_rgba(bounds))
     })?;
@@ -1706,6 +1764,63 @@ mod window_capture_tests {
         }
         // A frame of the wrong length is never trusted.
         assert!(crop_bgra_to_rgba(&frame[..40], 4, 3, 0, 0, 2, 2).is_none());
+    }
+
+    #[test]
+    fn a_hung_renderer_is_given_up_on_and_only_one_render_can_be_outstanding() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        };
+        static OUTSTANDING: AtomicBool = AtomicBool::new(false);
+        let (release, hold) = mpsc::channel::<()>();
+        let started = Instant::now();
+        // A renderer that never answers until released, like a window that stops pumping messages.
+        let result = render_within(Duration::from_millis(100), &OUTSTANDING, move || {
+            let _ = hold.recv();
+            Some(vec![1_u8])
+        });
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(OUTSTANDING.load(Ordering::Acquire));
+
+        // While it is parked no second render starts at all.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let second = render_within(Duration::from_millis(100), &OUTSTANDING, move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Some(vec![2_u8])
+        });
+        assert!(second.is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+
+        // Once the parked render returns, rendering works again.
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while OUTSTANDING.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "the abandoned render never finished"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let third = render_within(Duration::from_secs(5), &OUTSTANDING, || Some(vec![3_u8]));
+        assert_eq!(third, Some(vec![3_u8]));
+    }
+
+    #[test]
+    fn a_render_that_answers_in_time_is_returned_and_a_failed_one_is_not() {
+        static OUTSTANDING: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            render_within(Duration::from_secs(5), &OUTSTANDING, || Some(7_u8)),
+            Some(7)
+        );
+        assert_eq!(
+            render_within::<u8>(Duration::from_secs(5), &OUTSTANDING, || None),
+            None
+        );
     }
 
     #[test]

@@ -574,7 +574,7 @@ where
 {
     let inputs = click_inputs(button, click_count, modifiers);
     validate_target()?;
-    send_with_button_dwell_native("click_mouse", &inputs, control)
+    send_with_button_dwell_native("click_mouse", &inputs, control, validate_target)
 }
 
 /// How long a mouse button stays down. Events sent in one `SendInput` call carry the same
@@ -610,6 +610,7 @@ fn send_with_button_dwell_native(
     operation: &str,
     inputs: &[INPUT],
     control: &MutationControl,
+    validate: impl FnMut() -> Result<(), PlatformError>,
 ) -> Result<(), PlatformError> {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     send_with_button_dwell_if_idle(
@@ -620,6 +621,7 @@ fn send_with_button_dwell_native(
             // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
             unsafe { GetAsyncKeyState(key) < 0 }
         },
+        validate,
         native_send_inputs,
         || control.wait(operation, BUTTON_DWELL),
     )
@@ -630,6 +632,7 @@ fn send_with_button_dwell_if_idle(
     inputs: &[INPUT],
     control: &MutationControl,
     is_down: impl FnMut(i32) -> bool,
+    validate: impl FnMut() -> Result<(), PlatformError>,
     send: impl FnMut(&[INPUT]) -> Result<usize, PlatformError>,
     dwell: impl FnMut() -> Result<(), PlatformError>,
 ) -> Result<(), PlatformError> {
@@ -641,16 +644,20 @@ fn send_with_button_dwell_if_idle(
                 .to_owned(),
         });
     }
-    send_with_button_dwell(operation, inputs, control, send, dwell)
+    send_with_button_dwell(operation, inputs, control, validate, send, dwell)
 }
 
-/// Sends `inputs` in steps with a pause after each button press. Whatever the sent steps left
-/// held (the button, and modifiers pressed before it) is released if a later step fails or the
-/// pause is cancelled.
+/// Sends `inputs` in steps with a pause after each button press. The caller validated the
+/// target before the first step; `validate` runs again after every pause, immediately before
+/// the next step, because that step holds new input (a second press of a double click) and the
+/// foreground, destination or cursor may have changed during the dwell. Whatever the sent steps
+/// left held (the button, and modifiers pressed before it) is released if a later step fails,
+/// validation refuses or the pause is cancelled; that cleanup never contains a new press.
 fn send_with_button_dwell(
     operation: &str,
     inputs: &[INPUT],
     control: &MutationControl,
+    mut validate: impl FnMut() -> Result<(), PlatformError>,
     mut send: impl FnMut(&[INPUT]) -> Result<usize, PlatformError>,
     mut dwell: impl FnMut() -> Result<(), PlatformError>,
 ) -> Result<(), PlatformError> {
@@ -675,7 +682,10 @@ fn send_with_button_dwell(
             return Err(incomplete_input_error(operation, accepted, inputs.len()));
         }
         if index + 1 < steps.len()
-            && let Err(error) = control.check(operation).and_then(|()| dwell())
+            && let Err(error) = control
+                .check(operation)
+                .and_then(|()| dwell())
+                .and_then(|()| validate())
         {
             release_sent(&inputs[..accepted], control, &mut send);
             return Err(error);
@@ -1510,6 +1520,7 @@ mod progress_tests {
             "click_mouse",
             &inputs,
             &control,
+            || Ok(()),
             |batch| {
                 events_cell
                     .borrow_mut()
@@ -1541,6 +1552,7 @@ mod progress_tests {
             "click_mouse",
             &inputs,
             &control,
+            || Ok(()),
             |batch| {
                 sent.push(event_kinds(batch));
                 Ok(batch.len())
@@ -1560,6 +1572,7 @@ mod progress_tests {
                 "click_mouse",
                 &inputs,
                 &control,
+                || Ok(()),
                 |_| panic!("cancelled click must not dispatch"),
                 || Ok(()),
             )
@@ -1576,6 +1589,7 @@ mod progress_tests {
             "click_mouse",
             &inputs,
             &control,
+            || Ok(()),
             |batch| {
                 calls.push(event_kinds(batch));
                 // The first call accepts only the modifier press.
@@ -1597,10 +1611,77 @@ mod progress_tests {
             &inputs,
             &control,
             |_| true,
+            || Ok(()),
             |_| panic!("held button must not dispatch"),
             || Ok(()),
         )
         .unwrap_err();
         assert!(error.to_string().contains("already held"));
+    }
+
+    #[test]
+    fn a_target_that_stops_being_valid_during_the_dwell_gets_no_second_press() {
+        // A double click is three batches. Validation turns false during the first dwell.
+        let inputs = click_inputs(MouseButton::Left, 2, &[Key::Ctrl]);
+        let control = MutationControl::default();
+        let mut sent = Vec::new();
+        let mut validations = 0;
+        let result = send_with_button_dwell(
+            "click_mouse",
+            &inputs,
+            &control,
+            || {
+                validations += 1;
+                Err(PlatformError::TargetInvalidated {
+                    reason: "the foreground changed during the dwell".into(),
+                })
+            },
+            |batch| {
+                sent.push(event_kinds(batch));
+                Ok(batch.len())
+            },
+            || Ok(()),
+        );
+        assert!(matches!(
+            result,
+            Err(PlatformError::TargetInvalidated { .. })
+        ));
+        assert_eq!(validations, 1);
+        // Only the acknowledged press and modifier are released; no new press follows.
+        assert_eq!(sent, [vec!["key-down", "down"], vec!["up", "key-up"]]);
+        assert_eq!(control.progress().cleanup, CleanupStatus::Succeeded);
+    }
+
+    #[test]
+    fn every_batch_with_new_input_is_validated_right_before_it_is_sent() {
+        let inputs = click_inputs(MouseButton::Left, 3, &[]);
+        let control = MutationControl::default();
+        let log = std::cell::RefCell::new(Vec::<&str>::new());
+        send_with_button_dwell(
+            "click_mouse",
+            &inputs,
+            &control,
+            || {
+                log.borrow_mut().push("validate");
+                Ok(())
+            },
+            |batch| {
+                log.borrow_mut().push("send");
+                Ok(batch.len())
+            },
+            || {
+                log.borrow_mut().push("dwell");
+                Ok(())
+            },
+        )
+        .unwrap();
+        // down | up down | up down | up (four batches): the caller validated the first batch itself.
+        assert_eq!(
+            *log.borrow(),
+            [
+                "send", "dwell", "validate", "send", "dwell", "validate", "send", "dwell",
+                "validate", "send"
+            ]
+        );
     }
 }
