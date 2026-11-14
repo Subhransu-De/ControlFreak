@@ -1,18 +1,17 @@
 #![allow(unsafe_code)]
 
+use super::win32::{set_per_monitor_dpi_awareness, visit_monitors};
 use super::{
-    AssertUnwindSafe, BOOL, CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
-    CoUninitialize, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DWMWA_CLOAKED,
-    DWMWA_EXTENDED_FRAME_BOUNDS, DisplayBounds, DisplayInfo, DwmGetWindowAttribute, E_ACCESSDENIED,
-    EnumDisplayMonitors, EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetCursorPos,
-    GetForegroundWindow, GetMonitorInfoW, GetWindow, GetWindowLongPtrW, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HDC, HMONITOR, HWND,
-    IVirtualDesktopManager, IsIconic, IsWindow, IsWindowVisible, LPARAM, MAX_WAIT_MS,
-    MAX_WINDOW_TITLE_UTF16_UNITS, MAX_WINDOWS, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW,
-    MONITORINFOF_PRIMARY, MonitorFromWindow, OnceLock, POINT, PlatformError, RECT,
-    RPC_E_CHANGED_MODE, SW_RESTORE, SetForegroundWindow, SetProcessDpiAwarenessContext,
-    ShowWindowAsync, VirtualDesktopManager, WS_EX_TOOLWINDOW, WaitForWindowRequest, WindowBounds,
-    WindowInfo, c_void, catch_unwind, last_win32_error, size_of, win32_error,
+    AssertUnwindSafe, BOOL, CLSCTX_ALL, CoCreateInstance, DWMWA_CLOAKED,
+    DWMWA_EXTENDED_FRAME_BOUNDS, DisplayBounds, DisplayInfo, DwmGetWindowAttribute, EnumWindows,
+    GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMonitorInfoW,
+    GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, HMONITOR, HWND, IVirtualDesktopManager, IsIconic, IsWindow,
+    IsWindowVisible, LPARAM, MAX_WAIT_MS, MAX_WINDOW_TITLE_UTF16_UNITS, MAX_WINDOWS,
+    MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, MONITORINFOF_PRIMARY, MonitorFromWindow, OnceLock,
+    POINT, PlatformError, RECT, SW_RESTORE, SetForegroundWindow, ShowWindowAsync,
+    VirtualDesktopManager, WS_EX_TOOLWINDOW, WaitForWindowRequest, WindowBounds, WindowInfo,
+    c_void, catch_unwind, last_win32_error, size_of, win32_error,
 };
 
 pub(super) fn foreground_window_handle() -> HWND {
@@ -62,46 +61,11 @@ pub(super) fn current_cursor_position() -> Result<POINT, PlatformError> {
     Ok(point)
 }
 
-pub(super) struct ComApartment {
-    uninitialize: bool,
-}
+pub(super) use super::win32::ComApartment;
 
-impl ComApartment {
-    pub(super) fn initialize() -> Result<Self, PlatformError> {
-        // SAFETY: This initializes COM only for the current thread and passes no borrowed pointers.
-        let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        if result.is_ok() {
-            Ok(Self { uninitialize: true })
-        } else if result == RPC_E_CHANGED_MODE {
-            // The host initialized this worker thread with another apartment
-            // model. COM is still usable; its owner remains responsible for it.
-            Ok(Self {
-                uninitialize: false,
-            })
-        } else {
-            Err(win32_error(
-                "CoInitializeEx",
-                &windows::core::Error::from_hresult(result),
-            ))
-        }
-    }
-}
-
-impl ComApartment {
-    /// Whether this thread is in the multithreaded apartment rather than a host-owned STA.
-    const fn is_multithreaded(&self) -> bool {
-        self.uninitialize
-    }
-}
-
-impl Drop for ComApartment {
-    fn drop(&mut self) {
-        if self.uninitialize {
-            // SAFETY: `uninitialize` is true only when this instance successfully initialized COM
-            // on the current thread, so this exactly balances that initialization.
-            unsafe { CoUninitialize() };
-        }
-    }
+/// Joins the multithreaded apartment for Win32 calls that need COM.
+pub(super) fn initialize_com() -> Result<ComApartment, PlatformError> {
+    ComApartment::multithreaded().map_err(|error| win32_error("CoInitializeEx", &error))
 }
 
 pub(super) fn virtual_desktop_manager() -> Result<IVirtualDesktopManager, PlatformError> {
@@ -165,7 +129,7 @@ fn shared_virtual_desktop_manager(fresh: bool) -> Result<IVirtualDesktopManager,
 pub(super) fn with_virtual_desktop_manager<T>(
     query: impl Fn(&IVirtualDesktopManager) -> windows::core::Result<T>,
 ) -> Result<windows::core::Result<T>, PlatformError> {
-    let apartment = ComApartment::initialize()?;
+    let apartment = initialize_com()?;
     if !apartment.is_multithreaded() {
         // A host-initialized single-threaded apartment cannot call an MTA proxy directly.
         return Ok(query(&virtual_desktop_manager()?));
@@ -191,56 +155,12 @@ pub(super) fn current_virtual_desktop_id(manager: &IVirtualDesktopManager) -> Op
 pub(super) fn ensure_dpi_awareness() -> Result<(), PlatformError> {
     static DPI_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
     DPI_RESULT
-        .get_or_init(|| {
-            // SAFETY: This process-wide API takes a constant Windows-provided awareness context
-            // and does not retain Rust references.
-            let result = unsafe {
-                SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-            };
-            match result {
-                Ok(()) => Ok(()),
-                Err(error) if error.code() == E_ACCESSDENIED => Ok(()),
-                Err(error) => Err(error.to_string()),
-            }
-        })
+        .get_or_init(|| set_per_monitor_dpi_awareness().map_err(|error| error.to_string()))
         .clone()
         .map_err(|reason| PlatformError::OperationFailed {
             operation: "SetProcessDpiAwarenessContext".to_owned(),
             reason,
         })
-}
-
-#[derive(Default)]
-struct MonitorEnumeration {
-    displays: Vec<DisplayInfo>,
-    error: Option<String>,
-}
-
-unsafe extern "system" fn monitor_callback(
-    monitor: HMONITOR,
-    _monitor_dc: HDC,
-    _monitor_rect: *mut windows::Win32::Foundation::RECT,
-    data: LPARAM,
-) -> BOOL {
-    // SAFETY: `data` was created from the unique mutable `MonitorEnumeration` reference passed to
-    // synchronous EnumDisplayMonitors and remains valid for the complete callback invocation.
-    let enumeration = unsafe { &mut *(data.0 as *mut MonitorEnumeration) };
-    let outcome = catch_unwind(AssertUnwindSafe(|| monitor_info(monitor)));
-
-    match outcome {
-        Ok(Ok(display)) => {
-            enumeration.displays.push(display);
-            BOOL(1)
-        }
-        Ok(Err(error)) => {
-            enumeration.error = Some(error.to_string());
-            BOOL(0)
-        }
-        Err(_) => {
-            enumeration.error = Some("monitor callback panicked".to_owned());
-            BOOL(0)
-        }
-    }
 }
 
 fn monitor_info(monitor: HMONITOR) -> Result<DisplayInfo, PlatformError> {
@@ -296,34 +216,23 @@ fn monitor_info(monitor: HMONITOR) -> Result<DisplayInfo, PlatformError> {
 }
 
 pub(super) fn enumerate_displays() -> Result<Vec<DisplayInfo>, PlatformError> {
-    let mut enumeration = MonitorEnumeration::default();
-    // SAFETY: The LPARAM points to `enumeration`, which remains uniquely borrowed for this
-    // synchronous enumeration. The callback catches panics before returning across the FFI edge.
-    let succeeded = unsafe {
-        EnumDisplayMonitors(
-            None,
-            None,
-            Some(monitor_callback),
-            LPARAM((&raw mut enumeration).cast::<c_void>() as isize),
-        )
-    };
-
-    if !succeeded.as_bool() {
-        return Err(PlatformError::OperationFailed {
-            operation: "EnumDisplayMonitors".to_owned(),
-            reason: enumeration
-                .error
-                .unwrap_or_else(|| windows::core::Error::from_thread().to_string()),
-        });
-    }
-    if enumeration.displays.is_empty() {
+    let mut displays = Vec::new();
+    visit_monitors(|monitor| {
+        displays.push(monitor_info(monitor).map_err(|error| error.to_string())?);
+        Ok(())
+    })
+    .map_err(|reason| PlatformError::OperationFailed {
+        operation: "EnumDisplayMonitors".to_owned(),
+        reason,
+    })?;
+    if displays.is_empty() {
         return Err(PlatformError::OperationFailed {
             operation: "EnumDisplayMonitors".to_owned(),
             reason: "Windows reported no active displays".to_owned(),
         });
     }
 
-    enumeration.displays.sort_by(|left, right| {
+    displays.sort_by(|left, right| {
         right
             .is_primary
             .cmp(&left.is_primary)
@@ -331,7 +240,7 @@ pub(super) fn enumerate_displays() -> Result<Vec<DisplayInfo>, PlatformError> {
             .then_with(|| left.bounds.top.cmp(&right.bounds.top))
             .then_with(|| left.id.cmp(&right.id))
     });
-    Ok(enumeration.displays)
+    Ok(displays)
 }
 
 pub(super) fn find_display(display_id: &str) -> Result<DisplayInfo, PlatformError> {

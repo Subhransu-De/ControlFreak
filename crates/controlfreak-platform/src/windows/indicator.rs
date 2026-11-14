@@ -13,9 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::win32::{visit_monitors, windows_error};
 use windows::{
     Win32::{
-        Foundation::{COLORREF, D2DERR_RECREATE_TARGET, HWND, LPARAM, POINT, RECT, SIZE},
+        Foundation::{COLORREF, D2DERR_RECREATE_TARGET, HWND, POINT, RECT, SIZE},
         Graphics::{
             Direct2D::{
                 Common::{
@@ -45,8 +46,8 @@ use windows::{
                 AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
                 COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT,
                 CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject,
-                EnumDisplayMonitors, GetMonitorInfoW, GetSysColor, HBITMAP, HDC, HGDIOBJ, HMONITOR,
-                MONITORINFO, SelectObject,
+                GetMonitorInfoW, GetSysColor, HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFO,
+                SelectObject,
             },
         },
         System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
@@ -194,68 +195,22 @@ impl Monitor {
 /// Space kept clear on each side of a tab, in DIPs.
 const TAB_CLEARANCE_DIP: f32 = 16.0;
 
-#[derive(Default)]
-struct MonitorEnumeration {
-    monitors: Vec<Monitor>,
-    error: Option<String>,
-}
-
-unsafe extern "system" fn monitor_callback(
-    monitor: HMONITOR,
-    _dc: HDC,
-    _rect: *mut RECT,
-    data: LPARAM,
-) -> BOOL {
-    // SAFETY: `data` points to the uniquely borrowed enumeration supplied to the synchronous
-    // EnumDisplayMonitors call and remains live throughout this callback.
-    let enumeration = unsafe { &mut *(data.0 as *mut MonitorEnumeration) };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| monitor_info(monitor)));
-    match result {
-        Ok(Ok(monitor)) => {
-            enumeration.monitors.push(monitor);
-            BOOL(1)
-        }
-        Ok(Err(error)) => {
-            enumeration.error = Some(error.to_string());
-            BOOL(0)
-        }
-        Err(_) => {
-            enumeration.error = Some("monitor enumeration callback panicked".to_owned());
-            BOOL(0)
-        }
-    }
-}
-
 /// Active monitors sorted by position, so an unchanged layout compares equal between polls.
 pub(crate) fn enumerate_monitors() -> io::Result<Vec<Monitor>> {
-    let mut enumeration = MonitorEnumeration::default();
-    // SAFETY: The LPARAM points to `enumeration`, which is uniquely borrowed and remains alive for
-    // the complete synchronous enumeration; the callback catches panics across the FFI boundary.
-    let succeeded = unsafe {
-        EnumDisplayMonitors(
-            None,
-            None,
-            Some(monitor_callback),
-            LPARAM((&raw mut enumeration).cast::<c_void>() as isize),
-        )
-    };
-    if !succeeded.as_bool() {
-        return Err(io::Error::other(
-            enumeration
-                .error
-                .unwrap_or_else(|| WindowsError::from_thread().to_string()),
-        ));
-    }
-    if enumeration.monitors.is_empty() {
+    let mut monitors = Vec::new();
+    visit_monitors(|monitor| {
+        monitors.push(monitor_info(monitor).map_err(|error| error.to_string())?);
+        Ok(())
+    })
+    .map_err(io::Error::other)?;
+    if monitors.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "Windows reported no active monitors for the indicator",
         ));
     }
-    enumeration
-        .monitors
-        .sort_by_key(|monitor| (monitor.left, monitor.top, monitor.right, monitor.bottom));
-    Ok(enumeration.monitors)
+    monitors.sort_by_key(|monitor| (monitor.left, monitor.top, monitor.right, monitor.bottom));
+    Ok(monitors)
 }
 
 fn monitor_info(monitor: HMONITOR) -> io::Result<Monitor> {
@@ -2381,10 +2336,6 @@ impl Painter {
             Ok(path)
         }
     }
-}
-
-fn windows_error(context: &str, error: &WindowsError) -> io::Error {
-    io::Error::other(format!("{context} failed: {error}"))
 }
 
 #[cfg(test)]

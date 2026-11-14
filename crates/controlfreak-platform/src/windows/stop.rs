@@ -56,12 +56,13 @@ use windows::{
     core::{GUID, PCWSTR, w},
 };
 
-use super::desktop::{ComApartment, virtual_desktop_manager};
+use super::desktop::virtual_desktop_manager;
 use super::indicator::{
     Activity, FADE_IN, FADE_IN_FROM, Monitor, PaintedTab, Painter, Palette, READING, StopStatus,
     TabInputs, TabKind, TabModel, TabView, animations_enabled, enumerate_monitors, spoken,
     text_scale,
 };
+use super::win32::{ComApartment, windows_error};
 
 const CLASS_NAME: windows::core::PCWSTR = w!("ControlFreakUserStop");
 /// Longest the UI thread blocks while a tab is shown or about to change. Window messages, hook
@@ -1321,7 +1322,8 @@ fn run(
     ready: &mpsc::SyncSender<Result<(), String>>,
     started: &Cell<bool>,
 ) -> io::Result<()> {
-    let _com = ComApartment::initialize().map_err(|error| io::Error::other(error.to_string()))?;
+    let _com =
+        ComApartment::multithreaded().map_err(|error| windows_error("CoInitializeEx", &error))?;
     // Without the shell's manager the tab still works; it just cannot follow desktop switches.
     let desktops = virtual_desktop_manager().ok();
     let presenter = Presenter::new(Painter::new()?);
@@ -1563,10 +1565,6 @@ unsafe extern "system" fn window_proc(
 fn is_button_click(wparam: WPARAM, lparam: LPARAM) -> bool {
     let notification = (wparam.0 >> 16) & 0xffff;
     lparam.0 != 0 && u32::try_from(notification) == Ok(BN_CLICKED)
-}
-
-fn windows_error(context: &str, error: &windows::core::Error) -> io::Error {
-    io::Error::other(format!("{context} failed: {error}"))
 }
 
 #[cfg(test)]

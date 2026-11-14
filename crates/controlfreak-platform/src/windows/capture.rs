@@ -9,15 +9,15 @@ use windows::Win32::{
 
 use super::{
     ActionObservation, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, BitmapPixelFormat, CAPTUREBLT,
-    ComApartment, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS, DataWriter, DeleteDC,
-    DeleteObject, DisplayBounds, DisplayInfo, DisplayScreenshot, Duration, GetDC, GetDIBits,
-    HBITMAP, HDC, HGDIOBJ, HSTRING, Instant, Language, MAX_ACTION_IMAGE_WIDTH, MAX_CAPTURE_BYTES,
+    CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS, DataWriter, DeleteDC, DeleteObject,
+    DisplayBounds, DisplayInfo, DisplayScreenshot, Duration, GetDC, GetDIBits, HBITMAP, HDC,
+    HGDIOBJ, HSTRING, Instant, Language, MAX_ACTION_IMAGE_WIDTH, MAX_CAPTURE_BYTES,
     MAX_CAPTURE_WIDTH, MAX_WAIT_MS, ObservationMode, ObservationOptions, OcrEngine, OcrLine,
     OcrRegionRequest, OcrResult, OcrWord, OnceLock, PlatformError, ReleaseDC, SRCCOPY,
     SelectObject, SoftwareBitmap, SystemTime, UNIX_EPOCH, VISUAL_COMPARE_WIDTH, VISUAL_POLL_MS,
     VisualChangeResult, WaitForVisualChangeRequest, WindowBounds, WindowInfo, c_void,
     current_cursor_position, ensure_dpi_awareness, enumerate_displays, find_display,
-    foreground_window_handle, last_win32_error, size_of, win32_error, window_info,
+    foreground_window_handle, initialize_com, last_win32_error, size_of, win32_error, window_info,
 };
 
 struct ScreenDc(HDC);
@@ -890,7 +890,7 @@ pub(super) fn recognize_text(
     control.check("windows_ocr")?;
     let _timer = timing::start("ocr_recognize");
     ensure_dpi_awareness()?;
-    let _apartment = ComApartment::initialize()?;
+    let _apartment = initialize_com()?;
     let display = find_display(&request.display_id)?;
     let source_bounds = display_region_bounds(
         &display,

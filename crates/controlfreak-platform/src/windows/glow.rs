@@ -14,22 +14,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::win32::{
+    ComApartment, last_windows_error, set_per_monitor_dpi_awareness, windows_error,
+};
 use windows::{
     Win32::{
-        Foundation::{
-            E_ACCESSDENIED, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RPC_E_CHANGED_MODE,
-            WAIT_FAILED, WPARAM,
-        },
+        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WAIT_FAILED, WPARAM},
         System::{
-            Com::{
-                CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-                CoUninitialize,
-            },
+            Com::{CLSCTX_ALL, CoCreateInstance},
             LibraryLoader::GetModuleHandleW,
             Threading::GetCurrentThreadId,
         },
         UI::{
-            HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
             Shell::{IVirtualDesktopManager, VirtualDesktopManager},
             WindowsAndMessaging::{
                 CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
@@ -44,7 +40,7 @@ use windows::{
             },
         },
     },
-    core::{Error as WindowsError, GUID, w},
+    core::{GUID, w},
 };
 
 use super::indicator::{
@@ -103,7 +99,8 @@ impl HelperConfig {
 
 pub(crate) fn run(config: HelperConfig) -> io::Result<()> {
     ensure_dpi_awareness()?;
-    let _com = ComApartment::initialize()?;
+    let _com =
+        ComApartment::single_threaded().map_err(|error| windows_error("CoInitializeEx", &error))?;
     register_window_class()?;
     // SAFETY: COM is initialized on this thread and the class/interface IDs are Windows-provided.
     let manager: IVirtualDesktopManager =
@@ -893,42 +890,8 @@ impl Drop for LampWindow {
 }
 
 fn ensure_dpi_awareness() -> io::Result<()> {
-    // SAFETY: This process-wide call takes a Windows-provided constant and retains no references.
-    let result =
-        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) if error.code() == E_ACCESSDENIED => Ok(()),
-        Err(error) => Err(windows_error("SetProcessDpiAwarenessContext", &error)),
-    }
-}
-
-struct ComApartment(bool);
-
-impl ComApartment {
-    fn initialize() -> io::Result<Self> {
-        // SAFETY: This initializes COM for only the calling helper UI thread.
-        let result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-        if result.is_ok() {
-            Ok(Self(true))
-        } else if result == RPC_E_CHANGED_MODE {
-            Ok(Self(false))
-        } else {
-            Err(windows_error(
-                "CoInitializeEx",
-                &WindowsError::from_hresult(result),
-            ))
-        }
-    }
-}
-
-impl Drop for ComApartment {
-    fn drop(&mut self) {
-        if self.0 {
-            // SAFETY: This exactly balances the successful initialization performed by this guard.
-            unsafe { CoUninitialize() };
-        }
-    }
+    set_per_monitor_dpi_awareness()
+        .map_err(|error| windows_error("SetProcessDpiAwarenessContext", &error))
 }
 
 fn register_window_class() -> io::Result<()> {
@@ -986,19 +949,12 @@ fn pump_messages() -> bool {
     true
 }
 
-fn windows_error(context: &str, error: &WindowsError) -> io::Error {
-    io::Error::other(format!("{context} failed: {error}"))
-}
-
-fn last_windows_error(context: &str) -> io::Error {
-    windows_error(context, &WindowsError::from_thread())
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::indicator::{ADMIN_RED, AMBER, Painter, TURQUOISE, TabKind, TabView};
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::{GetWindowDisplayAffinity, WindowFromPoint};
+    use windows::core::Error as WindowsError;
 
     fn frame(color: Rgb, alpha: u8, admin: bool) -> LampFrame {
         LampFrame {

@@ -30,19 +30,16 @@ use controlfreak_core::{
     WindowScreenshot, WindowWaitResult,
 };
 use windows::Win32::{
-    Foundation::{E_ACCESSDENIED, HWND, LPARAM, POINT, RECT, RPC_E_CHANGED_MODE},
+    Foundation::{HWND, LPARAM, POINT, RECT},
     Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
     Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
-        CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC,
-        GetDIBits, GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONEAREST,
-        MONITORINFOEXW, MonitorFromWindow, ReleaseDC, SRCCOPY, SelectObject,
+        CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits,
+        GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW,
+        MonitorFromWindow, ReleaseDC, SRCCOPY, SelectObject,
     },
-    System::Com::{
-        CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
-    },
+    System::Com::{CLSCTX_ALL, CoCreateInstance},
     UI::{
-        HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
         Input::KeyboardAndMouse::{
             INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
             KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSE_EVENT_FLAGS,
@@ -77,6 +74,7 @@ mod privilege;
 mod process;
 mod shell;
 mod stop;
+mod win32;
 pub use stop::{SessionSignals, UserStop};
 
 pub use arbitration::DesktopArbitrator;
@@ -110,9 +108,9 @@ use capture::{
     validate_wait_values, wait_for_change,
 };
 use desktop::{
-    ComApartment, activate_window, current_cursor_position, current_virtual_desktop_id,
-    ensure_dpi_awareness, enumerate_displays, enumerate_window_candidates, enumerate_windows,
-    find_display, find_display_at_point, find_window, foreground_window_handle, issue_candidate,
+    activate_window, current_cursor_position, current_virtual_desktop_id, ensure_dpi_awareness,
+    enumerate_displays, enumerate_window_candidates, enumerate_windows, find_display,
+    find_display_at_point, find_window, foreground_window_handle, initialize_com, issue_candidate,
     resolve_window_reference, restore_window, validate_window_wait, virtual_desktop_manager,
     window_desktop_id, window_info, window_is_on_current_desktop, window_matches,
 };
@@ -737,7 +735,7 @@ impl WindowBackend for Backend {
 
     fn list_virtual_desktops(&self) -> Result<VirtualDesktopList, PlatformError> {
         ensure_dpi_awareness()?;
-        let _apartment = ComApartment::initialize()?;
+        let _apartment = initialize_com()?;
         let manager = virtual_desktop_manager()?;
         let current_id = current_virtual_desktop_id(&manager);
         let mut current_ids = std::collections::BTreeSet::<String>::new();
@@ -793,7 +791,7 @@ impl WindowBackend for Backend {
                 reason: format!("must be between 1 and {MAX_DESKTOP_SWITCH_STEPS}"),
             });
         }
-        let _apartment = ComApartment::initialize()?;
+        let _apartment = initialize_com()?;
         let manager = virtual_desktop_manager()?;
         let before = current_virtual_desktop_id(&manager);
         let arrow = match request.direction {
