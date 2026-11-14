@@ -27,7 +27,7 @@ use windows::{
             Accessibility::NotifyWinEvent,
             HiDpi::SystemParametersInfoForDpi,
             Input::{
-                GetCurrentInputMessageSource, IMO_INJECTED, INPUT_MESSAGE_ORIGIN_ID,
+                GetCurrentInputMessageSource, IMO_HARDWARE, INPUT_MESSAGE_ORIGIN_ID,
                 INPUT_MESSAGE_SOURCE,
                 KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE},
             },
@@ -589,16 +589,19 @@ fn button_origin(
     })
 }
 
-/// Whether a mouse or key message that reached the Stop button came from a person or from
-/// hardware, not from `SendInput` and its relatives. The agent's own input tools are injected, so
-/// the agent can never press the button; touch, pen and mouse hardware can. When the system
-/// cannot say where the message came from, it is treated as injected.
+/// Whether a mouse or key message that reached the Stop button came from input hardware (mouse,
+/// touch, pen or keyboard), as an allow-list: only an origin of `IMO_HARDWARE` counts. The
+/// agent's own input tools are injected, and a posted message from another process reports no
+/// origin (`IMO_UNAVAILABLE`), so neither can press the button. `IMO_SYSTEM` is refused too: no
+/// supported way to press the button produces it. An unreadable origin is refused. Assistive
+/// technology that invokes the button through UI Automation does not need an origin: it sends
+/// `BM_CLICK`, which is handled before this check.
 fn input_is_from_a_person(source: windows::core::Result<INPUT_MESSAGE_SOURCE>) -> bool {
-    source.is_ok_and(|source| !is_injected(source.originId))
+    source.is_ok_and(|source| is_hardware(source.originId))
 }
 
-fn is_injected(origin: INPUT_MESSAGE_ORIGIN_ID) -> bool {
-    origin == IMO_INJECTED
+fn is_hardware(origin: INPUT_MESSAGE_ORIGIN_ID) -> bool {
+    origin == IMO_HARDWARE
 }
 
 /// The current message's source. `BM_CLICK` and the other messages that do not come from the
@@ -2172,7 +2175,7 @@ mod tests {
 
     #[test]
     fn only_a_person_can_press_the_stop_button() {
-        use windows::Win32::UI::Input::{IMO_HARDWARE, IMO_SYSTEM, IMO_UNAVAILABLE};
+        use windows::Win32::UI::Input::{IMO_INJECTED, IMO_SYSTEM, IMO_UNAVAILABLE};
         let from = |origin| {
             input_is_from_a_person(Ok(INPUT_MESSAGE_SOURCE {
                 originId: origin,
@@ -2180,14 +2183,17 @@ mod tests {
             }))
         };
         assert!(from(IMO_HARDWARE), "mouse, touch and pen hardware");
-        assert!(from(IMO_SYSTEM));
-        assert!(from(IMO_UNAVAILABLE), "not from the input queue");
+        assert!(!from(IMO_SYSTEM), "nothing that presses the button reports the system");
+        assert!(
+            !from(IMO_UNAVAILABLE),
+            "a posted message from another process reports no origin"
+        );
         assert!(!from(IMO_INJECTED), "SendInput and injected touch");
         assert!(
             !input_is_from_a_person(Err(windows::core::Error::from_hresult(
                 windows::core::HRESULT(-1)
             ))),
-            "an unknown origin is treated as injected"
+            "an unreadable origin is refused"
         );
         for message in [WM_LBUTTONDOWN, WM_LBUTTONUP, WM_KEYDOWN, WM_CHAR] {
             assert!(is_person_only_message(message));

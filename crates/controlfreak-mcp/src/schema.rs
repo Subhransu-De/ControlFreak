@@ -775,7 +775,7 @@ fn display_id_property() -> Value {
     json!({
         "type": "string",
         "minLength": 1,
-        "description": "ID from list_displays, or \"primary\". Default: the primary display."
+        "description": "Display ID from list_displays, or \"primary\" (default)."
     })
 }
 
@@ -830,7 +830,7 @@ fn add_observation(properties: &mut JsonObject) {
         "observation".to_owned(),
         json!({
             "type": "object",
-            "description": "Default: 1280 px screenshot. mode none or metadata returns no image; region crops.",
+            "description": "Default: 1280 px screenshot. mode none or metadata sends no image; region crops.",
             "properties": {
                 "mode": { "type": "string", "enum": ["none", "metadata", "screenshot"], "default": "screenshot" },
                 "max_width": { "type": "integer", "minimum": 1, "maximum": MAX_CAPTURE_WIDTH },
@@ -955,9 +955,30 @@ fn output_schema(mut branches: Vec<Value>, mutating: bool) -> Arc<JsonObject> {
         schema["$defs"] = Value::Object(defs);
     }
     strip_lower_bounds(&mut schema);
+    strip_enum_types(&mut schema);
     match schema {
         Value::Object(schema) => Arc::new(schema),
         _ => Arc::default(),
+    }
+}
+
+/// `{"type":"string","enum":[...]}` and `{"enum":[...]}` accept exactly the same values when every
+/// member is a string, so the `type` only costs bytes in every `tools/list`. Input schemas keep
+/// it: some clients rebuild their own tool declarations from `type`.
+fn strip_enum_types(schema: &mut Value) {
+    match schema {
+        Value::Object(map) => {
+            let all_strings = map
+                .get("enum")
+                .and_then(Value::as_array)
+                .is_some_and(|members| members.iter().all(Value::is_string));
+            if all_strings && map.get("type") == Some(&json!("string")) {
+                map.remove("type");
+            }
+            map.values_mut().for_each(strip_enum_types);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_enum_types),
+        _ => {}
     }
 }
 
