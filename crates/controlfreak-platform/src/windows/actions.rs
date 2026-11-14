@@ -14,10 +14,6 @@ use super::{
 };
 
 impl PointerBackend for Backend {
-    fn move_mouse(&self, request: &MouseMoveRequest) -> Result<PointerActionResult, PlatformError> {
-        self.move_mouse_controlled(request, &MutationControl::default())
-    }
-
     fn move_mouse_controlled(
         &self,
         request: &MouseMoveRequest,
@@ -38,23 +34,12 @@ impl PointerBackend for Backend {
         )
     }
 
-    fn click_mouse(
-        &self,
-        request: &MouseClickRequest,
-    ) -> Result<PointerActionResult, PlatformError> {
-        self.click_mouse_controlled(request, &MutationControl::default())
-    }
-
     fn click_mouse_controlled(
         &self,
         request: &MouseClickRequest,
         control: &MutationControl,
     ) -> Result<PointerActionResult, PlatformError> {
         self.click_mouse_at_generation(request, control, None)
-    }
-
-    fn drag_mouse(&self, request: &MouseDragRequest) -> Result<PointerActionResult, PlatformError> {
-        self.drag_mouse_controlled(request, &MutationControl::default())
     }
 
     fn drag_mouse_controlled(
@@ -131,13 +116,6 @@ impl PointerBackend for Backend {
         Self::pointer_action_result("drag_mouse", foreground_before, &request.observation)
     }
 
-    fn scroll_mouse(
-        &self,
-        request: &MouseScrollRequest,
-    ) -> Result<PointerActionResult, PlatformError> {
-        self.scroll_mouse_controlled(request, &MutationControl::default())
-    }
-
     fn scroll_mouse_controlled(
         &self,
         request: &MouseScrollRequest,
@@ -187,10 +165,6 @@ impl PointerBackend for Backend {
 }
 
 impl KeyboardBackend for Backend {
-    fn press_keys(&self, request: &KeyChordRequest) -> Result<KeyboardActionResult, PlatformError> {
-        self.press_keys_controlled(request, &MutationControl::default())
-    }
-
     fn press_keys_controlled(
         &self,
         request: &KeyChordRequest,
@@ -212,10 +186,6 @@ impl KeyboardBackend for Backend {
             observation: observe_foreground(&request.observation)
                 .map_err(|error| post_action_error("press_keys", error.to_string()))?,
         })
-    }
-
-    fn type_text(&self, request: &TextInputRequest) -> Result<KeyboardActionResult, PlatformError> {
-        self.type_text_controlled(request, &MutationControl::default())
     }
 
     fn type_text_controlled(

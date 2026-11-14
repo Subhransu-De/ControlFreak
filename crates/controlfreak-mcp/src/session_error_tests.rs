@@ -7,7 +7,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 
 pub(super) struct Harness {
     pub(super) client: BufReader<tokio::io::DuplexStream>,
-    runtime: Arc<IndicatorRuntime>,
+    runtime: Arc<SessionRuntime>,
     serving: tokio::task::JoinHandle<()>,
 }
 
@@ -19,7 +19,7 @@ pub(super) async fn harness_with_backend(
     backend: Arc<dyn PlatformBackend>,
     owned: Arc<AtomicBool>,
 ) -> Harness {
-    let runtime = Arc::new(IndicatorRuntime::new_with_timing(
+    let runtime = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         || {
             Ok(RecordingIndicator {
@@ -293,8 +293,8 @@ fn fake_escape_monitor(stop: controlfreak_core::StopController, install: Result<
     });
 }
 
-fn escape_runtime(owned: Arc<AtomicBool>) -> Arc<IndicatorRuntime> {
-    Arc::new(IndicatorRuntime::new_with_timing(
+fn escape_runtime(owned: Arc<AtomicBool>) -> Arc<SessionRuntime> {
+    Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         || {
             Ok(RecordingIndicator {

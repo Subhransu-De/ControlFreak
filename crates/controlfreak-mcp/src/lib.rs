@@ -28,9 +28,9 @@ pub use session::{
     IndicatorLevel, SafetyIndicator,
 };
 #[cfg(test)]
-use session::{GlowTiming, IdleCommand, IdleWorker};
+use session::{GlowTiming, IdleCommand, IdleWorker, LocalArbitrator};
 use session::{
-    IndicatorRuntime, LocalArbitrator, OperationLease, SessionError, glow_timing_from_environment,
+    OperationLease, SessionError, SessionRuntime, glow_timing_from_environment,
     indicator_unavailable,
 };
 #[cfg(test)]
@@ -257,7 +257,7 @@ struct ControlFreakServer {
     backend: Arc<dyn PlatformBackend>,
     diagnostics: Arc<Diagnostics>,
     safety_indicator: SafetyIndicator,
-    indicator_runtime: Option<Arc<IndicatorRuntime>>,
+    session_runtime: Option<Arc<SessionRuntime>>,
     stop: controlfreak_core::StopController,
 }
 
@@ -265,9 +265,9 @@ impl ControlFreakServer {
     fn with_indicator(
         backend: Arc<dyn PlatformBackend>,
         safety_indicator: SafetyIndicator,
-        indicator_runtime: Option<Arc<IndicatorRuntime>>,
+        session_runtime: Option<Arc<SessionRuntime>>,
     ) -> Self {
-        let stop = indicator_runtime
+        let stop = session_runtime
             .as_ref()
             .map_or_else(controlfreak_core::StopController::default, |runtime| {
                 runtime.stop.clone()
@@ -277,7 +277,7 @@ impl ControlFreakServer {
             backend,
             diagnostics: Arc::new(Diagnostics::new()),
             safety_indicator,
-            indicator_runtime,
+            session_runtime,
         }
     }
 
@@ -314,7 +314,7 @@ impl ControlFreakServer {
             &self.backend,
             &self.diagnostics,
             &self.safety_indicator,
-            self.indicator_runtime.as_ref(),
+            self.session_runtime.as_ref(),
             arguments,
         )?;
         if let CallToolResponse::Complete(result) = result
@@ -334,7 +334,7 @@ impl ControlFreakServer {
         arguments: Option<JsonObject>,
     ) -> Result<CallToolResponse, ErrorData> {
         parse_arguments::<NoArguments>(arguments)?;
-        let Some(runtime) = self.indicator_runtime.clone() else {
+        let Some(runtime) = self.session_runtime.clone() else {
             return Err(indicator_unavailable(
                 &self.safety_indicator,
                 "desktop glow sessions are unavailable",
@@ -392,7 +392,7 @@ impl ControlFreakServer {
     /// The tool result for a request that admission refused.
     fn refused(&self, tool_name: &str, error: &PlatformError) -> CallToolResponse {
         let response = if self.stop.is_stopped() {
-            self.indicator_runtime
+            self.session_runtime
                 .as_ref()
                 .map_or_else(
                     || SessionError::stopped(&self.stop),
@@ -423,7 +423,7 @@ impl ControlFreakServer {
             }
             Route::Input(handler) => {
                 let is_switch = request.name == SWITCH_VIRTUAL_DESKTOP;
-                let Some(runtime) = self.indicator_runtime.as_ref() else {
+                let Some(runtime) = self.session_runtime.as_ref() else {
                     return handler(backend, request.arguments, None).await;
                 };
                 let lease = match runtime.acquire_mutation().await {
@@ -461,7 +461,7 @@ impl ControlFreakServer {
         &self,
         arguments: Option<JsonObject>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let Some(runtime) = self.indicator_runtime.as_ref() else {
+        let Some(runtime) = self.session_runtime.as_ref() else {
             return Err(indicator_unavailable(
                 &self.safety_indicator,
                 "desktop glow sessions are unavailable",
@@ -668,25 +668,6 @@ pub async fn serve_stdio(
     serve_stdio_inner(Arc::from(backend), SafetyIndicator::ready(), None).await
 }
 
-pub async fn serve_stdio_with_indicator<F, G>(
-    backend: Box<dyn PlatformBackend>,
-    safety_indicator: SafetyIndicator,
-    start_indicator: F,
-) -> Result<(), Box<dyn Error + Send + Sync>>
-where
-    F: Fn() -> Result<G, String> + Send + Sync + 'static,
-    G: ActivityIndicator + 'static,
-{
-    serve_stdio_with_indicator_and_arbitrator(
-        backend,
-        safety_indicator,
-        start_indicator,
-        Arc::new(LocalArbitrator),
-        controlfreak_core::StopController::default(),
-    )
-    .await
-}
-
 pub async fn serve_stdio_with_indicator_and_arbitrator<F, G>(
     backend: Box<dyn PlatformBackend>,
     safety_indicator: SafetyIndicator,
@@ -699,7 +680,7 @@ where
     G: ActivityIndicator + 'static,
 {
     let backend: Arc<dyn PlatformBackend> = Arc::from(backend);
-    let mut runtime = IndicatorRuntime::new_with_timing(
+    let mut runtime = SessionRuntime::new_with_timing(
         safety_indicator.clone(),
         start_indicator,
         arbitrator,
@@ -707,14 +688,14 @@ where
     );
     runtime.stop = stop;
     runtime.environment = Some(Arc::clone(&backend));
-    let indicator_runtime = Arc::new(runtime);
-    serve_stdio_inner(backend, safety_indicator, Some(indicator_runtime)).await
+    let session_runtime = Arc::new(runtime);
+    serve_stdio_inner(backend, safety_indicator, Some(session_runtime)).await
 }
 
 // rmcp drains responses after EOF. Close admission at EOF itself, before that drain.
 struct DisconnectReader<R> {
     inner: R,
-    runtime: Option<Arc<IndicatorRuntime>>,
+    runtime: Option<Arc<SessionRuntime>>,
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for DisconnectReader<R> {
@@ -739,7 +720,7 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for DisconnectReader<
     }
 }
 
-struct ServerCleanup(Option<Arc<IndicatorRuntime>>);
+struct ServerCleanup(Option<Arc<SessionRuntime>>);
 
 impl ServerCleanup {
     fn close(&self, reason: &str) {
@@ -755,7 +736,7 @@ impl Drop for ServerCleanup {
     }
 }
 
-async fn wait_for_cleanup(runtime: &IndicatorRuntime, timeout: Duration) -> std::io::Result<()> {
+async fn wait_for_cleanup(runtime: &SessionRuntime, timeout: Duration) -> std::io::Result<()> {
     tokio::time::timeout(timeout, async {
         while runtime.status()["draining"] == true {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -773,10 +754,10 @@ async fn wait_for_cleanup(runtime: &IndicatorRuntime, timeout: Duration) -> std:
 async fn serve_stdio_inner(
     backend: Arc<dyn PlatformBackend>,
     safety_indicator: SafetyIndicator,
-    indicator_runtime: Option<Arc<IndicatorRuntime>>,
+    session_runtime: Option<Arc<SessionRuntime>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let cleanup = ServerCleanup(indicator_runtime.clone());
-    let server = ControlFreakServer::with_indicator(backend, safety_indicator, indicator_runtime);
+    let cleanup = ServerCleanup(session_runtime.clone());
+    let server = ControlFreakServer::with_indicator(backend, safety_indicator, session_runtime);
     let instance_id = server.diagnostics.instance_id.clone();
     eprintln!(
         "{}",

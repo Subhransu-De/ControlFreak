@@ -648,7 +648,7 @@ fn visible_window_bounds(hwnd: HWND) -> Result<RECT, PlatformError> {
 }
 
 pub(super) fn find_window(window_id: &str) -> Result<WindowInfo, PlatformError> {
-    let (hwnd, expected_process_id) = parse_window_id(window_id)?;
+    let (hwnd, expected_process_id) = resolve_window_reference(window_id)?;
     let window = window_info(hwnd).map_err(|_| PlatformError::InvalidArgument {
         argument: "window_id".to_owned(),
         reason: format!("visible window '{window_id}' was not found; call list_windows again"),
@@ -716,7 +716,7 @@ pub(super) fn window_matches(window: &WindowInfo, request: &WaitForWindowRequest
             .is_none_or(|foreground| window.is_foreground == foreground)
 }
 
-pub(super) fn parse_window_id(window_id: &str) -> Result<(HWND, u32), PlatformError> {
+pub(super) fn resolve_window_reference(window_id: &str) -> Result<(HWND, u32), PlatformError> {
     super::target::resolve(window_id)
 }
 

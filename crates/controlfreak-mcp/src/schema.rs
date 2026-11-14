@@ -1150,7 +1150,7 @@ fn window_screenshot_schema() -> Value {
     def_ref("window_screenshot")
 }
 
-/// Session snapshot from `IndicatorRuntime::status` or the busy fallback of `try_status`.
+/// Session snapshot from `SessionRuntime::status` or the busy fallback of `try_status`.
 fn session_status_schema() -> Value {
     json!({
         "type": "object",

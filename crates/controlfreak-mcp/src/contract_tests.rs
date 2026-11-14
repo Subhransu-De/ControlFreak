@@ -41,7 +41,7 @@ fn window(id: &str) -> WindowInfo {
             height: 300,
         },
         display_id: "main".into(),
-        is_foreground: id == "w1",
+        is_foreground: id == "target-00000000-0000-0000-0000-000000000001",
         is_minimized: false,
         owner: None,
     }
@@ -70,7 +70,10 @@ impl ContractBackend {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             recorded: Mutex::default(),
-            windows: Mutex::new(vec![window("w1"), window("w2")]),
+            windows: Mutex::new(vec![
+                window("target-00000000-0000-0000-0000-000000000001"),
+                window("target-00000000-0000-0000-0000-000000000002"),
+            ]),
             click_error: Mutex::new(None),
         })
     }
@@ -116,7 +119,7 @@ impl BackendMetadata for ContractBackend {
             .unwrap()
             .validated
             .push(target.to_owned());
-        if target.starts_with('w') {
+        if target.starts_with("target-") {
             Ok(())
         } else {
             Err(PlatformError::TargetInvalidated {
@@ -492,7 +495,7 @@ async fn platform_failures_carry_retryable_and_a_stable_reason() {
     let result = call(
         &mut harness,
         CLICK_MOUSE,
-        json!({"target_ref": "w1", "x": 1, "y": 1}),
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000001", "x": 1, "y": 1}),
     )
     .await;
     let error = &result["structuredContent"]["error"];
@@ -583,21 +586,32 @@ async fn target_ref_is_an_alias_of_window_id() {
     let begun = call(
         &mut harness,
         BEGIN_CONTROL_SESSION,
-        json!({"target_ref": "w1"}),
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000001"}),
     )
     .await;
     assert_ne!(begun["isError"], true, "{begun}");
-    let by_alias = call(&mut harness, FOCUS_WINDOW, json!({"target_ref": "w1"})).await;
+    let by_alias = call(
+        &mut harness,
+        FOCUS_WINDOW,
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000001"}),
+    )
+    .await;
     assert_ne!(by_alias["isError"], true, "{by_alias}");
-    assert_eq!(backend.recorded(|r| r.focused[0].window_id.clone()), "w1");
+    assert_eq!(
+        backend.recorded(|r| r.focused[0].window_id.clone()),
+        "target-00000000-0000-0000-0000-000000000001"
+    );
     let both = call(
         &mut harness,
         FOCUS_WINDOW,
-        json!({"window_id": "w1", "target_ref": "w1"}),
+        json!({"window_id": "target-00000000-0000-0000-0000-000000000001", "target_ref": "target-00000000-0000-0000-0000-000000000001"}),
     )
     .await;
     assert_ne!(both["isError"], true, "{both}");
-    for arguments in [json!({"window_id": "w1", "target_ref": "w2"}), json!({})] {
+    for arguments in [
+        json!({"window_id": "target-00000000-0000-0000-0000-000000000001", "target_ref": "target-00000000-0000-0000-0000-000000000002"}),
+        json!({}),
+    ] {
         let refused = call(&mut harness, FOCUS_WINDOW, arguments).await;
         assert_eq!(refused["isError"], true, "{refused}");
         assert_eq!(
@@ -606,18 +620,31 @@ async fn target_ref_is_an_alias_of_window_id() {
         );
         assert_eq!(refused["structuredContent"]["status"], "not_started");
     }
-    let capture = call(&mut harness, CAPTURE_WINDOW, json!({"target_ref": "w2"})).await;
+    let capture = call(
+        &mut harness,
+        CAPTURE_WINDOW,
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000002"}),
+    )
+    .await;
     assert_ne!(capture["isError"], true, "{capture}");
-    assert_eq!(capture["structuredContent"]["window"]["id"], "w2");
+    assert_eq!(
+        capture["structuredContent"]["window"]["id"],
+        "target-00000000-0000-0000-0000-000000000002"
+    );
     let clash = call(
         &mut harness,
         CAPTURE_WINDOW,
-        json!({"window_id": "w1", "target_ref": "w2"}),
+        json!({"window_id": "target-00000000-0000-0000-0000-000000000001", "target_ref": "target-00000000-0000-0000-0000-000000000002"}),
     )
     .await;
     assert_eq!(clash["isError"], true, "{clash}");
     assert!(clash.to_string().contains("alias of window_id"));
-    let waited = call(&mut harness, WAIT_FOR_WINDOW, json!({"target_ref": "w2"})).await;
+    let waited = call(
+        &mut harness,
+        WAIT_FOR_WINDOW,
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000002"}),
+    )
+    .await;
     assert_eq!(waited["isError"], true, "{waited}");
     harness.finish().await;
 }
@@ -638,7 +665,10 @@ async fn switch_virtual_desktop_defaults_its_target_and_ends_the_session() {
     )
     .await;
     assert_ne!(switched["isError"], true, "{switched}");
-    assert_eq!(backend.recorded(|r| r.validated.clone()), ["w1"]);
+    assert_eq!(
+        backend.recorded(|r| r.validated.clone()),
+        ["target-00000000-0000-0000-0000-000000000001"]
+    );
     assert_eq!(backend.recorded(|r| r.switches), 1);
     let status = call(&mut harness, GET_SERVER_STATUS, json!({})).await;
     let session_state = status["structuredContent"]["session"]["state"].clone();
@@ -650,7 +680,7 @@ async fn switch_virtual_desktop_defaults_its_target_and_ends_the_session() {
     call(
         &mut harness,
         BEGIN_CONTROL_SESSION,
-        json!({"target_ref": "w2"}),
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000002"}),
     )
     .await;
     let again = call(
@@ -662,7 +692,7 @@ async fn switch_virtual_desktop_defaults_its_target_and_ends_the_session() {
     assert_ne!(again["isError"], true, "{again}");
     assert_eq!(
         backend.recorded(|r| r.validated.last().cloned()).as_deref(),
-        Some("w2")
+        Some("target-00000000-0000-0000-0000-000000000002")
     );
     let stale = call(
         &mut harness,
@@ -722,13 +752,13 @@ async fn omitted_display_id_means_the_primary_display() {
     call(
         &mut harness,
         BEGIN_CONTROL_SESSION,
-        json!({"target_ref": "w1"}),
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000001"}),
     )
     .await;
     let clicked = call(
         &mut harness,
         CLICK_MOUSE,
-        json!({"target_ref": "w1", "x": 3, "y": 4,
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000001", "x": 3, "y": 4,
                "observation": {"mode": "screenshot", "region": {"x": 0, "y": 0, "width": 5, "height": 5}}}),
     )
     .await;
@@ -773,7 +803,12 @@ async fn explicit_captures_default_to_a_model_friendly_width() {
             .collect::<Vec<_>>()
     });
     assert_eq!(widths, [Some(1280), None, Some(640)]);
-    let window = call(&mut harness, CAPTURE_WINDOW, json!({"window_id": "w1"})).await;
+    let window = call(
+        &mut harness,
+        CAPTURE_WINDOW,
+        json!({"window_id": "target-00000000-0000-0000-0000-000000000001"}),
+    )
+    .await;
     assert_eq!(window["structuredContent"]["image_width"], 400);
     assert_eq!(
         controlfreak_core::limits::DEFAULT_CAPTURE_WIDTH,
@@ -832,7 +867,7 @@ async fn every_wait_tool_accepts_the_same_timeout_range() {
 async fn run_actions_waits_are_bounded_and_never_last() {
     let backend = ContractBackend::new();
     let mut harness = harness(backend.clone()).await;
-    let run = |steps: Value| json!({"target_ref": "w1", "steps": steps});
+    let run = |steps: Value| json!({"target_ref": "target-00000000-0000-0000-0000-000000000001", "steps": steps});
     let ok = call(
         &mut harness,
         RUN_ACTIONS,
@@ -919,7 +954,7 @@ async fn observation_tools_stay_available_after_a_stop() {
     let refused = call(
         &mut harness,
         CLICK_MOUSE,
-        json!({"target_ref": "synthetic", "x": 0, "y": 0}),
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000004", "x": 0, "y": 0}),
     )
     .await;
     assert_eq!(refused["isError"], true, "{refused}");
@@ -938,13 +973,17 @@ async fn a_window_image_stops_mapping_points_once_its_window_changed() {
     call(
         &mut harness,
         BEGIN_CONTROL_SESSION,
-        json!({"target_ref": "w1"}),
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000001"}),
     )
     .await;
-    let capture = call(&mut harness, CAPTURE_WINDOW, json!({"window_id": "w1"})).await;
+    let capture = call(
+        &mut harness,
+        CAPTURE_WINDOW,
+        json!({"window_id": "target-00000000-0000-0000-0000-000000000001"}),
+    )
+    .await;
     let observation_id = capture["structuredContent"]["observation_id"].clone();
-    let click =
-        json!({"target_ref": "w1", "observation_id": observation_id, "image_x": 10, "image_y": 10});
+    let click = json!({"target_ref": "target-00000000-0000-0000-0000-000000000001", "observation_id": observation_id, "image_x": 10, "image_y": 10});
     let first = call(&mut harness, CLICK_MOUSE, click.clone()).await;
     assert_ne!(first["isError"], true, "{first}");
     // The window moves: its reference changes, so the old one is no longer listed.
@@ -964,7 +1003,7 @@ async fn a_window_image_stops_mapping_points_once_its_window_changed() {
 #[test]
 fn unknown_key_errors_suggest_a_name_and_advertised_keys_parse() {
     let error = parse_arguments::<PressKeysInput>(Some(rmcp::object!({
-        "target_ref": "w1", "keys": ["ctlr"]
+        "target_ref": "target-00000000-0000-0000-0000-000000000001", "keys": ["ctlr"]
     })))
     .unwrap_err();
     assert!(
@@ -979,7 +1018,7 @@ fn unknown_key_errors_suggest_a_name_and_advertised_keys_parse() {
         error.message
     );
     let far = parse_arguments::<PressKeysInput>(Some(rmcp::object!({
-        "target_ref": "w1", "keys": ["launch_browser"]
+        "target_ref": "target-00000000-0000-0000-0000-000000000001", "keys": ["launch_browser"]
     })))
     .unwrap_err();
     assert!(!far.message.contains("did you mean"), "{}", far.message);
@@ -1049,7 +1088,7 @@ fn guidance_states_the_foreground_rule_dialogs_and_the_permanent_stop() {
 #[test]
 fn click_mouse_defaults_to_the_left_button() {
     let input = parse_arguments::<ClickMouseInput>(Some(rmcp::object!({
-        "target_ref": "w1", "x": 1, "y": 1
+        "target_ref": "target-00000000-0000-0000-0000-000000000001", "x": 1, "y": 1
     })))
     .unwrap();
     assert_eq!(input.button, MouseButton::Left);

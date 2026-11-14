@@ -4,15 +4,7 @@ use controlfreak_core::{Capability, CapabilityState, OcrRegionRequest, Platform,
 fn backend_matches_compilation_target() {
     let report = controlfreak_platform::backend().report();
 
-    let expected = if cfg!(target_os = "windows") {
-        Platform::Windows
-    } else if cfg!(target_os = "macos") {
-        Platform::MacOs
-    } else if cfg!(target_os = "linux") {
-        Platform::Linux
-    } else {
-        Platform::Unsupported
-    };
+    let expected = Platform::Windows;
 
     assert_eq!(report.backend.platform, expected);
     let supported: Vec<Capability> = report
@@ -21,19 +13,15 @@ fn backend_matches_compilation_target() {
         .filter(|descriptor| matches!(descriptor.state, CapabilityState::Supported))
         .map(|descriptor| descriptor.capability)
         .collect();
-    if cfg!(target_os = "windows") {
-        assert_eq!(
-            supported,
-            [
-                Capability::ScreenCapture,
-                Capability::WindowEnumeration,
-                Capability::PointerMovement,
-                Capability::InputInjection,
-            ]
-        );
-    } else {
-        assert!(supported.is_empty());
-    }
+    assert_eq!(
+        supported,
+        [
+            Capability::ScreenCapture,
+            Capability::WindowEnumeration,
+            Capability::PointerMovement,
+            Capability::InputInjection,
+        ]
+    );
 }
 
 #[cfg(target_os = "windows")]

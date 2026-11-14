@@ -16,19 +16,12 @@ use crate::{
 #[serde(rename_all = "snake_case")]
 pub enum Platform {
     Windows,
-    MacOs,
-    Linux,
-    Unsupported,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DisplayServer {
     Dwm,
-    Quartz,
-    X11,
-    Wayland,
-    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,28 +251,24 @@ pub trait OcrBackend {
         ))
     }
 
-    fn click_text(&self, _request: &ClickTextRequest) -> Result<ClickTextResult, PlatformError> {
+    fn click_text_controlled(
+        &self,
+        _request: &ClickTextRequest,
+        _control: &MutationControl,
+    ) -> Result<ClickTextResult, PlatformError> {
         Err(PlatformError::unsupported(
             "click_text",
             "the active platform backend has no OCR interaction implementation",
         ))
     }
-
-    fn click_text_controlled(
-        &self,
-        request: &ClickTextRequest,
-        control: &MutationControl,
-    ) -> Result<ClickTextResult, PlatformError> {
-        control.check("click_text")?;
-        legacy_mutation(control, || self.click_text(request))
-    }
 }
 
 /// Controls the system pointer.
 pub trait PointerBackend {
-    fn move_mouse(
+    fn move_mouse_controlled(
         &self,
         _request: &MouseMoveRequest,
+        _control: &MutationControl,
     ) -> Result<PointerActionResult, PlatformError> {
         Err(PlatformError::unsupported(
             "move_mouse",
@@ -287,18 +276,10 @@ pub trait PointerBackend {
         ))
     }
 
-    fn move_mouse_controlled(
-        &self,
-        request: &MouseMoveRequest,
-        control: &MutationControl,
-    ) -> Result<PointerActionResult, PlatformError> {
-        control.check("move_mouse")?;
-        legacy_mutation(control, || self.move_mouse(request))
-    }
-
-    fn click_mouse(
+    fn click_mouse_controlled(
         &self,
         _request: &MouseClickRequest,
+        _control: &MutationControl,
     ) -> Result<PointerActionResult, PlatformError> {
         Err(PlatformError::unsupported(
             "click_mouse",
@@ -306,18 +287,10 @@ pub trait PointerBackend {
         ))
     }
 
-    fn click_mouse_controlled(
-        &self,
-        request: &MouseClickRequest,
-        control: &MutationControl,
-    ) -> Result<PointerActionResult, PlatformError> {
-        control.check("click_mouse")?;
-        legacy_mutation(control, || self.click_mouse(request))
-    }
-
-    fn drag_mouse(
+    fn drag_mouse_controlled(
         &self,
         _request: &MouseDragRequest,
+        _control: &MutationControl,
     ) -> Result<PointerActionResult, PlatformError> {
         Err(PlatformError::unsupported(
             "drag_mouse",
@@ -325,32 +298,15 @@ pub trait PointerBackend {
         ))
     }
 
-    fn drag_mouse_controlled(
-        &self,
-        request: &MouseDragRequest,
-        control: &MutationControl,
-    ) -> Result<PointerActionResult, PlatformError> {
-        control.check("drag_mouse")?;
-        legacy_mutation(control, || self.drag_mouse(request))
-    }
-
-    fn scroll_mouse(
+    fn scroll_mouse_controlled(
         &self,
         _request: &MouseScrollRequest,
+        _control: &MutationControl,
     ) -> Result<PointerActionResult, PlatformError> {
         Err(PlatformError::unsupported(
             "scroll_mouse",
             "the active platform backend has no pointer-scroll implementation",
         ))
-    }
-
-    fn scroll_mouse_controlled(
-        &self,
-        request: &MouseScrollRequest,
-        control: &MutationControl,
-    ) -> Result<PointerActionResult, PlatformError> {
-        control.check("scroll_mouse")?;
-        legacy_mutation(control, || self.scroll_mouse(request))
     }
 }
 
@@ -370,9 +326,10 @@ pub trait WindowBackend {
         ))
     }
 
-    fn switch_virtual_desktop(
+    fn switch_virtual_desktop_controlled(
         &self,
         _request: &VirtualDesktopSwitchRequest,
+        _control: &MutationControl,
     ) -> Result<VirtualDesktopSwitchResult, PlatformError> {
         Err(PlatformError::unsupported(
             "switch_virtual_desktop",
@@ -380,32 +337,15 @@ pub trait WindowBackend {
         ))
     }
 
-    fn switch_virtual_desktop_controlled(
-        &self,
-        request: &VirtualDesktopSwitchRequest,
-        control: &MutationControl,
-    ) -> Result<VirtualDesktopSwitchResult, PlatformError> {
-        control.check("switch_virtual_desktop")?;
-        legacy_mutation(control, || self.switch_virtual_desktop(request))
-    }
-
-    fn focus_window(
+    fn focus_window_controlled(
         &self,
         _request: &FocusWindowRequest,
+        _control: &MutationControl,
     ) -> Result<WindowFocusResult, PlatformError> {
         Err(PlatformError::unsupported(
             "focus_window",
             "the active platform backend has no window-focus implementation",
         ))
-    }
-
-    fn focus_window_controlled(
-        &self,
-        request: &FocusWindowRequest,
-        control: &MutationControl,
-    ) -> Result<WindowFocusResult, PlatformError> {
-        control.check("focus_window")?;
-        legacy_mutation(control, || self.focus_window(request))
     }
 
     fn capture_window(
@@ -442,9 +382,10 @@ pub trait WindowBackend {
 
 /// Sends keyboard shortcuts and Unicode text.
 pub trait KeyboardBackend {
-    fn press_keys(
+    fn press_keys_controlled(
         &self,
         _request: &KeyChordRequest,
+        _control: &MutationControl,
     ) -> Result<KeyboardActionResult, PlatformError> {
         Err(PlatformError::unsupported(
             "press_keys",
@@ -452,32 +393,15 @@ pub trait KeyboardBackend {
         ))
     }
 
-    fn press_keys_controlled(
-        &self,
-        request: &KeyChordRequest,
-        control: &MutationControl,
-    ) -> Result<KeyboardActionResult, PlatformError> {
-        control.check("press_keys")?;
-        legacy_mutation(control, || self.press_keys(request))
-    }
-
-    fn type_text(
+    fn type_text_controlled(
         &self,
         _request: &TextInputRequest,
+        _control: &MutationControl,
     ) -> Result<KeyboardActionResult, PlatformError> {
         Err(PlatformError::unsupported(
             "type_text",
             "the active platform backend has no text-input implementation",
         ))
-    }
-
-    fn type_text_controlled(
-        &self,
-        request: &TextInputRequest,
-        control: &MutationControl,
-    ) -> Result<KeyboardActionResult, PlatformError> {
-        control.check("type_text")?;
-        legacy_mutation(control, || self.type_text(request))
     }
 }
 
@@ -497,67 +421,9 @@ impl<T> PlatformBackend for T where
 {
 }
 
-// Legacy implementations cannot expose dispatch progress. Treat their failures as uncertain,
-// except explicit unsupported responses, which promise that no action was available.
-fn legacy_mutation<T>(
-    control: &MutationControl,
-    operation: impl FnOnce() -> Result<T, PlatformError>,
-) -> Result<T, PlatformError> {
-    let previous_cleanup = control.progress().cleanup;
-    let previous = control.dispatch_started();
-    // Legacy implementations cannot acknowledge release cleanup, including during unwinding.
-    control.cleanup_status(crate::CleanupStatus::Unknown);
-    let result = operation();
-    let unsupported = matches!(result, Err(PlatformError::Unsupported { .. }));
-    if unsupported {
-        control.dispatch_rejected(previous);
-    }
-    if result.is_ok() || unsupported {
-        control.cleanup_status(previous_cleanup);
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CleanupStatus, InputOutcome};
-
-    #[test]
-    fn legacy_results_preserve_only_known_delivery_and_cleanup() {
-        for (result, expected_input, expected_cleanup) in [
-            (Ok(()), InputOutcome::Unknown, CleanupStatus::NotNeeded),
-            (
-                Err(PlatformError::unsupported("synthetic", "unsupported")),
-                InputOutcome::NotStarted,
-                CleanupStatus::NotNeeded,
-            ),
-            (
-                Err(PlatformError::Unavailable {
-                    reason: "provider disconnected".into(),
-                }),
-                InputOutcome::Unknown,
-                CleanupStatus::Unknown,
-            ),
-        ] {
-            let control = MutationControl::default();
-            let expected_result = result.clone();
-            assert_eq!(legacy_mutation(&control, || result), expected_result);
-            assert_eq!(control.progress().input_outcome, expected_input);
-            assert_eq!(control.progress().cleanup, expected_cleanup);
-        }
-    }
-
-    #[test]
-    fn legacy_panic_leaves_delivery_and_cleanup_unknown() {
-        let control = MutationControl::default();
-        let result = std::panic::catch_unwind(|| {
-            legacy_mutation::<()>(&control, || panic!("injected provider panic"))
-        });
-        assert!(result.is_err());
-        assert_eq!(control.progress().input_outcome, InputOutcome::Unknown);
-        assert_eq!(control.progress().cleanup, CleanupStatus::Unknown);
-    }
 
     /// Reports the query as visible on passes `visible_from..visible_until`.
     struct ScriptedText {

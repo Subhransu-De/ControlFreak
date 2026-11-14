@@ -44,7 +44,7 @@ async fn cancelled_response_stays_draining_until_indicator_cleanup_returns() {
     let (finish, receiver) = mpsc::channel();
     let receiver = Arc::new(Mutex::new(receiver));
     let fixture = Arc::new(Fixture::default());
-    let runtime = Arc::new(IndicatorRuntime::new_with_timing(
+    let runtime = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         move || {
             Ok(BlockingHide {
@@ -236,9 +236,9 @@ impl ActivityIndicator for Indicator {
     }
 }
 impl Fixture {
-    fn runtime(self: &Arc<Self>) -> Arc<IndicatorRuntime> {
+    fn runtime(self: &Arc<Self>) -> Arc<SessionRuntime> {
         let fixture = Arc::clone(self);
-        let mut runtime = IndicatorRuntime::new_with_timing(
+        let mut runtime = SessionRuntime::new_with_timing(
             SafetyIndicator::dormant(),
             move || Ok(Indicator(Arc::clone(&fixture))),
             Arc::clone(self) as Arc<dyn ActivityArbitrator>,

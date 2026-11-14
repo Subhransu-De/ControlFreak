@@ -11,8 +11,8 @@ struct TestBackend;
 impl BackendMetadata for TestBackend {
     fn identity(&self) -> BackendIdentity {
         BackendIdentity {
-            platform: Platform::Unsupported,
-            display_server: DisplayServer::Unknown,
+            platform: Platform::Windows,
+            display_server: DisplayServer::Dwm,
             backend_id: "test".to_owned(),
         }
     }

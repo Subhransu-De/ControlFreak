@@ -113,7 +113,7 @@ use desktop::{
     ComApartment, activate_window, current_cursor_position, current_virtual_desktop_id,
     ensure_dpi_awareness, enumerate_displays, enumerate_window_candidates, enumerate_windows,
     find_display, find_display_at_point, find_window, foreground_window_handle, issue_candidate,
-    parse_window_id, restore_window, validate_window_wait, virtual_desktop_manager,
+    resolve_window_reference, restore_window, validate_window_wait, virtual_desktop_manager,
     window_desktop_id, window_info, window_is_on_current_desktop, window_matches,
 };
 use environment::ensure_interactive_input_desktop;
@@ -408,7 +408,10 @@ impl DisplayBackend for Backend {
         &self,
         request: &WaitForVisualChangeRequest,
     ) -> Result<VisualChangeResult, PlatformError> {
-        self.wait_for_visual_change_controlled(request, &MutationControl::default())
+        self.wait_for_visual_change_controlled(
+            request,
+            &controlfreak_core::MutationControl::default(),
+        )
     }
 
     fn wait_for_visual_change_controlled(
@@ -491,7 +494,10 @@ impl DisplayBackend for Backend {
         &self,
         request: &WaitForChangeSinceRequest,
     ) -> Result<VisualChangeResult, PlatformError> {
-        self.wait_for_change_since_controlled(request, &MutationControl::default())
+        self.wait_for_change_since_controlled(
+            request,
+            &controlfreak_core::MutationControl::default(),
+        )
     }
 
     fn wait_for_change_since_controlled(
@@ -582,7 +588,7 @@ fn ensure_baseline_display(
 
 impl OcrBackend for Backend {
     fn read_text_in_region(&self, request: &OcrRegionRequest) -> Result<OcrResult, PlatformError> {
-        self.read_text_in_region_controlled(request, &MutationControl::default())
+        self.read_text_in_region_controlled(request, &controlfreak_core::MutationControl::default())
     }
 
     fn read_text_in_region_controlled(
@@ -598,7 +604,7 @@ impl OcrBackend for Backend {
         &self,
         request: &FindTextRequest,
     ) -> Result<FindTextResult, PlatformError> {
-        self.find_text_on_screen_controlled(request, &MutationControl::default())
+        self.find_text_on_screen_controlled(request, &controlfreak_core::MutationControl::default())
     }
 
     fn find_text_on_screen_controlled(
@@ -660,10 +666,6 @@ impl OcrBackend for Backend {
             last = Some((result.clone(), generation));
             Ok(result)
         })
-    }
-
-    fn click_text(&self, request: &ClickTextRequest) -> Result<ClickTextResult, PlatformError> {
-        self.click_text_controlled(request, &MutationControl::default())
     }
 
     fn click_text_controlled(
@@ -741,7 +743,7 @@ impl WindowBackend for Backend {
         let mut current_ids = std::collections::BTreeSet::<String>::new();
         let mut grouped = std::collections::BTreeMap::<String, Vec<WindowInfo>>::new();
         for window in enumerate_windows()?.0 {
-            let Ok((hwnd, _)) = parse_window_id(&window.id) else {
+            let Ok((hwnd, _)) = resolve_window_reference(&window.id) else {
                 continue;
             };
             let Ok(desktop_id) = window_desktop_id(&manager, hwnd) else {
@@ -776,13 +778,6 @@ impl WindowBackend for Backend {
             order_available: false,
             names_available: false,
         })
-    }
-
-    fn switch_virtual_desktop(
-        &self,
-        request: &VirtualDesktopSwitchRequest,
-    ) -> Result<VirtualDesktopSwitchResult, PlatformError> {
-        self.switch_virtual_desktop_controlled(request, &MutationControl::default())
     }
 
     fn switch_virtual_desktop_controlled(
@@ -832,13 +827,6 @@ impl WindowBackend for Backend {
         })
     }
 
-    fn focus_window(
-        &self,
-        request: &FocusWindowRequest,
-    ) -> Result<WindowFocusResult, PlatformError> {
-        self.focus_window_controlled(request, &MutationControl::default())
-    }
-
     fn focus_window_controlled(
         &self,
         request: &FocusWindowRequest,
@@ -855,7 +843,7 @@ impl WindowBackend for Backend {
             ));
         }
         let window = find_window(&request.window_id)?;
-        let (hwnd, _) = parse_window_id(&request.window_id)?;
+        let (hwnd, _) = resolve_window_reference(&request.window_id)?;
         Self::ensure_window_input_target("focus_window", hwnd)?;
 
         let mut driver = NativeActivation {
@@ -908,7 +896,7 @@ impl WindowBackend for Backend {
             });
         }
         let bounds = display_bounds_from_window(window.bounds);
-        let (hwnd, _) = parse_window_id(&request.window_id)?;
+        let (hwnd, _) = resolve_window_reference(&request.window_id)?;
         // The window renders itself, so a window covered by others is captured as itself; a
         // window that cannot is copied from the screen, and `capture_method` says which.
         let capture =
@@ -934,7 +922,7 @@ impl WindowBackend for Backend {
         &self,
         request: &WaitForWindowRequest,
     ) -> Result<WindowWaitResult, PlatformError> {
-        self.wait_for_window_controlled(request, &MutationControl::default())
+        self.wait_for_window_controlled(request, &controlfreak_core::MutationControl::default())
     }
 
     fn wait_for_window_controlled(
@@ -950,7 +938,7 @@ impl WindowBackend for Backend {
         loop {
             // A window_id names one handle; matching it never depends on the list_windows cap.
             let target = match &request.window_id {
-                Some(id) => match parse_window_id(id) {
+                Some(id) => match resolve_window_reference(id) {
                     Ok((hwnd, _)) => Some(hwnd),
                     Err(_) => None,
                 },
@@ -1478,11 +1466,17 @@ mod tests {
         };
 
         assert!(matches!(
-            backend.scroll_mouse(&request(0, 0)),
+            backend.scroll_mouse_controlled(
+                &request(0, 0),
+                &controlfreak_core::MutationControl::default()
+            ),
             Err(PlatformError::InvalidArgument { .. })
         ));
         assert!(matches!(
-            backend.scroll_mouse(&request(12_001, 0)),
+            backend.scroll_mouse_controlled(
+                &request(12_001, 0),
+                &controlfreak_core::MutationControl::default()
+            ),
             Err(PlatformError::InvalidArgument { .. })
         ));
     }
@@ -1590,62 +1584,80 @@ mod tests {
         };
         let requests = [
             backend
-                .move_mouse(&MouseMoveRequest {
-                    display_id: "synthetic".into(),
-                    x: 0,
-                    y: 0,
-                    duration_ms: 0,
-                    observation: observation.clone(),
-                })
+                .move_mouse_controlled(
+                    &MouseMoveRequest {
+                        display_id: "synthetic".into(),
+                        x: 0,
+                        y: 0,
+                        duration_ms: 0,
+                        observation: observation.clone(),
+                    },
+                    &controlfreak_core::MutationControl::default(),
+                )
                 .map(|_| ()),
             backend
-                .click_mouse(&MouseClickRequest {
-                    display_id: "synthetic".into(),
-                    x: 0,
-                    y: 0,
-                    duration_ms: 0,
-                    button: MouseButton::Left,
-                    click_count: 1,
-                    modifiers: vec![],
-                    observation: observation.clone(),
-                })
+                .click_mouse_controlled(
+                    &MouseClickRequest {
+                        display_id: "synthetic".into(),
+                        x: 0,
+                        y: 0,
+                        duration_ms: 0,
+                        button: MouseButton::Left,
+                        click_count: 1,
+                        modifiers: vec![],
+                        observation: observation.clone(),
+                    },
+                    &controlfreak_core::MutationControl::default(),
+                )
                 .map(|_| ()),
             backend
-                .scroll_mouse(&MouseScrollRequest {
-                    display_id: "synthetic".into(),
-                    x: 0,
-                    y: 0,
-                    duration_ms: 0,
-                    delta_x: 0,
-                    delta_y: 120,
-                    observation: observation.clone(),
-                })
+                .scroll_mouse_controlled(
+                    &MouseScrollRequest {
+                        display_id: "synthetic".into(),
+                        x: 0,
+                        y: 0,
+                        duration_ms: 0,
+                        delta_x: 0,
+                        delta_y: 120,
+                        observation: observation.clone(),
+                    },
+                    &controlfreak_core::MutationControl::default(),
+                )
                 .map(|_| ()),
             backend
-                .drag_mouse(&MouseDragRequest {
-                    start_display_id: "synthetic".into(),
-                    end_display_id: "synthetic".into(),
-                    start_x: 0,
-                    start_y: 0,
-                    end_x: 1,
-                    end_y: 1,
-                    duration_ms: 0,
-                    button: MouseButton::Left,
-                    modifiers: vec![],
-                    observation: observation.clone(),
-                })
+                .drag_mouse_controlled(
+                    &MouseDragRequest {
+                        start_display_id: "synthetic".into(),
+                        end_display_id: "synthetic".into(),
+                        start_x: 0,
+                        start_y: 0,
+                        end_x: 1,
+                        end_y: 1,
+                        duration_ms: 0,
+                        button: MouseButton::Left,
+                        modifiers: vec![],
+                        observation: observation.clone(),
+                    },
+                    &controlfreak_core::MutationControl::default(),
+                )
                 .map(|_| ()),
             backend
-                .press_keys(&KeyChordRequest {
-                    keys: vec![Key::Enter],
-                    observation: observation.clone(),
-                })
+                .press_keys_controlled(
+                    &KeyChordRequest {
+                        keys: vec![Key::Enter],
+                        observation: observation.clone(),
+                    },
+                    &controlfreak_core::MutationControl::default(),
+                )
                 .map(|_| ()),
             backend
-                .type_text(&TextInputRequest {
-                    text: "synthetic".into(),
-                    observation,
-                })
+                .type_text_controlled(
+                    &TextInputRequest {
+                        text: "synthetic".into(),
+                        observation,
+                    },
+                    &controlfreak_core::MutationControl::default(),
+                )
                 .map(|_| ()),
         ];
         for result in requests {

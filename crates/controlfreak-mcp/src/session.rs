@@ -178,8 +178,10 @@ pub trait ActivityArbitrator: Send + Sync {
     fn release(&self);
 }
 
+#[cfg(test)]
 pub(super) struct LocalArbitrator;
 
+#[cfg(test)]
 impl ActivityArbitrator for LocalArbitrator {
     fn try_acquire(&self) -> Result<(), ArbitrationError> {
         Ok(())
@@ -347,7 +349,7 @@ impl ControlSession {
     }
 }
 
-pub(super) struct IndicatorRuntimeState {
+pub(super) struct SessionRuntimeState {
     control: Option<IndicatorControl>,
     active_mutations: usize,
     pub(super) generation: u64,
@@ -357,9 +359,9 @@ pub(super) struct IndicatorRuntimeState {
     pub(super) session: ControlSession,
 }
 
-pub(super) struct IndicatorRuntime {
+pub(super) struct SessionRuntime {
     pub(super) stop: controlfreak_core::StopController,
-    pub(super) state: Mutex<IndicatorRuntimeState>,
+    pub(super) state: Mutex<SessionRuntimeState>,
     lifecycle: Mutex<()>,
     pub(super) idle_worker: Mutex<Option<IdleWorker>>,
     safety_indicator: SafetyIndicator,
@@ -384,7 +386,7 @@ pub(super) struct IdleWorker {
     pub(super) thread: Option<thread::JoinHandle<()>>,
 }
 
-impl IndicatorRuntime {
+impl SessionRuntime {
     #[cfg(test)]
     pub(super) fn new_with_idle_delay<F, G>(
         safety_indicator: SafetyIndicator,
@@ -419,7 +421,7 @@ impl IndicatorRuntime {
     {
         Self {
             stop: controlfreak_core::StopController::default(),
-            state: Mutex::new(IndicatorRuntimeState {
+            state: Mutex::new(SessionRuntimeState {
                 control: None,
                 active_mutations: 0,
                 generation: 0,
@@ -1060,7 +1062,7 @@ impl IndicatorRuntime {
         Self::status_snapshot(&state)
     }
 
-    fn status_snapshot(state: &IndicatorRuntimeState) -> Value {
+    fn status_snapshot(state: &SessionRuntimeState) -> Value {
         let remaining_ms = state.session.close_deadline.map(|deadline| {
             u64::try_from(
                 deadline
@@ -1171,7 +1173,7 @@ pub(super) fn reads_the_screen(tool: &str) -> bool {
 }
 
 fn idle_worker_loop(
-    runtime: &std::sync::Weak<IndicatorRuntime>,
+    runtime: &std::sync::Weak<SessionRuntime>,
     receiver: &mpsc::Receiver<IdleCommand>,
 ) {
     let mut pending: Option<(u64, Instant)> = None;
@@ -1212,7 +1214,7 @@ fn idle_worker_loop(
 }
 
 pub(super) struct OperationLease {
-    runtime: Arc<IndicatorRuntime>,
+    runtime: Arc<SessionRuntime>,
     control: MutationControl,
 }
 
@@ -1233,7 +1235,7 @@ impl Drop for OperationLease {
  * above. Keep all teardown after this point outside the state mutex.
  */
 
-impl Drop for IndicatorRuntime {
+impl Drop for SessionRuntime {
     fn drop(&mut self) {
         if let Some(mut worker) = self
             .idle_worker

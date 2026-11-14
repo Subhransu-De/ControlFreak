@@ -15,8 +15,8 @@ use controlfreak_core::{
 
 use super::{
     ActivityArbitrator, ActivityIndicator, ArbitrationBusy, ArbitrationError, BeginSessionError,
-    CaptureDisplayInput, FocusWindowInput, GlowTiming, IndicatorHealth, IndicatorRuntime,
-    PressKeysInput, SafetyIndicator, handlers::run_platform_operation, parse_arguments,
+    CaptureDisplayInput, FocusWindowInput, GlowTiming, IndicatorHealth, PressKeysInput,
+    SafetyIndicator, SessionRuntime, handlers::run_platform_operation, parse_arguments,
     pointer_result, tool_error, tool_execution_error, tools,
 };
 
@@ -41,7 +41,7 @@ async fn wait_for_status(indicator: &SafetyIndicator, expected: &str) {
 
 // Keep scheduled deadlines queued so tests can deliver timeout callbacks in
 // an exact order, without racing the OS clock or changing production timing.
-fn manual_timeouts(runtime: &IndicatorRuntime) -> mpsc::Receiver<super::IdleCommand> {
+fn manual_timeouts(runtime: &SessionRuntime) -> mpsc::Receiver<super::IdleCommand> {
     let (sender, receiver) = mpsc::channel();
     *runtime.idle_worker.lock().unwrap() = Some(super::IdleWorker {
         sender,
@@ -50,7 +50,7 @@ fn manual_timeouts(runtime: &IndicatorRuntime) -> mpsc::Receiver<super::IdleComm
     receiver
 }
 
-fn expire_current_timeout(runtime: &IndicatorRuntime) {
+fn expire_current_timeout(runtime: &SessionRuntime) {
     let generation = runtime.state.lock().unwrap().generation;
     runtime.close_if_idle(generation);
 }
@@ -123,7 +123,7 @@ impl ActivityArbitrator for BrokenArbitrator {
 #[test]
 fn failed_arbitration_is_not_reported_as_a_busy_desktop() {
     let starts = Arc::new(AtomicUsize::new(0));
-    let runtime = Arc::new(IndicatorRuntime::new_with_timing(
+    let runtime = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         {
             let starts = Arc::clone(&starts);
@@ -246,7 +246,7 @@ async fn operation_leases_start_once_and_hide_after_the_last_call() {
     let indicator = SafetyIndicator::dormant();
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         move || {
             starts_for_runtime.fetch_add(1, Ordering::Relaxed);
@@ -290,7 +290,7 @@ async fn final_mutation_preserves_the_helper_failure_reason() {
     let health = Arc::new(Mutex::new(IndicatorHealth::Healthy));
     let health_for_runtime = Arc::clone(&health);
     let indicator = SafetyIndicator::dormant();
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         move || {
             Ok(HealthControlledIndicator {
@@ -317,7 +317,7 @@ async fn a_new_operation_cancels_the_pending_hide() {
     let indicator = SafetyIndicator::dormant();
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         move || {
             Ok(RecordingIndicator {
@@ -355,7 +355,7 @@ async fn sequential_operations_reuse_one_idle_worker() {
     let indicator = SafetyIndicator::dormant();
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         move || {
             Ok(RecordingIndicator {
@@ -387,7 +387,7 @@ async fn a_hide_failure_shuts_down_the_helper_and_degrades_status() {
     let indicator = SafetyIndicator::dormant();
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         move || {
             Ok(RecordingIndicator {
@@ -411,7 +411,7 @@ async fn a_hide_failure_shuts_down_the_helper_and_degrades_status() {
 #[tokio::test]
 async fn overlapping_operations_revalidate_helper_visibility() {
     let indicator = SafetyIndicator::dormant();
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         || Ok(FailingSecondShowIndicator { shows: 0 }),
         Duration::from_millis(10),
@@ -433,7 +433,7 @@ async fn a_hide_failure_restarts_the_helper_on_the_next_mutation() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
     let indicator = SafetyIndicator::dormant();
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         move || {
             Ok(RecordingIndicator {
@@ -457,7 +457,7 @@ async fn a_hide_failure_restarts_the_helper_on_the_next_mutation() {
 fn begin_clamps_expected_seconds_and_end_hides_immediately() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_timing(
+    let runtime = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         move || {
             Ok(RecordingIndicator {
@@ -520,7 +520,7 @@ fn begin_clamps_expected_seconds_and_end_hides_immediately() {
 async fn begin_keeps_acting_while_a_mutation_is_in_flight() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         SafetyIndicator::dormant(),
         move || {
             Ok(RecordingIndicator {
@@ -547,7 +547,7 @@ async fn begin_keeps_acting_while_a_mutation_is_in_flight() {
 async fn explicit_session_hold_survives_the_first_mutation() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_timing(
+    let runtime = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         move || {
             Ok(RecordingIndicator {
@@ -585,7 +585,7 @@ fn refused_server_stays_dark_until_the_owner_ends() {
     let first_events = Arc::new(Mutex::new(Vec::new()));
     let second_events = Arc::new(Mutex::new(Vec::new()));
     let second_starts = Arc::new(AtomicUsize::new(0));
-    let first = Arc::new(IndicatorRuntime::new_with_timing(
+    let first = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         {
             let events = Arc::clone(&first_events);
@@ -605,7 +605,7 @@ fn refused_server_stays_dark_until_the_owner_ends() {
             max_hold: Duration::from_secs(1),
         },
     ));
-    let second = Arc::new(IndicatorRuntime::new_with_timing(
+    let second = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         {
             let events = Arc::clone(&second_events);
@@ -643,7 +643,7 @@ fn refused_server_stays_dark_until_the_owner_ends() {
 fn failed_helper_start_releases_arbitration_for_the_next_server() {
     let owned = Arc::new(AtomicBool::new(false));
     let failed_starts = Arc::new(AtomicUsize::new(0));
-    let first = Arc::new(IndicatorRuntime::new_with_timing(
+    let first = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         {
             let failed_starts = Arc::clone(&failed_starts);
@@ -662,7 +662,7 @@ fn failed_helper_start_releases_arbitration_for_the_next_server() {
         },
     ));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let second = Arc::new(IndicatorRuntime::new_with_timing(
+    let second = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
         {
             let events = Arc::clone(&events);
@@ -701,7 +701,7 @@ fn failed_helper_start_releases_arbitration_for_the_next_server() {
 async fn end_waits_for_the_outstanding_mutation_guard() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         SafetyIndicator::dormant(),
         move || {
             Ok(RecordingIndicator {
@@ -731,7 +731,7 @@ async fn cancelling_acquisition_releases_the_completed_worker_lease() {
     let started_for_worker = Arc::clone(&started);
     let (continue_tx, continue_rx) = mpsc::sync_channel(1);
     let continue_rx = Arc::new(Mutex::new(continue_rx));
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         move || {
             started_for_worker.notify_one();
@@ -765,7 +765,7 @@ async fn cancelling_a_request_keeps_the_glow_until_blocking_work_ends() {
     let indicator = SafetyIndicator::dormant();
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_for_runtime = Arc::clone(&events);
-    let runtime = Arc::new(IndicatorRuntime::new_with_idle_delay(
+    let runtime = Arc::new(SessionRuntime::new_with_idle_delay(
         indicator.clone(),
         move || {
             Ok(RecordingIndicator {
