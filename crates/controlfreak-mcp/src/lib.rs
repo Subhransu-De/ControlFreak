@@ -196,6 +196,15 @@ impl ServerHandler for ControlFreakServer {
     async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
         let stop = self.stop.clone();
         tokio::spawn(async move {
+            // The stop latch wakes this task; the timeout below only notices a closed transport.
+            let changed = Arc::new(tokio::sync::Notify::new());
+            let waker = Arc::downgrade(&changed);
+            stop.subscribe(move || {
+                waker
+                    .upgrade()
+                    .map(|changed| changed.notify_one())
+                    .is_some()
+            });
             while !context.peer.is_transport_closed() {
                 if stop.user_stopped() {
                     let notification = rmcp::model::CustomNotification::new(
@@ -216,7 +225,7 @@ impl ServerHandler for ControlFreakServer {
                         .await;
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                let _ = tokio::time::timeout(Duration::from_secs(5), changed.notified()).await;
             }
         });
     }
@@ -259,6 +268,10 @@ impl ServerHandler for ControlFreakServer {
             let request_stages = Arc::new(std::sync::Mutex::new(Vec::new()));
             let worker_stages = Arc::clone(&request_stages);
             let request_future = async move {
+                if session::reads_the_screen(&request.name) {
+                    // Lets the indicator show a brief "reading" state; it claims no session.
+                    stop.note_observation();
+                }
                 if request.name == "stop_desktop_work" {
                     parse_arguments::<NoArguments>(request.arguments)?;
                     stop.stop();

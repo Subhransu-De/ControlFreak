@@ -91,17 +91,23 @@ indicator helper lifecycle, helper stderr, and error text. That log carries no d
 
 ## User stop and cancellation
 
-A native session tab on every display and a physical Esc latch stop independently
+A native session tab on every display, a **Stop agent** button on it and a physical Esc latch stop independently
 of MCP transport and provider progress. The tab is visible while this server owns
-the desktop, including cleanup, then says for 2.5 seconds that control was handed
+the desktop, including cleanup, then says briefly that control was handed
 back. After a cleanup failure it stays, unchanged and with recovery steps,
-until the server exits. It never takes focus or receives clicks, follows
+until the server exits. The tab itself never takes focus or receives clicks, follows
 the foreground virtual desktop, and is excluded from screen capture like the
-lamp. A dedicated keyboard hook examines key identity
+lamp. Only the Stop button takes clicks. It is a standard native button on its own window, so a mouse, touch, pen and accessibility tools (UI Automation Invoke) can press it. The agent cannot: its input tools are injected input, and the button's window procedure drops mouse and key messages whose origin is injected before the button sees them (if the system cannot be asked, the message counts as injected). A pointer action over the button is also refused, because the window under the point belongs to ControlFreak and not to the approved target. A press is a user stop with the same effects as Esc. The button appears only while the tab says an agent is working or waiting.
+
+The keyboard hook exists only while this server owns a session. It runs on a dedicated thread that does nothing but wait for session changes and service the hook, is installed when a session begins and removed when it ends, and a server that never starts a session never installs one. The tab says "Press Esc to stop" only after the hook is confirmed installed; if installation fails the Esc hint is omitted, the failure is logged to standard error, and the Stop button remains the stop control. The hook examines key identity
 and injection flags only to recognize physical Esc. It retains no typed values
 or keyboard history, ignores injected Esc, and consumes the stop key's press and
 release. Esc outside an owned session is passed through. A user-stop notification
 is sent over MCP and its reason remains available in status and refused actions.
+
+The tab and Stop button start with the first session. If they cannot start, sessions are refused with the reason and read-only tools keep working. If the tab fails after it started, the server fails closed: admission closes for the rest of the server's life and the reason is kept in refusals, in `get_server_status` (`safety_indicator.reason`) and on standard error.
+
+Observation tools that read the screen show a brief "reading the screen" state on the tab. It claims no session, takes no keys and offers no stop control, because there is nothing to stop.
 Clients may also stop all desktop work or cancel
 one request. No MCP call clears the stop latch. User-controlled server restart is
 the re-arming procedure, after draining and resolving any cleanup failure.
