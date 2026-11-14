@@ -77,14 +77,14 @@ pub(super) async fn call(harness: &mut Harness, name: &str, arguments: Value) ->
 fn begin() -> (&'static str, Value) {
     (
         BEGIN_CONTROL_SESSION,
-        json!({"target_ref": "fixture", "expected_seconds": 5}),
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000003", "expected_seconds": 5}),
     )
 }
 
 fn mutate() -> (&'static str, Value) {
     (
         MOVE_MOUSE,
-        json!({"display_id":"synthetic","x":0,"y":0,"target_ref":"fixture"}),
+        json!({"display_id":"synthetic","x":0,"y":0,"target_ref": "target-00000000-0000-0000-0000-000000000003"}),
     )
 }
 
@@ -317,7 +317,9 @@ fn a_session_is_admitted_only_after_the_esc_hook_is_confirmed() {
     let runtime = escape_runtime(Arc::clone(&owned));
     fake_escape_monitor(runtime.stop.clone(), Ok(()));
     let started = Instant::now();
-    runtime.begin_session(None, "fixture").unwrap();
+    runtime
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
     assert!(
         started.elapsed() >= Duration::from_millis(50),
         "admission waited for the hook"
@@ -331,7 +333,9 @@ fn a_session_is_refused_with_the_reason_when_the_esc_hook_cannot_be_installed() 
     let owned = Arc::new(AtomicBool::new(false));
     let runtime = escape_runtime(Arc::clone(&owned));
     fake_escape_monitor(runtime.stop.clone(), Err("hook refused"));
-    let error = runtime.begin_session(None, "fixture").unwrap_err();
+    let error = runtime
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap_err();
     let message = format!("{error:?}");
     assert!(message.contains("hook refused"), "{message}");
     assert!(message.contains("Esc"), "{message}");

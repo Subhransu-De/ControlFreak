@@ -142,7 +142,9 @@ fn failed_arbitration_is_not_reported_as_a_busy_desktop() {
             max_hold: Duration::from_secs(1),
         },
     ));
-    let Err(BeginSessionError::Session(error)) = runtime.begin_session(None, "synthetic") else {
+    let Err(BeginSessionError::Session(error)) =
+        runtime.begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+    else {
         panic!("broken arbitration must refuse the session");
     };
     let result = error.into_tool_result(&SafetyIndicator::dormant());
@@ -506,7 +508,10 @@ fn begin_clamps_expected_seconds_and_end_hides_immediately() {
         }
     });
     assert_eq!(snapshot(), before);
-    assert_eq!(runtime.status()["approved_target_ref"], "synthetic");
+    assert_eq!(
+        runtime.status()["approved_target_ref"],
+        "target-00000000-0000-0000-0000-000000000003"
+    );
     assert_eq!(*events.lock().unwrap(), ["armed"]);
     runtime.end_session().unwrap();
 
@@ -532,7 +537,9 @@ async fn begin_keeps_acting_while_a_mutation_is_in_flight() {
     ));
 
     let lease = runtime.acquire().await.unwrap();
-    runtime.begin_session(None, "synthetic").unwrap();
+    runtime
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
 
     assert_eq!(runtime.status()["state"], "acting");
     assert_eq!(runtime.status()["active_mutations"], 1);
@@ -628,13 +635,21 @@ fn refused_server_stays_dark_until_the_owner_ends() {
         },
     ));
 
-    first.begin_session(None, "synthetic").unwrap();
-    assert!(second.begin_session(None, "synthetic").is_err());
+    first
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
+    assert!(
+        second
+            .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+            .is_err()
+    );
     assert_eq!(second_starts.load(Ordering::Relaxed), 0);
     assert!(second_events.lock().unwrap().is_empty());
 
     first.end_session().unwrap();
-    second.begin_session(None, "synthetic").unwrap();
+    second
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
     assert_eq!(*second_events.lock().unwrap(), ["armed"]);
     second.end_session().unwrap();
 }
@@ -684,7 +699,7 @@ fn failed_helper_start_releases_arbitration_for_the_next_server() {
     ));
 
     assert!(matches!(
-        first.begin_session(None, "synthetic").unwrap_err(),
+        first.begin_session(None, "target-00000000-0000-0000-0000-000000000003").unwrap_err(),
         BeginSessionError::Session(super::SessionError::Indicator(reason))
             if reason == "native indicator initialization failed"
     ));
@@ -692,7 +707,9 @@ fn failed_helper_start_releases_arbitration_for_the_next_server() {
     assert_eq!(first.status()["owns_arbitration"], false);
     assert_eq!(first.status()["last_cleanup_reason"], "admission_failure");
 
-    second.begin_session(None, "synthetic").unwrap();
+    second
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
     second.end_session().unwrap();
     assert_eq!(*events.lock().unwrap(), ["armed", "hide"]);
 }
@@ -712,7 +729,9 @@ async fn end_waits_for_the_outstanding_mutation_guard() {
         Duration::from_secs(1),
     ));
 
-    runtime.begin_session(None, "synthetic").unwrap();
+    runtime
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .unwrap();
     let lease = runtime.acquire().await.unwrap();
     runtime.end_session().unwrap();
     assert_eq!(*events.lock().unwrap(), ["armed", "acting"]);
@@ -873,7 +892,7 @@ fn improved_arguments_accept_bounded_capture_focus_observation_and_uppercase_key
     assert_eq!(focus.observation.region.unwrap().width, 300);
 
     let chord = parse_arguments::<PressKeysInput>(Some(rmcp::object!({
-        "target_ref": "synthetic",
+        "target_ref": "target-00000000-0000-0000-0000-000000000003",
         "keys": ["CTRL", "L"]
     })))
     .unwrap();

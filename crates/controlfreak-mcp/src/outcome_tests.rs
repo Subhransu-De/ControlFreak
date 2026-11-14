@@ -39,7 +39,7 @@ impl SyntheticBackend {
 
 impl BackendMetadata for SyntheticBackend {
     fn validate_target_reference(&self, target: &str) -> Result<(), PlatformError> {
-        if target == "synthetic" {
+        if target == "target-00000000-0000-0000-0000-000000000003" {
             Ok(())
         } else {
             Err(PlatformError::TargetInvalidated {
@@ -415,10 +415,10 @@ fn action_requests() -> [(&'static str, Value); 9] {
         ),
         (PRESS_KEYS, json!({"keys":["enter"]})),
         (TYPE_TEXT, json!({"text":"synthetic"})),
-        (FOCUS_WINDOW, json!({"window_id":"synthetic"})),
+        (FOCUS_WINDOW, json!({"window_id":"target-00000000-0000-0000-0000-000000000003"})),
         (SWITCH_VIRTUAL_DESKTOP, json!({"direction":"right"})),
     ].map(|(name, mut arguments)| {
-        if name != FOCUS_WINDOW { arguments["target_ref"] = json!("synthetic"); }
+        if name != FOCUS_WINDOW { arguments["target_ref"] = json!("target-00000000-0000-0000-0000-000000000003"); }
         (name, arguments)
     })
 }

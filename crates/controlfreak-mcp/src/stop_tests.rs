@@ -42,7 +42,7 @@ impl WaitingBackend {
 
 impl BackendMetadata for WaitingBackend {
     fn validate_target_reference(&self, target: &str) -> Result<(), PlatformError> {
-        assert_eq!(target, "fixture");
+        assert_eq!(target, "target-00000000-0000-0000-0000-000000000003");
         Ok(())
     }
 
@@ -445,15 +445,15 @@ fn worker_requests() -> [(&'static str, Value); 7] {
     [
         (
             MOVE_MOUSE,
-            json!({"target_ref":"fixture","display_id":"fixture","x":0,"y":0}),
+            json!({"target_ref": "target-00000000-0000-0000-0000-000000000003","display_id":"fixture","x":0,"y":0}),
         ),
         (
             TYPE_TEXT,
-            json!({"target_ref":"fixture","text":"synthetic"}),
+            json!({"target_ref": "target-00000000-0000-0000-0000-000000000003","text":"synthetic"}),
         ),
         (
             RUN_ACTIONS,
-            json!({"target_ref":"fixture","steps":[{"action":"type_text","text":"synthetic"}]}),
+            json!({"target_ref": "target-00000000-0000-0000-0000-000000000003","steps":[{"action":"type_text","text":"synthetic"}]}),
         ),
         (
             WAIT_FOR_VISUAL_CHANGE,

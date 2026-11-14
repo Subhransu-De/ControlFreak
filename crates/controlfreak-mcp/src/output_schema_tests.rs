@@ -365,7 +365,7 @@ async fn every_observation_and_session_result_validates_against_tools_list() {
     let calls = [
         (
             BEGIN_CONTROL_SESSION,
-            json!({"target_ref": "synthetic"}),
+            json!({"target_ref": "target-00000000-0000-0000-0000-000000000003"}),
             false,
         ),
         (GET_SERVER_STATUS, json!({}), false),
@@ -394,7 +394,11 @@ async fn every_observation_and_session_result_validates_against_tools_list() {
             false,
         ),
         (LIST_WINDOWS, json!({}), false),
-        (CAPTURE_WINDOW, json!({"window_id": "synthetic"}), true),
+        (
+            CAPTURE_WINDOW,
+            json!({"window_id":"target-00000000-0000-0000-0000-000000000003"}),
+            true,
+        ),
         (
             WAIT_FOR_WINDOW,
             json!({"title_contains": "synthetic"}),
