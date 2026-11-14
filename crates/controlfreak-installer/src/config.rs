@@ -10,6 +10,26 @@ use toml_edit::{DocumentMut, Item, Table};
 
 pub type Result<T> = std::result::Result<T, &'static str>;
 
+/// Turns a message that includes a position into the error type.
+///
+/// The installer is a short-lived helper that reports one error and exits, so leaking one short
+/// message is simpler than carrying an owned error through every call.
+fn message(text: String) -> &'static str {
+    Box::leak(text.into_boxed_str())
+}
+
+/// The 1-based line and character column of a byte offset.
+fn line_and_column(text: &str, offset: usize) -> (usize, usize) {
+    let before = text.get(..offset.min(text.len())).unwrap_or(text);
+    let line = before.matches('\n').count() + 1;
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map_or(0, |last| last.chars().count())
+        + 1;
+    (line, column)
+}
+
 pub fn equivalent(left: &str, right: &str, toml: bool) -> bool {
     let decode = |text: &str| -> Option<Value> {
         if toml {
@@ -38,7 +58,15 @@ impl Document {
             return text
                 .parse()
                 .map(Self::Toml)
-                .map_err(|_| "Invalid TOML; repair the configuration and retry.");
+                .map_err(|error: toml_edit::TomlError| {
+                    // The span is a byte range in the text. Report only where, never what.
+                    let (line, column) = error
+                        .span()
+                        .map_or((1, 1), |span| line_and_column(text, span.start));
+                    message(format!(
+                        "Invalid TOML at line {line}, column {column}; repair the configuration and retry."
+                    ))
+                });
         }
         let options = ParseOptions {
             allow_comments: comments,
@@ -52,8 +80,13 @@ impl Document {
             allow_non_finite_numbers: false,
             allow_extended_string_escapes: false,
         };
-        let root = CstRootNode::parse(text, &options)
-            .map_err(|_| "Invalid JSON; repair the configuration and retry.")?;
+        let root = CstRootNode::parse(text, &options).map_err(|error| {
+            message(format!(
+                "Invalid JSON at line {}, column {}; repair the configuration and retry.",
+                error.line_display(),
+                error.column_display()
+            ))
+        })?;
         let object = root
             .object_value()
             .ok_or("Configuration must be an object.")?;
@@ -201,5 +234,30 @@ pub fn desired(executable: &str, toml: bool, opencode: bool) -> String {
         serde_json::json!({"type":"local", "command":[executable], "enabled":true}).to_string()
     } else {
         serde_json::json!({"command":executable,"args":[]}).to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Document;
+
+    fn error(text: &str, toml: bool) -> &'static str {
+        Document::parse(text, toml, false)
+            .err()
+            .expect("invalid configuration")
+    }
+
+    #[test]
+    fn parse_errors_give_line_and_column_but_never_content() {
+        let json = error("{\n  \"token\": \"hunter2\",\n  oops\n}", false);
+        assert!(json.contains("line 3, column 3"), "{json}");
+        let toml = error("name = \"hunter2\"\nbroken line\n", true);
+        assert!(toml.contains("line 2"), "{toml}");
+        for message in [json, toml] {
+            assert!(
+                !message.contains("hunter2") && !message.contains("oops"),
+                "{message}"
+            );
+        }
     }
 }

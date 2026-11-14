@@ -813,7 +813,6 @@ fn tool_surface_includes_windows_and_keyboard() {
     assert_eq!(
         names,
         [
-            "stop_desktop_work",
             "get_server_status",
             "begin_control_session",
             "end_control_session",
@@ -840,6 +839,7 @@ fn tool_surface_includes_windows_and_keyboard() {
             "press_keys",
             "type_text",
             "run_actions",
+            "stop_desktop_work",
         ]
     );
 }
@@ -852,6 +852,7 @@ fn improved_arguments_accept_bounded_capture_focus_observation_and_uppercase_key
         "include_cursor": false
     })))
     .unwrap();
+    let capture = capture.into_request().unwrap();
     assert_eq!(capture.max_width, Some(1600));
     assert!(!capture.include_cursor);
 

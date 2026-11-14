@@ -85,6 +85,7 @@ fn screenshot_metadata(screenshot: &DisplayScreenshot) -> Value {
             screenshot.source_bounds,
             screenshot.image_width,
             screenshot.image_height,
+            None,
         ),
     })
 }
@@ -156,6 +157,7 @@ pub(super) fn window_screenshot_result(screenshot: Encoded<WindowScreenshot>) ->
                 },
                 screenshot.image_width,
                 screenshot.image_height,
+                Some(screenshot.window.id.clone()),
             ),
         }),
     )
@@ -341,7 +343,14 @@ pub(super) fn tool_error(error: &PlatformError) -> CallToolResult {
             "platform_operation_failed"
         }
     };
-    let mut value = json!({"error": {"code": code, "message": error.to_string()}});
+    let mut value = json!({"error": {
+        "code": code,
+        "message": error.to_string(),
+        "retryable": error.retryable(),
+    }});
+    if let Some(reason) = error.reason_code() {
+        value["error"]["reason"] = json!(reason);
+    }
     if let PlatformError::ActivationFailed {
         attempts,
         elapsed_ms,
@@ -407,6 +416,18 @@ pub(super) fn with_progress(
     super::CallToolResponse::Complete(result)
 }
 
+/// Whether an input tool's response says any input was sent, fully or in part.
+pub(super) fn input_was_sent(response: &super::CallToolResponse) -> bool {
+    let super::CallToolResponse::Complete(result) = response else {
+        return false;
+    };
+    result
+        .structured_content
+        .as_ref()
+        .and_then(|content| content["status"].as_str())
+        .is_some_and(|status| status != "not_started")
+}
+
 pub(super) fn tool_execution_error(error: &ErrorData) -> CallToolResult {
     let code = if error.code == ErrorCode::INVALID_PARAMS {
         "invalid_arguments"
@@ -417,6 +438,7 @@ pub(super) fn tool_execution_error(error: &ErrorData) -> CallToolResult {
         "error": {
             "code": code,
             "message": error.message,
+            "retryable": false,
             "details": error.data,
         }
     }))

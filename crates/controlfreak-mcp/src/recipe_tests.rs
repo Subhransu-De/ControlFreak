@@ -457,7 +457,7 @@ async fn image_points_from_a_cropped_screenshot_reach_the_same_display_pixel() {
             6,
             json!({"target_ref":"fixture-target","display_id":"fixture","x":1,"y":1,
                    "observation_id":observation_id,"image_x":1,"image_y":1,"button":"left"}),
-            "provide either",
+            "provide x and y",
         ),
     ] {
         let refused = exchange(&mut client, call(id, CLICK_MOUSE, arguments)).await;

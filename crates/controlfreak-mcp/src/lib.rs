@@ -2,6 +2,8 @@
 
 #[cfg(test)]
 mod cleanup_tests;
+#[cfg(test)]
+mod contract_tests;
 mod diagnostics;
 #[cfg(test)]
 mod encoding_tests;
@@ -46,6 +48,8 @@ mod schema;
 #[cfg(test)]
 mod session_error_tests;
 
+#[cfg(test)]
+use controlfreak_core::{CaptureWindowRequest, WaitForChangeSinceRequest, WaitForWindowRequest};
 use handlers::{
     call_capture_display, call_capture_region, call_capture_visual_baseline, call_capture_window,
     call_click_mouse, call_click_text, call_drag_mouse, call_find_text_on_screen,
@@ -79,13 +83,12 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use controlfreak_core::{
-    ActionObservation, CaptureDisplayRequest, CaptureRegionRequest, CaptureWindowRequest,
-    ClickTextRequest, ClickTextResult, DisplayScreenshot, FocusWindowRequest, KeyChordRequest,
-    KeyboardActionResult, MouseClickRequest, MouseDragRequest, MouseMoveRequest,
-    MouseScrollRequest, MutationControl, OcrRegionRequest, PlatformBackend, PlatformError,
-    PointerActionResult, TextInputRequest, VirtualDesktopList, VirtualDesktopSwitchRequest,
-    VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest, VisualChangeResult,
-    WaitForChangeSinceRequest, WaitForVisualChangeRequest, WaitForWindowRequest, WindowFocusResult,
+    ActionObservation, CaptureDisplayRequest, CaptureRegionRequest, ClickTextRequest,
+    ClickTextResult, DisplayScreenshot, FocusWindowRequest, KeyChordRequest, KeyboardActionResult,
+    MouseClickRequest, MouseDragRequest, MouseMoveRequest, MouseScrollRequest, MutationControl,
+    OcrRegionRequest, PlatformBackend, PlatformError, PointerActionResult, TextInputRequest,
+    VirtualDesktopList, VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult, VisualBaseline,
+    VisualBaselineRequest, VisualChangeResult, WaitForVisualChangeRequest, WindowFocusResult,
     WindowScreenshot, WindowWaitResult,
 };
 use rmcp::{
@@ -100,20 +103,10 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 
+const STOP_DESKTOP_WORK: &str = "stop_desktop_work";
 const LIST_DISPLAYS: &str = "list_displays";
 const GET_SERVER_STATUS: &str = "get_server_status";
 const BEGIN_CONTROL_SESSION: &str = "begin_control_session";
-#[derive(Debug)]
-enum BeginSessionError {
-    Target(PlatformError),
-    Session(SessionError),
-}
-
-impl From<SessionError> for BeginSessionError {
-    fn from(error: SessionError) -> Self {
-        Self::Session(error)
-    }
-}
 const END_CONTROL_SESSION: &str = "end_control_session";
 const CAPTURE_DISPLAY: &str = "capture_display";
 const CAPTURE_REGION: &str = "capture_region";
@@ -137,11 +130,127 @@ const CAPTURE_WINDOW: &str = "capture_window";
 const WAIT_FOR_WINDOW: &str = "wait_for_window";
 const PRESS_KEYS: &str = "press_keys";
 const TYPE_TEXT: &str = "type_text";
-const MAX_MOVE_DURATION_MS: u32 = 10_000;
-const MAX_SCROLL_DELTA: i32 = 12_000;
-const MAX_TEXT_UTF16_UNITS: usize = 4_000;
-const MAX_CAPTURE_WIDTH: u32 = 7_680;
-const MAX_WAIT_MS: u32 = 30_000;
+
+const SERVER_INSTRUCTIONS: &str = "ControlFreak drives a Windows desktop. Workflow: list_windows (or any screenshot) gives a target_ref; call begin_control_session(target_ref) once; call focus_window; then use input tools with the same target_ref; call end_control_session when done. Input works only while the approved window is in the foreground. Dialogs and menus of the same application are accepted. A window from another process needs end_control_session and a new session. If foreground activation fails, ask the user to click the window. display_id is optional and defaults to the primary display; x and y are display-local physical pixels, or pass a screenshot's observation_id with image_x and image_y. Screenshots are 1280 px wide by default and every action returns one: reuse it, crop it with observation.region, or use observation.mode none or metadata to save tokens. Prefer click_text for a unique label and run_actions for a known sequence. Check isError and status. Input dispatch does not verify application effects, so observe before recovering from partial or unknown delivery, and never repeat an action when retry_action=false. stop_desktop_work is an emergency stop that closes input permanently: use end_control_session to finish. A notifications/controlfreak/session_stopped event or stop_reason=user_stop means the user ended control: do not resume or restart without their permission.";
+
+#[derive(Debug)]
+enum BeginSessionError {
+    Target(PlatformError),
+    Session(SessionError),
+}
+
+impl From<SessionError> for BeginSessionError {
+    fn from(error: SessionError) -> Self {
+        Self::Session(error)
+    }
+}
+
+type ToolFuture =
+    std::pin::Pin<Box<dyn Future<Output = Result<CallToolResponse, ErrorData>> + Send>>;
+type ToolHandler =
+    fn(Arc<dyn PlatformBackend>, Option<JsonObject>, Option<OperationLease>) -> ToolFuture;
+
+/// Wraps a tool function as a [`ToolHandler`].
+macro_rules! handler {
+    ($function:path) => {
+        |backend, arguments, lease| Box::pin($function(backend, arguments, lease))
+    };
+}
+
+/// How a request for a tool is admitted and run.
+#[derive(Clone, Copy)]
+enum Route {
+    /// Cancels all desktop work and closes admission.
+    Stop,
+    /// Reports server state, even after a stop.
+    Status,
+    /// Releases desktop control.
+    EndSession,
+    /// Reserves desktop control for one approved window.
+    BeginSession,
+    /// A short read of the desktop. Stays available after a stop, with request cancellation only.
+    Observe(ToolHandler),
+    /// A read that can wait for seconds. A stop cancels it while it runs, but a new one is still
+    /// admitted after a stop, because reading the screen is safe.
+    Watch(ToolHandler),
+    /// Changes the desktop. Needs admission and runs under an operation lease.
+    Input(ToolHandler),
+}
+
+/// Every tool by name and how it runs. A tool missing here does not exist, and `tools()` must
+/// publish exactly these names.
+static ROUTES: &[(&str, Route)] = &[
+    (STOP_DESKTOP_WORK, Route::Stop),
+    (GET_SERVER_STATUS, Route::Status),
+    (END_CONTROL_SESSION, Route::EndSession),
+    (BEGIN_CONTROL_SESSION, Route::BeginSession),
+    (LIST_DISPLAYS, Route::Observe(handler!(call_list_displays))),
+    (
+        CAPTURE_DISPLAY,
+        Route::Observe(handler!(call_capture_display)),
+    ),
+    (
+        CAPTURE_REGION,
+        Route::Observe(handler!(call_capture_region)),
+    ),
+    (
+        CAPTURE_WINDOW,
+        Route::Observe(handler!(call_capture_window)),
+    ),
+    (
+        CAPTURE_VISUAL_BASELINE,
+        Route::Observe(handler!(call_capture_visual_baseline)),
+    ),
+    (
+        WAIT_FOR_VISUAL_CHANGE,
+        Route::Watch(handler!(call_wait_for_visual_change)),
+    ),
+    (
+        WAIT_FOR_CHANGE_SINCE,
+        Route::Watch(handler!(call_wait_for_change_since)),
+    ),
+    (
+        READ_TEXT_IN_REGION,
+        Route::Watch(handler!(call_read_text_in_region)),
+    ),
+    (
+        FIND_TEXT_ON_SCREEN,
+        Route::Watch(handler!(call_find_text_on_screen)),
+    ),
+    (WAIT_FOR_TEXT, Route::Watch(handler!(call_wait_for_text))),
+    (LIST_WINDOWS, Route::Observe(handler!(call_list_windows))),
+    (
+        WAIT_FOR_WINDOW,
+        Route::Watch(handler!(call_wait_for_window)),
+    ),
+    (
+        LIST_VIRTUAL_DESKTOPS,
+        Route::Observe(handler!(call_list_virtual_desktops)),
+    ),
+    (CLICK_TEXT, Route::Input(handler!(call_click_text))),
+    (MOVE_MOUSE, Route::Input(handler!(call_move_mouse))),
+    (CLICK_MOUSE, Route::Input(handler!(call_click_mouse))),
+    (DRAG_MOUSE, Route::Input(handler!(call_drag_mouse))),
+    (SCROLL_MOUSE, Route::Input(handler!(call_scroll_mouse))),
+    (
+        SWITCH_VIRTUAL_DESKTOP,
+        Route::Input(handler!(call_switch_virtual_desktop)),
+    ),
+    (FOCUS_WINDOW, Route::Input(handler!(call_focus_window))),
+    (PRESS_KEYS, Route::Input(handler!(call_press_keys))),
+    (TYPE_TEXT, Route::Input(handler!(call_type_text))),
+    (RUN_ACTIONS, Route::Input(handler!(call_run_actions))),
+];
+
+fn route(tool: &str) -> Option<Route> {
+    ROUTES
+        .iter()
+        .find_map(|(name, route)| (*name == tool).then_some(*route))
+}
+
+fn is_mutating_tool(tool: &str) -> bool {
+    matches!(route(tool), Some(Route::Input(_)))
+}
 
 #[derive(Clone)]
 struct ControlFreakServer {
@@ -171,6 +280,238 @@ impl ControlFreakServer {
             indicator_runtime,
         }
     }
+
+    /// Runs one request through admission and its handler.
+    async fn route_request(
+        &self,
+        request: CallToolRequestParams,
+        context: &RequestContext<RoleServer>,
+        stages: Arc<Mutex<Vec<controlfreak_core::timing::StageTiming>>>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let tool_name = request.name.to_string();
+        let Some(route) = route(&tool_name) else {
+            return Err(ErrorData::invalid_params(
+                format!("unknown ControlFreak tool '{tool_name}'"),
+                Some(json!({ "tool": tool_name })),
+            ));
+        };
+        match route {
+            Route::Stop => {
+                parse_arguments::<NoArguments>(request.arguments)?;
+                self.stop.stop();
+                Ok(CallToolResult::structured(json!({"status": self.stop.status()})).into())
+            }
+            Route::Status => self.server_status(request.arguments),
+            Route::EndSession => self.end_session(request.arguments).await,
+            Route::BeginSession | Route::Observe(_) | Route::Watch(_) | Route::Input(_) => {
+                self.admitted_request(route, request, context, stages).await
+            }
+        }
+    }
+
+    fn server_status(&self, arguments: Option<JsonObject>) -> Result<CallToolResponse, ErrorData> {
+        let result = call_get_server_status(
+            &self.backend,
+            &self.diagnostics,
+            &self.safety_indicator,
+            self.indicator_runtime.as_ref(),
+            arguments,
+        )?;
+        if let CallToolResponse::Complete(result) = result
+            && let Some(mut content) = result.structured_content
+        {
+            content["stop_state"] = json!(self.stop.status());
+            if self.stop.user_stopped() {
+                content["stop_reason"] = json!("user_stop");
+            }
+            return Ok(CallToolResult::structured(content).into());
+        }
+        Err(ErrorData::internal_error("missing server status", None))
+    }
+
+    async fn end_session(
+        &self,
+        arguments: Option<JsonObject>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        parse_arguments::<NoArguments>(arguments)?;
+        let Some(runtime) = self.indicator_runtime.clone() else {
+            return Err(indicator_unavailable(
+                &self.safety_indicator,
+                "desktop glow sessions are unavailable",
+            ));
+        };
+        let worker = Arc::clone(&runtime);
+        tokio::task::spawn_blocking(move || worker.end_session())
+            .await
+            .map_err(|error| join_error(&error))?
+            .map_err(|reason| indicator_unavailable(&self.safety_indicator, &reason))?;
+        Ok(
+            CallToolResult::structured(json!({"status": "closing", "session": runtime.status()}))
+                .into(),
+        )
+    }
+
+    /// Admits a request that acts on the desktop or reads it, and runs it to completion.
+    async fn admitted_request(
+        &self,
+        route: Route,
+        request: CallToolRequestParams,
+        context: &RequestContext<RoleServer>,
+        stages: Arc<Mutex<Vec<controlfreak_core::timing::StageTiming>>>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let tool_name = request.name.to_string();
+        let admission = match route {
+            Route::Observe(_) => Ok(stop::Work::default()),
+            Route::Watch(_) => Ok(stop::Work::new(&self.stop).unwrap_or_default()),
+            _ => stop::Work::new(&self.stop),
+        };
+        let work = match admission {
+            Ok(work) => work.with_stages(stages),
+            Err(error) => return Ok(self.refused(&tool_name, &error)),
+        };
+        let cancellation = stop::CancelOnDrop(work.control.clone());
+        let request_control = work.control.clone();
+        let operation = stop::WORK.scope(work, self.run_admitted(route, request));
+        tokio::pin!(operation);
+        let result = tokio::select! {
+            biased;
+            () = context.ct.cancelled() => {
+                request_control.cancel();
+                operation.await
+            }
+            result = &mut operation => result,
+        };
+        drop(cancellation);
+        result
+    }
+
+    /// The tool result for a request that admission refused.
+    fn refused(&self, tool_name: &str, error: &PlatformError) -> CallToolResponse {
+        let response = if self.stop.is_stopped() {
+            self.indicator_runtime
+                .as_ref()
+                .map_or_else(
+                    || SessionError::stopped(&self.stop),
+                    |runtime| runtime.stop_refusal(),
+                )
+                .into_tool_result(&self.safety_indicator)
+                .into()
+        } else {
+            tool_error(error).into()
+        };
+        if is_mutating_tool(tool_name) {
+            results::with_progress(response, controlfreak_core::MutationProgress::default())
+        } else {
+            response
+        }
+    }
+
+    async fn run_admitted(
+        &self,
+        route: Route,
+        request: CallToolRequestParams,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let backend = Arc::clone(&self.backend);
+        match route {
+            Route::BeginSession => self.begin_session(request.arguments).await,
+            Route::Observe(handler) | Route::Watch(handler) => {
+                handler(backend, request.arguments, None).await
+            }
+            Route::Input(handler) => {
+                let is_switch = request.name == SWITCH_VIRTUAL_DESKTOP;
+                let Some(runtime) = self.indicator_runtime.as_ref() else {
+                    return handler(backend, request.arguments, None).await;
+                };
+                let lease = match runtime.acquire_mutation().await {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        return Ok(results::with_progress(
+                            error.into_tool_result(&self.safety_indicator).into(),
+                            controlfreak_core::MutationProgress::default(),
+                        ));
+                    }
+                };
+                let response = handler(backend, request.arguments, Some(lease)).await?;
+                if is_switch && results::input_was_sent(&response) {
+                    // The approved window is no longer on screen, so the session ends with the switch.
+                    let runtime = Arc::clone(runtime);
+                    let ended = tokio::task::spawn_blocking(move || runtime.end_session())
+                        .await
+                        .map_err(|error| join_error(&error))?;
+                    if let Err(reason) = ended {
+                        eprintln!(
+                            "{}",
+                            json!({"event": "session_end_after_switch_failed", "reason": reason})
+                        );
+                    }
+                }
+                Ok(response)
+            }
+            Route::Stop | Route::Status | Route::EndSession => {
+                unreachable!("lifecycle tools are handled before admission")
+            }
+        }
+    }
+
+    async fn begin_session(
+        &self,
+        arguments: Option<JsonObject>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let Some(runtime) = self.indicator_runtime.as_ref() else {
+            return Err(indicator_unavailable(
+                &self.safety_indicator,
+                "desktop glow sessions are unavailable",
+            ));
+        };
+        let input = parse_arguments::<BeginControlSessionInput>(arguments)?;
+        let runtime_for_worker = Arc::clone(runtime);
+        let work = stop::current();
+        let backend = Arc::clone(&self.backend);
+        let started = tokio::task::spawn_blocking(move || {
+            // A stop or shutdown cancels the request; report it as such.
+            let cancelled = |error| {
+                if runtime_for_worker.stop.is_stopped() {
+                    runtime_for_worker.stop_refusal().into()
+                } else {
+                    error
+                }
+            };
+            if let Some(work) = &work {
+                work.control
+                    .check("begin_control_session")
+                    .map_err(|error| cancelled(BeginSessionError::Target(error)))?;
+            }
+            backend
+                .validate_target_reference(&input.target_ref)
+                .map_err(BeginSessionError::Target)?;
+            runtime_for_worker.begin_session(input.expected_seconds, &input.target_ref)?;
+            if work
+                .as_ref()
+                .is_some_and(|work| work.control.is_cancelled())
+            {
+                runtime_for_worker
+                    .end_session()
+                    .map_err(SessionError::Indicator)?;
+                return Err(cancelled(
+                    SessionError::Indicator("session request was cancelled".to_owned()).into(),
+                ));
+            }
+            Ok(())
+        })
+        .await;
+        match started {
+            Ok(Ok(())) => Ok(CallToolResult::structured(json!({
+                "status": "armed",
+                "session": runtime.status(),
+            }))
+            .into()),
+            Ok(Err(BeginSessionError::Target(error))) => Ok(tool_error(&error).into()),
+            Ok(Err(BeginSessionError::Session(error))) => {
+                Ok(error.into_tool_result(&self.safety_indicator).into())
+            }
+            Err(error) => Err(join_error(&error)),
+        }
+    }
 }
 
 impl ServerHandler for ControlFreakServer {
@@ -188,9 +529,7 @@ impl ServerHandler for ControlFreakServer {
                 "controlfreak",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(
-                "ControlFreak is a computer-use MCP server. For tasks with multiple input actions, call begin_control_session first and end_control_session when finished. Actions return screenshots by default. Reuse them; capture again only when needed. Use observation.region to crop evidence to the affected area, or mode metadata/none when no image is needed; smaller images cost fewer tokens on every later turn. Every screenshot has an observation_id: pass it with image_x/image_y to pointer tools to act on a point in that image instead of converting coordinates. Use run_actions for a known sequence of clicks, scrolls, keys and text on one target, and wait_for_text to wait for a label to appear or disappear. Choose a server-issued target_ref from current window or screenshot observations. Pass it to begin_control_session and every input action; focus_window uses window_id. End the session before changing targets. Prefer click_text for unique visible labels. Check isError, status, and error text. Input dispatch and observation do not verify application effects. Observe again before recovering from partial or unknown delivery. Read structuredContent without serializing image data. Never repeat an action when retry_action=false. A notifications/controlfreak/session_stopped event or stop_reason=user_stop means the user ended control. Do not resume desktop actions or restart the server without the user's permission.",
-            )
+            .with_instructions(SERVER_INSTRUCTIONS)
     }
 
     async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
@@ -229,18 +568,14 @@ impl ServerHandler for ControlFreakServer {
         std::future::ready(Ok(ListToolsResult::with_all_items(tools())))
     }
 
-    #[allow(clippy::too_many_lines)]
     fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResponse, ErrorData>> + Send + '_ {
-        let stop = self.stop.clone();
-        let backend = Arc::clone(&self.backend);
-        let diagnostics = Arc::clone(&self.diagnostics);
-        let safety_indicator = self.safety_indicator.clone();
-        let indicator_runtime = self.indicator_runtime.clone();
+        let server = self.clone();
         async move {
+            let diagnostics = Arc::clone(&server.diagnostics);
             let tool_name = request.name.to_string();
             let operation_id = diagnostics
                 .next_operation_id
@@ -254,220 +589,15 @@ impl ServerHandler for ControlFreakServer {
                     u64::try_from(started.saturating_duration_since(completed).as_millis())
                         .unwrap_or(u64::MAX)
                 });
-            let reporting = Arc::clone(&diagnostics);
-            let report_name = tool_name.clone();
-            let request_stages = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let worker_stages = Arc::clone(&request_stages);
-            let request_future = async move {
-                if request.name == "stop_desktop_work" {
-                    parse_arguments::<NoArguments>(request.arguments)?;
-                    stop.stop();
-                    return Ok(CallToolResult::structured(json!({"status": stop.status()})).into());
-                }
-                if request.name == GET_SERVER_STATUS {
-                    let result = call_get_server_status(
-                        &backend,
-                        &diagnostics,
-                        &safety_indicator,
-                        indicator_runtime.as_ref(),
-                        request.arguments,
-                    )?;
-                    if let CallToolResponse::Complete(result) = result
-                        && let Some(mut content) = result.structured_content
-                    {
-                        content["stop_state"] = json!(stop.status());
-                        if stop.user_stopped() {
-                            content["stop_reason"] = json!("user_stop");
-                        }
-                        return Ok(CallToolResult::structured(content).into());
-                    }
-                    return Err(ErrorData::internal_error("missing server status", None));
-                }
-                if request.name == END_CONTROL_SESSION {
-                    parse_arguments::<NoArguments>(request.arguments)?;
-                    if let Some(runtime) = indicator_runtime {
-                        let worker = runtime.clone();
-                        tokio::task::spawn_blocking(move || worker.end_session())
-                            .await
-                            .map_err(|error| join_error(&error))?
-                            .map_err(|reason| indicator_unavailable(&safety_indicator, &reason))?;
-                        return Ok(CallToolResult::structured(
-                            json!({"status": "closing", "session": runtime.status()}),
-                        )
-                        .into());
-                    }
-                    return Err(indicator_unavailable(
-                        &safety_indicator,
-                        "desktop glow sessions are unavailable",
-                    ));
-                }
-                let admission = if matches!(
-                    request.name.as_ref(),
-                    LIST_DISPLAYS
-                        | LIST_WINDOWS
-                        | LIST_VIRTUAL_DESKTOPS
-                        | CAPTURE_DISPLAY
-                        | CAPTURE_REGION
-                        | CAPTURE_WINDOW
-                        | CAPTURE_VISUAL_BASELINE
-                ) {
-                    // Observations remain available after stop, but retain request cancellation.
-                    Ok(stop::Work::default())
-                } else {
-                    stop::Work::new(&stop)
-                };
-                let work = match admission {
-                    Ok(work) => work.with_stages(worker_stages),
-                    Err(error) => {
-                        let response = if stop.is_stopped() {
-                            indicator_runtime
-                                .as_ref()
-                                .map_or_else(
-                                    || SessionError::stopped(&stop),
-                                    |runtime| runtime.stop_refusal(),
-                                )
-                                .into_tool_result(&safety_indicator)
-                                .into()
-                        } else {
-                            tool_error(&error).into()
-                        };
-                        return Ok(if is_mutating_tool(&request.name) {
-                            results::with_progress(
-                                response,
-                                controlfreak_core::MutationProgress::default(),
-                            )
-                        } else {
-                            response
-                        });
-                    }
-                };
-                let cancellation = stop::CancelOnDrop(work.control.clone());
-                let request_control = work.control.clone();
-                let operation = stop::WORK.scope(work, async move {
-                    if tool_name == BEGIN_CONTROL_SESSION {
-                        match indicator_runtime.as_ref() {
-                            Some(runtime) => {
-                                let input =
-                                    parse_arguments::<BeginControlSessionInput>(request.arguments)?;
-                                let runtime_for_worker = Arc::clone(runtime);
-                                let work = stop::current();
-                                let backend = Arc::clone(&backend);
-                                match tokio::task::spawn_blocking(move || {
-                                    // A stop or shutdown cancels the request; report it as such.
-                                    let cancelled = |error| {
-                                        if runtime_for_worker.stop.is_stopped() {
-                                            runtime_for_worker.stop_refusal().into()
-                                        } else {
-                                            error
-                                        }
-                                    };
-                                    if let Some(work) = &work {
-                                        work.control.check("begin_control_session").map_err(
-                                            |error| cancelled(BeginSessionError::Target(error)),
-                                        )?;
-                                    }
-                                    backend
-                                        .validate_target_reference(&input.target_ref)
-                                        .map_err(BeginSessionError::Target)?;
-                                    runtime_for_worker
-                                        .begin_session(input.expected_seconds, &input.target_ref)?;
-                                    if work
-                                        .as_ref()
-                                        .is_some_and(|work| work.control.is_cancelled())
-                                    {
-                                        runtime_for_worker
-                                            .end_session()
-                                            .map_err(SessionError::Indicator)?;
-                                        return Err(cancelled(
-                                            SessionError::Indicator(
-                                                "session request was cancelled".to_owned(),
-                                            )
-                                            .into(),
-                                        ));
-                                    }
-                                    Ok(())
-                                })
-                                .await
-                                {
-                                    Ok(Ok(())) => Ok(CallToolResult::structured(json!({
-                                        "status": "armed",
-                                        "session": runtime.status(),
-                                    }))
-                                    .into()),
-                                    Ok(Err(BeginSessionError::Target(error))) => {
-                                        Ok(tool_error(&error).into())
-                                    }
-                                    Ok(Err(BeginSessionError::Session(error))) => {
-                                        Ok(error.into_tool_result(&safety_indicator).into())
-                                    }
-                                    Err(error) => Err(join_error(&error)),
-                                }
-                            }
-                            None => Err(indicator_unavailable(
-                                &safety_indicator,
-                                "desktop glow sessions are unavailable",
-                            )),
-                        }
-                    } else if is_mutating_tool(&tool_name) {
-                        match indicator_runtime.as_ref() {
-                            Some(runtime) => match runtime.acquire_mutation().await {
-                                Ok(operation_lease) => {
-                                    dispatch_tool(
-                                        backend,
-                                        &diagnostics,
-                                        &safety_indicator,
-                                        indicator_runtime.as_ref(),
-                                        request,
-                                        Some(operation_lease),
-                                    )
-                                    .await
-                                }
-                                Err(error) => Ok(results::with_progress(
-                                    error.into_tool_result(&safety_indicator).into(),
-                                    controlfreak_core::MutationProgress::default(),
-                                )),
-                            },
-                            None => {
-                                dispatch_tool(
-                                    backend,
-                                    &diagnostics,
-                                    &safety_indicator,
-                                    indicator_runtime.as_ref(),
-                                    request,
-                                    None,
-                                )
-                                .await
-                            }
-                        }
-                    } else {
-                        dispatch_tool(
-                            backend,
-                            &diagnostics,
-                            &safety_indicator,
-                            indicator_runtime.as_ref(),
-                            request,
-                            None,
-                        )
-                        .await
-                    }
-                });
-                tokio::pin!(operation);
-                let result = tokio::select! {
-                    biased;
-                    () = context.ct.cancelled() => {
-                        request_control.cancel();
-                        operation.await
-                    }
-                    result = &mut operation => result,
-                };
-                drop(cancellation);
-                result
-            };
-            let outcome = match request_future.await {
+            let request_stages = Arc::new(Mutex::new(Vec::new()));
+            let outcome = match server
+                .route_request(request, &context, Arc::clone(&request_stages))
+                .await
+            {
                 Ok(response) => Ok(response),
                 Err(error) => {
                     let response = tool_execution_error(&error).into();
-                    Ok(if is_mutating_tool(&report_name) {
+                    Ok(if is_mutating_tool(&tool_name) {
                         results::with_progress(
                             response,
                             controlfreak_core::MutationProgress::default(),
@@ -483,8 +613,8 @@ impl ServerHandler for ControlFreakServer {
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
             let stages_ms = diagnostics::stages_json(&stages);
-            let elapsed_ms = reporting.complete(
-                &report_name,
+            let elapsed_ms = diagnostics.complete(
+                &tool_name,
                 operation_id,
                 started,
                 gap_ms,
@@ -497,7 +627,7 @@ impl ServerHandler for ControlFreakServer {
                     meta.insert(
                         "controlfreak".to_owned(),
                         json!({
-                            "instance_id": reporting.instance_id,
+                            "instance_id": diagnostics.instance_id,
                             "operation_id": operation_id,
                             "elapsed_ms": elapsed_ms,
                             "stages_ms": stages_ms,
@@ -509,82 +639,6 @@ impl ServerHandler for ControlFreakServer {
             })
         }
     }
-}
-
-async fn dispatch_tool(
-    backend: Arc<dyn PlatformBackend>,
-    diagnostics: &Diagnostics,
-    safety_indicator: &SafetyIndicator,
-    indicator_runtime: Option<&Arc<IndicatorRuntime>>,
-    request: CallToolRequestParams,
-    operation_lease: Option<OperationLease>,
-) -> Result<CallToolResponse, ErrorData> {
-    match request.name.as_ref() {
-        GET_SERVER_STATUS => call_get_server_status(
-            &backend,
-            diagnostics,
-            safety_indicator,
-            indicator_runtime,
-            request.arguments,
-        ),
-        LIST_DISPLAYS => call_list_displays(backend, request.arguments, operation_lease).await,
-        CAPTURE_DISPLAY => call_capture_display(backend, request.arguments, operation_lease).await,
-        CAPTURE_REGION => call_capture_region(backend, request.arguments, operation_lease).await,
-        WAIT_FOR_VISUAL_CHANGE => {
-            call_wait_for_visual_change(backend, request.arguments, operation_lease).await
-        }
-        CAPTURE_VISUAL_BASELINE => {
-            call_capture_visual_baseline(backend, request.arguments, operation_lease).await
-        }
-        WAIT_FOR_CHANGE_SINCE => {
-            call_wait_for_change_since(backend, request.arguments, operation_lease).await
-        }
-        READ_TEXT_IN_REGION => {
-            call_read_text_in_region(backend, request.arguments, operation_lease).await
-        }
-        FIND_TEXT_ON_SCREEN => {
-            call_find_text_on_screen(backend, request.arguments, operation_lease).await
-        }
-        WAIT_FOR_TEXT => call_wait_for_text(backend, request.arguments, operation_lease).await,
-        RUN_ACTIONS => call_run_actions(backend, request.arguments, operation_lease).await,
-        CLICK_TEXT => call_click_text(backend, request.arguments, operation_lease).await,
-        MOVE_MOUSE => call_move_mouse(backend, request.arguments, operation_lease).await,
-        CLICK_MOUSE => call_click_mouse(backend, request.arguments, operation_lease).await,
-        DRAG_MOUSE => call_drag_mouse(backend, request.arguments, operation_lease).await,
-        SCROLL_MOUSE => call_scroll_mouse(backend, request.arguments, operation_lease).await,
-        LIST_WINDOWS => call_list_windows(backend, request.arguments, operation_lease).await,
-        LIST_VIRTUAL_DESKTOPS => {
-            call_list_virtual_desktops(backend, request.arguments, operation_lease).await
-        }
-        SWITCH_VIRTUAL_DESKTOP => {
-            call_switch_virtual_desktop(backend, request.arguments, operation_lease).await
-        }
-        FOCUS_WINDOW => call_focus_window(backend, request.arguments, operation_lease).await,
-        CAPTURE_WINDOW => call_capture_window(backend, request.arguments, operation_lease).await,
-        WAIT_FOR_WINDOW => call_wait_for_window(backend, request.arguments, operation_lease).await,
-        PRESS_KEYS => call_press_keys(backend, request.arguments, operation_lease).await,
-        TYPE_TEXT => call_type_text(backend, request.arguments, operation_lease).await,
-        unknown => Err(ErrorData::invalid_params(
-            format!("unknown ControlFreak tool '{unknown}'"),
-            Some(json!({ "tool": unknown })),
-        )),
-    }
-}
-
-fn is_mutating_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        CLICK_TEXT
-            | MOVE_MOUSE
-            | CLICK_MOUSE
-            | DRAG_MOUSE
-            | SCROLL_MOUSE
-            | SWITCH_VIRTUAL_DESKTOP
-            | FOCUS_WINDOW
-            | PRESS_KEYS
-            | TYPE_TEXT
-            | RUN_ACTIONS
-    )
 }
 
 fn join_error(error: &tokio::task::JoinError) -> ErrorData {

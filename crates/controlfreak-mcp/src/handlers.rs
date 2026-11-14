@@ -3,23 +3,24 @@ use controlfreak_core::{
     ObservationMode, ObservationOptions, PlatformError,
 };
 
+use super::observations::{resolve_display, resolve_observation};
 use super::requests::{ActionStep, RunActionsInput};
+use std::time::{Duration, Instant};
 
 use super::{
     Arc, CallToolResponse, CallToolResult, CaptureDisplayInput, CaptureDisplayRequest,
-    CaptureRegionInput, CaptureRegionRequest, CaptureWindowInput, CaptureWindowRequest, CarriesPng,
-    ClickMouseInput, ClickTextInput, ClickTextRequest, Diagnostics, DragMouseInput, Encoded,
-    ErrorData, FindTextInput, FocusWindowInput, FocusWindowRequest, IndicatorRuntime, JsonObject,
+    CaptureRegionInput, CaptureRegionRequest, CaptureWindowInput, CarriesPng, ClickMouseInput,
+    ClickTextInput, ClickTextRequest, Diagnostics, DragMouseInput, Encoded, ErrorData,
+    FindTextInput, FocusWindowInput, FocusWindowRequest, IndicatorRuntime, JsonObject,
     KeyChordRequest, MouseClickRequest, MouseDragRequest, MouseMoveRequest, MouseScrollRequest,
     MoveMouseInput, NoArguments, OcrRegionInput, OcrRegionRequest, OperationLease, Ordering,
     PlatformBackend, PressKeysInput, SafetyIndicator, ScrollMouseInput, SwitchVirtualDesktopInput,
     TextInputRequest, TypeTextInput, Value, VirtualDesktopSwitchRequest, VisualBaselineInput,
-    VisualBaselineRequest, WaitForChangeSinceInput, WaitForChangeSinceRequest, WaitForTextInput,
-    WaitForVisualChangeInput, WaitForVisualChangeRequest, WaitForWindowInput, WaitForWindowRequest,
-    click_text_result, join_error, json, keyboard_result, parse_arguments, pointer_result,
-    screenshot_result, tool_error, virtual_desktop_list_result, virtual_desktop_switch_result,
-    visual_baseline_result, visual_change_result, window_focus_result, window_screenshot_result,
-    window_wait_result,
+    VisualBaselineRequest, WaitForChangeSinceInput, WaitForTextInput, WaitForVisualChangeInput,
+    WaitForVisualChangeRequest, WaitForWindowInput, click_text_result, join_error, json,
+    keyboard_result, parse_arguments, pointer_result, screenshot_result, tool_error,
+    virtual_desktop_list_result, virtual_desktop_switch_result, visual_baseline_result,
+    visual_change_result, window_focus_result, window_screenshot_result, window_wait_result,
 };
 
 pub(super) async fn run_platform_operation<T, F>(
@@ -85,7 +86,7 @@ where
 /// Runs a mutation whose result may carry a screenshot, encoding it inside the blocking worker.
 pub(super) async fn run_encoded_mutation<T, F>(
     operation_lease: Option<OperationLease>,
-    target_ref: String,
+    target_ref: Option<String>,
     backend: Arc<dyn PlatformBackend>,
     operation: F,
 ) -> (Result<Encoded<T>, PlatformError>, MutationProgress)
@@ -99,9 +100,11 @@ where
     .await
 }
 
+/// `target_ref` is the window to approve. When it is `None`, the session's approved window is
+/// used, or the foreground window when no session has one yet.
 pub(super) async fn run_mutation_operation<T, F>(
     operation_lease: Option<OperationLease>,
-    target_ref: String,
+    target_ref: Option<String>,
     backend: Arc<dyn PlatformBackend>,
     operation: F,
 ) -> (Result<T, PlatformError>, MutationProgress)
@@ -126,6 +129,10 @@ where
         worker_control.check("mutation_worker")?;
         controlfreak_core::timing::reset();
         let result = (|| {
+            let target_ref = match target_ref {
+                Some(target_ref) => target_ref,
+                None => default_target(backend.as_ref(), &worker_control)?,
+            };
             backend.validate_target_reference(&target_ref)?;
             worker_control.bind_target(&target_ref)?;
             let result = operation(&worker_control);
@@ -149,6 +156,28 @@ where
         })
     });
     (result, control.progress())
+}
+
+/// The window an input tool acts on when the caller names none: the session's approved window,
+/// else the foreground window. The usual validation and binding still apply to it.
+fn default_target(
+    backend: &dyn PlatformBackend,
+    control: &MutationControl,
+) -> Result<String, PlatformError> {
+    if let Some(approved) = control.approved_target() {
+        return Ok(approved);
+    }
+    backend
+        .list_windows()?
+        .windows
+        .into_iter()
+        .find(|window| window.is_foreground)
+        .map(|window| window.id)
+        .ok_or_else(|| PlatformError::InvalidArgument {
+            argument: "target_ref".to_owned(),
+            reason: "no session window or foreground window is available; pass target_ref"
+                .to_owned(),
+        })
 }
 
 pub(super) fn call_get_server_status(
@@ -221,14 +250,18 @@ pub(super) async fn call_capture_display(
     arguments: Option<JsonObject>,
     operation_lease: Option<OperationLease>,
 ) -> Result<CallToolResponse, ErrorData> {
-    let input = parse_arguments::<CaptureDisplayInput>(arguments)?;
-    let request = CaptureDisplayRequest {
-        display_id: input.display_id,
-        max_width: input.max_width,
-        include_cursor: input.include_cursor,
+    let request = match parse_arguments::<CaptureDisplayInput>(arguments)?.into_request() {
+        Ok(request) => request,
+        Err(error) => return Ok(tool_error(&error).into()),
     };
-    let result =
-        run_image_operation(operation_lease, move || backend.capture_display(&request)).await?;
+    let result = run_image_operation(operation_lease, move || {
+        let request = CaptureDisplayRequest {
+            display_id: resolve_display(backend.as_ref(), &request.display_id)?,
+            ..request
+        };
+        backend.capture_display(&request)
+    })
+    .await?;
     match result {
         Ok(screenshot) => Ok(screenshot_result(screenshot).into()),
         Err(error) => Ok(tool_error(&error).into()),
@@ -240,18 +273,18 @@ pub(super) async fn call_capture_region(
     arguments: Option<JsonObject>,
     operation_lease: Option<OperationLease>,
 ) -> Result<CallToolResponse, ErrorData> {
-    let input = parse_arguments::<CaptureRegionInput>(arguments)?;
-    let request = CaptureRegionRequest {
-        display_id: input.display_id,
-        x: input.x,
-        y: input.y,
-        width: input.width,
-        height: input.height,
-        max_width: input.max_width,
-        include_cursor: input.include_cursor,
+    let request = match parse_arguments::<CaptureRegionInput>(arguments)?.into_request() {
+        Ok(request) => request,
+        Err(error) => return Ok(tool_error(&error).into()),
     };
-    let result =
-        run_image_operation(operation_lease, move || backend.capture_region(&request)).await?;
+    let result = run_image_operation(operation_lease, move || {
+        let request = CaptureRegionRequest {
+            display_id: resolve_display(backend.as_ref(), &request.display_id)?,
+            ..request
+        };
+        backend.capture_region(&request)
+    })
+    .await?;
     match result {
         Ok(screenshot) => Ok(screenshot_result(screenshot).into()),
         Err(error) => Ok(tool_error(&error).into()),
@@ -263,20 +296,14 @@ pub(super) async fn call_wait_for_visual_change(
     arguments: Option<JsonObject>,
     operation_lease: Option<OperationLease>,
 ) -> Result<CallToolResponse, ErrorData> {
-    let input = parse_arguments::<WaitForVisualChangeInput>(arguments)?;
-    let request = WaitForVisualChangeRequest {
-        display_id: input.display_id,
-        x: input.x,
-        y: input.y,
-        width: input.width,
-        height: input.height,
-        timeout_ms: input.timeout_ms,
-        stable_ms: input.stable_ms,
-        difference_threshold: input.difference_threshold,
-    };
+    let request = parse_arguments::<WaitForVisualChangeInput>(arguments)?.into_request();
     let control =
         super::stop::current().map_or_else(MutationControl::default, |work| work.control.clone());
     let result = run_image_operation(operation_lease, move || {
+        let request = WaitForVisualChangeRequest {
+            display_id: resolve_display(backend.as_ref(), &request.display_id)?,
+            ..request
+        };
         backend.wait_for_visual_change_controlled(&request, &control)
     })
     .await?;
@@ -291,15 +318,12 @@ pub(super) async fn call_capture_visual_baseline(
     arguments: Option<JsonObject>,
     operation_lease: Option<OperationLease>,
 ) -> Result<CallToolResponse, ErrorData> {
-    let input = parse_arguments::<VisualBaselineInput>(arguments)?;
-    let request = VisualBaselineRequest {
-        display_id: input.display_id,
-        x: input.x,
-        y: input.y,
-        width: input.width,
-        height: input.height,
-    };
+    let request = parse_arguments::<VisualBaselineInput>(arguments)?.into_request();
     let result = run_platform_operation(operation_lease, move || {
+        let request = VisualBaselineRequest {
+            display_id: resolve_display(backend.as_ref(), &request.display_id)?,
+            ..request
+        };
         backend.capture_visual_baseline(&request)
     })
     .await?;
@@ -314,13 +338,7 @@ pub(super) async fn call_wait_for_change_since(
     arguments: Option<JsonObject>,
     operation_lease: Option<OperationLease>,
 ) -> Result<CallToolResponse, ErrorData> {
-    let input = parse_arguments::<WaitForChangeSinceInput>(arguments)?;
-    let request = WaitForChangeSinceRequest {
-        baseline_id: input.baseline_id,
-        timeout_ms: input.timeout_ms,
-        stable_ms: input.stable_ms,
-        difference_threshold: input.difference_threshold,
-    };
+    let request = parse_arguments::<WaitForChangeSinceInput>(arguments)?.into_request();
     let control =
         super::stop::current().map_or_else(MutationControl::default, |work| work.control.clone());
     let result = run_image_operation(operation_lease, move || {
@@ -343,6 +361,10 @@ pub(super) async fn call_read_text_in_region(
     let control =
         super::stop::current().map_or_else(MutationControl::default, |work| work.control.clone());
     let result = run_platform_operation(operation_lease, move || {
+        let request = OcrRegionRequest {
+            display_id: resolve_display(backend.as_ref(), &request.display_id)?,
+            ..request
+        };
         backend.read_text_in_region_controlled(&request, &control)
     })
     .await?;
@@ -362,6 +384,8 @@ pub(super) async fn call_find_text_on_screen(
     let control =
         super::stop::current().map_or_else(MutationControl::default, |work| work.control.clone());
     let result = run_platform_operation(operation_lease, move || {
+        let mut request = request;
+        request.region.display_id = resolve_display(backend.as_ref(), &request.region.display_id)?;
         backend.find_text_on_screen_controlled(&request, &control)
     })
     .await?;
@@ -395,6 +419,9 @@ pub(super) async fn call_wait_for_text(
     let control =
         super::stop::current().map_or_else(MutationControl::default, |work| work.control.clone());
     let result = run_platform_operation(operation_lease, move || {
+        let mut request = request;
+        request.find.region.display_id =
+            resolve_display(backend.as_ref(), &request.find.region.display_id)?;
         backend.wait_for_text_controlled(&request, &control)
     })
     .await?;
@@ -437,14 +464,7 @@ pub(super) async fn call_click_text(
         "modifiers": input.modifiers,
     });
     let request = ClickTextRequest {
-        region: OcrRegionRequest {
-            display_id: input.display_id,
-            x: input.x,
-            y: input.y,
-            width: input.width,
-            height: input.height,
-            language: input.language,
-        },
+        region: input.region(),
         query: input.query,
         case_sensitive: input.case_sensitive,
         exact_match: input.exact_match,
@@ -456,9 +476,15 @@ pub(super) async fn call_click_text(
     };
     let (result, progress) = run_encoded_mutation(
         operation_lease,
-        input.target_ref,
+        Some(input.target_ref),
         Arc::clone(&backend),
-        move |control| backend.click_text_controlled(&request, control),
+        move |control| {
+            let mut request = request;
+            request.region.display_id =
+                resolve_display(backend.as_ref(), &request.region.display_id)?;
+            resolve_observation(backend.as_ref(), &mut request.observation)?;
+            backend.click_text_controlled(&request, control)
+        },
     )
     .await;
     match result {
@@ -479,13 +505,14 @@ pub(super) async fn call_move_mouse(
         Err(error) => return Ok(not_started(&error)),
     };
     let duration_ms = input.duration_ms;
-    let observation = input.observation.into();
+    let mut observation = input.observation.into();
     let (result, progress) = run_encoded_mutation(
         operation_lease,
-        input.target_ref,
+        Some(input.target_ref),
         Arc::clone(&backend),
         move |control| {
             let (display_id, x, y) = target.resolve(backend.as_ref())?;
+            resolve_observation(backend.as_ref(), &mut observation)?;
             let request = MouseMoveRequest {
                 display_id,
                 x,
@@ -518,13 +545,14 @@ pub(super) async fn call_click_mouse(
     let click_count = input.click_count;
     let modifiers = input.modifiers.clone();
     let duration_ms = input.duration_ms;
-    let observation = input.observation.into();
+    let mut observation = input.observation.into();
     let (result, progress) = run_encoded_mutation(
         operation_lease,
-        input.target_ref,
+        Some(input.target_ref),
         Arc::clone(&backend),
         move |control| {
             let (display_id, x, y) = target.resolve(backend.as_ref())?;
+            resolve_observation(backend.as_ref(), &mut observation)?;
             let click_request = MouseClickRequest {
                 display_id,
                 x,
@@ -575,14 +603,15 @@ pub(super) async fn call_drag_mouse(
     let button = input.button;
     let modifiers = input.modifiers;
     let duration_ms = input.duration_ms;
-    let observation = input.observation.into();
+    let mut observation = input.observation.into();
     let (result, progress) = run_encoded_mutation(
         operation_lease,
-        input.target_ref,
+        Some(input.target_ref),
         Arc::clone(&backend),
         move |control| {
             let (start_display_id, start_x, start_y) = start.resolve(backend.as_ref())?;
             let (end_display_id, end_x, end_y) = end.resolve(backend.as_ref())?;
+            resolve_observation(backend.as_ref(), &mut observation)?;
             let request = MouseDragRequest {
                 start_display_id,
                 start_x,
@@ -653,7 +682,11 @@ pub(super) async fn call_switch_virtual_desktop(
         operation_lease,
         input.target_ref,
         Arc::clone(&backend),
-        move |control| backend.switch_virtual_desktop_controlled(&request, control),
+        move |control| {
+            let mut request = request;
+            resolve_observation(backend.as_ref(), &mut request.observation)?;
+            backend.switch_virtual_desktop_controlled(&request, control)
+        },
     )
     .await;
     match result {
@@ -669,16 +702,24 @@ pub(super) async fn call_focus_window(
     operation_lease: Option<OperationLease>,
 ) -> Result<CallToolResponse, ErrorData> {
     let input = parse_arguments::<FocusWindowInput>(arguments)?;
+    let window_id = match input.window_id() {
+        Ok(window_id) => window_id,
+        Err(error) => return Ok(not_started(&error)),
+    };
     let request = FocusWindowRequest {
         timeout_ms: input.timeout_ms,
-        window_id: input.window_id,
+        window_id,
         observation: input.observation.into(),
     };
     let (result, progress) = run_encoded_mutation(
         operation_lease,
-        request.window_id.clone(),
+        Some(request.window_id.clone()),
         Arc::clone(&backend),
-        move |control| backend.focus_window_controlled(&request, control),
+        move |control| {
+            let mut request = request;
+            resolve_observation(backend.as_ref(), &mut request.observation)?;
+            backend.focus_window_controlled(&request, control)
+        },
     )
     .await;
     match result {
@@ -693,11 +734,9 @@ pub(super) async fn call_capture_window(
     arguments: Option<JsonObject>,
     operation_lease: Option<OperationLease>,
 ) -> Result<CallToolResponse, ErrorData> {
-    let input = parse_arguments::<CaptureWindowInput>(arguments)?;
-    let request = CaptureWindowRequest {
-        window_id: input.window_id,
-        max_width: input.max_width,
-        include_cursor: input.include_cursor,
+    let request = match parse_arguments::<CaptureWindowInput>(arguments)?.into_request() {
+        Ok(request) => request,
+        Err(error) => return Ok(tool_error(&error).into()),
     };
     let result =
         run_image_operation(operation_lease, move || backend.capture_window(&request)).await?;
@@ -712,14 +751,9 @@ pub(super) async fn call_wait_for_window(
     arguments: Option<JsonObject>,
     operation_lease: Option<OperationLease>,
 ) -> Result<CallToolResponse, ErrorData> {
-    let input = parse_arguments::<WaitForWindowInput>(arguments)?;
-    let request = WaitForWindowRequest {
-        window_id: input.window_id,
-        title_contains: input.title_contains,
-        class_name: input.class_name,
-        process_id: input.process_id,
-        is_foreground: input.is_foreground,
-        timeout_ms: input.timeout_ms,
+    let request = match parse_arguments::<WaitForWindowInput>(arguments)?.into_request() {
+        Ok(request) => request,
+        Err(error) => return Ok(tool_error(&error).into()),
     };
     let control =
         super::stop::current().map_or_else(MutationControl::default, |work| work.control.clone());
@@ -746,9 +780,13 @@ pub(super) async fn call_press_keys(
     };
     let (result, progress) = run_encoded_mutation(
         operation_lease,
-        input.target_ref,
+        Some(input.target_ref),
         Arc::clone(&backend),
-        move |control| backend.press_keys_controlled(&request, control),
+        move |control| {
+            let mut request = request;
+            resolve_observation(backend.as_ref(), &mut request.observation)?;
+            backend.press_keys_controlled(&request, control)
+        },
     )
     .await;
     match result {
@@ -775,9 +813,13 @@ pub(super) async fn call_type_text(
     };
     let (result, progress) = run_encoded_mutation(
         operation_lease,
-        input.target_ref,
+        Some(input.target_ref),
         Arc::clone(&backend),
-        move |control| backend.type_text_controlled(&request, control),
+        move |control| {
+            let mut request = request;
+            resolve_observation(backend.as_ref(), &mut request.observation)?;
+            backend.type_text_controlled(&request, control)
+        },
     )
     .await;
     match result {
@@ -804,13 +846,14 @@ pub(super) async fn call_scroll_mouse(
     let delta_x = input.delta_x;
     let delta_y = input.delta_y;
     let duration_ms = input.duration_ms;
-    let observation = input.observation.into();
+    let mut observation = input.observation.into();
     let (result, progress) = run_encoded_mutation(
         operation_lease,
-        input.target_ref,
+        Some(input.target_ref),
         Arc::clone(&backend),
         move |control| {
             let (display_id, x, y) = target.resolve(backend.as_ref())?;
+            resolve_observation(backend.as_ref(), &mut observation)?;
             let scroll_request = MouseScrollRequest {
                 display_id,
                 x,
@@ -862,9 +905,11 @@ pub(super) async fn call_run_actions(
     let worker_reports = Arc::clone(&reports);
     let (result, progress) = run_encoded_mutation(
         operation_lease,
-        input.target_ref,
+        Some(input.target_ref),
         Arc::clone(&backend),
         move |control| {
+            let mut final_observation = final_observation;
+            resolve_observation(backend.as_ref(), &mut final_observation)?;
             run_steps(
                 backend.as_ref(),
                 &steps,
@@ -900,19 +945,15 @@ pub(super) async fn call_run_actions(
     .map(|response| super::results::with_progress(response, progress))
 }
 
-fn run_steps(
+/// A step point as a display ID and display-local pixels.
+type ResolvedPoint = (String, u32, u32);
+
+/// Resolves every point of the batch before the first step sends input, so a bad later point
+/// cannot strand input from earlier steps.
+fn resolve_points(
     backend: &dyn PlatformBackend,
     steps: &[ActionStep],
-    final_observation: &ObservationOptions,
-    control: &MutationControl,
-    reports: &std::sync::Mutex<Vec<Value>>,
-) -> Result<ActionObservation, PlatformError> {
-    let report = |value: Value| {
-        reports
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(value);
-    };
+) -> Result<Vec<Option<ResolvedPoint>>, PlatformError> {
     // Resolve every image point before the first step sends input.
     let resolved = steps
         .iter()
@@ -920,7 +961,9 @@ fn run_steps(
             ActionStep::Click { target, .. } | ActionStep::Scroll { target, .. } => {
                 target.resolve(backend).map(Some)
             }
-            ActionStep::TypeText { .. } | ActionStep::PressKeys { .. } => Ok(None),
+            ActionStep::TypeText { .. }
+            | ActionStep::PressKeys { .. }
+            | ActionStep::Wait { .. } => Ok(None),
         })
         .collect::<Result<Vec<_>, _>>()?;
     // Direct coordinates are only echoed by resolution, so check every point against the
@@ -947,12 +990,57 @@ fn run_steps(
             });
         }
     }
+    Ok(resolved)
+}
+
+fn run_steps(
+    backend: &dyn PlatformBackend,
+    steps: &[ActionStep],
+    final_observation: &ObservationOptions,
+    control: &MutationControl,
+    reports: &std::sync::Mutex<Vec<Value>>,
+) -> Result<ActionObservation, PlatformError> {
+    let report = |value: Value| {
+        reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(value);
+    };
+    let resolved = resolve_points(backend, steps)?;
     let quiet = ObservationOptions {
         mode: ObservationMode::None,
         ..ObservationOptions::default()
     };
     let mut observation = None;
     for (index, (step, point)) in steps.iter().zip(resolved).enumerate() {
+        if let ActionStep::Wait { wait_ms } = step {
+            // A wait sends no input and is never the last step, so it needs no evidence.
+            let outcome = control
+                .check("run_actions")
+                .and_then(|()| pause(*wait_ms, control));
+            match outcome {
+                Ok(()) => {
+                    report(
+                        json!({ "index": index, "action": "wait", "status": "completed", "sent_events": 0 }),
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    report(
+                        json!({ "index": index, "action": "wait", "status": "failed", "sent_events": 0, "error": error.to_string() }),
+                    );
+                    for (skipped, step) in steps.iter().enumerate().skip(index + 1) {
+                        report(
+                            json!({ "index": skipped, "action": step.kind(), "status": "skipped", "sent_events": 0 }),
+                        );
+                    }
+                    if index > 0 {
+                        control.steps_incomplete();
+                    }
+                    return Err(error);
+                }
+            }
+        }
         let options = if index + 1 == steps.len() {
             final_observation.clone()
         } else {
@@ -1011,6 +1099,19 @@ fn run_steps(
         argument: "steps".to_owned(),
         reason: "at least one step is required".to_owned(),
     })
+}
+
+/// Pauses for `wait_ms`, in short slices so a stop or cancellation ends the pause promptly.
+fn pause(wait_ms: u32, control: &MutationControl) -> Result<(), PlatformError> {
+    let deadline = Instant::now() + Duration::from_millis(u64::from(wait_ms));
+    loop {
+        control.check("run_actions")?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(25)));
+    }
 }
 
 fn run_step(
@@ -1085,5 +1186,9 @@ fn run_step(
                 control,
             )
             .map(|result| result.observation),
+        ActionStep::Wait { .. } => Err(PlatformError::InvalidArgument {
+            argument: "steps".to_owned(),
+            reason: "a wait step produces no observation".to_owned(),
+        }),
     }
 }

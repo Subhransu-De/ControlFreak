@@ -128,20 +128,19 @@ use windows::{
     core::HSTRING,
 };
 
+use controlfreak_core::limits::{
+    MAX_CAPTURE_WIDTH, MAX_MOVE_DURATION_MS, MAX_SCROLL_DELTA, MAX_TEXT_UTF16_UNITS, MAX_WAIT_MS,
+};
+
 const MAX_CAPTURE_BYTES: usize = 512 * 1024 * 1024;
-const MAX_MOVE_DURATION_MS: u32 = 10_000;
-const MAX_SCROLL_DELTA: u32 = 12_000;
 const MOVE_FRAME_MS: u64 = 16;
 const POST_INPUT_SETTLE_MS: u64 = 75;
 const POST_FOCUS_SETTLE_MS: u64 = 150;
 const MAX_ACTION_IMAGE_WIDTH: u32 = 1_280;
-const MAX_TEXT_UTF16_UNITS: usize = 4_000;
 const MAX_CHORD_KEYS: usize = 8;
 const MAX_WINDOWS: usize = 200;
 const MAX_WINDOW_TITLE_UTF16_UNITS: usize = 512;
 const MAX_CLICK_COUNT: u8 = 3;
-const MAX_CAPTURE_WIDTH: u32 = 7_680;
-const MAX_WAIT_MS: u32 = 30_000;
 const VISUAL_POLL_MS: u64 = 100;
 const VISUAL_COMPARE_WIDTH: u32 = 320;
 const MAX_DESKTOP_SWITCH_STEPS: u8 = 10;

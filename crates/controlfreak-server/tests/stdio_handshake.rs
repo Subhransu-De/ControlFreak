@@ -106,13 +106,24 @@ fn assert_target_arguments(tools: &Value) {
                     | "scroll_mouse"
                     | "press_keys"
                     | "type_text"
-                    | "switch_virtual_desktop"
+                    | "run_actions"
             )
         ) {
             assert!(
                 tool["inputSchema"]["required"]
                     .as_array()
                     .expect("targeted tool required array")
+                    .iter()
+                    .any(|field| field == "target_ref")
+            );
+        }
+        // Switching desktops defaults to the session's window, so its target is optional.
+        if tool["name"] == "switch_virtual_desktop" {
+            assert!(tool["inputSchema"]["properties"]["target_ref"].is_object());
+            assert!(
+                !tool["inputSchema"]["required"]
+                    .as_array()
+                    .expect("required array")
                     .iter()
                     .any(|field| field == "target_ref")
             );
@@ -580,7 +591,6 @@ fn assert_tool_names(tools: &Value) {
     assert_eq!(
         tool_names,
         [
-            "stop_desktop_work",
             "get_server_status",
             "begin_control_session",
             "end_control_session",
@@ -606,7 +616,8 @@ fn assert_tool_names(tools: &Value) {
             "scroll_mouse",
             "press_keys",
             "type_text",
-            "run_actions"
+            "run_actions",
+            "stop_desktop_work"
         ]
     );
 }

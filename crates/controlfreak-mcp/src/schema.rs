@@ -2,27 +2,64 @@ use super::{
     Arc, BEGIN_CONTROL_SESSION, CAPTURE_DISPLAY, CAPTURE_REGION, CAPTURE_VISUAL_BASELINE,
     CAPTURE_WINDOW, CLICK_MOUSE, CLICK_TEXT, DRAG_MOUSE, END_CONTROL_SESSION, FIND_TEXT_ON_SCREEN,
     FOCUS_WINDOW, GET_SERVER_STATUS, JsonObject, LIST_DISPLAYS, LIST_VIRTUAL_DESKTOPS,
-    LIST_WINDOWS, MAX_CAPTURE_WIDTH, MAX_MOVE_DURATION_MS, MAX_SCROLL_DELTA, MAX_TEXT_UTF16_UNITS,
-    MAX_WAIT_MS, MOVE_MOUSE, PRESS_KEYS, READ_TEXT_IN_REGION, RUN_ACTIONS, SCROLL_MOUSE,
-    SWITCH_VIRTUAL_DESKTOP, TYPE_TEXT, Tool, ToolAnnotations, Value, WAIT_FOR_CHANGE_SINCE,
-    WAIT_FOR_TEXT, WAIT_FOR_VISUAL_CHANGE, WAIT_FOR_WINDOW, json, requests::MAX_RUN_ACTION_STEPS,
+    LIST_WINDOWS, MOVE_MOUSE, PRESS_KEYS, READ_TEXT_IN_REGION, RUN_ACTIONS, SCROLL_MOUSE,
+    STOP_DESKTOP_WORK, SWITCH_VIRTUAL_DESKTOP, TYPE_TEXT, Tool, ToolAnnotations, Value,
+    WAIT_FOR_CHANGE_SINCE, WAIT_FOR_TEXT, WAIT_FOR_VISUAL_CHANGE, WAIT_FOR_WINDOW, json,
+    requests::MAX_RUN_ACTION_STEPS,
+};
+use controlfreak_core::limits::{
+    DEFAULT_CAPTURE_WIDTH, MAX_CAPTURE_WIDTH, MAX_MOVE_DURATION_MS, MAX_RUN_ACTIONS_WAIT_MS,
+    MAX_SCROLL_DELTA, MAX_TEXT_UTF16_UNITS, MAX_WAIT_MS, MIN_WAIT_MS,
 };
 
+/// How a tool touches the desktop. It decides the annotations, which every client reads.
+#[derive(Clone, Copy)]
+enum Kind {
+    /// Reads desktop or server state only.
+    Observe { idempotent: bool },
+    /// Sends keyboard, mouse or focus input to the desktop.
+    Input { idempotent: bool },
+    /// Changes the control session without sending input.
+    Session,
+    /// Permanently closes input until the server restarts.
+    Stop,
+}
+
+impl Kind {
+    fn annotations(self, title: &str) -> ToolAnnotations {
+        let (read_only, destructive, idempotent, open_world) = match self {
+            Self::Observe { idempotent } => (true, false, idempotent, false),
+            Self::Input { idempotent } => (false, true, idempotent, true),
+            Self::Session => (false, false, true, false),
+            Self::Stop => (false, true, true, false),
+        };
+        ToolAnnotations::with_title(title)
+            .read_only(read_only)
+            .destructive(destructive)
+            .idempotent(idempotent)
+            .open_world(open_world)
+    }
+}
+
+fn tool(
+    name: &'static str,
+    title: &str,
+    kind: Kind,
+    description: &str,
+    input: JsonObject,
+    output: Arc<JsonObject>,
+) -> Tool {
+    Tool::new(name, description.to_owned(), input)
+        .with_title(title)
+        .with_raw_output_schema(output)
+        .with_annotations(kind.annotations(title))
+}
+
 /// Tool descriptions and schemas used by both `tools/list` and offline contract export.
+///
+/// The list starts with the tools an agent needs first and ends with the emergency stop.
 pub fn tools() -> Vec<Tool> {
     let mut tools = vec![
-        Tool::new(
-            "stop_desktop_work",
-            "Cancel active desktop work and close admission until the user restarts the server. Cleanup may still be draining. Cannot undo dispatched application operations.",
-            object_schema(JsonObject::new(), &[]),
-        )
-        .with_raw_output_schema(object_output_schema(json!({
-            "type": "object",
-            "properties": {"status": {"enum": ["ready", "draining", "stopped", "cleanup_failed"]}},
-            "required": ["status"],
-            "additionalProperties": false
-        })))
-        .with_annotations(ToolAnnotations::default().read_only(false).destructive(false).idempotent(true).open_world(false)),
         get_server_status_tool(),
         begin_control_session_tool(),
         end_control_session_tool(),
@@ -49,6 +86,7 @@ pub fn tools() -> Vec<Tool> {
         press_keys_tool(),
         type_text_tool(),
         run_actions_tool(),
+        stop_desktop_work_tool(),
     ];
     for tool in &mut tools {
         if super::is_mutating_tool(&tool.name) && tool.name != FOCUS_WINDOW
@@ -60,16 +98,40 @@ pub fn tools() -> Vec<Tool> {
                 .and_then(Value::as_object_mut)
                 .expect("targeted tool schemas define a properties object")
                 .insert(
-                "target_ref".into(), json!({"type": "string", "minLength": 1,
-                "description": "Server-issued target reference from a current window or screenshot observation. Must match the session's approved target. End the session before approving another target."}));
-            schema
-                .get_mut("required")
-                .and_then(Value::as_array_mut)
-                .expect("targeted tool schemas define a required array")
-                .push(json!("target_ref"));
+                    "target_ref".into(),
+                    json!({"type": "string", "minLength": 1,
+                    "description": "Approved window, from list_windows or a screenshot."}),
+                );
+            // Switching desktops may omit the target: it defaults to the session's window.
+            if tool.name != SWITCH_VIRTUAL_DESKTOP {
+                schema
+                    .get_mut("required")
+                    .and_then(Value::as_array_mut)
+                    .expect("targeted tool schemas define a required array")
+                    .push(json!("target_ref"));
+            }
         }
     }
     tools
+}
+
+fn stop_desktop_work_tool() -> Tool {
+    tool(
+        STOP_DESKTOP_WORK,
+        "Emergency stop",
+        Kind::Stop,
+        "To finish normally, call end_control_session instead. This emergency stop cancels all desktop work and closes input permanently until the user restarts the server. Do not call it to clean up. It cannot undo input that was already sent.",
+        object_schema(JsonObject::new(), &[]),
+        output_schema(
+            vec![json!({
+                "type": "object",
+                "properties": {"status": {"enum": ["ready", "draining", "stopped", "cleanup_failed"]}},
+                "required": ["status"],
+                "additionalProperties": false
+            })],
+            false,
+        ),
+    )
 }
 
 fn begin_control_session_tool() -> Tool {
@@ -79,184 +141,143 @@ fn begin_control_session_tool() -> Tool {
         json!({
             "type": "integer",
             "minimum": 1,
-            "description": "Requested reservation time. The server clamps it to CONTROLFREAK_GLOW_MAX_HOLD_MS."
+            "description": "Idle hold in seconds. Default 45. The server caps it, at 120 unless the operator changed the cap."
         }),
     );
-    Tool::new(
+    tool(
         BEGIN_CONTROL_SESSION,
-        "Reserve desktop control. Returns a retryable failure if another ControlFreak server owns it.",
+        "Begin control session",
+        Kind::Session,
+        "Start here before any input. Reserves desktop control for ONE window (target_ref from list_windows or a screenshot) and shows the user the control indicator. Input tools work only while that window is in the foreground, so call focus_window next if it is not. Dialogs and menus of the same application are accepted. A window from another process needs end_control_session and a new session. Error desktop_in_use is retryable: another ControlFreak server owns the desktop.",
         object_schema(properties, &[]),
-    )
-    .with_raw_output_schema(session_change_output_schema("armed"))
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(false)
-            .destructive(false)
-            .idempotent(true)
-            .open_world(false),
+        session_change_output_schema("armed"),
     )
 }
 
 fn end_control_session_tool() -> Tool {
-    Tool::new(
+    tool(
         END_CONTROL_SESSION,
-        "Stop accepting new input actions and release desktop control after pending actions finish.",
+        "End control session",
+        Kind::Session,
+        "The normal way to finish. Stops accepting input and releases desktop control after pending actions finish. Call it when the task is done, or before approving another window. Safe to call twice.",
         object_schema(JsonObject::new(), &[]),
-    )
-    .with_raw_output_schema(session_change_output_schema("closing"))
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(false)
-            .destructive(false)
-            .idempotent(true)
-            .open_world(false),
+        session_change_output_schema("closing"),
     )
 }
 
 fn get_server_status_tool() -> Tool {
-    Tool::new(
+    tool(
         GET_SERVER_STATUS,
-        "Return server identity, version, uptime, privileges, operation diagnostics, stop_state and any user stop_reason. A user_stop requires the user's permission before restarting or resuming control.",
+        "Server status",
+        Kind::Observe { idempotent: true },
+        "Return version, uptime, privileges, indicator health, session state, stop_state and recent operations. stop_reason=user_stop means the user ended control: do not resume without their permission.",
         object_schema(JsonObject::new(), &[]),
-    )
-    .with_raw_output_schema(server_status_output_schema())
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(true)
-            .destructive(false)
-            .idempotent(true)
-            .open_world(false),
+        server_status_output_schema(),
     )
 }
 
 fn list_displays_tool() -> Tool {
-    Tool::new(
+    tool(
         LIST_DISPLAYS,
-        "List active displays with IDs, primary status, and bounds in physical pixels.",
+        "List displays",
+        Kind::Observe { idempotent: true },
+        "List active displays: ID, name, primary flag and bounds in physical pixels (left and top can be negative). Every display_id parameter defaults to the primary display, so call this only on multi-display setups.",
         object_schema(JsonObject::new(), &[]),
-    )
-    .with_raw_output_schema(Arc::new(rmcp::object!({
-        "type": "object",
-        "properties": {
-            "count": { "type": "integer", "minimum": 0 },
-            "displays": {
-                "type": "array",
-                "items": display_schema(),
-            }
-        },
-        "required": ["count", "displays"],
-        "additionalProperties": false
-    })))
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(true)
-            .destructive(false)
-            .idempotent(true)
-            .open_world(false),
+        output_schema(
+            vec![json!({
+                "type": "object",
+                "properties": {
+                    "count": { "type": "integer", "minimum": 0 },
+                    "displays": { "type": "array", "items": def_ref("display") }
+                },
+                "required": ["count", "displays"],
+                "additionalProperties": false
+            })],
+            false,
+        ),
     )
 }
 
 fn capture_display_tool() -> Tool {
     let mut properties = JsonObject::new();
-    properties.insert(
-        "display_id".to_owned(),
-        json!({
-            "type": "string",
-            "minLength": 1,
-            "description": "Display ID returned by list_displays."
-        }),
-    );
+    properties.insert("display_id".to_owned(), display_id_property());
     add_capture_options(&mut properties);
-    Tool::new(
+    tool(
         CAPTURE_DISPLAY,
-        "Capture a display as PNG. Protected or HDR content may render incorrectly.",
-        object_schema(properties, &["display_id"]),
-    )
-    .with_raw_output_schema(object_output_schema(screenshot_schema()))
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(true)
-            .destructive(false)
-            .idempotent(false)
-            .open_world(false),
+        "Capture display",
+        Kind::Observe { idempotent: false },
+        "Capture a whole display as PNG, 1280 px wide by default (max_width changes it, native=true keeps full resolution). The result's observation_id maps image points to screen pixels for pointer tools. Protected or HDR content may render incorrectly.",
+        object_schema(properties, &[]),
+        output_schema(vec![screenshot_schema()], false),
     )
 }
 
 fn capture_region_tool() -> Tool {
     let mut properties = region_properties();
     add_capture_options(&mut properties);
-    Tool::new(
+    tool(
         CAPTURE_REGION,
-        "Capture a rectangular display region as PNG, at native resolution unless max_width is supplied.",
-        object_schema(
-            properties,
-            &["display_id", "x", "y", "width", "height"],
-        ),
+        "Capture region",
+        Kind::Observe { idempotent: false },
+        "Capture a rectangle as PNG, cheaper than a full capture when one area matters. x, y, width, height are display-local physical pixels. Width defaults to 1280 (max_width changes it, native=true keeps full resolution).",
+        object_schema(properties, &["x", "y", "width", "height"]),
+        output_schema(vec![screenshot_schema()], false),
     )
-    .with_raw_output_schema(object_output_schema(screenshot_schema()))
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(true)
-            .destructive(false)
-            .idempotent(false)
-            .open_world(false),
-    )
+}
+
+fn wait_properties() -> JsonObject {
+    let mut properties = JsonObject::new();
+    properties.insert("timeout_ms".to_owned(), timeout_property());
+    properties.insert(
+        "stable_ms".to_owned(),
+        json!({ "type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS, "default": 250 }),
+    );
+    properties.insert(
+        "difference_threshold".to_owned(),
+        json!({ "type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.01 }),
+    );
+    properties
+}
+
+fn timeout_property() -> Value {
+    json!({ "type": "integer", "minimum": MIN_WAIT_MS, "maximum": MAX_WAIT_MS, "default": 5000 })
 }
 
 fn wait_for_visual_change_tool() -> Tool {
     let mut properties = region_properties();
-    properties.insert(
-        "timeout_ms".to_owned(),
-        json!({
-            "type": "integer", "minimum": 1, "maximum": MAX_WAIT_MS, "default": 5000,
-            "description": "Maximum server-side wait. A timeout is returned as a successful result, not an error."
-        }),
-    );
-    properties.insert(
-        "stable_ms".to_owned(),
-        json!({
-            "type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS, "default": 250,
-            "description": "How long the changed region must remain visually stable before returning."
-        }),
-    );
-    properties.insert(
-        "difference_threshold".to_owned(),
-        json!({
-            "type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.01,
-            "description": "Normalized mean RGB difference required to count as changed."
-        }),
-    );
-    Tool::new(
+    properties.extend(wait_properties());
+    tool(
         WAIT_FOR_VISUAL_CHANGE,
-        "Wait for a region to change from its appearance at call time and settle. Return the final screenshot; timeout is a normal result.",
-        object_schema(
-            properties,
-            &["display_id", "x", "y", "width", "height"],
-        ),
-    )
-    .with_raw_output_schema(visual_change_output_schema())
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(true)
-            .destructive(false)
-            .idempotent(false)
-            .open_world(false),
+        "Wait for visual change",
+        Kind::Observe { idempotent: false },
+        "Wait until a region differs from how it looks at call time and then stays stable for stable_ms, and return its screenshot. A timeout (default 5000 ms, at most 30000; 0 checks once) is a normal result with timed_out=true, not an error. To compare against a moment before an action, use capture_visual_baseline and wait_for_change_since.",
+        object_schema(properties, &["x", "y", "width", "height"]),
+        visual_change_output_schema(),
     )
 }
 
 fn capture_visual_baseline_tool() -> Tool {
-    Tool::new(
+    tool(
         CAPTURE_VISUAL_BASELINE,
-        "Save a region's visual baseline without returning an image. Capture before an action, then use wait_for_change_since afterward to wait for its effects.",
-        object_schema(region_properties(), &["display_id", "x", "y", "width", "height"]),
-    )
-    .with_raw_output_schema(visual_baseline_output_schema())
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(true)
-            .destructive(false)
-            .idempotent(false)
-            .open_world(false),
+        "Save visual baseline",
+        Kind::Observe { idempotent: false },
+        "Save a region's appearance without returning an image. Call it BEFORE an action, then call wait_for_change_since afterwards. Baselines last 5 minutes and at most 16 are kept.",
+        object_schema(region_properties(), &["x", "y", "width", "height"]),
+        output_schema(
+            vec![json!({
+                "type": "object",
+                "properties": {
+                    "baseline_id": { "type": "string", "pattern": "^vb-[0-9a-f]{32}-[0-9a-f]{16}$" },
+                    "display": def_ref("display"),
+                    "source_bounds": def_ref("bounds"),
+                    "fingerprint": { "type": "string" },
+                    "expires_in_ms": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["baseline_id", "display", "source_bounds", "fingerprint", "expires_in_ms"],
+                "additionalProperties": false
+            })],
+            false,
+        ),
     )
 }
 
@@ -266,198 +287,148 @@ fn wait_for_change_since_tool() -> Tool {
         "baseline_id".to_owned(),
         json!({
             "type": "string", "pattern": "^vb-[0-9a-f]{32}-[0-9a-f]{16}$",
-            "description": "Unexpired baseline ID returned by capture_visual_baseline."
+            "description": "From capture_visual_baseline."
         }),
     );
-    Tool::new(
+    tool(
         WAIT_FOR_CHANGE_SINCE,
-        "Wait for a region to differ from its saved baseline and settle, then return a screenshot. Timeout is normal. Baselines expire after five minutes and can be reused while retained.",
+        "Wait for change since baseline",
+        Kind::Observe { idempotent: false },
+        "Wait until a region differs from its saved baseline and is stable, then return a screenshot. A timeout (default 5000 ms, at most 30000) is a normal result. The baseline can be reused until it expires after 5 minutes.",
         object_schema(properties, &["baseline_id"]),
-    )
-    .with_raw_output_schema(visual_change_output_schema())
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(true)
-            .destructive(false)
-            .idempotent(false)
-            .open_world(false),
+        visual_change_output_schema(),
     )
 }
 
 fn read_text_in_region_tool() -> Tool {
     let mut properties = region_properties();
     add_ocr_language(&mut properties);
-    Tool::new(
+    tool(
         READ_TEXT_IN_REGION,
-        "Read text in a region using OCR. Return lines and words with bounds in display-local physical pixels. No image or confidence scores.",
-        object_schema(properties, &["display_id", "x", "y", "width", "height"]),
-    )
-    .with_raw_output_schema(read_text_output_schema())
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(true)
-            .destructive(false)
-            .idempotent(false)
-            .open_world(false),
+        "Read text (OCR)",
+        Kind::Observe { idempotent: false },
+        "Read the text in a region with OCR. Returns lines and words with display-local pixel bounds, no image and no confidence scores. Needs a Windows OCR language pack.",
+        object_schema(properties, &["x", "y", "width", "height"]),
+        read_text_output_schema(),
     )
 }
 
-fn find_text_on_screen_tool() -> Tool {
-    let mut properties = region_properties();
-    add_ocr_language(&mut properties);
-    properties.insert("query".to_owned(), json!({ "type": "string", "minLength": 1, "description": "Text substring to find within each OCR line." }));
-    properties.insert(
-        "case_sensitive".to_owned(),
-        json!({ "type": "boolean", "default": false }),
-    );
-    properties.insert(
-        "max_results".to_owned(),
-        json!({ "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }),
-    );
-    properties.insert("match_mode".into(), json!({"type": "string", "enum": ["exact", "substring", "tolerant"], "default": "substring", "description": "Discovery only. Tolerant tries trimmed exact, NFKC/whitespace/punctuation normalization, two adjacent lines, then optional OCR confusions. The first nonempty tier wins even if ambiguous. No confidence scores or automatic input."}));
-    properties.insert("ocr_confusions".into(), json!({"type": "boolean", "default": false, "description": "Tolerant discovery only: allow one 0/O/o or 1/I/i/l/| substitution in a 4-64 character label."}));
-    Tool::new(
-        FIND_TEXT_ON_SCREEN,
-        "Discover OCR text within a region without authorizing input. Returns display-local bounds, match_tier, full candidate_count, and truncation flags. At most max_results candidates and 256 Unicode characters per candidate; ambiguity is never hidden by the limit.",
-        object_schema(properties, &["display_id", "x", "y", "width", "height", "query"]),
-    )
-    .with_raw_output_schema(find_text_output_schema())
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(true)
-            .destructive(false)
-            .idempotent(false)
-            .open_world(false),
-    )
-}
-
-fn wait_for_text_tool() -> Tool {
-    let mut properties = region_properties();
-    add_ocr_language(&mut properties);
-    properties.insert("query".to_owned(), json!({ "type": "string", "minLength": 1, "description": "Text to wait for, matched as in find_text_on_screen." }));
-    properties.insert("condition".to_owned(), json!({ "type": "string", "enum": ["appears", "disappears"], "default": "appears", "description": "appears: wait until at least one match is visible. disappears: wait until none is." }));
-    properties.insert(
-        "timeout_ms".to_owned(),
-        json!({ "type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS, "default": 5000 }),
-    );
-    properties.insert(
-        "case_sensitive".to_owned(),
-        json!({ "type": "boolean", "default": false }),
-    );
-    properties.insert(
-        "max_results".to_owned(),
-        json!({ "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }),
-    );
-    properties.insert("match_mode".into(), json!({"type": "string", "enum": ["exact", "substring", "tolerant"], "default": "substring"}));
-    properties.insert(
-        "ocr_confusions".into(),
-        json!({"type": "boolean", "default": false, "description": "Tolerant matching only."}),
-    );
-    Tool::new(
-        WAIT_FOR_TEXT,
-        "Repeat OCR discovery in a region until query appears or disappears, or timeout_ms elapses. Returns satisfied, timed_out, attempts, and the final pass's matches with display-local bounds. Each pass is a full recognition; prefer a small region. Discovery only: it never authorizes input.",
-        object_schema(properties, &["display_id", "x", "y", "width", "height", "query"]),
-    )
-    .with_raw_output_schema(wait_for_text_output_schema())
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(true)
-            .destructive(false)
-            .idempotent(false)
-            .open_world(false),
-    )
-}
-
-fn click_text_tool() -> Tool {
+fn text_query_properties() -> JsonObject {
     let mut properties = region_properties();
     add_ocr_language(&mut properties);
     properties.insert(
         "query".to_owned(),
-        json!({
-            "type": "string", "minLength": 1,
-            "description": "OCR text to click. Surrounding whitespace is ignored. The action is rejected unless exactly one matching line exists in the entire region."
-        }),
+        json!({ "type": "string", "minLength": 1 }),
     );
     properties.insert(
         "case_sensitive".to_owned(),
         json!({ "type": "boolean", "default": false }),
     );
     properties.insert(
+        "max_results".to_owned(),
+        json!({ "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }),
+    );
+    properties.insert("match_mode".into(), json!({"type": "string", "enum": ["exact", "substring", "tolerant"], "default": "substring", "description": "tolerant tries normalization, two adjacent lines, then optional OCR confusions; the first non-empty tier wins."}));
+    properties.insert(
+        "ocr_confusions".into(),
+        json!({"type": "boolean", "default": false, "description": "Tolerant only: allow one 0/O/o or 1/I/i/l/| substitution in a 4-64 character label."}),
+    );
+    properties
+}
+
+fn find_text_on_screen_tool() -> Tool {
+    tool(
+        FIND_TEXT_ON_SCREEN,
+        "Find text (OCR)",
+        Kind::Observe { idempotent: false },
+        "Find text in a region with OCR. Discovery only: it never sends input. Returns display-local bounds, match_tier, the full candidate_count and truncation flags. Use it to pick a query and region before click_text.",
+        object_schema(
+            text_query_properties(),
+            &["x", "y", "width", "height", "query"],
+        ),
+        find_text_output_schema(),
+    )
+}
+
+fn wait_for_text_tool() -> Tool {
+    let mut properties = text_query_properties();
+    properties.insert(
+        "condition".to_owned(),
+        json!({ "type": "string", "enum": ["appears", "disappears"], "default": "appears" }),
+    );
+    properties.insert("timeout_ms".to_owned(), timeout_property());
+    tool(
+        WAIT_FOR_TEXT,
+        "Wait for text (OCR)",
+        Kind::Observe { idempotent: false },
+        "Repeat OCR over a region until query appears or disappears, or timeout_ms (default 5000, at most 30000) elapses. Returns satisfied, timed_out, attempts and the last matches. Each pass is a full recognition, so keep the region small. Never sends input.",
+        object_schema(properties, &["x", "y", "width", "height", "query"]),
+        wait_for_text_output_schema(),
+    )
+}
+
+fn click_text_tool() -> Tool {
+    let mut properties = text_query_properties();
+    properties.remove("max_results");
+    properties.remove("match_mode");
+    properties.remove("ocr_confusions");
+    properties.insert(
         "exact_match".to_owned(),
         json!({
             "type": "boolean", "default": true,
-            "description": "Require the trimmed OCR line to equal query. Set false only when a unique substring is sufficient."
+            "description": "false accepts a unique substring."
         }),
     );
-    properties.insert(
-        "button".to_owned(),
-        json!({ "type": "string", "enum": ["left", "right", "middle"], "default": "left" }),
-    );
-    properties.insert(
-        "click_count".to_owned(),
-        json!({ "type": "integer", "minimum": 1, "maximum": 3, "default": 1 }),
-    );
+    properties.insert("button".to_owned(), button_property(true));
+    properties.insert("click_count".to_owned(), click_count_property());
     properties.insert("modifiers".to_owned(), modifier_schema());
-    properties.insert(
-        "duration_ms".to_owned(),
-        json!({ "type": "integer", "minimum": 0, "maximum": MAX_MOVE_DURATION_MS, "default": 0 }),
-    );
+    properties.insert("duration_ms".to_owned(), duration_property());
     add_observation(&mut properties);
-    Tool::new(
+    tool(
         CLICK_TEXT,
-        "Click the center of a unique exact or substring OCR line in a region. No tolerant fallback. Zero/multiple matches return ocr_no_match/ocr_ambiguous_match with recovery guidance and at most 20 candidates of 256 Unicode characters, with truncation flags. No input occurs on either outcome. Success reports matched_text bounds and match_tier.",
-        object_schema(
-            properties,
-            &["display_id", "x", "y", "width", "height", "query"],
-        ),
-    )
-    .with_raw_output_schema(pointer_action_output_schema())
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(false)
-            .destructive(true)
-            .idempotent(false)
-            .open_world(false),
+        "Click text (OCR)",
+        Kind::Input { idempotent: false },
+        "Click the unique visible text match inside a region. Needs a session whose window is in the foreground. Zero or several matches return ocr_no_match or ocr_ambiguous_match with candidates and send no input: narrow the region or look with find_text_on_screen. Success reports matched_text and match_tier.",
+        object_schema(properties, &["x", "y", "width", "height", "query"]),
+        action_output_schema(true),
     )
 }
 
 fn list_virtual_desktops_tool() -> Tool {
-    Tool::new(
+    tool(
         LIST_VIRTUAL_DESKTOPS,
-        "Group discoverable titled windows by desktop ID and identify the current group. Empty desktops, names, and desktop order are unavailable.",
+        "List virtual desktops",
+        Kind::Observe { idempotent: true },
+        "Group the discoverable titled windows by virtual desktop and mark the current one. Empty desktops, names and desktop order are not available.",
         object_schema(JsonObject::new(), &[]),
-    )
-    .with_raw_output_schema(Arc::new(rmcp::object!({
-        "type": "object",
-        "properties": {
-            "count": { "type": "integer", "minimum": 0 },
-            "desktops": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" },
-                        "is_current": { "type": "boolean" },
-                        "application_count": { "type": "integer", "minimum": 0 },
-                        "windows": { "type": "array", "items": window_schema() }
+        output_schema(
+            vec![json!({
+                "type": "object",
+                "properties": {
+                    "count": { "type": "integer", "minimum": 0 },
+                    "desktops": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "is_current": { "type": "boolean" },
+                                "application_count": { "type": "integer", "minimum": 0 },
+                                "windows": { "type": "array", "items": def_ref("window") }
+                            },
+                            "required": ["id", "is_current", "application_count", "windows"],
+                            "additionalProperties": false
+                        }
                     },
-                    "required": ["id", "is_current", "application_count", "windows"],
-                    "additionalProperties": false
-                }
-            },
-            "includes_empty_desktops": { "const": false },
-            "order_available": { "const": false },
-            "names_available": { "const": false }
-        },
-        "required": ["count", "desktops", "includes_empty_desktops", "order_available", "names_available"],
-        "additionalProperties": false
-    })))
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(true)
-            .destructive(false)
-            .idempotent(true)
-            .open_world(false),
+                    "includes_empty_desktops": { "const": false },
+                    "order_available": { "const": false },
+                    "names_available": { "const": false }
+                },
+                "required": ["count", "desktops", "includes_empty_desktops", "order_available", "names_available"],
+                "additionalProperties": false
+            })],
+            false,
+        ),
     )
 }
 
@@ -465,76 +436,61 @@ fn switch_virtual_desktop_tool() -> Tool {
     let mut properties = JsonObject::new();
     properties.insert(
         "direction".to_owned(),
-        json!({
-            "type": "string", "enum": ["left", "right"],
-            "description": "Relative direction in the Windows virtual-desktop strip."
-        }),
+        json!({ "type": "string", "enum": ["left", "right"] }),
     );
-    add_observation(&mut properties);
     properties.insert(
         "steps".to_owned(),
-        json!({
-            "type": "integer", "minimum": 1, "maximum": 10, "default": 1,
-            "description": "Number of relative desktop switches to request. Windows stops at an edge."
-        }),
+        json!({ "type": "integer", "minimum": 1, "maximum": 10, "default": 1, "description": "Windows stops at the last desktop." }),
     );
-    Tool::new(
+    add_observation(&mut properties);
+    tool(
         SWITCH_VIRTUAL_DESKTOP,
-        "Switch left or right across existing virtual desktops. changed=false means no switch was detected.",
+        "Switch virtual desktop",
+        Kind::Input { idempotent: false },
+        "Switch left or right across existing virtual desktops. Needs the session's window in the foreground. The switch ends the control session, because that window is no longer on screen: begin a new session on a window of the new desktop. target_ref is optional and defaults to the session's window, or to the foreground window when no session is active. changed=false means no switch was detected.",
         object_schema(properties, &["direction"]),
-    )
-    .with_raw_output_schema(action_output_schema(false))
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(false)
-            .destructive(false)
-            .idempotent(false)
-            .open_world(false),
+        action_output_schema(false),
     )
 }
 
 fn list_windows_tool() -> Tool {
-    Tool::new(
+    tool(
         LIST_WINDOWS,
-        "List visible titled top-level windows, foreground first, then by title. Returns at most 200; truncated=true means more exist, so use wait_for_window with title_contains, class_name, or process_id to reach them. Refresh IDs after windows open, close, or change ownership.",
+        "List windows",
+        Kind::Observe { idempotent: true },
+        "List visible titled top-level windows, foreground first, then by title. Each id is a target_ref for begin_control_session, focus_window and capture_window. Returns at most 200; truncated=true means more exist, so use wait_for_window with title_contains, class_name or process_id to reach them. Refresh ids after windows open, close or change owner.",
         object_schema(JsonObject::new(), &[]),
-    )
-    .with_raw_output_schema(Arc::new(rmcp::object!({
-        "type": "object",
-        "properties": {
-            "count": { "type": "integer", "minimum": 0 },
-            "truncated": { "type": "boolean", "description": "More eligible windows existed than were returned." },
-            "windows": { "type": "array", "items": window_schema() }
-        },
-        "required": ["count", "truncated", "windows"],
-        "additionalProperties": false
-    })))
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(true)
-            .destructive(false)
-            .idempotent(true)
-            .open_world(false),
+        output_schema(
+            vec![json!({
+                "type": "object",
+                "properties": {
+                    "count": { "type": "integer", "minimum": 0 },
+                    "truncated": { "type": "boolean" },
+                    "windows": { "type": "array", "items": def_ref("window") }
+                },
+                "required": ["count", "truncated", "windows"],
+                "additionalProperties": false
+            })],
+            false,
+        ),
     )
 }
 
 fn focus_window_tool() -> Tool {
     let mut properties = JsonObject::new();
-    properties.insert("timeout_ms".into(), json!({ "type": "integer", "minimum": 100, "maximum": 5000, "default": 1000, "description": "Total activation retry and settle budget in milliseconds." }));
+    properties.insert(
+        "timeout_ms".into(),
+        json!({ "type": "integer", "minimum": 100, "maximum": 5000, "default": 1000 }),
+    );
     add_window_id(&mut properties);
     add_observation(&mut properties);
-    Tool::new(
+    tool(
         FOCUS_WINDOW,
-        "Restore and focus an existing window, then verify it became foreground.",
-        object_schema(properties, &["window_id"]),
-    )
-    .with_raw_output_schema(action_output_schema(false))
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(false)
-            .destructive(false)
-            .idempotent(true)
-            .open_world(false),
+        "Focus window",
+        Kind::Input { idempotent: true },
+        "Bring the session's approved window to the foreground, restoring it if minimized, and verify it. Call it right after begin_control_session, and again whenever a window from another process took the foreground. It never sends keys or clicks to get focus: if Windows refuses, ask the user to click the window. window_id (or its alias target_ref) must be the approved window.",
+        object_schema(properties, &[]),
+        action_output_schema(false),
     )
 }
 
@@ -542,125 +498,121 @@ fn capture_window_tool() -> Tool {
     let mut properties = JsonObject::new();
     add_window_id(&mut properties);
     add_capture_options(&mut properties);
-    Tool::new(
+    tool(
         CAPTURE_WINDOW,
-        "Capture a window's visible frame without focusing it. Use a fresh window ID and restore minimized windows first.",
-        object_schema(properties, &["window_id"]),
-    )
-    .with_raw_output_schema(object_output_schema(window_screenshot_schema()))
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(true)
-            .destructive(false)
-            .idempotent(false)
-            .open_world(false),
+        "Capture window",
+        Kind::Observe { idempotent: false },
+        "Capture one window as PNG without focusing it. window_id (or its alias target_ref) comes from list_windows, and must be fresh. Restore minimized windows first. Width defaults to 1280 (max_width changes it, native=true keeps full resolution).",
+        object_schema(properties, &[]),
+        output_schema(vec![window_screenshot_schema()], false),
     )
 }
 
 fn wait_for_window_tool() -> Tool {
     let mut properties = JsonObject::new();
     add_window_id(&mut properties);
-    properties.insert("title_contains".to_owned(), json!({ "type": "string", "minLength": 1, "description": "Case-insensitive title substring." }));
-    properties.insert("class_name".to_owned(), json!({ "type": "string", "minLength": 1, "description": "Case-insensitive exact Win32 class name." }));
+    properties.insert(
+        "title_contains".to_owned(),
+        json!({ "type": "string", "minLength": 1, "description": "Case-insensitive substring." }),
+    );
+    properties.insert(
+        "class_name".to_owned(),
+        json!({ "type": "string", "minLength": 1, "description": "Case-insensitive exact Win32 class." }),
+    );
     properties.insert(
         "process_id".to_owned(),
         json!({ "type": "integer", "minimum": 1 }),
     );
     properties.insert("is_foreground".to_owned(), json!({ "type": "boolean" }));
-    properties.insert(
-        "timeout_ms".to_owned(),
-        json!({ "type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS, "default": 5000 }),
-    );
-    Tool::new(
+    properties.insert("timeout_ms".to_owned(), timeout_property());
+    tool(
         WAIT_FOR_WINDOW,
-        "Wait for a visible top-level window matching all supplied criteria. Requires at least one criterion. Timeout returns matched=false and timed_out=true.",
+        "Wait for window",
+        Kind::Observe { idempotent: false },
+        "Wait for a visible top-level window that matches every criterion given: window_id (or target_ref), title_contains, class_name, process_id, is_foreground. At least one is required. A timeout (default 5000 ms, at most 30000) returns matched=false and timed_out=true.",
         object_schema(properties, &[]),
-    )
-    .with_raw_output_schema(wait_for_window_output_schema())
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(true)
-            .destructive(false)
-            .idempotent(false)
-            .open_world(false),
+        output_schema(
+            vec![json!({
+                "type": "object",
+                "properties": {
+                    "matched": { "type": "boolean" },
+                    "timed_out": { "type": "boolean" },
+                    "elapsed_ms": { "type": "integer", "minimum": 0 },
+                    "window": { "oneOf": [def_ref("window"), { "type": "null" }] }
+                },
+                "required": ["matched", "timed_out", "elapsed_ms", "window"],
+                "additionalProperties": false
+            })],
+            false,
+        ),
     )
 }
 
 fn move_mouse_tool() -> Tool {
-    Tool::new(
+    tool(
         MOVE_MOUSE,
-        "Move the pointer within or between displays. Give display_id with display-local physical x/y, or observation_id with image_x/image_y from a returned screenshot.",
+        "Move mouse",
+        Kind::Input { idempotent: true },
+        "Move the pointer onto the approved window. Needs the window in the foreground. Give x and y (display-local physical pixels; display_id defaults to primary), or observation_id with image_x and image_y from a screenshot.",
         object_schema(pointer_properties(), &[]),
-    )
-    .with_raw_output_schema(pointer_action_output_schema())
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(false)
-            .destructive(false)
-            .idempotent(true)
-            .open_world(false),
+        action_output_schema(true),
     )
 }
 
 fn click_mouse_tool() -> Tool {
     let mut properties = pointer_properties();
-    properties.insert(
-        "button".to_owned(),
-        json!({
-            "type": "string",
-            "enum": ["left", "right", "middle"],
-            "description": "Mouse button to click. Middle-click commonly opens links in a background tab."
-        }),
-    );
-    properties.insert("click_count".to_owned(), json!({ "type": "integer", "minimum": 1, "maximum": 3, "default": 1, "description": "Number of clicks performed as one atomic input sequence." }));
+    properties.insert("button".to_owned(), button_property(true));
+    properties.insert("click_count".to_owned(), click_count_property());
     properties.insert("modifiers".to_owned(), modifier_schema());
-    Tool::new(
+    tool(
         CLICK_MOUSE,
-        "Click at display_id with display-local physical x/y, or at observation_id with image_x/image_y from a returned screenshot. Clicks and modifiers execute as one input sequence.",
-        object_schema(properties, &["button"]),
-    )
-    .with_raw_output_schema(pointer_action_output_schema())
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(false)
-            .destructive(true)
-            .idempotent(false)
-            .open_world(false),
+        "Click mouse",
+        Kind::Input { idempotent: false },
+        "Click on the approved window. Needs the window in the foreground. Give x and y (display-local physical pixels; display_id defaults to primary), or observation_id with image_x and image_y from a screenshot. Modifiers are held for the click and always released. button defaults to left.",
+        object_schema(properties, &[]),
+        action_output_schema(true),
     )
 }
 
 fn drag_mouse_tool() -> Tool {
     let mut properties = JsonObject::new();
     for prefix in ["start", "end"] {
-        properties.insert(format!("{prefix}_display_id"), json!({ "type": "string", "minLength": 1, "description": format!("{prefix} display ID returned by list_displays.") }));
-        properties.insert(format!("{prefix}_x"), json!({ "type": "integer", "minimum": 0, "description": format!("{prefix} physical-pixel X coordinate local to its display.") }));
-        properties.insert(format!("{prefix}_y"), json!({ "type": "integer", "minimum": 0, "description": format!("{prefix} physical-pixel Y coordinate local to its display.") }));
-    }
-    properties.insert("observation_id".to_owned(), json!({ "type": "string", "minLength": 1, "description": "Screenshot observation_id for start/end image points." }));
-    for prefix in ["start", "end"] {
-        for axis in ["x", "y"] {
-            properties.insert(format!("{prefix}_image_{axis}"), json!({ "type": "integer", "minimum": 0, "description": format!("{prefix} {axis} in the observation_id image's own pixels; replaces {prefix}_display_id/{prefix}_x/{prefix}_y.") }));
-        }
+        properties.insert(
+            format!("{prefix}_display_id"),
+            json!({ "type": "string", "minLength": 1 }),
+        );
+        properties.insert(
+            format!("{prefix}_x"),
+            json!({ "type": "integer", "minimum": 0 }),
+        );
+        properties.insert(
+            format!("{prefix}_y"),
+            json!({ "type": "integer", "minimum": 0 }),
+        );
     }
     properties.insert(
-        "button".to_owned(),
-        json!({ "type": "string", "enum": ["left", "right", "middle"] }),
+        "observation_id".to_owned(),
+        json!({ "type": "string", "minLength": 1 }),
     );
+    for prefix in ["start", "end"] {
+        for axis in ["x", "y"] {
+            properties.insert(
+                format!("{prefix}_image_{axis}"),
+                json!({ "type": "integer", "minimum": 0 }),
+            );
+        }
+    }
+    properties.insert("button".to_owned(), button_property(true));
     properties.insert("modifiers".to_owned(), modifier_schema());
-    properties.insert("duration_ms".to_owned(), json!({ "type": "integer", "minimum": 0, "maximum": MAX_MOVE_DURATION_MS, "default": 0, "description": "Smooth drag duration from start to end." }));
+    properties.insert("duration_ms".to_owned(), duration_property());
     add_observation(&mut properties);
-    Tool::new(
+    tool(
         DRAG_MOUSE,
-        "Drag within or between displays. Give each end as display_id with display-local x/y, or as image points in one observation_id. Hold the button and modifiers for the drag, then release all held inputs.",
-        object_schema(properties, &["button"]),
-    )
-    .with_raw_output_schema(pointer_action_output_schema())
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(false)
-            .destructive(true)
-            .idempotent(false)
-            .open_world(false),
+        "Drag mouse",
+        Kind::Input { idempotent: false },
+        "Press, move and release in one call. Needs the approved window in the foreground. Give each end as start_x/start_y or end_x/end_y (start_display_id and end_display_id default to primary), or as start_image_x/start_image_y and end_image_x/end_image_y in one screenshot's observation_id. The button and modifiers are always released.",
+        object_schema(properties, &[]),
+        action_output_schema(true),
     )
 }
 
@@ -670,33 +622,57 @@ fn scroll_mouse_tool() -> Tool {
         "delta_x".to_owned(),
         json!({
             "type": "integer",
-            "minimum": -MAX_SCROLL_DELTA,
+            "minimum": -i64::from(MAX_SCROLL_DELTA),
             "maximum": MAX_SCROLL_DELTA,
-            "default": 0,
-            "description": "Horizontal wheel delta: positive scrolls right and negative scrolls left. 120 is one wheel detent."
+            "default": 0
         }),
     );
     properties.insert(
         "delta_y".to_owned(),
         json!({
             "type": "integer",
-            "minimum": -MAX_SCROLL_DELTA,
+            "minimum": -i64::from(MAX_SCROLL_DELTA),
             "maximum": MAX_SCROLL_DELTA,
-            "description": "Vertical wheel delta: positive scrolls up and negative scrolls down. 120 is one wheel detent."
+            "description": "Positive scrolls up, negative down. 120 is one wheel detent."
         }),
     );
-    Tool::new(
+    tool(
         SCROLL_MOUSE,
-        "Move to display_id with display-local physical x/y, or observation_id with image_x/image_y, then scroll vertically or horizontally.",
+        "Scroll mouse",
+        Kind::Input { idempotent: false },
+        "Move to a point on the approved window, then scroll. Needs the window in the foreground. Give x and y (display_id defaults to primary) or observation_id with image_x and image_y. delta_x scrolls right when positive.",
         object_schema(properties, &["delta_y"]),
+        action_output_schema(true),
     )
-    .with_raw_output_schema(pointer_action_output_schema())
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(false)
-            .destructive(false)
-            .idempotent(false)
-            .open_world(false),
+}
+
+/// Canonical names of the non-alphanumeric keys. Letters, digits and F-keys are listed by range.
+const NAMED_KEYS: [&str; 19] = [
+    "ctrl",
+    "alt",
+    "shift",
+    "win",
+    "enter",
+    "tab",
+    "escape",
+    "space",
+    "backspace",
+    "delete",
+    "insert",
+    "home",
+    "end",
+    "page_up",
+    "page_down",
+    "arrow_up",
+    "arrow_down",
+    "arrow_left",
+    "arrow_right",
+];
+
+fn key_names_description() -> String {
+    format!(
+        "One chord pressed together and released in reverse order. Case-insensitive names: {}, a-z, 0-9, f1-f12. Use type_text for text.",
+        NAMED_KEYS.join(", ")
     )
 }
 
@@ -709,23 +685,18 @@ fn press_keys_tool() -> Tool {
             "minItems": 1,
             "maxItems": 8,
             "uniqueItems": true,
-            "description": format!("Keys pressed together as one chord, then released in reverse order. Names are case-insensitive. Canonical names: {}. Use type_text for text.", key_names().join(", ")),
+            "description": key_names_description(),
             "items": { "type": "string", "minLength": 1 }
         }),
     );
     add_observation(&mut properties);
-    Tool::new(
+    tool(
         PRESS_KEYS,
-        "Send a key or chord only while the approved target remains foreground. Observe and explicitly approve a target before input.",
+        "Press keys",
+        Kind::Input { idempotent: false },
+        "Send a key or chord to the approved window. Needs the window in the foreground; if it is not, call focus_window first. Refused if another process took the foreground.",
         object_schema(properties, &["keys"]),
-    )
-    .with_raw_output_schema(action_output_schema(false))
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(false)
-            .destructive(true)
-            .idempotent(false)
-            .open_world(false),
+        action_output_schema(false),
     )
 }
 
@@ -735,15 +706,31 @@ fn run_actions_tool() -> Tool {
     step.remove("observation");
     step.insert(
         "action".to_owned(),
-        json!({ "type": "string", "enum": ["click", "scroll", "type_text", "press_keys"] }),
+        json!({ "type": "string", "enum": ["click", "scroll", "type_text", "press_keys", "wait"] }),
     );
-    step.insert("button".to_owned(), json!({ "type": "string", "enum": ["left", "right", "middle"], "default": "left", "description": "click only." }));
-    step.insert("click_count".to_owned(), json!({ "type": "integer", "minimum": 1, "maximum": 3, "default": 1, "description": "click only." }));
+    step.insert("button".to_owned(), button_property(true));
+    step.insert("click_count".to_owned(), click_count_property());
     step.insert("modifiers".to_owned(), modifier_schema());
-    step.insert("delta_x".to_owned(), json!({ "type": "integer", "minimum": -MAX_SCROLL_DELTA, "maximum": MAX_SCROLL_DELTA, "default": 0, "description": "scroll only." }));
-    step.insert("delta_y".to_owned(), json!({ "type": "integer", "minimum": -MAX_SCROLL_DELTA, "maximum": MAX_SCROLL_DELTA, "default": 0, "description": "scroll only. Positive scrolls up." }));
-    step.insert("text".to_owned(), json!({ "type": "string", "minLength": 1, "maxLength": MAX_TEXT_UTF16_UNITS, "description": "type_text only." }));
-    step.insert("keys".to_owned(), json!({ "type": "array", "minItems": 1, "maxItems": 8, "uniqueItems": true, "items": { "type": "string", "minLength": 1 }, "description": "press_keys only: one chord, as in press_keys." }));
+    step.insert(
+        "delta_x".to_owned(),
+        json!({ "type": "integer", "minimum": -i64::from(MAX_SCROLL_DELTA), "maximum": MAX_SCROLL_DELTA, "default": 0 }),
+    );
+    step.insert(
+        "delta_y".to_owned(),
+        json!({ "type": "integer", "minimum": -i64::from(MAX_SCROLL_DELTA), "maximum": MAX_SCROLL_DELTA, "default": 0 }),
+    );
+    step.insert(
+        "text".to_owned(),
+        json!({ "type": "string", "minLength": 1, "maxLength": MAX_TEXT_UTF16_UNITS }),
+    );
+    step.insert(
+        "keys".to_owned(),
+        json!({ "type": "array", "minItems": 1, "maxItems": 8, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } }),
+    );
+    step.insert(
+        "wait_ms".to_owned(),
+        json!({ "type": "integer", "minimum": 1, "maximum": MAX_RUN_ACTIONS_WAIT_MS }),
+    );
     let mut properties = JsonObject::new();
     properties.insert(
         "steps".to_owned(),
@@ -751,7 +738,7 @@ fn run_actions_tool() -> Tool {
             "type": "array",
             "minItems": 1,
             "maxItems": MAX_RUN_ACTION_STEPS,
-            "description": "Ordered steps. click and scroll take display_id/x/y or observation_id/image_x/image_y.",
+            "description": "click and scroll take x/y or observation_id/image_x/image_y; type_text takes text; press_keys takes keys as in press_keys; wait takes wait_ms.",
             "items": {
                 "type": "object",
                 "properties": step,
@@ -761,18 +748,13 @@ fn run_actions_tool() -> Tool {
         }),
     );
     add_observation(&mut properties);
-    Tool::new(
+    tool(
         RUN_ACTIONS,
-        "Run up to 16 click, scroll, type_text, and press_keys steps in order on the approved target, with one final observation. All step arguments are checked before the first step runs. Each step keeps the single-action target checks and waits for the window to settle; the batch stops at the first failure and reports each step as completed, failed, or skipped. Use it for a known sequence, such as filling a form; observe between steps when the next step depends on the result.",
+        "Run action batch",
+        Kind::Input { idempotent: false },
+        "Run up to 16 click, scroll, type_text, press_keys and wait steps in order on the approved window, with one final screenshot. Needs the window in the foreground. Every step is checked before the first runs. The batch stops at the first failure and reports each step as completed, failed or skipped. A wait step pauses up to 5 s and cannot be the last step. Use it for a known sequence such as filling a form, and observe between steps when the next one depends on the result.",
         object_schema(properties, &["steps"]),
-    )
-    .with_raw_output_schema(action_output_schema(false))
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(false)
-            .destructive(true)
-            .idempotent(false)
-            .open_world(false),
+        action_output_schema(false),
     )
 }
 
@@ -784,23 +766,25 @@ fn type_text_tool() -> Tool {
             "type": "string",
             "minLength": 1,
             "maxLength": MAX_TEXT_UTF16_UNITS,
-            "description": "Unicode text to type into the current foreground window. This does not use the clipboard."
         }),
     );
     add_observation(&mut properties);
-    Tool::new(
+    tool(
         TYPE_TEXT,
-        "Type Unicode text into the approved foreground target without using the clipboard. Each text batch revalidates target ownership.",
+        "Type text",
+        Kind::Input { idempotent: false },
+        "Type Unicode text into the approved window without the clipboard. Needs the window in the foreground and revalidates it for each batch of characters. Use press_keys for shortcuts and special keys.",
         object_schema(properties, &["text"]),
+        action_output_schema(false),
     )
-    .with_raw_output_schema(action_output_schema(false))
-    .with_annotations(
-        ToolAnnotations::default()
-            .read_only(false)
-            .destructive(true)
-            .idempotent(false)
-            .open_world(false),
-    )
+}
+
+fn display_id_property() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "description": "ID from list_displays, or \"primary\". Default: the primary display."
+    })
 }
 
 fn add_window_id(properties: &mut JsonObject) {
@@ -809,8 +793,12 @@ fn add_window_id(properties: &mut JsonObject) {
         json!({
             "type": "string",
             "minLength": 1,
-            "description": "Opaque server-issued target reference returned by list_windows or an observation."
+            "description": "Window ID from list_windows or a screenshot. Alias: target_ref."
         }),
+    );
+    properties.insert(
+        "target_ref".to_owned(),
+        json!({ "type": "string", "minLength": 1, "description": "Alias of window_id." }),
     );
 }
 
@@ -818,16 +806,20 @@ fn add_capture_options(properties: &mut JsonObject) {
     properties.insert(
         "max_width".to_owned(),
         json!({
-            "type": "integer", "minimum": 1, "maximum": MAX_CAPTURE_WIDTH,
-            "description": "Optional exact maximum output width. Resizing preserves aspect ratio; use source_bounds and output dimensions for exact coordinate mapping."
+            "type": "integer", "minimum": 1, "maximum": MAX_CAPTURE_WIDTH, "default": DEFAULT_CAPTURE_WIDTH,
+            "description": "Maximum output width; aspect ratio is kept. Use source_bounds and the image size to map coordinates."
+        }),
+    );
+    properties.insert(
+        "native".to_owned(),
+        json!({
+            "type": "boolean", "default": false,
+            "description": "Return full resolution. Large images cost many tokens. Cannot be combined with max_width."
         }),
     );
     properties.insert(
         "include_cursor".to_owned(),
-        json!({
-            "type": "boolean", "default": true,
-            "description": "Draw the magenta ControlFreak cursor marker when the pointer lies inside the capture bounds."
-        }),
+        json!({ "type": "boolean", "default": true, "description": "Draw the magenta cursor marker." }),
     );
 }
 
@@ -836,7 +828,7 @@ fn add_ocr_language(properties: &mut JsonObject) {
         "language".to_owned(),
         json!({
             "type": "string", "minLength": 2,
-            "description": "Optional installed BCP-47 OCR language such as en-US. Omit to use Windows profile languages."
+            "description": "Installed BCP-47 OCR language such as en-US. Default: the Windows profile languages."
         }),
     );
 }
@@ -846,14 +838,13 @@ fn add_observation(properties: &mut JsonObject) {
         "observation".to_owned(),
         json!({
             "type": "object",
-            "description": "Post-action evidence. Omit for the compatible bounded screenshot default; metadata and none avoid returning image data.",
+            "description": "Default: 1280 px screenshot. mode none or metadata returns no image; region crops.",
             "properties": {
                 "mode": { "type": "string", "enum": ["none", "metadata", "screenshot"], "default": "screenshot" },
                 "max_width": { "type": "integer", "minimum": 1, "maximum": MAX_CAPTURE_WIDTH },
                 "include_cursor": { "type": "boolean", "default": true },
                 "region": {
                     "type": "object",
-                    "description": "Optional display-local crop for screenshot mode. Use this to return only the UI area affected by the action.",
                     "properties": {
                         "display_id": { "type": "string", "minLength": 1 },
                         "x": { "type": "integer", "minimum": 0 },
@@ -861,7 +852,7 @@ fn add_observation(properties: &mut JsonObject) {
                         "width": { "type": "integer", "minimum": 1 },
                         "height": { "type": "integer", "minimum": 1 }
                     },
-                    "required": ["display_id", "x", "y", "width", "height"],
+                    "required": ["x", "y", "width", "height"],
                     "additionalProperties": false
                 }
             },
@@ -870,31 +861,32 @@ fn add_observation(properties: &mut JsonObject) {
     );
 }
 
-fn wait_properties() -> JsonObject {
+fn region_properties() -> JsonObject {
     let mut properties = JsonObject::new();
-    properties.insert(
-        "timeout_ms".to_owned(),
-        json!({ "type": "integer", "minimum": 1, "maximum": MAX_WAIT_MS, "default": 5000 }),
-    );
-    properties.insert(
-        "stable_ms".to_owned(),
-        json!({ "type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS, "default": 250 }),
-    );
-    properties.insert(
-        "difference_threshold".to_owned(),
-        json!({ "type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.01 }),
-    );
+    properties.insert("display_id".to_owned(), display_id_property());
+    for (name, minimum) in [("x", 0), ("y", 0), ("width", 1), ("height", 1)] {
+        properties.insert(
+            name.to_owned(),
+            json!({ "type": "integer", "minimum": minimum }),
+        );
+    }
     properties
 }
 
-fn region_properties() -> JsonObject {
-    let mut properties = JsonObject::new();
-    properties.insert("display_id".to_owned(), json!({ "type": "string", "minLength": 1, "description": "Display ID returned by list_displays." }));
-    properties.insert("x".to_owned(), json!({ "type": "integer", "minimum": 0, "description": "Region left edge in display-local physical pixels." }));
-    properties.insert("y".to_owned(), json!({ "type": "integer", "minimum": 0, "description": "Region top edge in display-local physical pixels." }));
-    properties.insert("width".to_owned(), json!({ "type": "integer", "minimum": 1, "description": "Region width in physical pixels." }));
-    properties.insert("height".to_owned(), json!({ "type": "integer", "minimum": 1, "description": "Region height in physical pixels." }));
-    properties
+fn button_property(default_left: bool) -> Value {
+    let mut schema = json!({ "type": "string", "enum": ["left", "right", "middle"] });
+    if default_left {
+        schema["default"] = json!("left");
+    }
+    schema
+}
+
+fn click_count_property() -> Value {
+    json!({ "type": "integer", "minimum": 1, "maximum": 3, "default": 1 })
+}
+
+fn duration_property() -> Value {
+    json!({ "type": "integer", "minimum": 0, "maximum": MAX_MOVE_DURATION_MS, "default": 0, "description": "Smooth movement time in ms." })
 }
 
 fn modifier_schema() -> Value {
@@ -904,7 +896,7 @@ fn modifier_schema() -> Value {
         "uniqueItems": true,
         "default": [],
         "items": { "type": "string", "minLength": 1 },
-        "description": "Case-insensitive modifier names ctrl, alt, shift, or win, held for the complete atomic mouse action and always released afterward."
+        "description": "ctrl, alt, shift or win, held for the whole action and always released."
     })
 }
 
@@ -915,165 +907,194 @@ fn pointer_properties() -> JsonObject {
         json!({
             "type": "string",
             "minLength": 1,
-            "description": "observation_id of a returned screenshot. Use with image_x/image_y instead of display_id/x/y."
+            "description": "From a screenshot. Use with image_x and image_y instead of x and y."
         }),
     );
-    properties.insert(
-        "image_x".to_owned(),
-        json!({
-            "type": "integer",
-            "minimum": 0,
-            "description": "X in that screenshot's own pixels; the server maps it through the crop and scale."
-        }),
-    );
-    properties.insert(
-        "image_y".to_owned(),
-        json!({
-            "type": "integer",
-            "minimum": 0,
-            "description": "Y in that screenshot's own pixels."
-        }),
-    );
-    properties.insert(
-        "display_id".to_owned(),
-        json!({
-            "type": "string",
-            "minLength": 1,
-            "description": "Target display ID returned by list_displays."
-        }),
-    );
-    properties.insert(
-        "x".to_owned(),
-        json!({
-            "type": "integer",
-            "minimum": 0,
-            "description": "Physical-pixel X coordinate local to the target display."
-        }),
-    );
-    properties.insert(
-        "y".to_owned(),
-        json!({
-            "type": "integer",
-            "minimum": 0,
-            "description": "Physical-pixel Y coordinate local to the target display."
-        }),
-    );
-    properties.insert(
-        "duration_ms".to_owned(),
-        json!({
-            "type": "integer",
-            "minimum": 0,
-            "maximum": MAX_MOVE_DURATION_MS,
-            "default": 0,
-            "description": "Optional movement duration before the action. A nonzero value moves smoothly between displays."
-        }),
-    );
+    for axis in ["x", "y"] {
+        properties.insert(
+            format!("image_{axis}"),
+            json!({ "type": "integer", "minimum": 0 }),
+        );
+    }
+    properties.insert("display_id".to_owned(), display_id_property());
+    for (axis, text) in [("x", "Physical-pixel X"), ("y", "Physical-pixel Y")] {
+        properties.insert(
+            axis.to_owned(),
+            json!({ "type": "integer", "minimum": 0, "description": format!("{text} local to the display.") }),
+        );
+    }
+    properties.insert("duration_ms".to_owned(), duration_property());
     add_observation(&mut properties);
     properties
 }
 
-fn pointer_action_output_schema() -> Arc<JsonObject> {
-    action_output_schema(true)
+/// Wraps tool-specific success schemas with the error envelope the server really returns, so a
+/// client that validates `structuredContent` against `outputSchema` never rejects an error.
+/// Shared sub-schemas move into `$defs`, so each is written once per tool.
+fn output_schema(mut branches: Vec<Value>, mutating: bool) -> Arc<JsonObject> {
+    branches.push(error_schema(mutating));
+    let mut schema = json!({ "type": "object", "anyOf": branches });
+    let text = schema.to_string();
+    let mut needed: Vec<&'static str> = Vec::new();
+    let mut pending: Vec<&'static str> = DEFS
+        .iter()
+        .copied()
+        .filter(|name| text.contains(&format!("#/$defs/{name}\"")))
+        .collect();
+    while let Some(name) = pending.pop() {
+        if needed.contains(&name) {
+            continue;
+        }
+        needed.push(name);
+        let body = definition(name).to_string();
+        pending.extend(
+            DEFS.iter()
+                .copied()
+                .filter(|other| body.contains(&format!("#/$defs/{other}\""))),
+        );
+    }
+    if !needed.is_empty() {
+        let defs: serde_json::Map<String, Value> = DEFS
+            .iter()
+            .copied()
+            .filter(|name| needed.contains(name))
+            .map(|name| (name.to_owned(), definition(name)))
+            .collect();
+        schema["$defs"] = Value::Object(defs);
+    }
+    strip_lower_bounds(&mut schema);
+    match schema {
+        Value::Object(schema) => Arc::new(schema),
+        _ => Arc::default(),
+    }
+}
+
+/// Counters, sizes and times in results are produced by the server and never negative, so a
+/// `minimum` on them only costs bytes in every `tools/list`. Input schemas keep their bounds.
+fn strip_lower_bounds(schema: &mut Value) {
+    match schema {
+        Value::Object(map) => {
+            map.remove("minimum");
+            map.values_mut().for_each(strip_lower_bounds);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_lower_bounds),
+        _ => {}
+    }
+}
+
+const DEFS: [&str; 7] = [
+    "bounds",
+    "display",
+    "window",
+    "screenshot",
+    "window_screenshot",
+    "session",
+    "input",
+];
+
+fn def_ref(name: &str) -> Value {
+    json!({ "$ref": format!("#/$defs/{name}") })
+}
+
+fn definition(name: &str) -> Value {
+    match name {
+        "bounds" => bounds_schema(),
+        "display" => display_schema(),
+        "window" => window_schema(),
+        "screenshot" => screenshot_body(),
+        "window_screenshot" => window_screenshot_body(),
+        "session" => session_status_schema(),
+        "input" => input_progress_schema(),
+        other => unreachable!("unknown schema definition {other}"),
+    }
+}
+
+/// The error envelope every tool can return. `details` is free-form and a refused input action
+/// also carries its progress fields, so extra properties stay allowed.
+fn error_schema(mutating: bool) -> Value {
+    let mut properties = json!({
+        "error": {
+            "type": "object",
+            "properties": {
+                "code": { "type": "string" },
+                "message": { "type": "string" },
+                "retryable": { "type": "boolean" },
+                "reason": { "type": "string" },
+                "details": {}
+            },
+            "required": ["code", "message"]
+        }
+    });
+    if mutating {
+        // A refused or interrupted input action reports its progress next to the error. Input
+        // that was sent while only the evidence failed has a warning instead of an error.
+        properties["operation"] = json!({"type": "string"});
+        properties["warning"] = json!({"type": "string"});
+        properties["details"] = json!({"type": "object"});
+        properties["status"] =
+            json!({"enum": ["completed_unverified", "not_started", "partially_sent", "unknown"]});
+        properties["input"] = def_ref("input");
+        properties["observation_status"] = json!({"enum": ["failed", "not_attempted"]});
+        properties["effect_verification"] = json!({"const": "unverified"});
+        properties["retry_action"] = json!({"const": false});
+        return json!({
+            "type": "object",
+            "properties": properties,
+            "required": ["status", "input", "observation_status", "effect_verification", "retry_action"],
+            "additionalProperties": false,
+            "anyOf": [{"required": ["error"]}, {"required": ["operation", "warning"]}]
+        });
+    }
+    json!({ "type": "object", "properties": properties, "required": ["error"], "additionalProperties": false })
+}
+
+fn input_progress_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "input_outcome": {"enum": ["not_started", "input_sent", "partially_sent", "unknown"]},
+            "sent_events": {"type": "integer", "minimum": 0},
+            "target_remained_foreground": { "type": ["boolean", "null"] },
+            "activation_attempts": { "type": "integer", "minimum": 0 },
+            "activation_elapsed_ms": { "type": "integer", "minimum": 0 },
+            "cleanup": {"enum": ["not_needed", "succeeded", "unknown"]}
+        },
+        "required": ["input_outcome", "sent_events", "cleanup"],
+        "additionalProperties": false
+    })
 }
 
 fn action_output_schema(include_position: bool) -> Arc<JsonObject> {
-    let mut schema = json!({
+    let mut success = json!({
         "type": "object",
         "properties": {
             "action": { "type": "object" },
             "observation": {
                 "type": "object",
                 "properties": {
-                    "foreground_window": {
-                        "oneOf": [window_schema(), { "type": "null" }]
-                    },
-                    "screenshot": {
-                        "oneOf": [screenshot_schema(), { "type": "null" }]
-                    }
+                    "foreground_window": { "oneOf": [def_ref("window"), { "type": "null" }] },
+                    "screenshot": { "oneOf": [def_ref("screenshot"), { "type": "null" }] }
                 },
                 "required": ["foreground_window", "screenshot"],
                 "additionalProperties": false
-            }
+            },
+            "status": {"const": "completed"},
+            "input": {"$ref": "#/$defs/input", "properties": {"input_outcome": {"const": "input_sent"}}},
+            "observation_status": {"const": "succeeded"},
+            "effect_verification": {"const": "unverified"},
+            "retry_action": {"const": false}
         },
-        "required": ["action", "observation"],
+        "required": ["action", "observation", "status", "input", "observation_status", "effect_verification", "retry_action"],
         "additionalProperties": false
     });
     if include_position {
-        schema["properties"]["position"] = position_schema();
-        schema["required"]
+        success["properties"]["position"] = position_schema();
+        success["required"]
             .as_array_mut()
             .expect("required is an array")
-            .push(Value::String("position".to_owned()));
+            .push(json!("position"));
     }
-    let progress_properties = mutation_progress_properties();
-    let mut incomplete = json!({
-        "type": "object",
-        "properties": {
-            "operation": {"type": "string"},
-            "warning": {"type": "string"},
-            "details": {"type": "object", "description": "run_actions: per-step reports when the final observation failed."},
-            "error": {
-                "type": "object",
-                "properties": {"code": {"type": "string"}, "message": {"type": "string"}, "details": {}},
-                "required": ["code", "message"],
-                "additionalProperties": false
-            }
-        },
-        "required": [],
-        "additionalProperties": false,
-        "anyOf": [{"required": ["error"]}, {"required": ["operation", "warning"]}]
-    });
-    for variant in [&mut schema, &mut incomplete] {
-        for (name, property) in progress_properties.as_object().expect("properties object") {
-            variant["properties"][name] = property.clone();
-            variant["required"]
-                .as_array_mut()
-                .expect("required array")
-                .push(json!(name));
-        }
-    }
-    schema["properties"]["status"] = json!({"const": "completed"});
-    schema["properties"]["observation_status"] = json!({"const": "succeeded"});
-    schema["properties"]["input"]["properties"]["input_outcome"] = json!({"const": "input_sent"});
-    incomplete["properties"]["status"] =
-        json!({"enum": ["completed_unverified", "not_started", "partially_sent", "unknown"]});
-    incomplete["properties"]["observation_status"] = json!({"enum": ["failed", "not_attempted"]});
-    incomplete["oneOf"] = json!(
-        [
-            ("completed_unverified", "input_sent", "failed"),
-            ("not_started", "not_started", "not_attempted"),
-            ("partially_sent", "partially_sent", "not_attempted"),
-            ("unknown", "unknown", "not_attempted"),
-        ]
-        .map(|(status, input, observation)| json!({"properties": {
-            "status": {"const": status},
-            "input": {"properties": {"input_outcome": {"const": input}}},
-            "observation_status": {"const": observation}
-        }}))
-    );
-    Arc::new(rmcp::object!({"type": "object", "oneOf": [schema, incomplete]}))
-}
-
-fn mutation_progress_properties() -> Value {
-    json!({
-        "status": {"enum": ["completed", "completed_unverified", "not_started", "partially_sent", "unknown"]},
-        "input": {
-            "type": "object",
-            "properties": {
-                "input_outcome": {"enum": ["not_started", "input_sent", "partially_sent", "unknown"]},
-                "sent_events": {"type": "integer", "minimum": 0},
-                "target_remained_foreground": { "type": ["boolean", "null"] },
-                "activation_attempts": { "type": "integer", "minimum": 0 },
-                "activation_elapsed_ms": { "type": "integer", "minimum": 0 },
-                    "cleanup": {"enum": ["not_needed", "succeeded", "unknown"]}
-            },
-            "required": ["input_outcome", "sent_events", "cleanup"],
-            "additionalProperties": false
-        },
-        "observation_status": {"enum": ["succeeded", "failed", "not_attempted"]},
-        "effect_verification": {"const": "unverified"},
-        "retry_action": {"const": false}
-    })
+    output_schema(vec![success], true)
 }
 
 /// Image metadata shared by every screenshot-bearing result. `subject` adds the
@@ -1085,10 +1106,10 @@ fn image_metadata_schema(subject: Vec<(&str, Value, bool)>) -> Value {
         "capture_method": { "type": "string" },
         "image_width": { "type": "integer", "minimum": 1 },
         "image_height": { "type": "integer", "minimum": 1 },
-        "downscale_factor": { "type": "integer", "minimum": 1, "description": "Backward-compatible ceiling ratio. For exact mapping use source_bounds and image dimensions." },
+        "downscale_factor": { "type": "integer", "minimum": 1 },
         "resize_method": { "type": "string", "enum": ["native", "area_average"] },
         "cursor_marker": { "type": "boolean" },
-        "observation_id": { "type": "string", "description": "Pass with image_x/image_y to pointer tools to act on a point in this image." }
+        "observation_id": { "type": "string" }
     });
     let mut required: Vec<&str> = vec![
         "mime_type",
@@ -1114,27 +1135,27 @@ fn image_metadata_schema(subject: Vec<(&str, Value, bool)>) -> Value {
     })
 }
 
-fn screenshot_schema() -> Value {
+fn screenshot_body() -> Value {
     image_metadata_schema(vec![
         ("target_ref", json!({"type": ["string", "null"]}), false),
-        ("display", display_schema(), true),
-        ("source_bounds", bounds_schema(), true),
+        ("display", def_ref("display"), true),
+        ("source_bounds", def_ref("bounds"), true),
     ])
+}
+
+fn window_screenshot_body() -> Value {
+    image_metadata_schema(vec![
+        ("window", def_ref("window"), true),
+        ("source_bounds", def_ref("bounds"), true),
+    ])
+}
+
+fn screenshot_schema() -> Value {
+    def_ref("screenshot")
 }
 
 fn window_screenshot_schema() -> Value {
-    image_metadata_schema(vec![
-        ("window", window_schema(), true),
-        ("source_bounds", bounds_schema(), true),
-    ])
-}
-
-fn object_output_schema(schema: Value) -> Arc<JsonObject> {
-    // Every caller passes an object literal; a test requires each tool to publish one.
-    match schema {
-        Value::Object(schema) => Arc::new(schema),
-        _ => Arc::default(),
-    }
+    def_ref("window_screenshot")
 }
 
 /// Session snapshot from `IndicatorRuntime::status` or the busy fallback of `try_status`.
@@ -1162,126 +1183,103 @@ fn session_status_schema() -> Value {
 }
 
 fn session_change_output_schema(status: &str) -> Arc<JsonObject> {
-    object_output_schema(json!({
-        "type": "object",
-        "properties": {
-            "status": { "const": status },
-            "session": session_status_schema()
-        },
-        "required": ["status", "session"],
-        "additionalProperties": false
-    }))
+    output_schema(
+        vec![json!({
+            "type": "object",
+            "properties": {
+                "status": { "const": status },
+                "session": def_ref("session")
+            },
+            "required": ["status", "session"],
+            "additionalProperties": false
+        })],
+        false,
+    )
 }
 
 fn server_status_output_schema() -> Arc<JsonObject> {
-    object_output_schema(json!({
-        "type": "object",
-        "properties": {
-            "status": { "enum": ["ready", "degraded"] },
-            "safety_indicator": {
-                "type": "object",
-                "properties": {
-                    "status": { "type": "string" },
-                    "reason": { "type": ["string", "null"] }
-                },
-                "required": ["status", "reason"],
-                "additionalProperties": false
-            },
-            "session": { "oneOf": [session_status_schema(), { "type": "null" }] },
-            "version": { "type": "string" },
-            "instance_id": { "type": "string" },
-            "process_id": { "type": "integer", "minimum": 0 },
-            "server_elevated": { "type": "boolean" },
-            "windows_integrity_level": { "enum": ["untrusted", "low", "medium", "medium_plus", "high", "system", "protected", "unknown"] },
-            "elevated_operation_allowed": { "type": "boolean" },
-            "uptime_ms": { "type": "integer", "minimum": 0 },
-            "operations_started": { "type": "integer", "minimum": 0 },
-            "operations_completed": { "type": "integer", "minimum": 0 },
-            "operations_failed": { "type": "integer", "minimum": 0 },
-            "recent_operations": {
-                "type": "array",
-                "items": {
+    output_schema(
+        vec![json!({
+            "type": "object",
+            "properties": {
+                "status": { "enum": ["ready", "degraded"] },
+                "safety_indicator": {
                     "type": "object",
                     "properties": {
-                        "operation_id": { "type": "integer", "minimum": 0 },
-                        "tool": { "type": "string" },
                         "status": { "type": "string" },
-                        "elapsed_ms": { "type": "integer", "minimum": 0 },
-                        "gap_ms": { "type": ["integer", "null"], "minimum": 0 },
-                        "stages_ms": { "type": "object", "additionalProperties": { "type": "number" } }
+                        "reason": { "type": ["string", "null"] }
                     },
-                    "required": ["operation_id", "tool", "status", "elapsed_ms", "gap_ms", "stages_ms"],
+                    "required": ["status", "reason"],
                     "additionalProperties": false
-                }
-            },
-            "backend": {
-                "type": "object",
-                "properties": {
-                    "platform": { "type": "string" },
-                    "display_server": { "type": "string" },
-                    "backend_id": { "type": "string" }
                 },
-                "required": ["platform", "display_server", "backend_id"],
-                "additionalProperties": false
+                "session": { "oneOf": [def_ref("session"), { "type": "null" }] },
+                "version": { "type": "string" },
+                "instance_id": { "type": "string" },
+                "process_id": { "type": "integer", "minimum": 0 },
+                "server_elevated": { "type": "boolean" },
+                "windows_integrity_level": { "enum": ["untrusted", "low", "medium", "medium_plus", "high", "system", "protected", "unknown"] },
+                "elevated_operation_allowed": { "type": "boolean" },
+                "uptime_ms": { "type": "integer", "minimum": 0 },
+                "operations_started": { "type": "integer", "minimum": 0 },
+                "operations_completed": { "type": "integer", "minimum": 0 },
+                "operations_failed": { "type": "integer", "minimum": 0 },
+                "recent_operations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "operation_id": { "type": "integer", "minimum": 0 },
+                            "tool": { "type": "string" },
+                            "status": { "type": "string" },
+                            "elapsed_ms": { "type": "integer", "minimum": 0 },
+                            "gap_ms": { "type": ["integer", "null"], "minimum": 0 },
+                            "stages_ms": { "type": "object", "additionalProperties": { "type": "number" } }
+                        },
+                        "required": ["operation_id", "tool", "status", "elapsed_ms", "gap_ms", "stages_ms"],
+                        "additionalProperties": false
+                    }
+                },
+                "backend": {
+                    "type": "object",
+                    "properties": {
+                        "platform": { "type": "string" },
+                        "display_server": { "type": "string" },
+                        "backend_id": { "type": "string" }
+                    },
+                    "required": ["platform", "display_server", "backend_id"],
+                    "additionalProperties": false
+                },
+                "stop_state": { "type": "string" },
+                "stop_reason": { "const": "user_stop" }
             },
-            "stop_state": { "type": "string" },
-            "stop_reason": { "const": "user_stop" }
-        },
-        "required": [
-            "status", "safety_indicator", "session", "version", "instance_id", "process_id",
-            "server_elevated", "windows_integrity_level", "elevated_operation_allowed", "uptime_ms",
-            "operations_started", "operations_completed", "operations_failed", "recent_operations",
-            "backend", "stop_state"
-        ],
-        "additionalProperties": false
-    }))
+            "required": [
+                "status", "safety_indicator", "session", "version", "instance_id", "process_id",
+                "server_elevated", "windows_integrity_level", "elevated_operation_allowed", "uptime_ms",
+                "operations_started", "operations_completed", "operations_failed", "recent_operations",
+                "backend", "stop_state"
+            ],
+            "additionalProperties": false
+        })],
+        false,
+    )
 }
 
 fn visual_change_output_schema() -> Arc<JsonObject> {
-    let mut schema = json!({
-        "type": "object",
-        "properties": {
-            "changed": { "type": "boolean" },
-            "timed_out": { "type": "boolean" },
-            "difference": { "type": "number", "minimum": 0 },
-            "elapsed_ms": { "type": "integer", "minimum": 0 },
-            "screenshot": screenshot_schema()
-        },
-        "required": ["changed", "timed_out", "difference", "elapsed_ms", "screenshot"],
-        "additionalProperties": false
-    });
-    schema["properties"]["screenshot"]["description"] =
-        json!("The final image; the PNG itself is the image content block.");
-    object_output_schema(schema)
-}
-
-fn visual_baseline_output_schema() -> Arc<JsonObject> {
-    object_output_schema(json!({
-        "type": "object",
-        "properties": {
-            "baseline_id": { "type": "string", "pattern": "^vb-[0-9a-f]{32}-[0-9a-f]{16}$" },
-            "display": display_schema(),
-            "source_bounds": bounds_schema(),
-            "fingerprint": { "type": "string" },
-            "expires_in_ms": { "type": "integer", "minimum": 0 }
-        },
-        "required": ["baseline_id", "display", "source_bounds", "fingerprint", "expires_in_ms"],
-        "additionalProperties": false
-    }))
-}
-
-fn wait_for_window_output_schema() -> Arc<JsonObject> {
-    object_output_schema(json!({
-        "type": "object",
-        "properties": {
-            "matched": { "type": "boolean" },
-            "timed_out": { "type": "boolean" },
-            "elapsed_ms": { "type": "integer", "minimum": 0 },
-            "window": { "oneOf": [window_schema(), { "type": "null" }] }
-        },
-        "required": ["matched", "timed_out", "elapsed_ms", "window"],
-        "additionalProperties": false
-    }))
+    output_schema(
+        vec![json!({
+            "type": "object",
+            "properties": {
+                "changed": { "type": "boolean" },
+                "timed_out": { "type": "boolean" },
+                "difference": { "type": "number", "minimum": 0 },
+                "elapsed_ms": { "type": "integer", "minimum": 0 },
+                "screenshot": screenshot_schema()
+            },
+            "required": ["changed", "timed_out", "difference", "elapsed_ms", "screenshot"],
+            "additionalProperties": false
+        })],
+        false,
+    )
 }
 
 fn text_box_schema(extra: Value, extra_required: &[&str]) -> Value {
@@ -1311,19 +1309,22 @@ fn read_text_output_schema() -> Arc<JsonObject> {
         json!({"words": {"type": "array", "items": word}}),
         &["words"],
     );
-    object_output_schema(json!({
-        "type": "object",
-        "properties": {
-            "target_ref": { "type": ["string", "null"] },
-            "display": display_schema(),
-            "source_bounds": bounds_schema(),
-            "language": { "type": "string" },
-            "text": { "type": "string" },
-            "lines": { "type": "array", "items": line }
-        },
-        "required": ["display", "source_bounds", "language", "text", "lines"],
-        "additionalProperties": false
-    }))
+    output_schema(
+        vec![json!({
+            "type": "object",
+            "properties": {
+                "target_ref": { "type": ["string", "null"] },
+                "display": def_ref("display"),
+                "source_bounds": def_ref("bounds"),
+                "language": { "type": "string" },
+                "text": { "type": "string" },
+                "lines": { "type": "array", "items": line }
+            },
+            "required": ["display", "source_bounds", "language", "text", "lines"],
+            "additionalProperties": false
+        })],
+        false,
+    )
 }
 
 /// Fields shared by `find_text_on_screen` and `wait_for_text` discovery passes.
@@ -1332,8 +1333,8 @@ fn text_discovery_properties() -> Value {
         "count": { "type": "integer", "minimum": 0 },
         "target_ref": { "type": ["string", "null"] },
         "query": { "type": "string" },
-        "display": display_schema(),
-        "source_bounds": bounds_schema(),
+        "display": def_ref("display"),
+        "source_bounds": def_ref("bounds"),
         "language": { "type": "string" },
         "matches": { "type": "array", "items": text_box_schema(json!({}), &[]) },
         "match_tier": { "enum": ["exact", "substring", "normalized", "joined", "ocr_confusion", null] },
@@ -1362,12 +1363,15 @@ fn find_text_output_schema() -> Arc<JsonObject> {
     properties["recovery"] = json!({ "type": "string" });
     let mut required = TEXT_DISCOVERY_REQUIRED.to_vec();
     required.push("recovery");
-    object_output_schema(json!({
-        "type": "object",
-        "properties": properties,
-        "required": required,
-        "additionalProperties": false
-    }))
+    output_schema(
+        vec![json!({
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": false
+        })],
+        false,
+    )
 }
 
 fn wait_for_text_output_schema() -> Arc<JsonObject> {
@@ -1385,12 +1389,15 @@ fn wait_for_text_output_schema() -> Arc<JsonObject> {
         "elapsed_ms",
         "attempts",
     ]);
-    object_output_schema(json!({
-        "type": "object",
-        "properties": properties,
-        "required": required,
-        "additionalProperties": false
-    }))
+    output_schema(
+        vec![json!({
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": false
+        })],
+        false,
+    )
 }
 
 fn bounds_schema() -> Value {
@@ -1445,17 +1452,7 @@ fn display_schema() -> Value {
         "properties": {
             "id": { "type": "string" },
             "name": { "type": "string" },
-            "bounds": {
-                "type": "object",
-                "properties": {
-                    "left": { "type": "integer" },
-                    "top": { "type": "integer" },
-                    "width": { "type": "integer", "minimum": 1 },
-                    "height": { "type": "integer", "minimum": 1 }
-                },
-                "required": ["left", "top", "width", "height"],
-                "additionalProperties": false
-            },
+            "bounds": def_ref("bounds"),
             "is_primary": { "type": "boolean" }
         },
         "required": ["id", "name", "bounds", "is_primary"],
@@ -1471,94 +1468,22 @@ fn window_schema() -> Value {
             "title": { "type": "string" },
             "class_name": { "type": "string" },
             "process_id": { "type": "integer", "minimum": 0 },
-            "bounds": {
-                "type": "object",
-                "properties": {
-                    "left": { "type": "integer" },
-                    "top": { "type": "integer" },
-                    "width": { "type": "integer", "minimum": 1 },
-                    "height": { "type": "integer", "minimum": 1 }
-                },
-                "required": ["left", "top", "width", "height"],
-                "additionalProperties": false
-            },
+            "bounds": def_ref("bounds"),
             "display_id": { "type": "string" },
             "is_foreground": { "type": "boolean" },
-            "is_minimized": { "type": "boolean" }
+            "is_minimized": { "type": "boolean" },
+            "owner": { "type": ["string", "null"] }
         },
         "required": ["id", "title", "class_name", "process_id", "bounds", "display_id", "is_foreground", "is_minimized"],
         "additionalProperties": false
     })
 }
 
-fn key_names() -> Vec<&'static str> {
-    vec![
-        "ctrl",
-        "alt",
-        "shift",
-        "win",
-        "enter",
-        "tab",
-        "escape",
-        "space",
-        "backspace",
-        "delete",
-        "insert",
-        "home",
-        "end",
-        "page_up",
-        "page_down",
-        "arrow_up",
-        "arrow_down",
-        "arrow_left",
-        "arrow_right",
-        "a",
-        "b",
-        "c",
-        "d",
-        "e",
-        "f",
-        "g",
-        "h",
-        "i",
-        "j",
-        "k",
-        "l",
-        "m",
-        "n",
-        "o",
-        "p",
-        "q",
-        "r",
-        "s",
-        "t",
-        "u",
-        "v",
-        "w",
-        "x",
-        "y",
-        "z",
-        "0",
-        "1",
-        "2",
-        "3",
-        "4",
-        "5",
-        "6",
-        "7",
-        "8",
-        "9",
-        "f1",
-        "f2",
-        "f3",
-        "f4",
-        "f5",
-        "f6",
-        "f7",
-        "f8",
-        "f9",
-        "f10",
-        "f11",
-        "f12",
-    ]
+/// Every key name `press_keys` advertises, also used to suggest a name for an unknown key.
+pub(super) fn all_key_names() -> Vec<String> {
+    let mut names: Vec<String> = NAMED_KEYS.iter().map(|name| (*name).to_owned()).collect();
+    names.extend(('a'..='z').map(String::from));
+    names.extend(('0'..='9').map(String::from));
+    names.extend((1..=12).map(|number| format!("f{number}")));
+    names
 }
