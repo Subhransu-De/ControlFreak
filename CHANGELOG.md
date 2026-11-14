@@ -39,8 +39,16 @@ versioned section and uses that section for the corresponding GitHub Release not
   in the executable; its license is in THIRD-PARTY-NOTICES.md, which is now installed with
   ControlFreak. The glow helper protocol gains a `TONE` command for the amber lamp.
 
+- The session tab gets a **Stop agent** button that works with a mouse, touch, pen and accessibility tools (UI Automation Invoke). Injected input, which is all the agent can send, cannot press it. Physical Esc still stops a session.
+- The low-level keyboard hook for Esc is installed only while a session is owned, on a dedicated thread, and removed when the session ends. The tab says "Press Esc to stop" only after the hook is confirmed installed.
+- The session tab, Stop button and Esc monitor start with the first session. If they cannot start, the server still runs, read-only tools work, and sessions are refused with the reason. A tab failure after start-up still fails closed, and the reason is now kept in refusals, `get_server_status` and standard error.
+- Captures and OCR show a brief "ControlFreak is reading the screen" state on the tab without claiming a session. The waiting tab says "ControlFreak is waiting for the next action", and the tab returns to dormant 1 second after a normal session end.
+- The indicator no longer polls while idle: the tab thread, the lamp helper and the stop notification wait for events, the session worker polls only while a session is owned, and an idle lamp-helper actor polls twice a second. Lock and desktop-switch detection during a hold is unchanged.
+- Failed helper shutdowns are retried with a growing delay and abandoned after about a minute, with the reason on standard error.
+
 ### Fixed
 
+- The lamp helper no longer exits when the foreground window has no virtual desktop, such as the taskbar, the desktop or Start. It stays on its current desktop, so shell windows in front no longer cancel input or block new sessions.
 - GitHub release notes no longer break each changelog entry mid-sentence. Wrapped entries are joined into single lines when the notes are generated.
 
 ## [0.1.0] - 2026-10-18

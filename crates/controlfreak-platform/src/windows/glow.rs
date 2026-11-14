@@ -6,7 +6,10 @@
 
 use std::{
     io::{self, BufRead, BufWriter, Write},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -14,7 +17,8 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{
-            E_ACCESSDENIED, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RPC_E_CHANGED_MODE, WPARAM,
+            E_ACCESSDENIED, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RPC_E_CHANGED_MODE,
+            WAIT_FAILED, WPARAM,
         },
         System::{
             Com::{
@@ -22,6 +26,7 @@ use windows::{
                 CoUninitialize,
             },
             LibraryLoader::GetModuleHandleW,
+            Threading::GetCurrentThreadId,
         },
         UI::{
             HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
@@ -29,11 +34,13 @@ use windows::{
             WindowsAndMessaging::{
                 CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
                 DispatchMessageW, GetForegroundWindow, HTTRANSPARENT, HWND_TOPMOST, MA_NOACTIVATE,
-                MSG, PM_REMOVE, PeekMessageW, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
+                MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW,
+                PostThreadMessageW, QS_ALLINPUT, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
                 SWP_NOACTIVATE, SWP_SHOWWINDOW, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
-                TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WM_MOUSEACTIVATE, WM_NCHITTEST,
-                WNDCLASSW, WS_DISABLED, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-                WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+                TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED,
+                WM_MOUSEACTIVATE, WM_NCHITTEST, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
+                WM_THEMECHANGED, WNDCLASSW, WS_DISABLED, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+                WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
             },
         },
     },
@@ -47,7 +54,14 @@ use super::indicator::{
 
 const PROTOCOL_PREFIX: &str = "CFP/1";
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// While the lamp is shown, the shell is polled this often to follow the desktop and keep the
+/// lamp above windows that became topmost after it. Neither has a window message.
 const TOPOLOGY_INTERVAL: Duration = Duration::from_millis(500);
+/// While the lamp is hidden nothing needs following; display, DPI and colour changes arrive as
+/// window messages, so this is only a safety net.
+const HIDDEN_TOPOLOGY_INTERVAL: Duration = Duration::from_secs(2);
+/// Set by the window procedure when Windows announces a display, DPI or colour change.
+static TOPOLOGY_DIRTY: AtomicBool = AtomicBool::new(false);
 const MINIMUM_VISIBLE: Duration = Duration::from_millis(800);
 const FADE_OUT: Duration = Duration::from_millis(250);
 const INITIAL_VISIBLE_OPACITY: f64 = FADE_IN_FROM as f64;
@@ -97,21 +111,21 @@ pub(crate) fn run(config: HelperConfig) -> io::Result<()> {
             .map_err(|error| windows_error("CoCreateInstance(VirtualDesktopManager)", &error))?;
     let mut renderer = Renderer::new(manager)?;
     let (sender, receiver) = mpsc::channel();
-    spawn_command_reader(sender)?;
+    // SAFETY: Takes no arguments and returns this thread's ID.
+    spawn_command_reader(sender, unsafe { GetCurrentThreadId() })?;
     let stdout = io::stdout();
     let mut output = BufWriter::new(stdout.lock());
     write_state(&mut output, config.generation, 0, "HIDDEN")?;
 
     let mut visual = VisualState::new();
     let mut next_frame = Instant::now();
-    let mut next_topology = Instant::now() + TOPOLOGY_INTERVAL;
-    let mut early = None;
+    let mut next_topology = Instant::now() + HIDDEN_TOPOLOGY_INTERVAL;
     loop {
         if !pump_messages() {
             return Ok(());
         }
 
-        while let Some(event) = early.take().or_else(|| receiver.try_recv().ok()) {
+        while let Ok(event) = receiver.try_recv() {
             match event {
                 InputEvent::Line(line) => {
                     let Some(command) = parse_command(&line, config.generation)? else {
@@ -148,9 +162,9 @@ pub(crate) fn run(config: HelperConfig) -> io::Result<()> {
             }
         }
 
-        if now >= next_topology {
-            renderer.sync_topology(false)?;
-            next_topology = now + TOPOLOGY_INTERVAL;
+        if now >= next_topology || TOPOLOGY_DIRTY.swap(false, Ordering::AcqRel) {
+            renderer.sync_topology()?;
+            next_topology = now + topology_interval(visual.visible);
         }
 
         if visual.visible && now >= next_frame {
@@ -158,20 +172,49 @@ pub(crate) fn run(config: HelperConfig) -> io::Result<()> {
             next_frame = now + FRAME_INTERVAL;
         }
 
-        let sleep = if visual.visible {
-            next_frame.saturating_duration_since(Instant::now())
+        // Sleep until the next frame, or while hidden until the safety poll. A command from the
+        // server, which waits for its acknowledgement before each input action, or a window
+        // message ends the wait at once.
+        let until = if visual.visible {
+            next_frame.min(next_topology)
         } else {
-            Duration::from_millis(20)
+            next_topology
         };
-        // Wake for the next command instead of sleeping through it; the server waits for its
-        // acknowledgement before each input action.
-        early = receiver
-            .recv_timeout(sleep.min(Duration::from_millis(20)))
-            .ok();
+        wait_for_events(until.saturating_duration_since(Instant::now()))?;
     }
 }
 
-fn spawn_command_reader(sender: mpsc::Sender<InputEvent>) -> io::Result<()> {
+/// How often the shell is polled for the lamp's desktop and z-order.
+const fn topology_interval(visible: bool) -> Duration {
+    if visible {
+        TOPOLOGY_INTERVAL
+    } else {
+        HIDDEN_TOPOLOGY_INTERVAL
+    }
+}
+
+/// Blocks until a window message or posted command wake-up arrives, or `timeout` elapses.
+/// `MWMO_INPUTAVAILABLE` also returns for messages an earlier peek saw but left in the queue.
+fn wait_for_events(timeout: Duration) -> io::Result<()> {
+    let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    // SAFETY: No handles are passed; the call only waits on this thread's message queue.
+    let result = unsafe {
+        MsgWaitForMultipleObjectsEx(None, milliseconds, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
+    };
+    if result == WAIT_FAILED {
+        return Err(last_windows_error("MsgWaitForMultipleObjectsEx"));
+    }
+    Ok(())
+}
+
+/// Reads commands on their own thread and wakes the UI thread, which sleeps in its message
+/// queue, after each one.
+fn spawn_command_reader(sender: mpsc::Sender<InputEvent>, ui_thread: u32) -> io::Result<()> {
+    let wake = move || {
+        // SAFETY: Posts a value-only message to a thread ID; if that thread has exited the call
+        // only fails, and the helper is already shutting down.
+        let _ = unsafe { PostThreadMessageW(ui_thread, WM_APP, WPARAM(0), LPARAM(0)) };
+    };
     thread::Builder::new()
         .name("controlfreak-native-glow-input".to_owned())
         .spawn(move || {
@@ -181,14 +224,17 @@ fn spawn_command_reader(sender: mpsc::Sender<InputEvent>) -> io::Result<()> {
                         if sender.send(InputEvent::Line(line)).is_err() {
                             return;
                         }
+                        wake();
                     }
                     Err(error) => {
                         let _ = sender.send(InputEvent::Error(error.to_string()));
+                        wake();
                         return;
                     }
                 }
             }
             let _ = sender.send(InputEvent::Eof);
+            wake();
         })
         .map(|_| ())
 }
@@ -516,6 +562,28 @@ fn smooth(value: f64) -> f64 {
     value * value * (3.0 - 2.0 * value)
 }
 
+/// What to do about the desktop the foreground window is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DesktopFollow {
+    /// Leave the lamp where it is.
+    Stay,
+    Move(GUID),
+}
+
+/// A desktop ID from the shell, or `None` when the shell could not name one. The shell reports
+/// `TYPE_E_ELEMENTNOTFOUND` for the taskbar, the desktop and the Start surfaces, which belong to
+/// every desktop, and an all-zero ID for windows it does not track.
+fn usable_desktop<E>(lookup: Result<GUID, E>) -> Option<GUID> {
+    lookup.ok().filter(|desktop| *desktop != GUID::zeroed())
+}
+
+fn desktop_follow(current: Option<GUID>, foreground: Option<GUID>) -> DesktopFollow {
+    match foreground {
+        Some(desktop) if current != Some(desktop) => DesktopFollow::Move(desktop),
+        _ => DesktopFollow::Stay,
+    }
+}
+
 struct Renderer {
     manager: IVirtualDesktopManager,
     desktop_id: Option<GUID>,
@@ -540,11 +608,11 @@ impl Renderer {
             palette: Palette::system(),
             tone: Tone::Normal,
         };
-        renderer.sync_topology(false)?;
+        renderer.sync_topology()?;
         Ok(renderer)
     }
 
-    fn sync_topology(&mut self, require_foreground: bool) -> io::Result<()> {
+    fn sync_topology(&mut self) -> io::Result<()> {
         self.animated = animations_enabled();
         self.palette = Palette::system();
         let monitors = enumerate_monitors()?;
@@ -557,48 +625,48 @@ impl Renderer {
             self.monitors = monitors;
             self.desktop_id = None;
         }
-        let followed = self.follow_foreground_desktop()?;
+        self.follow_foreground_desktop();
         // Keep a visible lamp above windows that became topmost after it.
         if self.visible {
             for window in &self.windows {
                 window.position(true)?;
             }
         }
-        if followed || !require_foreground {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "Windows reported no foreground window for the desktop glow",
-            ))
-        }
+        Ok(())
     }
 
-    fn follow_foreground_desktop(&mut self) -> io::Result<bool> {
+    /// Moves the lamp to the virtual desktop of the foreground window. The shell cannot map every
+    /// window to a desktop (the taskbar, the desktop and Start have none), and a window can close
+    /// between the two calls; none of that may end the helper, which would cancel the agent's
+    /// input. The lamp then stays where it is, as the session tab does.
+    fn follow_foreground_desktop(&mut self) {
         // SAFETY: This has no pointer parameters and returns a Windows-owned handle or null.
         let foreground = unsafe { GetForegroundWindow() };
-        if foreground.is_invalid() {
-            return Ok(false);
-        }
-        // SAFETY: The COM manager is initialized and `foreground` is a live Windows-owned HWND.
-        let desktop_id = unsafe { self.manager.GetWindowDesktopId(foreground) }
-            .map_err(|error| windows_error("IVirtualDesktopManager::GetWindowDesktopId", &error))?;
-        if self.desktop_id == Some(desktop_id) {
-            return Ok(true);
-        }
+        let found = if foreground.is_invalid() {
+            None
+        } else {
+            // SAFETY: The COM manager is initialized and `foreground` is a Windows-owned HWND; a
+            // window that closed in between only makes the call fail.
+            usable_desktop(unsafe { self.manager.GetWindowDesktopId(foreground) })
+        };
+        let DesktopFollow::Move(desktop_id) = desktop_follow(self.desktop_id, found) else {
+            return;
+        };
+        let mut moved = true;
         for window in &self.windows {
             // SAFETY: Both the COM interface and helper-owned HWND are live for this call.
-            unsafe {
+            moved &= unsafe {
                 self.manager
                     .MoveWindowToDesktop(window.hwnd, &raw const desktop_id)
             }
-            .map_err(|error| {
-                windows_error("IVirtualDesktopManager::MoveWindowToDesktop", &error)
-            })?;
-            window.position(self.visible)?;
+            .is_ok();
+            // A lamp that cannot be repositioned is retried with the next poll.
+            let _ = window.position(self.visible);
         }
-        self.desktop_id = Some(desktop_id);
-        Ok(true)
+        // Remember the desktop only once every lamp is on it, so a failed move is retried.
+        if moved {
+            self.desktop_id = Some(desktop_id);
+        }
     }
 
     fn set_visible(&mut self, visible: bool) -> io::Result<()> {
@@ -618,9 +686,9 @@ impl Renderer {
     }
 
     fn present_level(&mut self, level: Level, opacity: f64) -> io::Result<()> {
-        // A LEVEL acknowledgement authorizes the parent to mutate input, so first make sure the
-        // lamp is on the current foreground desktop and has a non-transparent rendered frame.
-        self.sync_topology(true)?;
+        // A LEVEL acknowledgement authorizes the parent to mutate input, so first move the lamp to
+        // the foreground desktop where the shell can tell, and give it a non-transparent frame.
+        self.sync_topology()?;
         self.render(level, opacity)?;
         self.set_visible(true)
     }
@@ -890,6 +958,13 @@ unsafe extern "system" fn window_proc(
     match message {
         WM_NCHITTEST => LRESULT(isize::try_from(HTTRANSPARENT).unwrap_or(-1)),
         WM_MOUSEACTIVATE => LRESULT(isize::try_from(MA_NOACTIVATE).unwrap_or(3)),
+        // Displays, DPI and colours are re-read at once instead of at the next safety poll.
+        WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE | WM_SYSCOLORCHANGE
+        | WM_THEMECHANGED => {
+            TOPOLOGY_DIRTY.store(true, Ordering::Release);
+            // SAFETY: Windows supplied all callback arguments and owns the referenced HWND.
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
         // SAFETY: Windows supplied all callback arguments and owns the referenced HWND.
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
@@ -1037,6 +1112,70 @@ mod tests {
         };
         let (_, width, height) = lamp_bounds(tiny, lamp_geometry(96, false, false));
         assert_eq!((width, height), (80, 4), "never taller than the display");
+    }
+
+    /// `TYPE_E_ELEMENTNOTFOUND`, which the shell returns for the taskbar, the desktop and Start.
+    const SHELL_WINDOW_HAS_NO_DESKTOP: i32 = 0x8002_802B_u32.cast_signed();
+
+    #[test]
+    fn shell_windows_without_a_desktop_id_leave_the_lamp_where_it_is() {
+        let shell: Result<GUID, WindowsError> = Err(WindowsError::from_hresult(
+            windows::core::HRESULT(SHELL_WINDOW_HAS_NO_DESKTOP),
+        ));
+        let current = GUID::from_u128(7);
+        assert_eq!(usable_desktop(shell), None, "a failed lookup is tolerated");
+        assert_eq!(usable_desktop::<()>(Ok(GUID::zeroed())), None);
+        assert_eq!(
+            desktop_follow(Some(current), None),
+            DesktopFollow::Stay,
+            "the lamp stays on its desktop"
+        );
+        assert_eq!(desktop_follow(None, None), DesktopFollow::Stay);
+    }
+
+    #[test]
+    fn the_lamp_follows_a_real_desktop_change_once() {
+        let first = GUID::from_u128(1);
+        let second = GUID::from_u128(2);
+        assert_eq!(
+            desktop_follow(None, Some(first)),
+            DesktopFollow::Move(first)
+        );
+        assert_eq!(
+            desktop_follow(Some(first), Some(first)),
+            DesktopFollow::Stay
+        );
+        assert_eq!(
+            desktop_follow(Some(first), Some(second)),
+            DesktopFollow::Move(second)
+        );
+        assert_eq!(usable_desktop::<()>(Ok(second)), Some(second));
+    }
+
+    #[test]
+    fn the_idle_helper_sleeps_long_and_a_shown_lamp_polls_the_shell() {
+        assert!(topology_interval(false) >= Duration::from_secs(1));
+        assert_eq!(topology_interval(true), TOPOLOGY_INTERVAL);
+    }
+
+    #[test]
+    fn the_helper_wait_returns_for_a_posted_command_wake_up() {
+        let mut message = MSG::default();
+        // SAFETY: `message` is writable and this test thread owns its queue.
+        while unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }.as_bool() {}
+        let started = Instant::now();
+        wait_for_events(Duration::from_millis(40)).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(30), "times out");
+        // SAFETY: Posting a plain-value message to this thread's own queue.
+        unsafe { PostThreadMessageW(GetCurrentThreadId(), WM_APP, WPARAM(0), LPARAM(0)) }.unwrap();
+        let started = Instant::now();
+        wait_for_events(Duration::from_secs(5)).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "woken, not polled"
+        );
+        // SAFETY: Remove the test message so the queue is left empty.
+        while unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }.as_bool() {}
     }
 
     #[test]

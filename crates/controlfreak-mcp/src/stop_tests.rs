@@ -221,6 +221,52 @@ async fn assert_human_stop_lifecycle(requested: ProtocolVersion) {
 }
 
 #[tokio::test]
+async fn screen_reading_tools_are_counted_for_the_indicator_without_claiming_a_session() {
+    let backend = Arc::new(WaitingBackend::idle());
+    let server = ControlFreakServer::with_indicator(backend, SafetyIndicator::dormant(), None);
+    let stop = server.stop.clone();
+    let (client_io, server_io) = tokio::io::duplex(65536);
+    let serving = tokio::spawn(async move {
+        server
+            .serve(server_io)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap()
+    });
+    let mut client = BufReader::new(client_io);
+    outcome_tests::exchange(&mut client, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"reading-test","version":"1"}
+    }})).await;
+    client
+        .get_mut()
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .unwrap();
+    let call = |id: u32, name: &'static str, arguments: Value| json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}});
+    // Listing displays and reading status read no pixels.
+    outcome_tests::exchange(&mut client, call(2, LIST_DISPLAYS, json!({}))).await;
+    outcome_tests::exchange(&mut client, call(3, GET_SERVER_STATUS, json!({}))).await;
+    assert_eq!(stop.observation_count(), 0);
+    outcome_tests::exchange(
+        &mut client,
+        call(4, CAPTURE_DISPLAY, json!({"display_id": "fixture"})),
+    )
+    .await;
+    assert_eq!(stop.observation_count(), 1, "a capture reads the screen");
+    assert!(
+        !stop.session_active(),
+        "reading the screen never claims a session"
+    );
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(5), serving)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn transport_stop_and_client_cancellation_reach_every_worker_kind() {
     for cancellation_mode in ["request", "tool", "human"] {
         let user_stop = cancellation_mode != "request";

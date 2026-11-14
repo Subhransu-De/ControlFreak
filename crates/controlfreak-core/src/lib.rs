@@ -46,7 +46,7 @@ pub use platform::{
 };
 pub use report::CapabilityReport;
 pub use security::{IntegrityLevel, SecurityContext};
-pub use stop::{StopController, StopRegistration};
+pub use stop::{Backoff, StopController, StopRegistration, retry_with_backoff};
 pub use text_matching::{discover_text, select_text_candidate, validate_text_discovery};
 pub use window::{
     CaptureWindowRequest, FocusWindowRequest, WaitForWindowRequest, WindowBounds,

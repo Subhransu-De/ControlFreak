@@ -360,6 +360,10 @@ impl ControlFreakServer {
         stages: Arc<Mutex<Vec<controlfreak_core::timing::StageTiming>>>,
     ) -> Result<CallToolResponse, ErrorData> {
         let tool_name = request.name.to_string();
+        if session::reads_the_screen(&tool_name) {
+            // Lets the indicator show a brief "reading" state; it claims no session.
+            self.stop.note_observation();
+        }
         let admission = match route {
             Route::Observe(_) => Ok(stop::Work::default()),
             Route::Watch(_) => Ok(stop::Work::new(&self.stop).unwrap_or_default()),
@@ -535,6 +539,15 @@ impl ServerHandler for ControlFreakServer {
     async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
         let stop = self.stop.clone();
         tokio::spawn(async move {
+            // The stop latch wakes this task; the timeout below only notices a closed transport.
+            let changed = Arc::new(tokio::sync::Notify::new());
+            let waker = Arc::downgrade(&changed);
+            stop.subscribe(move || {
+                waker
+                    .upgrade()
+                    .map(|changed| changed.notify_one())
+                    .is_some()
+            });
             while !context.peer.is_transport_closed() {
                 if stop.user_stopped() {
                     let notification = rmcp::model::CustomNotification::new(
@@ -555,7 +568,7 @@ impl ServerHandler for ControlFreakServer {
                         .await;
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                let _ = tokio::time::timeout(Duration::from_secs(5), changed.notified()).await;
             }
         });
     }

@@ -1,6 +1,12 @@
 #![forbid(unsafe_code)]
 
-use std::{env, error::Error, fmt, io, process::ExitCode, sync::Arc};
+use std::{
+    env,
+    error::Error,
+    fmt, io,
+    process::ExitCode,
+    sync::{Arc, Mutex},
+};
 
 use controlfreak_core::{PlatformBackend, SecurityContext};
 use controlfreak_platform::OcrHelperCommand;
@@ -182,13 +188,45 @@ async fn run_server(allow_elevated: bool) -> Result<(), Box<dyn Error + Send + S
         ));
         let stop = controlfreak_core::StopController::default();
         let signals = Arc::new(controlfreak_platform::SessionSignals::new(elevated));
-        let _user_stop =
-            controlfreak_platform::UserStop::start(stop.clone(), Arc::clone(&signals))?;
+        // The session tab, its Stop button and the Esc monitor start with the first session, not
+        // with the server. A failure to start them is a refused session with a reason, never a
+        // server that does not start: read-only tools keep working. The next session retries.
+        let session_tab: Mutex<Option<controlfreak_platform::UserStop>> = Mutex::new(None);
+        let tab_stop = stop.clone();
+        let tab_signals = Arc::clone(&signals);
+        let tab_indicator = safety_indicator.clone();
         let glow_stop = stop.clone();
         controlfreak_mcp::serve_stdio_with_indicator_and_arbitrator(
             platform_backend(security_context)?,
             safety_indicator,
             move || {
+                // Debug builds under test run without any desktop indicator, so the test suite
+                // never creates windows or a keyboard hook unless it asks for them.
+                if desktop_glow::disabled_for_tests() {
+                    return desktop_glow::DesktopGlow::start(
+                        elevated,
+                        glow_stop.clone(),
+                        Arc::clone(&signals),
+                    );
+                }
+                ensure_started(&session_tab, || {
+                    let indicator = tab_indicator.clone();
+                    controlfreak_platform::UserStop::start(
+                        &tab_stop,
+                        Arc::clone(&tab_signals),
+                        move |reason| indicator.report_failure(reason),
+                    )
+                })
+                .map_err(|reason| {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "session_tab_unavailable",
+                            "reason": reason,
+                        })
+                    );
+                    format!("the session tab and Stop button could not start: {reason}")
+                })?;
                 desktop_glow::DesktopGlow::start(elevated, glow_stop.clone(), Arc::clone(&signals))
             },
             arbitrator,
@@ -199,6 +237,22 @@ async fn run_server(allow_elevated: bool) -> Result<(), Box<dyn Error + Send + S
 
     #[cfg(not(target_os = "windows"))]
     controlfreak_mcp::serve_stdio(controlfreak_platform::backend()).await
+}
+
+/// Starts `value` into `slot` if it is not there yet. A failure leaves the slot empty, so the
+/// next call tries again.
+#[cfg(target_os = "windows")]
+fn ensure_started<T, E>(
+    slot: &Mutex<Option<T>>,
+    start: impl FnOnce() -> Result<T, E>,
+) -> Result<(), E> {
+    let mut slot = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.is_none() {
+        *slot = Some(start()?);
+    }
+    Ok(())
 }
 
 fn run_ocr_helper() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -280,6 +334,36 @@ mod tests {
             },
             elevated_operation_allowed: allowed,
         }
+    }
+
+    #[test]
+    fn the_session_tab_starts_once_and_a_failed_start_is_retried_not_fatal() {
+        let slot: Mutex<Option<u32>> = Mutex::new(None);
+        let mut starts = 0;
+        let failed: Result<(), String> = ensure_started(&slot, || {
+            starts += 1;
+            Err("Direct2D is unavailable".to_owned())
+        });
+        assert_eq!(failed.unwrap_err(), "Direct2D is unavailable");
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "nothing is kept after a failure"
+        );
+        assert_eq!(starts, 1);
+
+        ensure_started::<_, String>(&slot, || {
+            starts += 1;
+            Ok(7)
+        })
+        .unwrap();
+        assert_eq!(*slot.lock().unwrap(), Some(7), "the retry succeeds");
+        ensure_started::<_, String>(&slot, || {
+            starts += 1;
+            Ok(8)
+        })
+        .unwrap();
+        assert_eq!(starts, 2, "a running tab is not started again");
+        assert_eq!(*slot.lock().unwrap(), Some(7));
     }
 
     #[test]
