@@ -53,6 +53,7 @@ fn window() -> controlfreak_core::WindowInfo {
         display_id: "synthetic".into(),
         is_foreground: true,
         is_minimized: false,
+        owner: None,
     }
 }
 
@@ -95,7 +96,7 @@ fn find_result(found: bool) -> controlfreak_core::FindTextResult {
     }
 }
 
-struct ObservationBackend;
+pub(super) struct ObservationBackend;
 
 impl BackendMetadata for ObservationBackend {
     fn validate_target_reference(&self, _: &str) -> Result<(), PlatformError> {
@@ -225,6 +226,7 @@ impl WindowBackend for ObservationBackend {
             image_height: 5,
             downscale_factor: 2,
             cursor_marker: true,
+            capture_method: "windows_print_window",
         })
     }
     fn wait_for_window(
@@ -363,7 +365,7 @@ async fn every_observation_and_session_result_validates_against_tools_list() {
     let calls = [
         (
             BEGIN_CONTROL_SESSION,
-            json!({"target_ref": "synthetic"}),
+            json!({"target_ref": "target-00000000-0000-0000-0000-000000000003"}),
             false,
         ),
         (GET_SERVER_STATUS, json!({}), false),
@@ -392,7 +394,11 @@ async fn every_observation_and_session_result_validates_against_tools_list() {
             false,
         ),
         (LIST_WINDOWS, json!({}), false),
-        (CAPTURE_WINDOW, json!({"window_id": "synthetic"}), true),
+        (
+            CAPTURE_WINDOW,
+            json!({"window_id":"target-00000000-0000-0000-0000-000000000003"}),
+            true,
+        ),
         (
             WAIT_FOR_WINDOW,
             json!({"title_contains": "synthetic"}),

@@ -1,11 +1,17 @@
 #![allow(unsafe_code)]
 
+//! The session tab, its Stop button and the physical-Esc monitor.
+//!
+//! Two threads, so a slow paint can never delay a keystroke. The tab thread paints the tab and
+//! the Stop button and owns every window. The Esc thread owns the low-level keyboard hook, and
+//! only while a session is owned; it does nothing else.
+
 use controlfreak_core::StopController;
 use std::{
     cell::{Cell, RefCell},
     io,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
@@ -15,47 +21,68 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WAIT_FAILED, WAIT_TIMEOUT, WPARAM},
+        Graphics::Gdi::{CreateFontIndirectW, DeleteObject, HFONT, HGDIOBJ, LOGFONTW},
         System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
         UI::{
             Accessibility::NotifyWinEvent,
-            Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE},
-            Shell::IVirtualDesktopManager,
+            HiDpi::SystemParametersInfoForDpi,
+            Input::{
+                GetCurrentInputMessageSource, IMO_HARDWARE, INPUT_MESSAGE_ORIGIN_ID,
+                INPUT_MESSAGE_SOURCE,
+                KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE},
+            },
+            Shell::{
+                DefSubclassProc, IVirtualDesktopManager, RemoveWindowSubclass, SetWindowSubclass,
+            },
             WindowsAndMessaging::{
-                CHILDID_SELF, CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
-                DispatchMessageW, EVENT_OBJECT_NAMECHANGE, EVENT_SYSTEM_ALERT, GetForegroundWindow,
-                HHOOK, HTTRANSPARENT, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MA_NOACTIVATE,
-                MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, OBJID_WINDOW, PM_REMOVE,
-                PeekMessageW, PostThreadMessageW, QS_ALLINPUT, RegisterClassW, SW_HIDE,
+                BM_CLICK, BN_CLICKED, BS_PUSHBUTTON, CHILDID_SELF, CallNextHookEx, CreateWindowExW,
+                DefWindowProcW, DestroyWindow, DispatchMessageW, EVENT_OBJECT_NAMECHANGE,
+                EVENT_SYSTEM_ALERT, GetForegroundWindow, HHOOK, HTTRANSPARENT, HWND_TOPMOST,
+                KBDLLHOOKSTRUCT, LLKHF_INJECTED, MA_NOACTIVATE, MSG, MWMO_INPUTAVAILABLE,
+                MsgWaitForMultipleObjectsEx, OBJID_WINDOW, PM_REMOVE, PeekMessageW,
+                PostThreadMessageW, QS_ALLINPUT, RegisterClassW, SPI_GETICONTITLELOGFONT, SW_HIDE,
                 SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowDisplayAffinity,
                 SetWindowPos, SetWindowTextW, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx,
-                UnregisterClassW, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WM_APP, WM_CLOSE,
-                WM_DISPLAYCHANGE, WM_DPICHANGED, WM_KEYDOWN, WM_KEYUP, WM_MOUSEACTIVATE,
-                WM_NCHITTEST, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP,
-                WM_THEMECHANGED, WNDCLASSW, WS_DISABLED, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-                WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+                UnregisterClassW, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WINDOW_STYLE, WM_APP,
+                WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_KEYDOWN,
+                WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+                WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST, WM_RBUTTONDOWN,
+                WM_RBUTTONUP, WM_SETFONT, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_SYSKEYDOWN,
+                WM_SYSKEYUP, WM_THEMECHANGED, WNDCLASSW, WS_DISABLED, WS_EX_LAYERED,
+                WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
             },
         },
     },
     core::{GUID, PCWSTR, w},
 };
 
-use super::desktop::{ComApartment, virtual_desktop_manager};
+use super::desktop::virtual_desktop_manager;
 use super::indicator::{
-    Activity, FADE_IN, FADE_IN_FROM, Monitor, PaintedTab, Painter, Palette, StopStatus, TabInputs,
-    TabKind, TabModel, TabView, animations_enabled, enumerate_monitors, spoken, text_scale,
+    Activity, FADE_IN, FADE_IN_FROM, Monitor, PaintedTab, Painter, Palette, READING, StopStatus,
+    TabInputs, TabKind, TabModel, TabView, animations_enabled, enumerate_monitors, spoken,
+    text_scale,
 };
+use super::win32::{ComApartment, windows_error};
 
 const CLASS_NAME: windows::core::PCWSTR = w!("ControlFreakUserStop");
-/// Longest the UI thread blocks while idle. It bounds how soon a session start, a state change
-/// or shutdown is noticed; hook callbacks and window messages wake the wait immediately.
+/// Longest the UI thread blocks while a tab is shown or about to change. Window messages, hook
+/// callbacks and every session, stop or observation change wake the wait immediately, so this
+/// only paces the tab's own timers (the waiting delay, the handback and the reading state).
 const POLL_INTERVAL_MS: u32 = 100;
 /// Frame interval while a tab fades in or out.
 const FADE_FRAME_MS: u32 = 16;
 /// The tab fades in with the lamp, and fades out over the same short time.
 const TAB_FADE: Duration = FADE_IN;
-/// Display, contrast, text-size and animation settings are re-read at least this often, and at
-/// once when Windows announces a change.
+/// While a tab is shown, display, contrast, text-size and animation settings and the foreground
+/// desktop are re-read at least this often, and at once when Windows announces a change.
 const SETTINGS_INTERVAL: Duration = Duration::from_millis(500);
+/// With nothing shown the tab thread has nothing to follow: Windows announces display and
+/// setting changes as messages, and a session wakes the thread. This is only a safety net.
+const IDLE_SETTINGS_INTERVAL: Duration = Duration::from_secs(2);
+/// The label of the Stop button, which is also its accessible name.
+const STOP_BUTTON_LABEL: PCWSTR = w!("Stop agent");
+/// Identifies this module's subclass on the Stop button.
+const BUTTON_SUBCLASS_ID: usize = 0x5354_4f50;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EscapeState {
@@ -79,6 +106,8 @@ pub struct SessionSignals {
     actions: AtomicU64,
     /// The tab's UI thread, woken on every change so it does not wait for its next poll.
     ui_thread: AtomicU32,
+    /// The tab about to start was started by a screen read, which it should show.
+    announce_read: AtomicBool,
     elevated: bool,
 }
 
@@ -88,8 +117,15 @@ impl SessionSignals {
             activity: AtomicU8::new(0),
             actions: AtomicU64::new(0),
             ui_thread: AtomicU32::new(0),
+            announce_read: AtomicBool::new(false),
             elevated,
         }
+    }
+
+    /// Asks the next tab to start with the screen read that caused it still to be shown, instead
+    /// of treating every read so far as already seen. Used when a read starts the tab.
+    pub fn announce_latest_read(&self) {
+        self.announce_read.store(true, Ordering::Release);
     }
 
     /// Records an acknowledged indicator level: `true` while an input action runs.
@@ -121,7 +157,7 @@ impl SessionSignals {
     }
 
     fn wake(&self) {
-        let thread = self.ui_thread.load(Ordering::Acquire);
+        let thread = self.ui_thread.load(Ordering::SeqCst);
         if thread != 0 {
             // SAFETY: Posts a value-only message to a thread ID; a thread that has exited only
             // makes the call fail, which is harmless because its next poll picks up the change.
@@ -130,64 +166,346 @@ impl SessionSignals {
     }
 }
 
-/// Independent native session tab and physical Esc monitor. Never calls a provider.
+/// Independent native session tab, Stop button and (for sessions) physical Esc monitor. Never calls a provider.
 pub struct UserStop {
     shutdown: Arc<AtomicBool>,
+    signals: Arc<SessionSignals>,
     worker: Option<thread::JoinHandle<()>>,
+    /// Owns the keyboard hook, which exists only while a session is owned.
+    escape: Option<EscapeMonitor>,
 }
 
 impl UserStop {
-    pub fn start(controller: StopController, signals: Arc<SessionSignals>) -> Result<Self, String> {
+    /// Starts the tab and its Stop button, without the Esc monitor, so it can show the brief
+    /// "reading the screen" state for observation tools. It claims no session and installs no
+    /// keyboard hook; [`UserStop::attach_session_monitor`] adds the Esc monitor for sessions.
+    ///
+    /// A failure to start is returned and stops nothing: the server keeps running and the caller
+    /// tolerates it (observation) or refuses the session with the reason. After a successful
+    /// start, a failure of the tab thread closes admission with its reason (see
+    /// [`StopController::stop_with_failure`]) and calls `report` with the same text.
+    pub fn start_tab(
+        controller: &StopController,
+        signals: Arc<SessionSignals>,
+        report: impl Fn(String) + Send + 'static,
+    ) -> Result<Self, String> {
         super::ensure_dpi_awareness().map_err(|error| error.to_string())?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let exiting = Arc::clone(&shutdown);
+        let thread_signals = Arc::clone(&signals);
         let (sender, receiver) = mpsc::sync_channel(1);
+        let thread_controller = controller.clone();
         let worker = thread::Builder::new()
             .name("controlfreak-user-stop".to_owned())
             .spawn(move || {
+                let controller = thread_controller;
                 CONTROLLER.with(|slot| *slot.borrow_mut() = Some(controller.clone()));
-                if let Err(error) = run(&controller, &signals, &exiting, &sender) {
-                    controller.stop();
-                    let _ = sender.send(Err(error.to_string()));
+                let started = Cell::new(false);
+                if let Err(error) = run(&controller, &thread_signals, &exiting, &sender, &started) {
+                    if started.get() {
+                        record_tab_failure(&controller, &report, &error);
+                    } else {
+                        let _ = sender.send(Err(error.to_string()));
+                    }
                 }
                 CONTROLLER.with(|slot| *slot.borrow_mut() = None);
             })
             .map_err(|error| error.to_string())?;
         let guard = Self {
             shutdown,
+            signals,
             worker: Some(worker),
+            escape: None,
         };
         receiver.recv().map_err(|error| error.to_string())??;
+        // Every session, stop and observation change wakes the tab thread at once. The listener
+        // is added only now, so a start that failed leaves nothing behind for a retry to pile on.
+        let waker: Weak<SessionSignals> = Arc::downgrade(&guard.signals);
+        controller.subscribe(move || {
+            waker.upgrade().is_some_and(|signals| {
+                signals.wake();
+                true
+            })
+        });
         Ok(guard)
+    }
+
+    /// Starts the Esc monitor if it is not running. Its keyboard hook belongs to a thread of its
+    /// own and exists only while a session is owned. Calling it again changes nothing.
+    pub fn attach_session_monitor(&mut self, controller: &StopController) -> Result<(), String> {
+        if self.escape.is_none() {
+            self.escape = Some(
+                EscapeMonitor::start(controller, || Box::new(SystemHook::default()))
+                    .map_err(|error| format!("the Esc monitor could not start: {error}"))?,
+            );
+        }
+        Ok(())
     }
 }
 
 impl Drop for UserStop {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Release);
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.signals.wake();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        self.escape.take();
+    }
+}
+
+/// The tab and its Stop button are gone after a successful start, so fail closed and keep the
+/// reason where the agent (refusals), `get_server_status` (through `report`) and the log see it.
+fn record_tab_failure(controller: &StopController, report: &impl Fn(String), error: &io::Error) {
+    let reason = format!("the session tab stopped working: {error}");
+    eprintln!(
+        "{}",
+        serde_json::json!({"event": "session_tab_failed", "reason": reason})
+    );
+    controller.stop_with_failure(reason.clone());
+    report(reason);
+}
+
+/// Installs and removes the low-level keyboard hook on the thread that calls it. A trait so that
+/// tests can count installs without hooking the developer's keyboard.
+trait KeyboardHook {
+    fn install(&mut self) -> io::Result<()>;
+    fn uninstall(&mut self);
+}
+
+/// The real hook. Both calls must run on the Esc monitor thread, which pumps its messages.
+#[derive(Default)]
+struct SystemHook {
+    hook: Option<HHOOK>,
+}
+
+impl KeyboardHook for SystemHook {
+    fn install(&mut self) -> io::Result<()> {
+        if self.hook.is_some() {
+            return Ok(());
+        }
+        // SAFETY: The module handle call takes no pointers; the hook callback is a plain function
+        // and the calling thread pumps messages, as a low-level hook requires.
+        unsafe {
+            let instance: HINSTANCE = GetModuleHandleW(None)
+                .map_err(|error| windows_error("GetModuleHandleW", &error))?
+                .into();
+            // A key already held before monitoring must retain its matching release.
+            ESC_STATE.with(|state| {
+                state.set(if GetAsyncKeyState(i32::from(VK_ESCAPE.0)) < 0 {
+                    EscapeState::PassedThrough
+                } else {
+                    EscapeState::Released
+                });
+            });
+            self.hook = Some(
+                SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), Some(instance), 0)
+                    .map_err(|error| windows_error("SetWindowsHookExW", &error))?,
+            );
+        }
+        Ok(())
+    }
+
+    fn uninstall(&mut self) {
+        if let Some(hook) = self.hook.take() {
+            // SAFETY: The handle was returned by SetWindowsHookExW on this thread and is released
+            // exactly once.
+            let _ = unsafe { UnhookWindowsHookEx(hook) };
+        }
+        ESC_STATE.with(|state| state.set(EscapeState::Released));
+    }
+}
+
+impl Drop for SystemHook {
+    fn drop(&mut self) {
+        self.uninstall();
+    }
+}
+
+/// Watches for session ownership and keeps the keyboard hook installed exactly while a session is
+/// owned. The thread does only that, so the hook is never starved by painting or shell calls.
+struct EscapeMonitor {
+    exiting: Arc<AtomicBool>,
+    thread_id: Arc<AtomicU32>,
+    worker: Option<thread::JoinHandle<()>>,
+    controller: StopController,
+}
+
+impl EscapeMonitor {
+    fn start(
+        controller: &StopController,
+        make_hook: impl FnOnce() -> Box<dyn KeyboardHook> + Send + 'static,
+    ) -> io::Result<Self> {
+        let exiting = Arc::new(AtomicBool::new(false));
+        let thread_id = Arc::new(AtomicU32::new(0));
+        let wake_id = Arc::clone(&thread_id);
+        let wake_exiting = Arc::clone(&exiting);
+        let wake_exiting_on_failure = Arc::clone(&exiting);
+        controller.subscribe(move || {
+            post_wake(wake_id.load(Ordering::Acquire));
+            !wake_exiting.load(Ordering::Acquire)
+        });
+        let worker = {
+            let controller = controller.clone();
+            let thread_id = Arc::clone(&thread_id);
+            let exiting = Arc::clone(&exiting);
+            thread::Builder::new()
+                .name("controlfreak-escape-hook".to_owned())
+                .spawn(move || escape_loop(&controller, make_hook(), &thread_id, &exiting))
+                // The listener above is already subscribed; mark it finished so it removes
+                // itself on the next notification instead of lingering.
+                .inspect_err(|_| wake_exiting_on_failure.store(true, Ordering::Release))?
+        };
+        controller.set_esc_monitor_attached(true);
+        Ok(Self {
+            exiting,
+            thread_id,
+            worker: Some(worker),
+            controller: controller.clone(),
+        })
+    }
+}
+
+impl Drop for EscapeMonitor {
+    fn drop(&mut self) {
+        // SeqCst pairs this store and the thread ID load with the monitor's mirror-image
+        // store of its thread ID and load of this flag, so one of them always sees the other.
+        self.exiting.store(true, Ordering::SeqCst);
+        post_wake(self.thread_id.load(Ordering::SeqCst));
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.controller.set_esc_monitor_attached(false);
+    }
+}
+
+/// Wakes a thread that sleeps in its message queue.
+fn post_wake(thread: u32) {
+    if thread != 0 {
+        // SAFETY: Posts a value-only message to a thread ID; a thread that has exited only makes
+        // the call fail, which is harmless because it re-reads the state before it sleeps again.
+        let _ = unsafe { PostThreadMessageW(thread, WM_APP, WPARAM(0), LPARAM(0)) };
+    }
+}
+
+fn escape_loop(
+    controller: &StopController,
+    hook: Box<dyn KeyboardHook>,
+    thread_id: &AtomicU32,
+    exiting: &AtomicBool,
+) {
+    CONTROLLER.with(|slot| *slot.borrow_mut() = Some(controller.clone()));
+    // Create this thread's message queue before announcing it, so a wake-up is never lost.
+    drain_messages();
+    // SAFETY: Takes no arguments and returns this thread's ID.
+    thread_id.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
+    escape_loop_with(controller, hook, exiting, drain_messages, || {
+        wait_for_input(ESCAPE_SAFETY_MS).map(|_| ())
+    });
+    CONTROLLER.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// The longest the Esc monitor sleeps without a wake-up. Posted wake-ups end the wait at once;
+/// this only bounds the damage if one is ever consumed unseen, so shutdown cannot hang.
+const ESCAPE_SAFETY_MS: u32 = 2_000;
+
+fn escape_loop_with(
+    controller: &StopController,
+    mut hook: Box<dyn KeyboardHook>,
+    exiting: &AtomicBool,
+    mut drain: impl FnMut(),
+    mut wait: impl FnMut() -> windows::core::Result<()>,
+) {
+    let mut installed = false;
+    loop {
+        // Drain first and read the flag after it: a shutdown wake-up that the drain consumes is
+        // then still seen through the flag it follows, instead of being lost before the wait.
+        drain();
+        if exiting.load(Ordering::SeqCst) {
+            break;
+        }
+        // One failed install per session is reported; the controller forgets the failure when the
+        // next session starts, so retrying on every wake-up would only spam.
+        let failed = controller.esc_install_failed();
+        let (session_owned, generation) = controller.session_snapshot();
+        match hook_action(session_owned, installed, failed) {
+            HookAction::Install => match hook.install() {
+                Ok(()) => {
+                    installed = true;
+                    controller.confirm_esc_hook(generation);
+                }
+                Err(error) => {
+                    controller.set_esc_install_failed(error.to_string());
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "esc_monitor_unavailable",
+                            "reason": error.to_string(),
+                        })
+                    );
+                }
+            },
+            HookAction::Uninstall => {
+                controller.set_esc_stop_available(false);
+                hook.uninstall();
+                installed = false;
+            }
+            HookAction::Wait => {
+                // A hook kept from the previous session is confirmed again for this one.
+                if installed && session_owned {
+                    controller.confirm_esc_hook(generation);
+                }
+            }
+        }
+        // The wait dispatches nothing itself. It returns when any message is queued for this
+        // thread, including a pending hook call, and `drain_messages` at the top of the loop
+        // answers it. A session change, or shutdown, posts a message that ends the wait too.
+        if wait().is_err() {
+            break;
+        }
+    }
+    if installed {
+        controller.set_esc_stop_available(false);
+        hook.uninstall();
+    }
+}
+
+/// What the Esc monitor does next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HookAction {
+    Install,
+    Uninstall,
+    Wait,
+}
+
+fn hook_action(session_owned: bool, installed: bool, failed: bool) -> HookAction {
+    match (session_owned, installed, failed) {
+        (true, false, false) => HookAction::Install,
+        (false, true, _) => HookAction::Uninstall,
+        _ => HookAction::Wait,
+    }
+}
+
+/// Dispatches every queued message so hook callbacks and window messages are answered.
+fn drain_messages() {
+    let mut message = MSG::default();
+    // SAFETY: `message` is writable for each synchronous dequeue on this thread's own queue.
+    while unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+        // SAFETY: The message was just retrieved for a window owned by this thread, or has none.
+        unsafe { DispatchMessageW(&raw const message) };
     }
 }
 
 // Owned by the UI thread, including partially initialized failure paths.
 struct NativeStop {
-    hook: HHOOK,
     instance: HINSTANCE,
     tabs: Vec<TabWindow>,
 }
 
 impl NativeStop {
     fn create() -> io::Result<Self> {
-        Self::create_with_hook(true)
-    }
-
-    /// Tests pass `false`: a low-level hook on a thread that never pumps messages would delay
-    /// every keystroke on the machine.
-    fn create_with_hook(install_hook: bool) -> io::Result<Self> {
-        // SAFETY: This UI thread owns the class and hook. The guard releases every successfully
-        // created resource if a later call fails.
+        // SAFETY: This UI thread owns the class. The guard releases every successfully created
+        // resource if a later call fails.
         unsafe {
             let instance: HINSTANCE = GetModuleHandleW(None)
                 .map_err(|error| windows_error("GetModuleHandleW", &error))?
@@ -204,25 +522,10 @@ impl NativeStop {
                     &windows::core::Error::from_thread(),
                 ));
             }
-            let mut native = Self {
-                hook: HHOOK::default(),
+            Ok(Self {
                 instance,
                 tabs: Vec::new(),
-            };
-            // A key already held before monitoring must retain its matching release.
-            ESC_STATE.with(|state| {
-                state.set(if GetAsyncKeyState(i32::from(VK_ESCAPE.0)) < 0 {
-                    EscapeState::PassedThrough
-                } else {
-                    EscapeState::Released
-                });
-            });
-            if install_hook {
-                native.hook =
-                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), Some(instance), 0)
-                        .map_err(|error| windows_error("SetWindowsHookExW", &error))?;
-            }
-            Ok(native)
+            })
         }
     }
 
@@ -242,20 +545,18 @@ impl NativeStop {
 
 impl Drop for NativeStop {
     fn drop(&mut self) {
-        // Remove the callback before destroying the windows and their class.
+        // Destroy the windows before their class.
         self.tabs.clear();
-        // SAFETY: These handles were created on this thread and are released once.
+        // SAFETY: The class was registered on this thread and is released once.
         unsafe {
-            if !self.hook.is_invalid() {
-                let _ = UnhookWindowsHookEx(self.hook);
-            }
             let _ = UnregisterClassW(CLASS_NAME, Some(self.instance));
         }
     }
 }
 
 /// The tab on one display: a click-through, capture-excluded layered window centred on the
-/// display's top edge, hanging from the lamp the glow helper draws there.
+/// display's top edge, hanging from the lamp the glow helper draws there. Its Stop button is the
+/// one part that takes clicks.
 struct TabWindow {
     hwnd: HWND,
     monitor: Monitor,
@@ -264,6 +565,312 @@ struct TabWindow {
     visible: bool,
     /// The accessible name last given to the window.
     name: String,
+    button: StopButton,
+    text_scale: f32,
+}
+
+/// Size of the Stop button in physical pixels for one display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ButtonMetrics {
+    width: i32,
+    height: i32,
+    /// Space between the tab body and the button.
+    gap: i32,
+}
+
+/// The button grows with the display's DPI and with the Windows text size, so its label never
+/// clips.
+fn button_metrics(dpi: u32, text_scale: f32) -> ButtonMetrics {
+    let dpi_scale = f64::from(dpi.max(96)) / 96.0;
+    let text = f64::from(text_scale.clamp(1.0, 2.25));
+    let px = |dip: f64, scale: f64| -> i32 {
+        // Small positive DIP values times a bounded scale.
+        #[allow(clippy::cast_possible_truncation)]
+        let value = (dip * scale).round() as i32;
+        value
+    };
+    ButtonMetrics {
+        width: px(104.0, dpi_scale * text),
+        height: px(32.0, dpi_scale * text),
+        gap: px(6.0, dpi_scale),
+    }
+}
+
+/// Where the button goes: centred under the tab body, kept inside the display. `None` when the
+/// display is too short to show it.
+fn button_origin(
+    monitor: Monitor,
+    tab_left: i32,
+    tab_width: i32,
+    body_bottom: i32,
+    metrics: ButtonMetrics,
+) -> Option<POINT> {
+    let y = monitor.top + body_bottom + metrics.gap;
+    if y + metrics.height > monitor.bottom || metrics.width > monitor.width() {
+        return None;
+    }
+    let centred = tab_left + (tab_width - metrics.width) / 2;
+    Some(POINT {
+        x: centred.clamp(monitor.left, monitor.right - metrics.width),
+        y,
+    })
+}
+
+/// Whether a mouse or key message that reached the Stop button came from input hardware (mouse,
+/// touch, pen or keyboard), as an allow-list: only an origin of `IMO_HARDWARE` counts. The
+/// agent's own input tools are injected, and a posted message from another process reports no
+/// origin (`IMO_UNAVAILABLE`), so neither can press the button. `IMO_SYSTEM` is refused too: no
+/// supported way to press the button produces it. An unreadable origin is refused. Assistive
+/// technology that invokes the button through UI Automation does not need an origin: it sends
+/// `BM_CLICK`, which is handled before this check.
+fn input_is_from_a_person(source: windows::core::Result<INPUT_MESSAGE_SOURCE>) -> bool {
+    source.is_ok_and(|source| is_hardware(source.originId))
+}
+
+fn is_hardware(origin: INPUT_MESSAGE_ORIGIN_ID) -> bool {
+    origin == IMO_HARDWARE
+}
+
+/// The current message's source. `BM_CLICK` and the other messages that do not come from the
+/// input queue report no origin; they are not input and are handled before this is asked.
+fn current_input_is_from_a_person() -> bool {
+    let mut source = INPUT_MESSAGE_SOURCE::default();
+    // SAFETY: `source` is writable for the synchronous call, which reads the calling thread's
+    // current message.
+    input_is_from_a_person(
+        unsafe { GetCurrentInputMessageSource(&raw mut source) }.map(|()| source),
+    )
+}
+
+/// A real, native push button on its own small window, owned by the tab. Being a standard
+/// `BUTTON` it exposes the Invoke pattern to UI Automation, so voice control and switch access
+/// can press it, as can a mouse, finger or pen; an on-screen keyboard sends keys, which the
+/// button drops. It is enabled and not transparent, so hit-testing resolves to
+/// it, and its process is not the target's, which the pointer checks refuse; its subclass also
+/// drops injected input. It never takes focus.
+struct StopButton {
+    hwnd: HWND,
+    font: Option<HFONT>,
+    /// The DPI and text scale the font and size were made for.
+    fitted: Option<(u32, u32)>,
+    shown: Option<(i32, i32, i32, i32)>,
+}
+
+impl StopButton {
+    fn create(instance: HINSTANCE, owner: HWND) -> io::Result<Self> {
+        // SAFETY: The class is a system class, the owner is a live window of this thread, and the
+        // returned HWND is owned by this value until Drop destroys it.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("BUTTON"),
+                STOP_BUTTON_LABEL,
+                WS_POPUP | WINDOW_STYLE(BS_PUSHBUTTON.cast_unsigned()),
+                0,
+                0,
+                1,
+                1,
+                Some(owner),
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .map_err(|error| windows_error("CreateWindowExW(BUTTON)", &error))?;
+        // SAFETY: This thread owns `hwnd`; capture affinity stores no Rust pointers.
+        if let Err(error) = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } {
+            // SAFETY: Window creation succeeded and ownership has not escaped this function.
+            let _ = unsafe { DestroyWindow(hwnd) };
+            return Err(windows_error("SetWindowDisplayAffinity", &error));
+        }
+        // SAFETY: `hwnd` belongs to this thread; the callback is a plain function and keeps no
+        // reference data.
+        if !unsafe { SetWindowSubclass(hwnd, Some(button_subclass), BUTTON_SUBCLASS_ID, 0) }
+            .as_bool()
+        {
+            // SAFETY: Window creation succeeded and ownership has not escaped this function.
+            let _ = unsafe { DestroyWindow(hwnd) };
+            return Err(windows_error(
+                "SetWindowSubclass",
+                &windows::core::Error::from_thread(),
+            ));
+        }
+        Ok(Self {
+            hwnd,
+            font: None,
+            fitted: None,
+            shown: None,
+        })
+    }
+
+    /// Gives the button the system message font at this display's DPI and the Windows text size.
+    fn fit(&mut self, dpi: u32, text_scale: f32) {
+        let key = (dpi, text_scale.to_bits());
+        if self.fitted == Some(key) {
+            return;
+        }
+        let mut font = LOGFONTW::default();
+        // SAFETY: `font` is writable and its size is passed; the call fills it for this DPI.
+        let found = unsafe {
+            SystemParametersInfoForDpi(
+                SPI_GETICONTITLELOGFONT.0,
+                u32::try_from(size_of::<LOGFONTW>()).unwrap_or(0),
+                Some((&raw mut font).cast()),
+                0,
+                dpi,
+            )
+        };
+        if found.is_err() {
+            return;
+        }
+        // The icon-title font height is negative (character height); scale its magnitude.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            font.lfHeight =
+                (f64::from(font.lfHeight) * f64::from(text_scale.clamp(1.0, 2.25))).round() as i32;
+        }
+        font.lfWeight = 600;
+        // SAFETY: `font` is fully initialized by the call above.
+        let created = unsafe { CreateFontIndirectW(&raw const font) };
+        if created.is_invalid() {
+            return;
+        }
+        // SAFETY: The button owns its window; the font stays alive until it replaces or drops it,
+        // and the button is told not to repaint twice (WM_SETFONT with a redraw flag).
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                self.hwnd,
+                WM_SETFONT,
+                Some(WPARAM(created.0 as usize)),
+                Some(LPARAM(1)),
+            );
+        }
+        if let Some(previous) = self.font.replace(created) {
+            // SAFETY: The previous font was created here and is no longer selected anywhere.
+            let _ = unsafe { DeleteObject(HGDIOBJ(previous.0)) };
+        }
+        self.fitted = Some(key);
+    }
+
+    /// Shows the button at `rect` (left, top, width, height) above everything, or hides it.
+    fn place(&mut self, rect: Option<(i32, i32, i32, i32)>) {
+        if self.shown == rect {
+            return;
+        }
+        match rect {
+            Some((x, y, width, height)) => {
+                // SAFETY: This thread owns the HWND; the call only moves, sizes and shows it
+                // above other topmost windows, without activating it.
+                let _ = unsafe {
+                    SetWindowPos(
+                        self.hwnd,
+                        Some(HWND_TOPMOST),
+                        x,
+                        y,
+                        width,
+                        height,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    )
+                };
+            }
+            None => {
+                // SAFETY: Hiding a window owned by this thread retains no pointers.
+                let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+            }
+        }
+        self.shown = rect;
+    }
+
+    /// Keeps a shown button above windows that became topmost after it.
+    fn raise(&self) {
+        if self.shown.is_some() {
+            // SAFETY: This thread owns the HWND; the call changes only z-order.
+            let _ = unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                )
+            };
+        }
+    }
+}
+
+impl Drop for StopButton {
+    fn drop(&mut self) {
+        // SAFETY: The window and font are owned by this value and released once. Destroying the
+        // owner earlier would already have destroyed the window, which only makes this fail.
+        unsafe {
+            let _ = RemoveWindowSubclass(self.hwnd, Some(button_subclass), BUTTON_SUBCLASS_ID);
+            let _ = DestroyWindow(self.hwnd);
+            if let Some(font) = self.font.take() {
+                let _ = DeleteObject(HGDIOBJ(font.0));
+            }
+        }
+    }
+}
+
+/// Stops the control session as the user's stop, if one is owned.
+fn invoke_stop() -> bool {
+    CONTROLLER.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(StopController::stop_by_user)
+    })
+}
+
+/// Whether a message is mouse or key input, which the Stop button ignores when injected.
+fn is_person_only_message(message: u32) -> bool {
+    matches!(
+        message,
+        WM_LBUTTONDOWN
+            | WM_LBUTTONUP
+            | WM_LBUTTONDBLCLK
+            | WM_RBUTTONDOWN
+            | WM_RBUTTONUP
+            | WM_MBUTTONDOWN
+            | WM_MBUTTONUP
+            | WM_KEYDOWN
+            | WM_KEYUP
+            | WM_SYSKEYDOWN
+            | WM_SYSKEYUP
+            | WM_CHAR
+    )
+}
+
+unsafe extern "system" fn button_subclass(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    match message {
+        // A click never activates the button's window, so it never takes focus from the user.
+        WM_MOUSEACTIVATE => return LRESULT(isize::try_from(MA_NOACTIVATE).unwrap_or(3)),
+        // UI Automation's Invoke pattern, and therefore assistive technology, clicks this way.
+        // It is not input, so it needs no origin.
+        BM_CLICK => {
+            invoke_stop();
+            return LRESULT(0);
+        }
+        message if is_person_only_message(message) && !current_input_is_from_a_person() => {
+            return LRESULT(0);
+        }
+        WM_NCDESTROY => {
+            // SAFETY: The window is being destroyed; this removes the subclass that is running.
+            let _ =
+                unsafe { RemoveWindowSubclass(window, Some(button_subclass), BUTTON_SUBCLASS_ID) };
+        }
+        _ => {}
+    }
+    // SAFETY: Forward unchanged callback arguments to the next procedure in the chain.
+    unsafe { DefSubclassProc(window, message, wparam, lparam) }
 }
 
 impl TabWindow {
@@ -300,6 +907,14 @@ impl TabWindow {
             let _ = unsafe { DestroyWindow(hwnd) };
             return Err(windows_error("SetWindowDisplayAffinity", &error));
         }
+        let button = match StopButton::create(instance, hwnd) {
+            Ok(button) => button,
+            Err(error) => {
+                // SAFETY: Window creation succeeded and ownership has not escaped this function.
+                let _ = unsafe { DestroyWindow(hwnd) };
+                return Err(error);
+            }
+        };
         Ok(Self {
             hwnd,
             monitor,
@@ -310,7 +925,33 @@ impl TabWindow {
             },
             visible: false,
             name: String::new(),
+            button,
+            text_scale: 1.0,
         })
+    }
+
+    /// Shows or hides the Stop button under the tab body. It is offered only while `offered`,
+    /// the tab is fully shown and the display has room for it.
+    fn place_stop_button(&mut self, offered: bool) {
+        let rect = self
+            .tab
+            .as_ref()
+            .filter(|_| offered && self.visible)
+            .and_then(|tab| {
+                let metrics = button_metrics(self.monitor.dpi, self.text_scale);
+                button_origin(
+                    self.monitor,
+                    self.origin.x,
+                    tab.width,
+                    tab.body_bottom,
+                    metrics,
+                )
+                .map(|origin| (origin.x, origin.y, metrics.width, metrics.height))
+            });
+        if rect.is_some() {
+            self.button.fit(self.monitor.dpi, self.text_scale);
+        }
+        self.button.place(rect);
     }
 
     /// Paints `view` for this display and names the window with its words, so a window rebuilt
@@ -338,6 +979,7 @@ impl TabWindow {
             tab.spoken.clone()
         };
         self.origin = tab_origin(self.monitor, tab.width);
+        self.text_scale = settings.text_scale;
         self.tab = Some(tab);
         self.set_name(&name);
         Ok(())
@@ -381,6 +1023,7 @@ impl TabWindow {
 
     /// Keeps a visible tab above windows that became topmost after it.
     fn raise(&self) {
+        self.button.raise();
         if self.visible {
             // SAFETY: This thread owns the HWND; the call changes only z-order, without
             // activating the window or changing its size or position.
@@ -424,6 +1067,7 @@ impl TabWindow {
     }
 
     fn hide(&mut self) {
+        self.button.place(None);
         if self.visible {
             // SAFETY: Hiding a window owned by this thread retains no pointers.
             let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
@@ -434,6 +1078,8 @@ impl TabWindow {
 
 impl Drop for TabWindow {
     fn drop(&mut self) {
+        // Destroying the owner destroys the button's window with it; the button then only
+        // releases its font.
         // SAFETY: `hwnd` is owned by this value and is destroyed exactly once.
         let _ = unsafe { DestroyWindow(self.hwnd) };
     }
@@ -538,6 +1184,13 @@ impl Presenter {
 
     fn fading(&self) -> bool {
         !matches!(self.phase, Phase::Steady)
+    }
+
+    /// Whether the Stop button is shown: only under a steady tab that says an agent owns the PC.
+    /// Stopping, a possibly held key, a handback and reading the screen never offer it, because
+    /// there is nothing left to stop or no session to stop.
+    fn stop_button_offered(&self) -> bool {
+        !self.fading() && self.shown.is_some_and(|view| stop_button_for(view.kind))
     }
 
     fn paint(
@@ -654,6 +1307,11 @@ impl Presenter {
     }
 }
 
+/// The tab messages that go with a Stop button.
+const fn stop_button_for(kind: TabKind) -> bool {
+    matches!(kind, TabKind::Working | TabKind::Waiting)
+}
+
 /// Stopping and a possibly held key never wait behind a fade.
 fn urgent(view: TabView) -> bool {
     matches!(view.kind, TabKind::Stopping | TabKind::InputHeld)
@@ -668,10 +1326,16 @@ fn announces(previous: Option<TabView>, next: TabView) -> bool {
         // A session announces itself only when it also introduces itself on screen, so a run of
         // one-shot actions within a minute of each other is not announced again and again.
         TabKind::Working | TabKind::Waiting => {
-            next.expanded && matches!(previous, None | Some(TabKind::HandedBack { .. }))
+            next.expanded
+                && matches!(
+                    previous,
+                    None | Some(TabKind::HandedBack { .. } | TabKind::Reading)
+                )
         }
         TabKind::Stopping => previous != Some(TabKind::Stopping),
         TabKind::InputHeld => previous != Some(TabKind::InputHeld),
+        // Reading the screen is a quiet rename: it claims nothing and takes nothing.
+        TabKind::Reading => false,
         // A normal end is a quiet rename; the handback after a stop is announced.
         TabKind::HandedBack { after_stop } => {
             after_stop && !matches!(previous, Some(TabKind::HandedBack { .. }))
@@ -715,8 +1379,10 @@ fn run(
     signals: &SessionSignals,
     exiting: &AtomicBool,
     ready: &mpsc::SyncSender<Result<(), String>>,
+    started: &Cell<bool>,
 ) -> io::Result<()> {
-    let _com = ComApartment::initialize().map_err(|error| io::Error::other(error.to_string()))?;
+    let _com =
+        ComApartment::multithreaded().map_err(|error| windows_error("CoInitializeEx", &error))?;
     // Without the shell's manager the tab still works; it just cannot follow desktop switches.
     let desktops = virtual_desktop_manager().ok();
     let presenter = Presenter::new(Painter::new()?);
@@ -726,7 +1392,8 @@ fn run(
     // SAFETY: Takes no arguments and returns this thread's ID.
     signals
         .ui_thread
-        .store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+        .store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
+    started.set(true);
     let _ = ready.send(Ok(()));
     let result = tab_loop(
         controller,
@@ -736,7 +1403,7 @@ fn run(
         presenter,
         desktops.as_ref(),
     );
-    signals.ui_thread.store(0, Ordering::Release);
+    signals.ui_thread.store(0, Ordering::SeqCst);
     result
 }
 
@@ -751,21 +1418,32 @@ fn tab_loop(
     let mut desktop = None;
     let mut model = TabModel::default();
     let mut settings = Settings::read();
-    let mut next_settings = Instant::now() + SETTINGS_INTERVAL;
+    let mut next_settings = Instant::now() + IDLE_SETTINGS_INTERVAL;
     let mut was_shown = false;
-    while !exiting.load(Ordering::Acquire) {
-        // SAFETY: Dispatch only messages retrieved for this dedicated UI thread.
-        unsafe {
-            let mut message = MSG::default();
-            for _ in 0..64 {
-                if !PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE).as_bool() {
-                    break;
-                }
-                DispatchMessageW(&raw const message);
-            }
+    // A tab started by a screen read shows that read; any other start ignores older reads.
+    let mut seen_observations = controller.observation_count().saturating_sub(u64::from(
+        signals.announce_read.swap(false, Ordering::AcqRel),
+    ));
+    let mut reading_until: Option<Instant> = None;
+    loop {
+        // Drain first and read the flag after it, so a shutdown wake-up consumed by the drain is
+        // still seen. The wait below is bounded as well.
+        drain_messages();
+        if exiting.load(Ordering::SeqCst) {
+            break;
         }
         let now = Instant::now();
         let mut repaint = false;
+        let observations = controller.observation_count();
+        if observations != seen_observations {
+            seen_observations = observations;
+            reading_until = Some(now + READING);
+        }
+        let reading = reading_until.is_some_and(|until| now < until);
+        // The Esc hint is offered only while the hook is confirmed installed.
+        repaint |= presenter
+            .painter
+            .set_esc_hint(controller.esc_stop_available());
         if now >= next_settings || SETTINGS_CHANGED.with(|flag| flag.replace(false)) {
             let fresh = Settings::read();
             repaint |= fresh != settings;
@@ -778,7 +1456,7 @@ fn tab_loop(
                 follow_foreground_desktop(manager, &mut desktop, &native.tabs);
             }
             native.tabs.iter().for_each(TabWindow::raise);
-            next_settings = now + SETTINGS_INTERVAL;
+            next_settings = now + settings_interval(was_shown);
         }
         let view = model.view(
             now,
@@ -788,25 +1466,59 @@ fn tab_loop(
                 activity: signals.activity(),
                 actions: signals.actions(),
                 elevated: signals.elevated,
+                reading,
             },
         );
-        // A tab about to appear first moves to the desktop the user is looking at.
-        if view.is_some()
-            && !was_shown
-            && let Some(manager) = desktops
-        {
-            follow_foreground_desktop(manager, &mut desktop, &native.tabs);
+        // A tab about to appear first moves to the desktop the user is looking at, and from then
+        // on the shell is followed at the shown interval.
+        if view.is_some() && !was_shown {
+            next_settings = next_settings.min(now + SETTINGS_INTERVAL);
+            if let Some(manager) = desktops {
+                follow_foreground_desktop(manager, &mut desktop, &native.tabs);
+            }
         }
         was_shown = view.is_some();
         presenter.update(&mut native.tabs, view, &settings, repaint, now)?;
-        wait_for_input(if presenter.fading() {
-            FADE_FRAME_MS
-        } else {
-            POLL_INTERVAL_MS
-        })
-        .map_err(|error| windows_error("MsgWaitForMultipleObjectsEx", &error))?;
+        // The Stop button is offered with a tab that says an agent owns the PC, once it is fully
+        // on screen, and never with any other message.
+        let offered = presenter.stop_button_offered();
+        for tab in &mut native.tabs {
+            tab.place_stop_button(offered);
+        }
+        let timeout = wait_timeout_ms(
+            presenter.fading(),
+            was_shown,
+            next_settings.saturating_duration_since(now),
+        );
+        wait_for_input(timeout)
+            .map_err(|error| windows_error("MsgWaitForMultipleObjectsEx", &error))?;
     }
     Ok(())
+}
+
+/// How often settings and the foreground desktop are re-read.
+const fn settings_interval(shown: bool) -> Duration {
+    if shown {
+        SETTINGS_INTERVAL
+    } else {
+        IDLE_SETTINGS_INTERVAL
+    }
+}
+
+/// How long the tab thread sleeps before it must look again. While a tab is fading, shown or
+/// about to change on a timer (the waiting delay, the handback, the reading state), it paces
+/// those timers. With nothing shown there is no timer: the thread sleeps until the next settings
+/// check, and a session, stop, observation or Windows message wakes it earlier.
+fn wait_timeout_ms(fading: bool, shown: bool, until_settings: Duration) -> u32 {
+    if fading {
+        FADE_FRAME_MS
+    } else if shown {
+        POLL_INTERVAL_MS
+    } else {
+        u32::try_from(until_settings.as_millis())
+            .unwrap_or(u32::MAX)
+            .max(1)
+    }
 }
 
 /// What ended a [`wait_for_input`] call.
@@ -819,8 +1531,8 @@ enum WaitOutcome {
 }
 
 /// Blocks until this thread has queue input or `timeout_ms` elapses. Low-level keyboard hook
-/// calls arrive as sent messages and run inside this wait, so keystrokes are answered at once
-/// instead of after a sleep. `MWMO_INPUTAVAILABLE` also returns for messages that an earlier
+/// calls are delivered to this thread as sent messages, so the wait returns when one is pending
+/// and `drain_messages` answers it at once instead of after a sleep. `MWMO_INPUTAVAILABLE` also returns for messages that an earlier
 /// peek already saw but did not remove, which a plain wait would sleep through. The timeout is
 /// only for session, state and fade polling, so an idle thread wakes `1000 / timeout_ms` times
 /// per second.
@@ -904,20 +1616,29 @@ unsafe extern "system" fn window_proc(
         | WM_DPICHANGED => SETTINGS_CHANGED.with(|flag| flag.set(true)),
         WM_NCHITTEST => return LRESULT(isize::try_from(HTTRANSPARENT).unwrap_or(-1)),
         WM_MOUSEACTIVATE => return LRESULT(isize::try_from(MA_NOACTIVATE).unwrap_or(3)),
+        // The Stop button reports a click here. Injected clicks never get this far: the button's
+        // subclass drops them before the button sees them.
+        WM_COMMAND if is_button_click(wparam, lparam) => {
+            invoke_stop();
+            return LRESULT(0);
+        }
         _ => {}
     }
     // SAFETY: Forward unchanged Win32 callback arguments to the default procedure.
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
 
-fn windows_error(context: &str, error: &windows::core::Error) -> io::Error {
-    io::Error::other(format!("{context} failed: {error}"))
+/// A `WM_COMMAND` from a control (non-null `lparam`) with the `BN_CLICKED` notification.
+fn is_button_click(wparam: WPARAM, lparam: LPARAM) -> bool {
+    let notification = (wparam.0 >> 16) & 0xffff;
+    lparam.0 != 0 && u32::try_from(notification) == Ok(BN_CLICKED)
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::indicator::{TabKind, TabView};
     use super::*;
+    use controlfreak_core::EscHook;
     use windows::Win32::{
         System::Threading::GetCurrentThreadId,
         UI::WindowsAndMessaging::{
@@ -1013,7 +1734,7 @@ mod tests {
     fn messages_change_in_place_and_safety_messages_show_at_once_at_full_strength() {
         let _windows = window_class_lock();
         super::super::ensure_dpi_awareness().unwrap();
-        let mut native = NativeStop::create_with_hook(false).unwrap();
+        let mut native = NativeStop::create().unwrap();
         native
             .sync_monitors(&[enumerate_monitors().unwrap().remove(0)])
             .unwrap();
@@ -1071,7 +1792,7 @@ mod tests {
     fn a_new_session_fades_in_fully_and_is_announced_exactly_once() {
         let _windows = window_class_lock();
         super::super::ensure_dpi_awareness().unwrap();
-        let mut native = NativeStop::create_with_hook(false).unwrap();
+        let mut native = NativeStop::create().unwrap();
         native
             .sync_monitors(&[enumerate_monitors().unwrap().remove(0)])
             .unwrap();
@@ -1143,7 +1864,7 @@ mod tests {
         );
         // SAFETY: Remove the wake-up messages so the queue is left empty.
         while unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }.as_bool() {}
-        signals.ui_thread.store(0, Ordering::Release);
+        signals.ui_thread.store(0, Ordering::SeqCst);
     }
 
     #[test]
@@ -1192,7 +1913,7 @@ mod tests {
     fn point_targeting_skips_the_disabled_session_tab() {
         let _windows = window_class_lock();
         super::super::ensure_dpi_awareness().unwrap();
-        let mut native = NativeStop::create_with_hook(false).unwrap();
+        let mut native = NativeStop::create().unwrap();
         let monitor = enumerate_monitors().unwrap().remove(0);
         native.sync_monitors(&[monitor]).unwrap();
         let painter = Painter::new().unwrap();
@@ -1279,5 +2000,452 @@ mod tests {
         assert!(consume_escape(&stop, esc, false, true, false, &consumed));
         assert!(consume_escape(&stop, esc, false, false, true, &consumed));
         assert!(!consume_escape(&stop, esc, false, false, true, &consumed));
+    }
+
+    #[derive(Clone, Default)]
+    struct HookCounts {
+        attempts: Arc<AtomicU32>,
+        installs: Arc<AtomicU32>,
+        removals: Arc<AtomicU32>,
+        fail: Arc<AtomicBool>,
+    }
+
+    struct FakeHook(HookCounts);
+
+    impl KeyboardHook for FakeHook {
+        fn install(&mut self) -> io::Result<()> {
+            self.0.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.0.fail.load(Ordering::SeqCst) {
+                return Err(io::Error::other("hook refused"));
+            }
+            self.0.installs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn uninstall(&mut self) {
+            self.0.removals.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn eventually(what: &str, condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_shutdown_whose_wake_up_the_drain_consumed_still_ends_the_monitor() {
+        let controller = StopController::default();
+        let exiting = AtomicBool::new(false);
+        let waits = Cell::new(0_u32);
+        // The shutdown arrives while the queue is drained, which swallows its only wake-up.
+        escape_loop_with(
+            &controller,
+            Box::new(FakeHook(HookCounts::default())),
+            &exiting,
+            || exiting.store(true, Ordering::SeqCst),
+            || {
+                waits.set(waits.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            waits.get(),
+            0,
+            "the loop must not sleep after the flag was set"
+        );
+    }
+
+    #[test]
+    fn the_keyboard_hook_exists_only_while_a_session_is_owned() {
+        let controller = StopController::default();
+        let counts = HookCounts::default();
+        let monitor = EscapeMonitor::start(&controller, {
+            let counts = counts.clone();
+            move || Box::new(FakeHook(counts))
+        })
+        .unwrap();
+        // No session: nothing is hooked, however long the server has been running.
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(counts.attempts.load(Ordering::SeqCst), 0);
+        assert!(!controller.esc_stop_available());
+
+        controller.set_session_active(true);
+        eventually("the hook to be installed", || {
+            controller.esc_stop_available()
+        });
+        assert_eq!(counts.installs.load(Ordering::SeqCst), 1);
+
+        controller.set_session_active(false);
+        // The monitor announces that Esc is unavailable before it removes the hook, so wait for
+        // the removal itself.
+        eventually("the hook to be removed", || {
+            counts.removals.load(Ordering::SeqCst) == 1
+        });
+        assert!(!controller.esc_stop_available());
+
+        controller.set_session_active(true);
+        eventually("the hook to be installed again", || {
+            controller.esc_stop_available()
+        });
+        assert_eq!(counts.installs.load(Ordering::SeqCst), 2);
+        // Shutting down with a session still owned removes the hook too.
+        drop(monitor);
+        assert_eq!(counts.removals.load(Ordering::SeqCst), 2);
+        assert!(!controller.esc_stop_available());
+    }
+
+    #[test]
+    fn a_hook_that_cannot_be_installed_is_reported_once_and_retried_next_session() {
+        let controller = StopController::default();
+        let counts = HookCounts::default();
+        counts.fail.store(true, Ordering::SeqCst);
+        let monitor = EscapeMonitor::start(&controller, {
+            let counts = counts.clone();
+            move || Box::new(FakeHook(counts))
+        })
+        .unwrap();
+        controller.set_session_active(true);
+        eventually("the first attempt", || {
+            counts.attempts.load(Ordering::SeqCst) == 1
+        });
+        // Other changes during the session do not retry in a loop.
+        controller.note_observation();
+        controller.note_observation();
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(counts.attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            !controller.esc_stop_available(),
+            "the tab is told Esc is not available"
+        );
+
+        controller.set_session_active(false);
+        counts.fail.store(false, Ordering::SeqCst);
+        // Give the monitor time to see the session end before the next one begins.
+        thread::sleep(Duration::from_millis(150));
+        controller.set_session_active(true);
+        eventually("the retry", || controller.esc_stop_available());
+        assert_eq!(counts.installs.load(Ordering::SeqCst), 1);
+        drop(monitor);
+    }
+
+    #[test]
+    fn admission_can_wait_for_the_monitor_to_confirm_the_hook() {
+        let controller = StopController::default();
+        let counts = HookCounts::default();
+        let monitor = EscapeMonitor::start(&controller, {
+            let counts = counts.clone();
+            move || Box::new(FakeHook(counts))
+        })
+        .unwrap();
+        controller.set_session_active(true);
+        let wait = Duration::from_secs(5);
+        assert_eq!(controller.wait_for_esc_hook(wait), EscHook::Installed);
+        assert_eq!(counts.installs.load(Ordering::SeqCst), 1);
+
+        // A refused install is a verdict for the session, not a timeout.
+        controller.set_session_active(false);
+        eventually("the hook to be removed", || {
+            !controller.esc_stop_available()
+        });
+        counts.fail.store(true, Ordering::SeqCst);
+        controller.set_session_active(true);
+        assert_eq!(
+            controller.wait_for_esc_hook(wait),
+            EscHook::Failed("hook refused".into())
+        );
+        drop(monitor);
+        assert_eq!(
+            controller.wait_for_esc_hook(wait),
+            EscHook::NotMonitored,
+            "a stopped monitor leaves nothing to wait for"
+        );
+    }
+
+    #[test]
+    fn the_hook_decision_covers_every_state() {
+        use HookAction::{Install, Uninstall, Wait};
+        for (owned, installed, failed, expected) in [
+            (true, false, false, Install),
+            (true, true, false, Wait),
+            (true, false, true, Wait),
+            (false, true, false, Uninstall),
+            (false, false, true, Wait),
+            (false, false, false, Wait),
+        ] {
+            assert_eq!(
+                hook_action(owned, installed, failed),
+                expected,
+                "owned {owned}, installed {installed}, failed {failed}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_idle_tab_thread_sleeps_until_its_safety_check_not_in_short_polls() {
+        let long = Duration::from_secs(2);
+        assert_eq!(wait_timeout_ms(false, false, long), 2_000);
+        assert_eq!(wait_timeout_ms(false, false, Duration::ZERO), 1);
+        assert_eq!(wait_timeout_ms(false, true, long), POLL_INTERVAL_MS);
+        assert_eq!(wait_timeout_ms(true, false, long), FADE_FRAME_MS);
+        assert_eq!(settings_interval(false), IDLE_SETTINGS_INTERVAL);
+        assert_eq!(settings_interval(true), SETTINGS_INTERVAL);
+    }
+
+    #[test]
+    fn the_stop_button_fits_the_display_and_text_size_and_stays_on_the_display() {
+        let at_100 = button_metrics(96, 1.0);
+        assert_eq!((at_100.width, at_100.height), (104, 32));
+        let at_200 = button_metrics(192, 1.0);
+        assert_eq!((at_200.width, at_200.height), (208, 64));
+        let big_text = button_metrics(96, 2.0);
+        assert_eq!((big_text.width, big_text.height), (208, 64));
+        assert_eq!(button_metrics(96, 9.0), button_metrics(96, 2.25));
+
+        let monitor = Monitor {
+            left: -1920,
+            top: -300,
+            right: 0,
+            bottom: 780,
+            dpi: 96,
+        };
+        let origin = button_origin(monitor, -1260, 600, 80, at_100).unwrap();
+        assert_eq!(
+            origin.y,
+            monitor.top + 80 + at_100.gap,
+            "under the tab body"
+        );
+        assert_eq!(origin.x, -1260 + (600 - 104) / 2, "centred under the tab");
+        let edge = button_origin(monitor, -40, 600, 80, at_100).unwrap();
+        assert_eq!(
+            edge.x,
+            monitor.right - at_100.width,
+            "never off the display"
+        );
+        let short = Monitor {
+            bottom: monitor.top + 100,
+            ..monitor
+        };
+        assert!(button_origin(short, -1260, 600, 80, at_100).is_none());
+    }
+
+    #[test]
+    fn only_a_person_can_press_the_stop_button() {
+        use windows::Win32::UI::Input::{IMO_INJECTED, IMO_SYSTEM, IMO_UNAVAILABLE};
+        let from = |origin| {
+            input_is_from_a_person(Ok(INPUT_MESSAGE_SOURCE {
+                originId: origin,
+                ..Default::default()
+            }))
+        };
+        assert!(from(IMO_HARDWARE), "mouse, touch and pen hardware");
+        assert!(
+            !from(IMO_SYSTEM),
+            "nothing that presses the button reports the system"
+        );
+        assert!(
+            !from(IMO_UNAVAILABLE),
+            "a posted message from another process reports no origin"
+        );
+        assert!(!from(IMO_INJECTED), "SendInput and injected touch");
+        assert!(
+            !input_is_from_a_person(Err(windows::core::Error::from_hresult(
+                windows::core::HRESULT(-1)
+            ))),
+            "an unreadable origin is refused"
+        );
+        for message in [WM_LBUTTONDOWN, WM_LBUTTONUP, WM_KEYDOWN, WM_CHAR] {
+            assert!(is_person_only_message(message));
+        }
+        assert!(!is_person_only_message(BM_CLICK));
+        assert!(!is_person_only_message(WM_MOUSEACTIVATE));
+    }
+
+    #[test]
+    fn a_command_is_a_click_only_from_a_control_with_the_clicked_notification() {
+        assert!(is_button_click(WPARAM(BN_CLICKED as usize), LPARAM(1)));
+        assert!(!is_button_click(WPARAM(BN_CLICKED as usize), LPARAM(0)));
+        assert!(!is_button_click(WPARAM(1 << 16), LPARAM(1)));
+    }
+
+    #[test]
+    fn the_stop_button_is_offered_only_with_a_steady_session_tab() {
+        let mut presenter = Presenter::new(Painter::new().unwrap());
+        let settings = Settings {
+            palette: Palette::STANDARD,
+            text_scale: 1.0,
+            animated: false,
+        };
+        let view = |kind| TabView {
+            kind,
+            admin: false,
+            expanded: false,
+        };
+        let show = |presenter: &mut Presenter, kind| {
+            presenter
+                .update(&mut [], Some(view(kind)), &settings, false, Instant::now())
+                .unwrap();
+            presenter.stop_button_offered()
+        };
+        assert!(!presenter.stop_button_offered(), "nothing shown");
+        assert!(show(&mut presenter, TabKind::Working));
+        assert!(show(&mut presenter, TabKind::Waiting));
+        assert!(!show(&mut presenter, TabKind::Stopping));
+        assert!(!show(&mut presenter, TabKind::InputHeld));
+        assert!(!show(
+            &mut presenter,
+            TabKind::HandedBack { after_stop: false }
+        ));
+        assert!(
+            !show(&mut presenter, TabKind::Reading),
+            "reading the screen owns nothing to stop"
+        );
+        presenter
+            .update(&mut [], None, &settings, false, Instant::now())
+            .unwrap();
+        assert!(!presenter.stop_button_offered());
+    }
+
+    #[test]
+    fn the_esc_hint_is_painted_only_while_the_hook_is_confirmed() {
+        let painter = Painter::new().unwrap();
+        let view = TabView {
+            kind: TabKind::Working,
+            admin: false,
+            expanded: true,
+        };
+        let paint = |painter: &Painter| {
+            painter
+                .paint(view, &Palette::STANDARD, 96, 3840, 1.0)
+                .unwrap()
+        };
+        assert!(
+            paint(&painter).spoken.contains("Esc to stop"),
+            "offered by default"
+        );
+        assert!(painter.set_esc_hint(false), "a change is reported");
+        assert!(!painter.set_esc_hint(false), "no change, no repaint");
+        let without = paint(&painter);
+        assert!(!without.spoken.contains("Esc"), "{}", without.spoken);
+        assert!(without.body_bottom > 0);
+        assert!(painter.set_esc_hint(true));
+        assert!(paint(&painter).spoken.contains("Esc to stop"));
+    }
+
+    #[test]
+    fn the_stop_button_is_a_real_enabled_button_that_stops_only_an_owned_session() {
+        use windows::Win32::UI::{
+            Input::KeyboardAndMouse::IsWindowEnabled,
+            WindowsAndMessaging::{GWL_EXSTYLE, GetParent, GetWindowLongPtrW},
+        };
+        let _windows = window_class_lock();
+        super::super::ensure_dpi_awareness().unwrap();
+        let mut native = NativeStop::create().unwrap();
+        let monitor = enumerate_monitors().unwrap().remove(0);
+        native.sync_monitors(&[monitor]).unwrap();
+        let tab = &native.tabs[0];
+        let button = tab.button.hwnd;
+
+        // Enabled and not transparent, unlike the tab, so hit-testing resolves to this process.
+        // SAFETY: Both windows are live and owned by this thread.
+        unsafe {
+            assert!(IsWindowEnabled(button).as_bool());
+            assert!(!IsWindowEnabled(tab.hwnd).as_bool());
+            let style = u32::try_from(GetWindowLongPtrW(button, GWL_EXSTYLE)).unwrap();
+            assert_eq!(style & WS_EX_TRANSPARENT.0, 0);
+            assert_ne!(style & WS_EX_NOACTIVATE.0, 0, "never takes focus");
+            assert_eq!(GetParent(button).unwrap(), tab.hwnd, "owned by its tab");
+        }
+        let mut affinity = 0_u32;
+        // SAFETY: `affinity` is writable for the synchronous call and the window is live.
+        unsafe { GetWindowDisplayAffinity(button, &raw mut affinity) }.unwrap();
+        assert_eq!(affinity, WDA_EXCLUDEFROMCAPTURE.0, "never in screenshots");
+
+        // UI Automation's Invoke pattern clicks with BM_CLICK; the owner hears BN_CLICKED.
+        let controller = StopController::default();
+        CONTROLLER.with(|slot| *slot.borrow_mut() = Some(controller.clone()));
+        // SAFETY: Same live window; BM_CLICK carries no pointers.
+        unsafe { SendMessageW(button, BM_CLICK, Some(WPARAM(0)), Some(LPARAM(0))) };
+        assert!(!controller.is_stopped(), "no session, nothing to stop");
+        controller.set_session_active(true);
+        // A command that does not come from a control is not a click.
+        // SAFETY: Same live window; the message carries no pointers.
+        unsafe { SendMessageW(tab.hwnd, WM_COMMAND, Some(WPARAM(0)), Some(LPARAM(0))) };
+        assert!(!controller.is_stopped());
+        // SAFETY: Same live window; BM_CLICK carries no pointers.
+        unsafe { SendMessageW(button, BM_CLICK, Some(WPARAM(0)), Some(LPARAM(0))) };
+        assert!(controller.user_stopped(), "invoked, so stopped by the user");
+
+        let again = StopController::default();
+        again.set_session_active(true);
+        CONTROLLER.with(|slot| *slot.borrow_mut() = Some(again.clone()));
+        // SAFETY: Same live windows; the control handle is only compared by the callee.
+        unsafe {
+            SendMessageW(
+                tab.hwnd,
+                WM_COMMAND,
+                Some(WPARAM(BN_CLICKED as usize)),
+                Some(LPARAM(button.0 as isize)),
+            )
+        };
+        assert!(again.user_stopped(), "a click reported by the button");
+        CONTROLLER.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    #[test]
+    fn the_stop_button_takes_clicks_where_the_tab_lets_them_through() {
+        use windows::Win32::UI::WindowsAndMessaging::HTCLIENT;
+        let _windows = window_class_lock();
+        super::super::ensure_dpi_awareness().unwrap();
+        let mut native = NativeStop::create().unwrap();
+        let monitor = enumerate_monitors().unwrap().remove(0);
+        native.sync_monitors(&[monitor]).unwrap();
+        let tab = &native.tabs[0];
+        // A point inside the (still tiny, hidden) button window, in screen coordinates.
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        // SAFETY: `rect` is writable for the synchronous call and the window is live.
+        unsafe { GetWindowRect(tab.button.hwnd, &raw mut rect) }.unwrap();
+        let centre = LPARAM(
+            (isize::try_from(rect.top).unwrap() << 16)
+                | (isize::try_from(rect.left).unwrap() & 0xffff),
+        );
+        let hit_test = |window| {
+            // SAFETY: Value-only hit test sent to a live window of this thread.
+            unsafe { SendMessageW(window, WM_NCHITTEST, Some(WPARAM(0)), Some(centre)) }.0
+        };
+        assert_eq!(
+            hit_test(tab.hwnd),
+            isize::try_from(HTTRANSPARENT).unwrap(),
+            "the tab is click-through"
+        );
+        assert_eq!(
+            hit_test(tab.button.hwnd),
+            isize::try_from(HTCLIENT).unwrap(),
+            "the button is not: a click on it belongs to this process, which the target \
+             checks refuse"
+        );
+    }
+
+    #[test]
+    fn a_tab_failure_after_start_up_fails_closed_and_keeps_its_reason() {
+        let controller = StopController::default();
+        let reported = std::sync::Mutex::new(Vec::new());
+        record_tab_failure(
+            &controller,
+            &|reason| reported.lock().unwrap().push(reason),
+            &io::Error::other("no active monitors"),
+        );
+        assert!(controller.is_stopped());
+        assert!(!controller.user_stopped(), "this is not a user stop");
+        let refusal = controller.refusal_message().unwrap();
+        assert!(refusal.contains("session tab stopped working"), "{refusal}");
+        assert!(refusal.contains("no active monitors"), "{refusal}");
+        assert_eq!(
+            controller.failure_reason(),
+            reported.lock().unwrap().first().cloned(),
+            "the status report and the refusal give the same reason"
+        );
     }
 }

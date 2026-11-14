@@ -1,18 +1,23 @@
 #![allow(unsafe_code)]
 
 use controlfreak_core::timing;
+use windows::Win32::{
+    Foundation::{HWND, RECT},
+    Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow},
+    UI::WindowsAndMessaging::{GetWindowRect, IsHungAppWindow},
+};
 
 use super::{
     ActionObservation, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, BitmapPixelFormat, CAPTUREBLT,
-    ComApartment, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS, DataWriter, DeleteDC,
-    DeleteObject, DisplayBounds, DisplayInfo, DisplayScreenshot, Duration, GetDC, GetDIBits,
-    HBITMAP, HDC, HGDIOBJ, HSTRING, Instant, Language, MAX_ACTION_IMAGE_WIDTH, MAX_CAPTURE_BYTES,
+    CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS, DataWriter, DeleteDC, DeleteObject,
+    DisplayBounds, DisplayInfo, DisplayScreenshot, Duration, GetDC, GetDIBits, HBITMAP, HDC,
+    HGDIOBJ, HSTRING, Instant, Language, MAX_ACTION_IMAGE_WIDTH, MAX_CAPTURE_BYTES,
     MAX_CAPTURE_WIDTH, MAX_WAIT_MS, ObservationMode, ObservationOptions, OcrEngine, OcrLine,
     OcrRegionRequest, OcrResult, OcrWord, OnceLock, PlatformError, ReleaseDC, SRCCOPY,
     SelectObject, SoftwareBitmap, SystemTime, UNIX_EPOCH, VISUAL_COMPARE_WIDTH, VISUAL_POLL_MS,
     VisualChangeResult, WaitForVisualChangeRequest, WindowBounds, WindowInfo, c_void,
     current_cursor_position, ensure_dpi_awareness, enumerate_displays, find_display,
-    foreground_window_handle, last_win32_error, size_of, win32_error, window_info,
+    foreground_window_handle, initialize_com, last_win32_error, size_of, win32_error, window_info,
 };
 
 struct ScreenDc(HDC);
@@ -284,19 +289,20 @@ fn foreground_window_info() -> Option<WindowInfo> {
         .flatten()
 }
 
-fn capture_rgba(bounds: DisplayBounds) -> Result<Vec<u8>, PlatformError> {
-    let width = i32::try_from(bounds.width).map_err(|_| PlatformError::OperationFailed {
+/// Bitmap dimensions and byte count of a 32-bit capture, refused beyond Win32 and safety limits.
+fn capture_geometry(width: u32, height: u32) -> Result<(i32, i32, usize), PlatformError> {
+    let signed_width = i32::try_from(width).map_err(|_| PlatformError::OperationFailed {
         operation: "capture_display".to_owned(),
         reason: "display width exceeds the Win32 bitmap limit".to_owned(),
     })?;
-    let height = i32::try_from(bounds.height).map_err(|_| PlatformError::OperationFailed {
+    let signed_height = i32::try_from(height).map_err(|_| PlatformError::OperationFailed {
         operation: "capture_display".to_owned(),
         reason: "display height exceeds the Win32 bitmap limit".to_owned(),
     })?;
-    let byte_count = usize::try_from(bounds.width)
+    let byte_count = usize::try_from(width)
         .ok()
         .and_then(|width| {
-            usize::try_from(bounds.height)
+            usize::try_from(height)
                 .ok()
                 .and_then(|height| width.checked_mul(height))
         })
@@ -306,31 +312,17 @@ fn capture_rgba(bounds: DisplayBounds) -> Result<Vec<u8>, PlatformError> {
             operation: "capture_display".to_owned(),
             reason: format!("capture buffer exceeds the {MAX_CAPTURE_BYTES}-byte safety limit"),
         })?;
+    Ok((signed_width, signed_height, byte_count))
+}
 
-    let screen_dc = ScreenDc::acquire()?;
-    let memory_dc = MemoryDc::create(screen_dc.0)?;
-    let bitmap = Bitmap::create(screen_dc.0, width, height)?;
-
-    {
-        let _selection = SelectedObject::select(memory_dc.0, bitmap.0.into())?;
-        // SAFETY: Both DCs and the selected bitmap are live, coordinates/dimensions were validated,
-        // and BitBlt retains no Rust references after returning.
-        unsafe {
-            BitBlt(
-                memory_dc.0,
-                0,
-                0,
-                width,
-                height,
-                Some(screen_dc.0),
-                bounds.left,
-                bounds.top,
-                SRCCOPY | CAPTUREBLT,
-            )
-        }
-        .map_err(|error| win32_error("BitBlt", &error))?;
-    }
-
+/// Reads a bitmap that is not selected into any DC as top-down 32-bit BGRA into `buffer`.
+fn read_bitmap_bgra(
+    memory_dc: &MemoryDc,
+    bitmap: &Bitmap,
+    width: i32,
+    height: i32,
+    buffer: &mut [u8],
+) -> Result<(), PlatformError> {
     let mut bitmap_info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: u32::try_from(size_of::<BITMAPINFOHEADER>()).map_err(|_| {
@@ -348,40 +340,409 @@ fn capture_rgba(bounds: DisplayBounds) -> Result<Vec<u8>, PlatformError> {
         },
         ..Default::default()
     };
-    let mut bgra = vec![0_u8; byte_count];
-    // SAFETY: `bgra` has the checked size required for the requested 32-bit image, BITMAPINFO is
-    // initialized for that layout, and all GDI handles remain live through the call.
+    debug_assert_eq!(
+        buffer.len(),
+        usize::try_from(width).unwrap_or(0) * usize::try_from(height).unwrap_or(0) * 4
+    );
+    // SAFETY: `buffer` has exactly the size of the requested 32-bit image (checked by
+    // `capture_geometry` for the callers), BITMAPINFO is initialized for that layout, the bitmap
+    // is not selected into a DC, and all GDI handles remain live through the call.
     let copied_lines = unsafe {
         GetDIBits(
             memory_dc.0,
             bitmap.0,
             0,
-            bounds.height,
-            Some(bgra.as_mut_ptr().cast::<c_void>()),
+            u32::try_from(height).unwrap_or(0),
+            Some(buffer.as_mut_ptr().cast::<c_void>()),
             &raw mut bitmap_info,
             DIB_RGB_COLORS,
         )
     };
-    if copied_lines != height {
-        return Err(PlatformError::OperationFailed {
+    if copied_lines == height {
+        Ok(())
+    } else {
+        Err(PlatformError::OperationFailed {
             operation: "GetDIBits".to_owned(),
             reason: format!("copied {copied_lines} of {height} scan lines"),
-        });
+        })
+    }
+}
+
+/// Reads one screen rectangle repeatedly. The device contexts, the bitmap and the pixel buffer
+/// are created once, so each further read is one `BitBlt` and one `GetDIBits` with no allocation.
+struct FrameGrabber {
+    screen_dc: ScreenDc,
+    memory_dc: MemoryDc,
+    bitmap: Bitmap,
+    bounds: DisplayBounds,
+    width: i32,
+    height: i32,
+    /// The latest read: top-down BGRA, the byte after each pixel's red byte unspecified.
+    buffer: Vec<u8>,
+}
+
+impl FrameGrabber {
+    fn new(bounds: DisplayBounds) -> Result<Self, PlatformError> {
+        let (width, height, byte_count) = capture_geometry(bounds.width, bounds.height)?;
+        let screen_dc = ScreenDc::acquire()?;
+        let memory_dc = MemoryDc::create(screen_dc.0)?;
+        let bitmap = Bitmap::create(screen_dc.0, width, height)?;
+        Ok(Self {
+            screen_dc,
+            memory_dc,
+            bitmap,
+            bounds,
+            width,
+            height,
+            buffer: vec![0_u8; byte_count],
+        })
     }
 
-    for pixel in bgra.chunks_exact_mut(4) {
+    /// Replaces `self.buffer` with the rectangle's current pixels.
+    fn grab(&mut self) -> Result<(), PlatformError> {
+        {
+            // GetDIBits needs the bitmap unselected, so it is selected only around the copy.
+            let _selection = SelectedObject::select(self.memory_dc.0, self.bitmap.0.into())?;
+            // SAFETY: Both DCs and the selected bitmap are live, coordinates and dimensions were
+            // validated when the grabber was created, and BitBlt retains no Rust references.
+            unsafe {
+                BitBlt(
+                    self.memory_dc.0,
+                    0,
+                    0,
+                    self.width,
+                    self.height,
+                    Some(self.screen_dc.0),
+                    self.bounds.left,
+                    self.bounds.top,
+                    SRCCOPY | CAPTUREBLT,
+                )
+            }
+            .map_err(|error| win32_error("BitBlt", &error))?;
+        }
+        read_bitmap_bgra(
+            &self.memory_dc,
+            &self.bitmap,
+            self.width,
+            self.height,
+            &mut self.buffer,
+        )
+    }
+}
+
+/// Converts a BGRA frame to opaque RGBA in place.
+fn bgra_to_rgba(frame: &mut [u8]) {
+    for pixel in frame.chunks_exact_mut(4) {
         pixel.swap(0, 2);
         pixel[3] = u8::MAX;
     }
-    Ok(bgra)
 }
 
-pub(super) fn capture_bounds(
+fn capture_rgba(bounds: DisplayBounds) -> Result<Vec<u8>, PlatformError> {
+    let mut grabber = FrameGrabber::new(bounds)?;
+    grabber.grab()?;
+    let mut frame = std::mem::take(&mut grabber.buffer);
+    bgra_to_rgba(&mut frame);
+    Ok(frame)
+}
+
+/// How a window screenshot was produced; reported to clients as `capture_method`.
+const CAPTURE_METHOD_PRINT_WINDOW: &str = "windows_print_window";
+const CAPTURE_METHOD_SCREEN: &str = "windows_gdi";
+
+/// `PW_RENDERFULLCONTENT`: ask the window (and DWM) to render all of its content, including
+/// layered and hardware-accelerated child content, even when it is covered by other windows.
+const PW_RENDERFULLCONTENT: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(2);
+
+/// Copies the part of a window-sized BGRA frame that starts at (`left`, `top`) and is
+/// `width` x `height` as opaque RGBA. `None` if that part is not inside the frame.
+fn crop_bgra_to_rgba(
+    frame: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    left: i64,
+    top: i64,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    let right = left.checked_add(i64::from(width))?;
+    let bottom = top.checked_add(i64::from(height))?;
+    if left < 0
+        || top < 0
+        || right > i64::from(frame_width)
+        || bottom > i64::from(frame_height)
+        || frame.len()
+            != usize::try_from(u64::from(frame_width) * u64::from(frame_height) * 4).ok()?
+    {
+        return None;
+    }
+    let stride = usize::try_from(frame_width).ok()? * 4;
+    let row_bytes = usize::try_from(width).ok()? * 4;
+    let mut rgba = Vec::with_capacity(row_bytes * usize::try_from(height).ok()?);
+    for row in 0..usize::try_from(height).ok()? {
+        let start = (usize::try_from(top).ok()? + row) * stride + usize::try_from(left).ok()? * 4;
+        rgba.extend_from_slice(&frame[start..start + row_bytes]);
+    }
+    bgra_to_rgba(&mut rgba);
+    Some(rgba)
+}
+
+/// A window that failed to render itself comes back fully black; real windows are not.
+fn is_blank_frame(rgba: &[u8]) -> bool {
+    rgba.chunks_exact(4)
+        .all(|pixel| pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0)
+}
+
+/// Renders the window itself into a bitmap, so what covers it on screen is irrelevant, and
+/// returns the part inside `visible` (the frame bounds that coordinates are reported in) as
+/// RGBA. `None` when the window cannot render itself, returns nothing, or its pixels do not line
+/// up with `visible`; the caller then copies the screen instead.
+fn print_window_rgba(hwnd: HWND, visible: DisplayBounds) -> Option<Vec<u8>> {
+    let mut rect = RECT::default();
+    // SAFETY: rect is writable for the synchronous call, which retains no references.
+    unsafe { GetWindowRect(hwnd, &raw mut rect) }.ok()?;
+    let full_width = u32::try_from(rect.right.checked_sub(rect.left)?).ok()?;
+    let full_height = u32::try_from(rect.bottom.checked_sub(rect.top)?).ok()?;
+    if full_width == 0 || full_height == 0 {
+        return None;
+    }
+    let (width, height, byte_count) = capture_geometry(full_width, full_height).ok()?;
+    let screen_dc = ScreenDc::acquire().ok()?;
+    let memory_dc = MemoryDc::create(screen_dc.0).ok()?;
+    let bitmap = Bitmap::create(screen_dc.0, width, height).ok()?;
+    {
+        let _selection = SelectedObject::select(memory_dc.0, bitmap.0.into()).ok()?;
+        // SAFETY: hwnd is a window handle checked by the caller, the memory DC has the bitmap
+        // selected, and PrintWindow retains no references after returning.
+        if !unsafe { PrintWindow(hwnd, memory_dc.0, PW_RENDERFULLCONTENT) }.as_bool() {
+            return None;
+        }
+    }
+    let mut frame = vec![0_u8; byte_count];
+    read_bitmap_bgra(&memory_dc, &bitmap, width, height, &mut frame).ok()?;
+    let rgba = crop_bgra_to_rgba(
+        &frame,
+        full_width,
+        full_height,
+        i64::from(visible.left) - i64::from(rect.left),
+        i64::from(visible.top) - i64::from(rect.top),
+        visible.width,
+        visible.height,
+    )?;
+    (!is_blank_frame(&rgba)).then_some(rgba)
+}
+
+/// How long a window may take to render itself. `PrintWindow` waits for the target application
+/// to handle `WM_PRINT`, and an application that stops pumping messages would hold the call
+/// forever. A window that is flagged as hung is not asked at all; for any other, the render runs
+/// on its own thread and the caller waits at most this long before copying the screen instead.
+const PRINT_WINDOW_DEADLINE: Duration = Duration::from_secs(2);
+
+/// How often a capture that is waiting for the render slot looks again.
+const RENDER_SLOT_POLL: Duration = Duration::from_millis(5);
+
+/// The single render slot. At most one render thread exists at a time: another window capture
+/// waits for the slot, within the same deadline as its own render, while that render is still
+/// in flight, and copies the screen at once if the render was already abandoned. A window that
+/// never answers therefore costs one parked thread and its GDI objects rather than one per call,
+/// two captures in parallel both get their window's own rendering, and a hung window does not
+/// make every later capture wait out the deadline.
+struct RenderSlot {
+    state: std::sync::Mutex<SlotState>,
+}
+
+#[derive(Clone, Copy)]
+struct SlotState {
+    busy: bool,
+    /// The waiter gave up on the render in the slot; it is parked until the application answers.
+    abandoned: bool,
+    /// Identifies the render that holds the slot, so a late timeout or finish never touches a
+    /// later render.
+    generation: u64,
+}
+
+impl RenderSlot {
+    const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(SlotState {
+                busy: false,
+                abandoned: false,
+                generation: 0,
+            }),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, SlotState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Takes the slot. `Ok(None)` means wait and try again, `Err(())` means the render in the
+    /// slot was abandoned and will not finish soon.
+    fn try_take(&self) -> Result<Option<u64>, ()> {
+        let mut state = self.state();
+        if !state.busy {
+            state.busy = true;
+            state.abandoned = false;
+            state.generation += 1;
+            return Ok(Some(state.generation));
+        }
+        if state.abandoned { Err(()) } else { Ok(None) }
+    }
+
+    fn abandon(&self, generation: u64) {
+        let mut state = self.state();
+        if state.busy && state.generation == generation {
+            state.abandoned = true;
+        }
+    }
+
+    fn release(&self, generation: u64) {
+        let mut state = self.state();
+        if state.busy && state.generation == generation {
+            state.busy = false;
+            state.abandoned = false;
+        }
+    }
+
+    #[cfg(test)]
+    fn is_busy(&self) -> bool {
+        self.state().busy
+    }
+}
+
+static RENDER_SLOT: RenderSlot = RenderSlot::new();
+
+/// Frees the render slot when dropped, on success, failure or unwinding.
+struct HeldRender(&'static RenderSlot, u64);
+
+impl Drop for HeldRender {
+    fn drop(&mut self) {
+        self.0.release(self.1);
+    }
+}
+
+/// Runs `render` on a worker thread and waits at most `deadline` for its answer. `None` means
+/// the render failed, the slot and the render together took too long, or an earlier render was
+/// already abandoned and still has not returned. The worker owns everything it creates and
+/// frees the slot only when it really finishes, so an abandoned render cleans up after itself
+/// whenever the application finally answers.
+fn render_within<T: Send + 'static>(
+    deadline: Duration,
+    slot: &'static RenderSlot,
+    render: impl FnOnce() -> Option<T> + Send + 'static,
+) -> Option<T> {
+    let started = Instant::now();
+    let generation = loop {
+        match slot.try_take() {
+            Ok(Some(generation)) => break generation,
+            Ok(None) if started.elapsed() < deadline => std::thread::sleep(RENDER_SLOT_POLL),
+            Ok(None) | Err(()) => return None,
+        }
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("controlfreak-print-window".to_owned())
+        .spawn(move || {
+            // Frees the slot even if `render` panics, so one failed render never turns every
+            // later window capture into a screen copy.
+            let held = HeldRender(slot, generation);
+            let rendered = render();
+            drop(held);
+            // The receiver is gone after a timeout; the result is then dropped here.
+            let _ = sender.send(rendered);
+        });
+    if spawned.is_err() {
+        slot.release(generation);
+        return None;
+    }
+    let answer = receiver.recv_timeout(deadline.saturating_sub(started.elapsed()));
+    if answer.is_err() {
+        slot.abandon(generation);
+    }
+    answer.ok().flatten()
+}
+
+/// `print_window_rgba` with the bounds described on [`PRINT_WINDOW_DEADLINE`].
+fn print_window_bounded(hwnd: HWND, visible: DisplayBounds) -> Option<Vec<u8>> {
+    // SAFETY: IsHungAppWindow only reads the window's responsiveness state for a handle value.
+    if unsafe { IsHungAppWindow(hwnd) }.as_bool() {
+        return None;
+    }
+    // A raw handle value crosses the thread boundary; the worker re-validates it through the
+    // window APIs, which fail for a handle that no longer exists.
+    let raw = hwnd.0 as isize;
+    render_within(PRINT_WINDOW_DEADLINE, &RENDER_SLOT, move || {
+        print_window_rgba(HWND(raw as *mut c_void), visible)
+    })
+}
+
+/// Picks the pixels for a window screenshot: the window's own rendering if there is one, else a
+/// copy of its screen rectangle.
+fn window_pixels(
+    printed: Option<Vec<u8>>,
+    copy_screen: impl FnOnce() -> Result<Vec<u8>, PlatformError>,
+) -> Result<(Vec<u8>, &'static str), PlatformError> {
+    match printed {
+        Some(rgba) => Ok((rgba, CAPTURE_METHOD_PRINT_WINDOW)),
+        None => copy_screen().map(|rgba| (rgba, CAPTURE_METHOD_SCREEN)),
+    }
+}
+
+/// A window screenshot ready to return.
+pub(super) struct WindowCapture {
+    pub(super) png: Vec<u8>,
+    pub(super) image_width: u32,
+    pub(super) image_height: u32,
+    pub(super) downscale_factor: u32,
+    pub(super) cursor_marker: bool,
+    pub(super) capture_method: &'static str,
+}
+
+/// Captures `hwnd` by rendering the window, so an occluded window shows its own content rather
+/// than whatever covers it, and falls back to a screen copy of `bounds` if it cannot. Either way
+/// the image covers exactly `bounds`, so mapping image points to screen points is unchanged.
+pub(super) fn capture_window_bounds(
+    hwnd: HWND,
+    bounds: DisplayBounds,
+    max_width: Option<u32>,
+    include_cursor_marker: bool,
+) -> Result<WindowCapture, PlatformError> {
+    let printed = timing::time("capture_print_window", || {
+        print_window_bounded(hwnd, bounds)
+    });
+    let (rgba, capture_method) = window_pixels(printed, || {
+        timing::time("capture_gdi", || capture_rgba(bounds))
+    })?;
+    let (png, image_width, image_height, downscale_factor, cursor_marker) =
+        finish_image(rgba, bounds, max_width, include_cursor_marker)?;
+    Ok(WindowCapture {
+        png,
+        image_width,
+        image_height,
+        downscale_factor,
+        cursor_marker,
+        capture_method,
+    })
+}
+
+fn capture_bounds(
     bounds: DisplayBounds,
     max_width: Option<u32>,
     include_cursor_marker: bool,
 ) -> Result<(Vec<u8>, u32, u32, u32, bool), PlatformError> {
-    let bgra = timing::time("capture_gdi", || capture_rgba(bounds))?;
+    let rgba = timing::time("capture_gdi", || capture_rgba(bounds))?;
+    finish_image(rgba, bounds, max_width, include_cursor_marker)
+}
+
+/// Resizes, marks the cursor on and PNG-encodes a captured frame of `bounds`.
+fn finish_image(
+    bgra: Vec<u8>,
+    bounds: DisplayBounds,
+    max_width: Option<u32>,
+    include_cursor_marker: bool,
+) -> Result<(Vec<u8>, u32, u32, u32, bool), PlatformError> {
     let (image_width, image_height, downscale_factor) =
         scaled_dimensions(bounds.width, bounds.height, max_width);
     let mut rgba = if image_width == bounds.width && image_height == bounds.height {
@@ -459,7 +820,9 @@ const SETTLE_STABLE: Duration = Duration::from_millis(60);
 /// Watches the approved window across an input action, so the action returns as soon as the
 /// window has visibly responded and stopped changing, instead of always sleeping the full cap.
 pub(super) struct SettleWatch {
-    bounds: DisplayBounds,
+    /// Reads the window with reused GDI objects and one pixel buffer.
+    grabber: FrameGrabber,
+    /// The window before input, as BGRA.
     before: Vec<u8>,
 }
 
@@ -483,15 +846,21 @@ impl SettleWatch {
         {
             return None;
         }
-        let before = timing::time("settle_capture", || capture_rgba(bounds)).ok()?;
-        Some(Self { bounds, before })
+        let mut grabber = FrameGrabber::new(bounds).ok()?;
+        timing::time("settle_capture", || grabber.grab()).ok()?;
+        let before = grabber.buffer.clone();
+        Some(Self { grabber, before })
     }
 
     /// Waits until the window changed and then stayed identical for at least `SETTLE_STABLE`,
-    /// or until `cap`.
-    pub(super) fn wait(self, cap: Duration) -> SettleOutcome {
+    /// or until `cap`. Frames are compared as the BGRA the screen read produces, with no
+    /// conversion or allocation per read.
+    pub(super) fn wait(mut self, cap: Duration) -> SettleOutcome {
         let started = Instant::now();
-        let mut changed: Option<(Vec<u8>, Instant)> = None;
+        // The latest frame that differed from its predecessor, and when it was read. Swapping
+        // it with the grabber's buffer keeps both buffers at full size without copying.
+        let mut held = vec![0_u8; self.before.len()];
+        let mut changed_at: Option<Instant> = None;
         loop {
             let remaining = cap.saturating_sub(started.elapsed());
             if remaining.is_zero() {
@@ -499,21 +868,26 @@ impl SettleWatch {
             }
             std::thread::sleep(SETTLE_POLL.min(remaining));
             let read_at = Instant::now();
-            let Ok(frame) = timing::time("settle_capture", || capture_rgba(self.bounds)) else {
+            if timing::time("settle_capture", || self.grabber.grab()).is_err() {
                 std::thread::sleep(cap.saturating_sub(started.elapsed()));
                 return SettleOutcome::Capped;
-            };
-            match &changed {
-                Some((last, since)) if changed_pixels(last, &frame, 1) == 0 => {
-                    if read_at.saturating_duration_since(*since) >= SETTLE_STABLE {
+            }
+            let frame = &self.grabber.buffer;
+            match changed_at {
+                Some(since) if changed_pixels(&held, frame, 1) == 0 => {
+                    if read_at.saturating_duration_since(since) >= SETTLE_STABLE {
                         return SettleOutcome::Settled;
                     }
                 }
-                Some(_) => changed = Some((frame, read_at)),
-                None if changed_pixels(&self.before, &frame, SETTLE_MIN_CHANGED_PIXELS)
+                Some(_) => {
+                    std::mem::swap(&mut held, &mut self.grabber.buffer);
+                    changed_at = Some(read_at);
+                }
+                None if changed_pixels(&self.before, frame, SETTLE_MIN_CHANGED_PIXELS)
                     >= SETTLE_MIN_CHANGED_PIXELS =>
                 {
-                    changed = Some((frame, read_at));
+                    std::mem::swap(&mut held, &mut self.grabber.buffer);
+                    changed_at = Some(read_at);
                 }
                 None => {}
             }
@@ -521,16 +895,57 @@ impl SettleWatch {
     }
 }
 
-/// Counts RGBA pixels that differ between two equally sized frames, stopping at `limit`.
+/// Counts pixels whose three colour bytes differ between two equally sized 4-byte-per-pixel
+/// frames, stopping at `limit`. The fourth byte is ignored: a screen read leaves it unspecified,
+/// so BGRA frames and RGBA frames with a constant alpha both compare correctly.
 fn changed_pixels(left: &[u8], right: &[u8], limit: usize) -> usize {
     if left.len() != right.len() {
         return limit;
     }
     left.chunks_exact(4)
         .zip(right.chunks_exact(4))
-        .filter(|(left, right)| left != right)
+        .filter(|(left, right)| left[..3] != right[..3])
         .take(limit)
         .count()
+}
+
+/// Reads a screen region and fingerprints its pixels, reusing the GDI objects and pixel buffer
+/// for every read. `wait_for_text` compares this with the fingerprint of the exact frame that
+/// recognition read (`recognize_text_fingerprinted`), so a result is reused only for pixels it was
+/// really computed from.
+pub(super) struct RegionChange {
+    grabber: FrameGrabber,
+}
+
+impl RegionChange {
+    pub(super) fn new(bounds: DisplayBounds) -> Result<Self, PlatformError> {
+        Ok(Self {
+            grabber: FrameGrabber::new(bounds)?,
+        })
+    }
+
+    pub(super) fn fingerprint(&mut self) -> Result<u64, PlatformError> {
+        self.grabber.grab()?;
+        Ok(pixel_fingerprint(&self.grabber.buffer, false))
+    }
+}
+
+/// Hashes the three colour bytes of every pixel and ignores the fourth, which a screen read
+/// leaves unspecified. `red_first` selects RGBA input; otherwise the frame is BGRA, so both
+/// layouts of the same pixels give the same value.
+fn pixel_fingerprint(frame: &[u8], red_first: bool) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for pixel in frame.chunks_exact(4) {
+        let (blue, red) = if red_first {
+            (pixel[2], pixel[0])
+        } else {
+            (pixel[0], pixel[2])
+        };
+        let colour = u64::from(blue) | u64::from(pixel[1]) << 8 | u64::from(red) << 16;
+        hash = (hash ^ colour).wrapping_mul(PRIME);
+    }
+    hash ^ (frame.len() as u64)
 }
 
 pub(super) fn capture_comparison_frame(bounds: DisplayBounds) -> Result<Vec<u8>, PlatformError> {
@@ -618,14 +1033,15 @@ pub(super) fn wait_for_change(
     })
 }
 
-pub(super) fn recognize_text(
+/// Recognizes text and also returns the fingerprint of the exact frame that was recognized.
+pub(super) fn recognize_text_fingerprinted(
     request: &OcrRegionRequest,
     control: &controlfreak_core::MutationControl,
-) -> Result<OcrResult, PlatformError> {
+) -> Result<(OcrResult, u64), PlatformError> {
     control.check("windows_ocr")?;
     let _timer = timing::start("ocr_recognize");
     ensure_dpi_awareness()?;
-    let _apartment = ComApartment::initialize()?;
+    let _apartment = initialize_com()?;
     let display = find_display(&request.display_id)?;
     let source_bounds = display_region_bounds(
         &display,
@@ -644,6 +1060,7 @@ pub(super) fn recognize_text(
         });
     }
     let rgba = timing::time("capture_gdi", || capture_rgba(source_bounds))?;
+    let fingerprint = pixel_fingerprint(&rgba, true);
     let writer = DataWriter::new().map_err(ocr_error)?;
     writer.WriteBytes(&rgba).map_err(ocr_error)?;
     let buffer = writer.DetachBuffer().map_err(ocr_error)?;
@@ -707,14 +1124,17 @@ pub(super) fn recognize_text(
             words,
         });
     }
-    Ok(OcrResult {
-        target_ref: None,
-        display,
-        source_bounds,
-        language,
-        text: recognized.Text().map_err(ocr_error)?.to_string(),
-        lines,
-    })
+    Ok((
+        OcrResult {
+            target_ref: None,
+            display,
+            source_bounds,
+            language,
+            text: recognized.Text().map_err(ocr_error)?.to_string(),
+            lines,
+        },
+        fingerprint,
+    ))
 }
 
 fn ocr_engine(language: Option<&str>) -> Result<OcrEngine, PlatformError> {
@@ -1021,12 +1441,24 @@ fn set_marker_pixel(rgba: &mut [u8], width: u32, height: u32, x: i64, y: i64) {
 }
 
 /// Encodes opaque RGBA pixels as an RGB PNG; dropping the constant alpha channel makes the image
-/// smaller and faster to encode without changing what the client sees.
+/// smaller and faster to encode without changing what the client sees. Rows are converted one at
+/// a time as they are written, so no second full-frame buffer is built.
 pub(super) fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, PlatformError> {
-    let rgb: Vec<u8> = rgba
-        .chunks_exact(4)
-        .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
-        .collect();
+    use std::io::Write as _;
+    let failed = |reason: String| PlatformError::OperationFailed {
+        operation: "encode_png".to_owned(),
+        reason,
+    };
+    let row_pixels = usize::try_from(width).map_err(|error| failed(error.to_string()))?;
+    if rgba.len()
+        != row_pixels
+            .saturating_mul(4)
+            .saturating_mul(usize::try_from(height).map_err(|error| failed(error.to_string()))?)
+    {
+        return Err(failed(
+            "pixel data does not match the image dimensions".to_owned(),
+        ));
+    }
     let mut output = Vec::new();
     let mut encoder = png::Encoder::new(&mut output, width, height);
     encoder.set_color(png::ColorType::Rgb);
@@ -1036,22 +1468,28 @@ pub(super) fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>
     encoder.set_deflate_compression(png::DeflateCompression::Level(2));
     let mut writer = encoder
         .write_header()
-        .map_err(|error| PlatformError::OperationFailed {
-            operation: "encode_png".to_owned(),
-            reason: error.to_string(),
-        })?;
-    writer
-        .write_image_data(&rgb)
-        .map_err(|error| PlatformError::OperationFailed {
-            operation: "encode_png".to_owned(),
-            reason: error.to_string(),
-        })?;
-    writer
-        .finish()
-        .map_err(|error| PlatformError::OperationFailed {
-            operation: "encode_png".to_owned(),
-            reason: error.to_string(),
-        })?;
+        .map_err(|error| failed(error.to_string()))?;
+    {
+        let mut stream = writer
+            .stream_writer()
+            .map_err(|error| failed(error.to_string()))?;
+        let mut row = Vec::with_capacity(row_pixels * 3);
+        if row_pixels > 0 {
+            for source in rgba.chunks_exact(row_pixels * 4) {
+                row.clear();
+                row.extend(
+                    source
+                        .chunks_exact(4)
+                        .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]),
+                );
+                stream
+                    .write_all(&row)
+                    .map_err(|error| failed(error.to_string()))?;
+            }
+        }
+        stream.finish().map_err(|error| failed(error.to_string()))?;
+    }
+    writer.finish().map_err(|error| failed(error.to_string()))?;
     Ok(output)
 }
 
@@ -1368,5 +1806,267 @@ mod live_encode_benchmarks {
             "{width}x{height}: shipped {:.1}ms {} bytes; balanced default {:.1}ms {} bytes",
             shipped.0, shipped.1, previous.0, previous.1
         );
+    }
+}
+
+#[cfg(test)]
+mod window_capture_tests {
+    use super::*;
+
+    /// A 4x3 BGRA frame whose pixel (x, y) is blue = x, green = y, red = 100 + x + y.
+    fn gradient() -> Vec<u8> {
+        let mut frame = Vec::new();
+        for y in 0..3_u8 {
+            for x in 0..4_u8 {
+                frame.extend_from_slice(&[x, y, 100 + x + y, 0]);
+            }
+        }
+        frame
+    }
+
+    #[test]
+    fn cropping_keeps_the_visible_frame_and_converts_bgra_to_opaque_rgba() {
+        // The window is 4x3; the visible frame is the 2x2 block at offset (1, 1), as when the
+        // window has invisible resize borders.
+        let rgba = crop_bgra_to_rgba(&gradient(), 4, 3, 1, 1, 2, 2).unwrap();
+        assert_eq!(
+            rgba,
+            [
+                102, 1, 1, 255, // x=1, y=1
+                103, 1, 2, 255, // x=2, y=1
+                103, 2, 1, 255, // x=1, y=2
+                104, 2, 2, 255, // x=2, y=2
+            ]
+        );
+        let whole = crop_bgra_to_rgba(&gradient(), 4, 3, 0, 0, 4, 3).unwrap();
+        assert_eq!(whole.len(), 48);
+        assert_eq!(&whole[..4], [100, 0, 0, 255]);
+    }
+
+    #[test]
+    fn cropping_refuses_a_visible_frame_that_does_not_line_up_with_the_pixels() {
+        let frame = gradient();
+        for (left, top, width, height) in [
+            (-1, 0, 2, 2),
+            (0, -1, 2, 2),
+            (3, 0, 2, 2),
+            (0, 2, 2, 2),
+            (0, 0, 5, 3),
+            (i64::MAX, 0, 2, 2),
+        ] {
+            assert!(
+                crop_bgra_to_rgba(&frame, 4, 3, left, top, width, height).is_none(),
+                "{left},{top},{width},{height}"
+            );
+        }
+        // A frame of the wrong length is never trusted.
+        assert!(crop_bgra_to_rgba(&frame[..40], 4, 3, 0, 0, 2, 2).is_none());
+    }
+
+    #[test]
+    fn a_hung_renderer_is_given_up_on_and_only_one_render_can_be_outstanding() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+        static TEST_SLOT: RenderSlot = RenderSlot::new();
+        let (release, hold) = mpsc::channel::<()>();
+        let started = Instant::now();
+        // A renderer that never answers until released, like a window that stops pumping messages.
+        let result = render_within(Duration::from_millis(100), &TEST_SLOT, move || {
+            let _ = hold.recv();
+            Some(vec![1_u8])
+        });
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(TEST_SLOT.is_busy());
+
+        // While it is parked no second render starts at all.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let second = render_within(Duration::from_millis(100), &TEST_SLOT, move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Some(vec![2_u8])
+        });
+        assert!(second.is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+
+        // Once the parked render returns, rendering works again.
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while TEST_SLOT.is_busy() {
+            assert!(
+                Instant::now() < deadline,
+                "the abandoned render never finished"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let third = render_within(Duration::from_secs(5), &TEST_SLOT, || Some(vec![3_u8]));
+        assert_eq!(third, Some(vec![3_u8]));
+    }
+
+    #[test]
+    fn a_capture_behind_an_abandoned_render_falls_back_at_once() {
+        use std::sync::mpsc;
+        static SLOT: RenderSlot = RenderSlot::new();
+        let (release, hold) = mpsc::channel::<()>();
+        assert!(
+            render_within(Duration::from_millis(50), &SLOT, move || {
+                let _ = hold.recv();
+                Some(1_u8)
+            })
+            .is_none()
+        );
+        let started = Instant::now();
+        assert!(render_within(Duration::from_secs(30), &SLOT, || Some(2_u8)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while SLOT.is_busy() {
+            assert!(
+                Instant::now() < deadline,
+                "the abandoned render never finished"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            render_within(Duration::from_secs(5), &SLOT, || Some(3_u8)),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn a_second_render_waits_for_the_slot_instead_of_giving_up() {
+        use std::sync::mpsc;
+        static TEST_SLOT: RenderSlot = RenderSlot::new();
+        let (release, hold) = mpsc::channel::<()>();
+        let (started, running) = mpsc::channel::<()>();
+        let first = std::thread::spawn(move || {
+            render_within(Duration::from_secs(10), &TEST_SLOT, move || {
+                started.send(()).unwrap();
+                let _ = hold.recv();
+                Some(1_u8)
+            })
+        });
+        running.recv().unwrap();
+        let second = std::thread::spawn(|| {
+            render_within(Duration::from_secs(10), &TEST_SLOT, || Some(2_u8))
+        });
+        // The second capture has to be waiting, not already answered or abandoned.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!second.is_finished());
+        release.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), Some(1));
+        assert_eq!(second.join().unwrap(), Some(2));
+    }
+
+    #[test]
+    fn a_render_that_answers_in_time_is_returned_and_a_failed_one_is_not() {
+        static TEST_SLOT: RenderSlot = RenderSlot::new();
+        assert_eq!(
+            render_within(Duration::from_secs(5), &TEST_SLOT, || Some(7_u8)),
+            Some(7)
+        );
+        assert_eq!(
+            render_within::<u8>(Duration::from_secs(5), &TEST_SLOT, || None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_render_that_panics_still_frees_the_render_slot() {
+        static TEST_SLOT: RenderSlot = RenderSlot::new();
+        let panicked = render_within::<u8>(Duration::from_secs(5), &TEST_SLOT, || {
+            panic!("synthetic render failure")
+        });
+        assert_eq!(panicked, None);
+        // The worker clears the slot while unwinding; allow it a moment to finish doing so.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while TEST_SLOT.is_busy() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            render_within(Duration::from_secs(5), &TEST_SLOT, || Some(9_u8)),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn only_a_fully_black_render_counts_as_a_failed_print() {
+        assert!(is_blank_frame(&[0, 0, 0, 255, 0, 0, 0, 0]));
+        assert!(!is_blank_frame(&[0, 0, 0, 255, 0, 1, 0, 255]));
+        assert!(is_blank_frame(&[]));
+    }
+
+    #[test]
+    fn the_window_is_rendered_itself_and_the_screen_copy_is_only_a_fallback() {
+        let rendered = vec![1, 2, 3, 255];
+        let (pixels, method) = window_pixels(Some(rendered.clone()), || {
+            panic!("an occluded window must not be copied from the screen")
+        })
+        .unwrap();
+        assert_eq!((pixels, method), (rendered, "windows_print_window"));
+        let (pixels, method) = window_pixels(None, || Ok(vec![9, 9, 9, 255])).unwrap();
+        assert_eq!((pixels, method), (vec![9, 9, 9, 255], "windows_gdi"));
+        assert!(
+            window_pixels(None, || Err(PlatformError::OperationFailed {
+                operation: "BitBlt".into(),
+                reason: "synthetic".into(),
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pixel_fingerprints_ignore_the_fourth_byte_and_the_channel_layout_but_not_any_colour() {
+        let bgra = vec![30, 20, 10, 0, 60, 50, 40, 0];
+        let same = vec![30, 20, 10, 255, 60, 50, 40, 7];
+        let rgba = vec![10, 20, 30, 255, 40, 50, 60, 255];
+        assert_eq!(
+            pixel_fingerprint(&bgra, false),
+            pixel_fingerprint(&same, false)
+        );
+        assert_eq!(
+            pixel_fingerprint(&bgra, false),
+            pixel_fingerprint(&rgba, true)
+        );
+        let mut other = same.clone();
+        other[5] = 51;
+        assert_ne!(
+            pixel_fingerprint(&bgra, false),
+            pixel_fingerprint(&other, false)
+        );
+        assert_ne!(
+            pixel_fingerprint(&bgra, false),
+            pixel_fingerprint(&bgra[..7], false),
+            "different sizes never match"
+        );
+    }
+
+    #[test]
+    fn png_rows_are_written_without_a_full_frame_rgb_copy_and_round_trip() {
+        let (width, height) = (5_u32, 4_u32);
+        let rgba: Vec<u8> = (0..width * height)
+            .flat_map(|index| {
+                let value = u8::try_from(index * 11).unwrap();
+                [value, value / 2, 255 - value, 255]
+            })
+            .collect();
+        let encoded = encode_png(width, height, &rgba).unwrap();
+        let mut reader = png::Decoder::new(std::io::Cursor::new(encoded))
+            .read_info()
+            .unwrap();
+        let mut pixels = vec![0_u8; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!((info.width, info.height), (width, height));
+        let expected: Vec<u8> = rgba
+            .chunks_exact(4)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect();
+        assert_eq!(pixels, expected);
+        // Mismatched pixel data is refused instead of writing a corrupt image.
+        assert!(encode_png(width, height, &rgba[..rgba.len() - 4]).is_err());
+        assert!(encode_png(width + 1, height, &rgba).is_err());
     }
 }

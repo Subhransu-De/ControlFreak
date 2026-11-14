@@ -1,5 +1,7 @@
 #![allow(unsafe_code)]
 
+use controlfreak_core::VirtualDesktopDirection;
+
 use super::{
     Duration, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, Instant, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, Key, KeyChordRequest,
@@ -187,9 +189,65 @@ where
     F: FnMut() -> Result<(), PlatformError>,
 {
     control.check(operation)?;
+    ensure_keys_press_alone(keys, native_layout_answer)?;
     let inputs = key_chord_inputs(keys);
     validate_target()?;
     send_releasing_native(operation, &inputs, control)
+}
+
+/// The operation name of the desktop switch in refusals and cancellation.
+pub(super) const DESKTOP_SWITCH_OPERATION: &str = "switch_virtual_desktop";
+
+/// Sends the desktop-switch shortcut `steps` times. `validate` runs before every hop with the
+/// zero-based hop number: the first hop checks the approved target in full, later hops check
+/// only what still applies once the desktop has changed (see `target::validate_after_switch`).
+/// Progress is cumulative, so a failure or cancellation after some hops leaves
+/// `PartiallySent` with the events of the completed hops.
+pub(super) fn send_desktop_switch_hops(
+    direction: VirtualDesktopDirection,
+    steps: u8,
+    control: &MutationControl,
+    validate: impl FnMut(u8) -> Result<(), PlatformError>,
+    settle: impl FnMut(),
+) -> Result<(), PlatformError> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    let arrow = match direction {
+        VirtualDesktopDirection::Left => Key::ArrowLeft,
+        VirtualDesktopDirection::Right => Key::ArrowRight,
+    };
+    send_desktop_switch_hops_with(
+        DESKTOP_SWITCH_OPERATION,
+        &key_chord_inputs(&[Key::Ctrl, Key::Win, arrow]),
+        steps,
+        control,
+        validate,
+        |key| {
+            // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
+            unsafe { GetAsyncKeyState(key) < 0 }
+        },
+        native_send_inputs,
+        settle,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_desktop_switch_hops_with(
+    operation: &str,
+    inputs: &[INPUT],
+    steps: u8,
+    control: &MutationControl,
+    mut validate: impl FnMut(u8) -> Result<(), PlatformError>,
+    mut is_down: impl FnMut(i32) -> bool,
+    mut send: impl FnMut(&[INPUT]) -> Result<usize, PlatformError>,
+    mut settle: impl FnMut(),
+) -> Result<(), PlatformError> {
+    for hop in 0..steps {
+        control.check(operation)?;
+        validate(hop)?;
+        send_releasing_if_idle(operation, inputs, control, &mut is_down, &mut send)?;
+        settle();
+    }
+    Ok(())
 }
 
 pub(super) fn key_chord_inputs(keys: &[Key]) -> Vec<INPUT> {
@@ -212,33 +270,126 @@ pub(super) fn send_unicode_text<F>(
 where
     F: FnMut() -> Result<(), PlatformError>,
 {
-    send_unicode_text_with(utf16, control, validate_target, native_send_inputs)
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    send_text_checking_held_keys(utf16, control, validate_target, native_send_inputs, |key| {
+        // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
+        unsafe { GetAsyncKeyState(key) < 0 }
+    })
 }
 
+#[cfg(test)]
 fn send_unicode_text_with<F, S>(
     utf16: &[u16],
     control: &MutationControl,
-    mut validate_target: F,
-    mut send: S,
+    validate_target: F,
+    send: S,
 ) -> Result<(), PlatformError>
 where
     F: FnMut() -> Result<(), PlatformError>,
     S: FnMut(&[INPUT]) -> Result<usize, PlatformError>,
 {
-    for batch in unicode_batches(utf16) {
-        control.check("type_text")?;
-        let mut inputs = Vec::with_capacity(batch.len() * 2);
-        for unit in batch {
-            inputs.push(unicode_input(*unit, false));
-            inputs.push(unicode_input(*unit, true));
-        }
-        validate_target()?;
-        send_releasing("type_text", &inputs, control, &mut send)?;
-        if batch.len() + 1 >= UNITS_PER_TEXT_BATCH {
-            thread::sleep(Duration::from_millis(2));
+    send_text_checking_held_keys(utf16, control, validate_target, send, |_| false)
+}
+
+/// Virtual keys of the four modifiers: Shift, Ctrl, Alt, and the left and right Win keys.
+const HELD_MODIFIER_KEYS: [i32; 5] = [0x10, 0x11, 0x12, 0x5B, 0x5C];
+
+/// Unicode packets carry no virtual key, so only the Enter and Tab segments can repeat a key the
+/// person already holds. Those go through the same held-key refusal as `press_keys`, before
+/// any input of that segment is sent.
+fn send_text_checking_held_keys<F, S>(
+    utf16: &[u16],
+    control: &MutationControl,
+    mut validate_target: F,
+    mut send: S,
+    mut is_down: impl FnMut(i32) -> bool,
+) -> Result<(), PlatformError>
+where
+    F: FnMut() -> Result<(), PlatformError>,
+    S: FnMut(&[INPUT]) -> Result<usize, PlatformError>,
+{
+    for segment in text_segments(utf16) {
+        match segment {
+            TextSegment::Text(units) => {
+                for batch in unicode_batches(units) {
+                    control.check("type_text")?;
+                    let mut inputs = Vec::with_capacity(batch.len() * 2);
+                    for unit in batch {
+                        inputs.push(unicode_input(*unit, false));
+                        inputs.push(unicode_input(*unit, true));
+                    }
+                    validate_target()?;
+                    send_releasing("type_text", &inputs, control, &mut send)?;
+                    if batch.len() + 1 >= UNITS_PER_TEXT_BATCH {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                }
+            }
+            TextSegment::Key(key) => {
+                control.check("type_text")?;
+                let inputs = [keyboard_input(key, false), keyboard_input(key, true)];
+                // A held modifier would turn the key into a shortcut (Alt+Tab, Ctrl+Enter), which
+                // the Unicode text before it never could be, so it is refused like the key itself.
+                if any_requested_input_held(&inputs, &mut is_down)
+                    || HELD_MODIFIER_KEYS.iter().any(|key| is_down(*key))
+                {
+                    return Err(PlatformError::failed(
+                        controlfreak_core::FailureCause::KeyHeld,
+                        "type_text",
+                        "a requested key or mouse button is already held; release it before retrying",
+                    ));
+                }
+                validate_target()?;
+                send_releasing("type_text", &inputs, control, &mut send)?;
+            }
         }
     }
     Ok(())
+}
+
+/// One run of `type_text` input: characters sent as Unicode packets, or a key that must be
+/// pressed as a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextSegment<'a> {
+    Text(&'a [u16]),
+    Key(Key),
+}
+
+/// Splits text so line breaks and tabs become Enter and Tab key presses. A Unicode packet for
+/// U+000A, U+000D or U+0009 reaches a control as a character, and many controls ignore it
+/// instead of submitting a form, inserting a line or moving focus. `\r\n` is one Enter; a lone
+/// `\r` or `\n` is also one Enter.
+fn text_segments(utf16: &[u16]) -> Vec<TextSegment<'_>> {
+    const TAB: u16 = 0x09;
+    const LINE_FEED: u16 = 0x0A;
+    const CARRIAGE_RETURN: u16 = 0x0D;
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < utf16.len() {
+        let key = match utf16[index] {
+            TAB => Key::Tab,
+            LINE_FEED | CARRIAGE_RETURN => Key::Enter,
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        if start < index {
+            segments.push(TextSegment::Text(&utf16[start..index]));
+        }
+        segments.push(TextSegment::Key(key));
+        index += if utf16[index] == CARRIAGE_RETURN && utf16.get(index + 1) == Some(&LINE_FEED) {
+            2
+        } else {
+            1
+        };
+        start = index;
+    }
+    if start < utf16.len() {
+        segments.push(TextSegment::Text(&utf16[start..]));
+    }
+    segments
 }
 
 const UNITS_PER_TEXT_BATCH: usize = 50;
@@ -260,7 +411,119 @@ fn unicode_batches(utf16: &[u16]) -> impl Iterator<Item = &[u16]> {
     })
 }
 
+/// The virtual key for `key` under the foreground window's keyboard layout.
 fn virtual_key(key: Key) -> (VIRTUAL_KEY, bool) {
+    virtual_key_with(key, native_layout_answer)
+}
+
+/// What the active keyboard layout says about typing one character with a single key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutAnswer {
+    /// This virtual key types it with no modifier.
+    Unshifted(u16),
+    /// The layout types it only with Shift, Ctrl or `AltGr` held, so no key on its own types it.
+    NeedsModifier,
+    /// The layout cannot say, or has no key for it.
+    Unavailable,
+}
+
+/// Refuses a chord with a named punctuation key that the active layout types only with Shift or
+/// `AltGr`. Sending the US virtual key instead would press a key that types another character
+/// (on a German layout, `slash` would send the key that types `-`), and a key press cannot carry
+/// the modifier without changing what the chord means. `type_text` types the character itself.
+fn ensure_keys_press_alone(
+    keys: &[Key],
+    layout: impl Fn(char) -> LayoutAnswer,
+) -> Result<(), PlatformError> {
+    for key in keys {
+        if let Some(character) = oem_character(*key)
+            && layout(character) == LayoutAnswer::NeedsModifier
+        {
+            let advice = if keys.len() > 1 {
+                "name the key combination your layout uses for it instead (for example ctrl+shift+7), or use type_text if you only need the character"
+            } else {
+                "use type_text to type it"
+            };
+            return Err(PlatformError::InvalidArgument {
+                argument: "keys".to_owned(),
+                reason: format!(
+                    "the active keyboard layout types '{character}' only with Shift or AltGr held, so the key '{}' cannot be pressed on its own; {advice}",
+                    key.canonical_name()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The character a layout-dependent OEM key types without modifiers. Comma, period, minus and
+/// plus keep one virtual key on every layout, so they need no lookup.
+const fn oem_character(key: Key) -> Option<char> {
+    Some(match key {
+        Key::Semicolon => ';',
+        Key::Slash => '/',
+        Key::Backtick => '`',
+        Key::LeftBracket => '[',
+        Key::Backslash => '\\',
+        Key::RightBracket => ']',
+        Key::Quote => '\'',
+        _ => return None,
+    })
+}
+
+/// Virtual keys of the punctuation, numpad, system and media keys; zero for any other key, which
+/// `every_key_has_its_own_virtual_key` rules out. The punctuation codes are the US ones.
+const fn symbol_and_system_code(key: Key) -> u16 {
+    match key {
+        Key::Semicolon => 0xBA,
+        Key::Slash => 0xBF,
+        Key::Backtick => 0xC0,
+        Key::LeftBracket => 0xDB,
+        Key::Backslash => 0xDC,
+        Key::RightBracket => 0xDD,
+        Key::Quote => 0xDE,
+        Key::Comma => 0xBC,
+        Key::Period => 0xBE,
+        Key::Minus => 0xBD,
+        Key::Equals => 0xBB,
+        Key::Numpad0 => 0x60,
+        Key::Numpad1 => 0x61,
+        Key::Numpad2 => 0x62,
+        Key::Numpad3 => 0x63,
+        Key::Numpad4 => 0x64,
+        Key::Numpad5 => 0x65,
+        Key::Numpad6 => 0x66,
+        Key::Numpad7 => 0x67,
+        Key::Numpad8 => 0x68,
+        Key::Numpad9 => 0x69,
+        Key::NumpadMultiply => 0x6A,
+        Key::NumpadAdd => 0x6B,
+        Key::NumpadSubtract => 0x6D,
+        Key::NumpadDecimal => 0x6E,
+        Key::NumpadDivide => 0x6F,
+        Key::NumLock => 0x90,
+        Key::PrintScreen => 0x2C,
+        Key::CapsLock => 0x14,
+        Key::ScrollLock => 0x91,
+        Key::Pause => 0x13,
+        Key::Menu => 0x5D,
+        Key::VolumeMute => 0xAD,
+        Key::VolumeDown => 0xAE,
+        Key::VolumeUp => 0xAF,
+        Key::MediaNext => 0xB0,
+        Key::MediaPrevious => 0xB1,
+        Key::MediaStop => 0xB2,
+        Key::MediaPlayPause => 0xB3,
+        _ => 0,
+    }
+}
+
+/// Maps a key to a virtual key. `layout` answers which unshifted virtual key types a character on
+/// the active layout. A named punctuation key means "the key that types this character", so a
+/// layout that types it unshifted decides the code. When the layout cannot say, or has no key for
+/// the character, the US virtual key is used. A layout that needs Shift or `AltGr` for it never
+/// gets this far: `ensure_keys_press_alone` refuses such a chord first.
+fn virtual_key_with(key: Key, layout: impl FnOnce(char) -> LayoutAnswer) -> (VIRTUAL_KEY, bool) {
     let code = match key {
         Key::Backspace => 0x08,
         Key::Tab => 0x09,
@@ -329,6 +592,11 @@ fn virtual_key(key: Key) -> (VIRTUAL_KEY, bool) {
         Key::F10 => 0x79,
         Key::F11 => 0x7A,
         Key::F12 => 0x7B,
+        other => symbol_and_system_code(other),
+    };
+    let code = match oem_character(key).map(layout) {
+        Some(LayoutAnswer::Unshifted(moved)) => moved,
+        _ => code,
     };
     let extended = matches!(
         key,
@@ -343,8 +611,43 @@ fn virtual_key(key: Key) -> (VIRTUAL_KEY, bool) {
             | Key::ArrowDown
             | Key::ArrowLeft
             | Key::ArrowRight
+            | Key::NumpadDivide
+            | Key::NumLock
+            | Key::PrintScreen
+            | Key::Menu
     );
     (VIRTUAL_KEY(code), extended)
+}
+
+/// How the foreground thread's layout types `character`.
+fn native_layout_answer(character: char) -> LayoutAnswer {
+    use windows::Win32::UI::{
+        Input::KeyboardAndMouse::{GetKeyboardLayout, VkKeyScanExW},
+        WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId},
+    };
+    let Ok(unit) = u16::try_from(u32::from(character)) else {
+        return LayoutAnswer::Unavailable;
+    };
+    // SAFETY: These queries take a borrowed window handle and a value, and retain nothing. A null
+    // foreground handle or a zero thread selects the calling thread's layout.
+    let scan = unsafe {
+        let thread = GetWindowThreadProcessId(GetForegroundWindow(), None);
+        VkKeyScanExW(unit, GetKeyboardLayout(thread))
+    };
+    layout_answer(scan)
+}
+
+/// Decodes a `VkKeyScan` result: -1 means no key; the high byte holds the Shift, Ctrl and Alt
+/// state the character needs.
+fn layout_answer(scan: i16) -> LayoutAnswer {
+    let [low, high] = scan.to_le_bytes();
+    if scan == -1 {
+        LayoutAnswer::Unavailable
+    } else if high == 0 {
+        LayoutAnswer::Unshifted(u16::from(low))
+    } else {
+        LayoutAnswer::NeedsModifier
+    }
 }
 
 fn mouse_button_flags(button: MouseButton) -> (MOUSE_EVENT_FLAGS, MOUSE_EVENT_FLAGS) {
@@ -415,7 +718,161 @@ where
 {
     let inputs = click_inputs(button, click_count, modifiers);
     validate_target()?;
-    send_releasing_native("click_mouse", &inputs, control)
+    send_with_button_dwell_native("click_mouse", &inputs, control, validate_target)
+}
+
+/// How long a mouse button stays down. Events sent in one `SendInput` call carry the same
+/// timestamp, and applications that act on the press (menus, drag sources, custom buttons)
+/// can miss a button that is released in the same instant.
+pub(super) const BUTTON_DWELL: Duration = Duration::from_millis(20);
+
+/// Splits an input sequence after every mouse-button press, so the caller can pause with the
+/// button held. Sequences with no press come back whole.
+fn split_after_button_down(inputs: &[INPUT]) -> Vec<&[INPUT]> {
+    let is_button_down = |input: &INPUT| {
+        // SAFETY: INPUT values in these sequences are built locally with a matching union tag.
+        input.r#type == INPUT_MOUSE
+            && unsafe { input.Anonymous.mi.dwFlags }.0
+                & (MOUSEEVENTF_LEFTDOWN.0 | MOUSEEVENTF_RIGHTDOWN.0 | MOUSEEVENTF_MIDDLEDOWN.0)
+                != 0
+    };
+    let mut steps = Vec::new();
+    let mut start = 0;
+    for (index, input) in inputs.iter().enumerate() {
+        if is_button_down(input) {
+            steps.push(&inputs[start..=index]);
+            start = index + 1;
+        }
+    }
+    if start < inputs.len() {
+        steps.push(&inputs[start..]);
+    }
+    steps
+}
+
+/// Whether a step holds new input (a button or key going down) rather than only releasing.
+fn step_presses_something(step: &[INPUT]) -> bool {
+    step.iter().any(|input| {
+        // SAFETY: INPUT values in these sequences are built locally with a matching union tag.
+        unsafe {
+            if input.r#type == INPUT_KEYBOARD {
+                !input.Anonymous.ki.dwFlags.contains(KEYEVENTF_KEYUP)
+            } else if input.r#type == INPUT_MOUSE {
+                input.Anonymous.mi.dwFlags.0
+                    & (MOUSEEVENTF_LEFTDOWN.0 | MOUSEEVENTF_RIGHTDOWN.0 | MOUSEEVENTF_MIDDLEDOWN.0)
+                    != 0
+            } else {
+                false
+            }
+        }
+    })
+}
+
+fn send_with_button_dwell_native(
+    operation: &str,
+    inputs: &[INPUT],
+    control: &MutationControl,
+    validate: impl FnMut() -> Result<(), PlatformError>,
+) -> Result<(), PlatformError> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    send_with_button_dwell_if_idle(
+        operation,
+        inputs,
+        control,
+        |key| {
+            // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
+            unsafe { GetAsyncKeyState(key) < 0 }
+        },
+        validate,
+        native_send_inputs,
+        || control.wait(operation, BUTTON_DWELL),
+    )
+}
+
+fn send_with_button_dwell_if_idle(
+    operation: &str,
+    inputs: &[INPUT],
+    control: &MutationControl,
+    is_down: impl FnMut(i32) -> bool,
+    validate: impl FnMut() -> Result<(), PlatformError>,
+    send: impl FnMut(&[INPUT]) -> Result<usize, PlatformError>,
+    dwell: impl FnMut() -> Result<(), PlatformError>,
+) -> Result<(), PlatformError> {
+    control.check(operation)?;
+    if any_requested_input_held(inputs, is_down) {
+        return Err(PlatformError::failed(
+            controlfreak_core::FailureCause::KeyHeld,
+            operation,
+            "a requested key or mouse button is already held; release it before retrying",
+        ));
+    }
+    send_with_button_dwell(operation, inputs, control, validate, send, dwell)
+}
+
+/// Sends `inputs` in steps with a pause after each button press. The caller validated the
+/// target before the first step; `validate` runs again after every pause, immediately before
+/// the next step, because that step holds new input (a second press of a double click) and the
+/// foreground, destination or cursor may have changed during the dwell. Whatever the sent steps
+/// left held (the button, and modifiers pressed before it) is released if a later step fails,
+/// validation refuses or the pause is cancelled; that cleanup never contains a new press.
+fn send_with_button_dwell(
+    operation: &str,
+    inputs: &[INPUT],
+    control: &MutationControl,
+    mut validate: impl FnMut() -> Result<(), PlatformError>,
+    mut send: impl FnMut(&[INPUT]) -> Result<usize, PlatformError>,
+    mut dwell: impl FnMut() -> Result<(), PlatformError>,
+) -> Result<(), PlatformError> {
+    control.check(operation)?;
+    // If dispatch unwinds, release state is unknown until cleanup has acknowledged it.
+    control.cleanup_status(controlfreak_core::CleanupStatus::Unknown);
+    let steps = split_after_button_down(inputs);
+    let mut accepted = 0;
+    for (index, step) in steps.iter().enumerate() {
+        let delivered = match dispatch_inputs(step, control, &mut send) {
+            Ok(count) => count,
+            Err(error) => {
+                if accepted > 0 {
+                    release_sent(&inputs[..accepted], control, &mut send);
+                }
+                return Err(error);
+            }
+        };
+        accepted += delivered;
+        if delivered != step.len() {
+            release_sent(&inputs[..accepted], control, &mut send);
+            return Err(incomplete_input_error(operation, accepted, inputs.len()));
+        }
+        if let Some(next) = steps.get(index + 1) {
+            // A step that only releases is never held back by a refusal: whatever the person or
+            // the target changed during the pause, the release is what puts the input right.
+            let pause = control.check(operation).and_then(|()| dwell());
+            let checked = if step_presses_something(next) {
+                pause.and_then(|()| validate())
+            } else {
+                pause
+            };
+            if let Err(error) = checked {
+                release_sent(&inputs[..accepted], control, &mut send);
+                return Err(error);
+            }
+        }
+    }
+    control.cleanup_status(controlfreak_core::CleanupStatus::NotNeeded);
+    Ok(())
+}
+
+fn release_sent(
+    acknowledged: &[INPUT],
+    control: &MutationControl,
+    send: impl FnOnce(&[INPUT]) -> Result<usize, PlatformError>,
+) {
+    let owned = owned_releases(acknowledged);
+    if owned.is_empty() {
+        control.cleanup_status(controlfreak_core::CleanupStatus::NotNeeded);
+    } else {
+        send_cleanup(&owned, control, send);
+    }
 }
 
 pub(super) fn send_drag_press<F>(
@@ -530,10 +987,11 @@ fn ensure_pointer_idle_with(
     mut is_down: impl FnMut(i32) -> bool,
 ) -> Result<(), PlatformError> {
     if [1, 2, 4, 5, 6].into_iter().any(&mut is_down) {
-        return Err(PlatformError::OperationFailed {
-            operation: operation.to_owned(),
-            reason: "a mouse button is already held; refusing to move the user's drag".to_owned(),
-        });
+        return Err(PlatformError::failed(
+            controlfreak_core::FailureCause::KeyHeld,
+            operation,
+            "a mouse button is already held; refusing to move the user's drag",
+        ));
     }
     Ok(())
 }
@@ -565,11 +1023,11 @@ fn send_releasing_if_idle(
 ) -> Result<(), PlatformError> {
     control.check(operation)?;
     if any_requested_input_held(inputs, is_down) {
-        return Err(PlatformError::OperationFailed {
-            operation: operation.to_owned(),
-            reason: "a requested key or mouse button is already held; release it before retrying"
-                .to_owned(),
-        });
+        return Err(PlatformError::failed(
+            controlfreak_core::FailureCause::KeyHeld,
+            operation,
+            "a requested key or mouse button is already held; release it before retrying",
+        ));
     }
     send_releasing(operation, inputs, control, send)
 }
@@ -718,12 +1176,13 @@ fn send_cleanup(
 }
 
 fn incomplete_input_error(operation: &str, inserted: usize, requested: usize) -> PlatformError {
-    PlatformError::OperationFailed {
-        operation: operation.to_owned(),
-        reason: format!(
+    PlatformError::failed(
+        controlfreak_core::FailureCause::InputBlocked,
+        operation,
+        format!(
             "SendInput inserted {inserted} of {requested} events; Windows may block input targeting a higher-integrity application"
         ),
-    }
+    )
 }
 
 pub(super) fn post_action_error(operation: &str, reason: String) -> PlatformError {
@@ -813,6 +1272,120 @@ mod progress_tests {
             assert!(releases.len() <= 2);
         }
         assert!(owned_releases(&clicks).is_empty());
+    }
+
+    /// A fake desktop for the switch shortcut: each accepted hop moves the approved window off
+    /// the current desktop, as the real shortcut does.
+    struct FakeDesktops {
+        target_on_current: std::cell::Cell<bool>,
+        sent: std::cell::Cell<u32>,
+    }
+
+    fn run_switch(
+        steps: u8,
+        control: &MutationControl,
+        world: &FakeDesktops,
+        fail_send_on: Option<u32>,
+        cancel_after_hop: Option<u8>,
+    ) -> Result<(), PlatformError> {
+        let inputs = key_chord_inputs(&[Key::Ctrl, Key::Win, Key::ArrowRight]);
+        send_desktop_switch_hops_with(
+            "switch_virtual_desktop",
+            &inputs,
+            steps,
+            control,
+            |hop| {
+                if hop == 0 {
+                    // The full validation: the approved window must be on the current desktop.
+                    assert!(world.target_on_current.get(), "first hop needs the target");
+                } else if cancel_after_hop == Some(hop) {
+                    control.cancel();
+                }
+                Ok(())
+            },
+            |_| false,
+            |batch| {
+                if fail_send_on == Some(world.sent.get()) {
+                    return Err(failure());
+                }
+                world.sent.set(world.sent.get() + 1);
+                world.target_on_current.set(false);
+                Ok(batch.len())
+            },
+            || {},
+        )
+    }
+
+    #[test]
+    fn a_multi_step_switch_continues_after_the_target_leaves_the_current_desktop() {
+        let control = MutationControl::default();
+        let world = FakeDesktops {
+            target_on_current: true.into(),
+            sent: 0.into(),
+        };
+        run_switch(3, &control, &world, None, None).unwrap();
+        assert_eq!(world.sent.get(), 3);
+        assert_eq!(control.progress().sent_events, 18);
+        assert_eq!(control.progress().cleanup, CleanupStatus::NotNeeded);
+    }
+
+    #[test]
+    fn a_failed_later_hop_keeps_the_completed_hops_and_reports_its_own_delivery_unknown() {
+        let control = MutationControl::default();
+        let world = FakeDesktops {
+            target_on_current: true.into(),
+            sent: 0.into(),
+        };
+        assert!(run_switch(4, &control, &world, Some(2), None).is_err());
+        assert_eq!(world.sent.get(), 2);
+        let progress = control.progress();
+        // The two completed hops are counted; the hop whose send failed is honestly unknown.
+        assert_eq!(progress.sent_events, 12);
+        assert_eq!(progress.input_outcome, InputOutcome::Unknown);
+    }
+
+    #[test]
+    fn a_failed_validation_after_the_first_hop_keeps_the_first_hop_progress() {
+        let control = MutationControl::default();
+        let inputs = key_chord_inputs(&[Key::Ctrl, Key::Win, Key::ArrowLeft]);
+        let mut sent = 0;
+        let result = send_desktop_switch_hops_with(
+            "switch_virtual_desktop",
+            &inputs,
+            3,
+            &control,
+            |hop| if hop == 1 { Err(failure()) } else { Ok(()) },
+            |_| false,
+            |batch| {
+                sent += 1;
+                Ok(batch.len())
+            },
+            || {},
+        );
+        assert!(result.is_err());
+        assert_eq!(sent, 1);
+        assert_eq!(control.progress().sent_events, 6);
+        assert_eq!(
+            control.progress().input_outcome,
+            InputOutcome::PartiallySent
+        );
+    }
+
+    #[test]
+    fn cancellation_after_the_first_hop_stops_before_the_next_shortcut() {
+        let control = MutationControl::default();
+        let world = FakeDesktops {
+            target_on_current: true.into(),
+            sent: 0.into(),
+        };
+        let error = run_switch(5, &control, &world, None, Some(1)).unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(world.sent.get(), 1);
+        assert_eq!(control.progress().sent_events, 6);
+        assert_eq!(
+            control.progress().input_outcome,
+            InputOutcome::PartiallySent
+        );
     }
 
     #[test]
@@ -1006,5 +1579,536 @@ mod progress_tests {
             controlfreak_core::MutationProgress::default()
         );
         assert_ne!(control.progress(), next.progress());
+    }
+
+    fn utf16(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    #[test]
+    fn line_breaks_and_tabs_become_enter_and_tab_key_presses() {
+        let text = utf16("a\r\nb\n\tc\r");
+        let segments = text_segments(&text);
+        assert_eq!(
+            segments,
+            [
+                TextSegment::Text(&text[0..1]),
+                TextSegment::Key(Key::Enter),
+                TextSegment::Text(&text[3..4]),
+                TextSegment::Key(Key::Enter),
+                TextSegment::Key(Key::Tab),
+                TextSegment::Text(&text[6..7]),
+                TextSegment::Key(Key::Enter),
+            ]
+        );
+        assert!(text_segments(&[]).is_empty());
+        let plain = utf16("no controls \u{1f980}");
+        assert_eq!(text_segments(&plain), [TextSegment::Text(&plain)]);
+        // Consecutive breaks are separate presses, and a CR LF pair is one.
+        let blank = utf16("\n\n\r\n\r\r");
+        assert_eq!(text_segments(&blank), [TextSegment::Key(Key::Enter); 5]);
+    }
+
+    #[test]
+    fn typed_text_sends_return_and_tab_as_virtual_keys_between_unicode_packets() {
+        let control = MutationControl::default();
+        let mut sent: Vec<Vec<(u16, u16, bool)>> = Vec::new();
+        let mut validations = 0;
+        send_unicode_text_with(
+            &utf16("ab\r\n\tc"),
+            &control,
+            || {
+                validations += 1;
+                Ok(())
+            },
+            |inputs| {
+                sent.push(
+                    inputs
+                        .iter()
+                        .map(|input| {
+                            // SAFETY: Every INPUT here was built by this module as a keyboard event.
+                            let key = unsafe { input.Anonymous.ki };
+                            (key.wVk.0, key.wScan, key.dwFlags.contains(KEYEVENTF_KEYUP))
+                        })
+                        .collect(),
+                );
+                Ok(inputs.len())
+            },
+        )
+        .unwrap();
+        // Text, Enter, Tab, text: each is validated and sent as its own batch.
+        assert_eq!(validations, 4);
+        assert_eq!(sent.len(), 4);
+        assert_eq!(
+            sent[0],
+            [(0, 97, false), (0, 97, true), (0, 98, false), (0, 98, true)]
+        );
+        assert_eq!(sent[1], [(0x0D, 0, false), (0x0D, 0, true)]);
+        assert_eq!(sent[2], [(0x09, 0, false), (0x09, 0, true)]);
+        assert_eq!(sent[3], [(0, 99, false), (0, 99, true)]);
+        assert_eq!(control.progress().sent_events, 10);
+    }
+
+    #[test]
+    fn a_held_enter_or_tab_is_refused_without_sending_anything_for_that_segment() {
+        for (text, held, earlier) in [
+            ("a\nb", 0x0D, 2),
+            ("a\tb", 0x09, 2),
+            ("\n", 0x0D, 0),
+            ("ab\tc", 0x09, 4),
+        ] {
+            let control = MutationControl::default();
+            let mut batches = 0;
+            let result = send_text_checking_held_keys(
+                &utf16(text),
+                &control,
+                || Ok(()),
+                |inputs| {
+                    batches += 1;
+                    Ok(inputs.len())
+                },
+                |key| key == held,
+            );
+            let error = result.expect_err("a held key must be refused");
+            assert_eq!(error.reason_code(), Some("key_held"), "{text:?}");
+            // Only the text before the key was sent; no down and no compensating up for the key.
+            assert_eq!(control.progress().sent_events, earlier, "{text:?}");
+            assert_eq!(batches, usize::from(earlier > 0), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_held_modifier_refuses_enter_and_tab_but_not_plain_text() {
+        for modifier in HELD_MODIFIER_KEYS {
+            let control = MutationControl::default();
+            let mut batches = 0;
+            let error = send_text_checking_held_keys(
+                &utf16("ab\tc"),
+                &control,
+                || Ok(()),
+                |inputs| {
+                    batches += 1;
+                    Ok(inputs.len())
+                },
+                |key| key == modifier,
+            )
+            .expect_err("a held modifier must refuse the key segment");
+            assert_eq!(error.reason_code(), Some("key_held"), "{modifier:#x}");
+            // The text before the key went out; the key itself did not.
+            assert_eq!((batches, control.progress().sent_events), (1, 4));
+        }
+        let control = MutationControl::default();
+        send_text_checking_held_keys(
+            &utf16("abc"),
+            &control,
+            || Ok(()),
+            |inputs| Ok(inputs.len()),
+            |_| true,
+        )
+        .expect("Unicode text carries no virtual key and is not affected by a held modifier");
+    }
+
+    #[test]
+    fn a_key_that_becomes_held_after_earlier_text_is_refused_at_its_segment() {
+        let control = MutationControl::default();
+        let mut sent_batches = 0;
+        let mut queries = 0;
+        let result = send_text_checking_held_keys(
+            &utf16("a\nb\n"),
+            &control,
+            || Ok(()),
+            |inputs| {
+                sent_batches += 1;
+                Ok(inputs.len())
+            },
+            |key| {
+                if key != 0x0D {
+                    return false;
+                }
+                queries += 1;
+                queries > 1
+            },
+        );
+        assert!(result.is_err());
+        // Text and the first Enter went out; the second Enter was refused before sending.
+        assert_eq!(sent_batches, 3);
+        assert_eq!(control.progress().sent_events, 2 + 2 + 2);
+    }
+
+    #[test]
+    fn a_refused_revalidation_before_a_line_break_keeps_the_earlier_text() {
+        let control = MutationControl::default();
+        let mut validations = 0;
+        let mut batches = 0;
+        let result = send_unicode_text_with(
+            &utf16("ab\ncd"),
+            &control,
+            || {
+                validations += 1;
+                if validations == 2 {
+                    Err(failure())
+                } else {
+                    Ok(())
+                }
+            },
+            |inputs| {
+                batches += 1;
+                Ok(inputs.len())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(batches, 1);
+        assert_eq!(control.progress().sent_events, 4);
+    }
+
+    #[test]
+    fn punctuation_keys_use_the_layout_when_it_types_them_unshifted() {
+        for (key, character, us) in [
+            (Key::Semicolon, ';', 0xBA),
+            (Key::Slash, '/', 0xBF),
+            (Key::Backtick, '`', 0xC0),
+            (Key::LeftBracket, '[', 0xDB),
+            (Key::Backslash, '\\', 0xDC),
+            (Key::RightBracket, ']', 0xDD),
+            (Key::Quote, '\'', 0xDE),
+        ] {
+            // Without a layout answer the US key position is used.
+            assert_eq!(
+                virtual_key_with(key, |_| LayoutAnswer::Unavailable),
+                (VIRTUAL_KEY(us), false)
+            );
+            // A layout that moves the character to another key wins.
+            let (vk, extended) = virtual_key_with(key, |asked| {
+                assert_eq!(asked, character);
+                LayoutAnswer::Unshifted(0x41)
+            });
+            assert_eq!((vk.0, extended), (0x41, false));
+        }
+        // Keys that never move do not consult the layout at all.
+        for (key, vk) in [
+            (Key::Comma, 0xBC),
+            (Key::Period, 0xBE),
+            (Key::Minus, 0xBD),
+            (Key::Equals, 0xBB),
+        ] {
+            assert_eq!(
+                virtual_key_with(key, |_| panic!("layout lookup is not needed")),
+                (VIRTUAL_KEY(vk), false)
+            );
+        }
+    }
+
+    #[test]
+    fn layout_results_are_classified_by_the_modifiers_they_need() {
+        assert_eq!(layout_answer(0x00BA), LayoutAnswer::Unshifted(0xBA));
+        assert_eq!(layout_answer(0x01BA), LayoutAnswer::NeedsModifier);
+        assert_eq!(layout_answer(0x06BA), LayoutAnswer::NeedsModifier);
+        assert_eq!(layout_answer(-1), LayoutAnswer::Unavailable);
+    }
+
+    #[test]
+    fn a_punctuation_key_that_needs_shift_or_altgr_on_the_layout_is_refused_not_guessed() {
+        // A German-style layout: slash needs Shift, backslash needs AltGr, the rest are plain.
+        let german = |character: char| match character {
+            '/' | '\\' => LayoutAnswer::NeedsModifier,
+            ';' => LayoutAnswer::Unshifted(0xC0),
+            _ => LayoutAnswer::Unavailable,
+        };
+        for keys in [
+            vec![Key::Slash],
+            vec![Key::Ctrl, Key::Backslash],
+            vec![Key::Ctrl, Key::Semicolon, Key::Slash],
+        ] {
+            let error = ensure_keys_press_alone(&keys, german).unwrap_err();
+            assert!(
+                matches!(&error, PlatformError::InvalidArgument { argument, .. } if argument == "keys"),
+                "{error}"
+            );
+            assert!(error.to_string().contains("type_text"), "{error}");
+            // A chord is told to name the layout's own combination; a single key is not.
+            assert_eq!(
+                error.to_string().contains("ctrl+shift+7"),
+                keys.len() > 1,
+                "{error}"
+            );
+        }
+        // Keys that the layout types plainly, or cannot say anything about, are not refused, and
+        // neither are keys that are not layout-dependent punctuation.
+        ensure_keys_press_alone(&[Key::Ctrl, Key::Semicolon, Key::Quote, Key::A], german).unwrap();
+        ensure_keys_press_alone(&[Key::Comma, Key::Enter], |_| LayoutAnswer::NeedsModifier)
+            .unwrap();
+    }
+
+    #[test]
+    fn numpad_system_and_media_keys_map_to_their_virtual_keys() {
+        for (key, vk, extended) in [
+            (Key::Numpad0, 0x60, false),
+            (Key::Numpad9, 0x69, false),
+            (Key::NumpadMultiply, 0x6A, false),
+            (Key::NumpadAdd, 0x6B, false),
+            (Key::NumpadSubtract, 0x6D, false),
+            (Key::NumpadDecimal, 0x6E, false),
+            (Key::NumpadDivide, 0x6F, true),
+            (Key::NumLock, 0x90, true),
+            (Key::PrintScreen, 0x2C, true),
+            (Key::CapsLock, 0x14, false),
+            (Key::ScrollLock, 0x91, false),
+            (Key::Pause, 0x13, false),
+            (Key::Menu, 0x5D, true),
+            (Key::VolumeMute, 0xAD, false),
+            (Key::VolumeDown, 0xAE, false),
+            (Key::VolumeUp, 0xAF, false),
+            (Key::MediaNext, 0xB0, false),
+            (Key::MediaPrevious, 0xB1, false),
+            (Key::MediaStop, 0xB2, false),
+            (Key::MediaPlayPause, 0xB3, false),
+        ] {
+            assert_eq!(
+                virtual_key_with(key, |_| panic!("not a layout-dependent key")),
+                (VIRTUAL_KEY(vk), extended),
+                "{key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_key_has_its_own_virtual_key() {
+        let mut seen = std::collections::HashMap::new();
+        for key in Key::ALL.iter().copied() {
+            let (vk, _) = virtual_key_with(key, |_| LayoutAnswer::Unavailable);
+            assert_ne!(vk.0, 0, "{key:?}");
+            if let Some(previous) = seen.insert(vk.0, key) {
+                panic!("{previous:?} and {key:?} share virtual key {:#x}", vk.0);
+            }
+        }
+    }
+
+    fn event_kinds(inputs: &[INPUT]) -> Vec<&'static str> {
+        inputs
+            .iter()
+            .map(|input| {
+                if input.r#type == INPUT_MOUSE {
+                    // SAFETY: Every INPUT here was built by this module with a matching tag.
+                    let flags = unsafe { input.Anonymous.mi.dwFlags };
+                    if flags.contains(MOUSEEVENTF_LEFTDOWN) {
+                        "down"
+                    } else {
+                        "up"
+                    }
+                } else {
+                    // SAFETY: As above, for a keyboard event.
+                    let up = unsafe { input.Anonymous.ki.dwFlags }.contains(KEYEVENTF_KEYUP);
+                    if up { "key-up" } else { "key-down" }
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn clicks_pause_with_the_button_held_and_not_after_the_last_event() {
+        let inputs = click_inputs(MouseButton::Left, 2, &[Key::Ctrl]);
+        let steps = split_after_button_down(&inputs);
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| event_kinds(step))
+                .collect::<Vec<_>>(),
+            [
+                vec!["key-down", "down"],
+                vec!["up", "down"],
+                vec!["up", "key-up"]
+            ]
+        );
+        let control = MutationControl::default();
+        let events_cell = std::cell::RefCell::new(Vec::<String>::new());
+        send_with_button_dwell(
+            "click_mouse",
+            &inputs,
+            &control,
+            || Ok(()),
+            |batch| {
+                events_cell
+                    .borrow_mut()
+                    .push(format!("send:{}", batch.len()));
+                Ok(batch.len())
+            },
+            || {
+                events_cell.borrow_mut().push("dwell".to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *events_cell.borrow(),
+            ["send:2", "dwell", "send:2", "dwell", "send:2"]
+        );
+        assert_eq!(control.progress().cleanup, CleanupStatus::NotNeeded);
+        // No press, no pause.
+        let keys = key_chord_inputs(&[Key::Ctrl, Key::C]);
+        assert_eq!(split_after_button_down(&keys).len(), 1);
+    }
+
+    #[test]
+    fn a_failed_or_cancelled_pause_releases_the_button_and_modifiers_that_were_sent() {
+        let inputs = click_inputs(MouseButton::Left, 1, &[Key::Ctrl]);
+        let control = MutationControl::default();
+        let mut sent = Vec::new();
+        let result = send_with_button_dwell(
+            "click_mouse",
+            &inputs,
+            &control,
+            || Ok(()),
+            |batch| {
+                sent.push(event_kinds(batch));
+                Ok(batch.len())
+            },
+            || Err(failure()),
+        );
+        assert!(result.is_err());
+        // The release of everything still held follows the first step, in reverse order.
+        assert_eq!(sent, [vec!["key-down", "down"], vec!["up", "key-up"]]);
+        assert_eq!(control.progress().cleanup, CleanupStatus::Succeeded);
+
+        // A click cancelled before anything was sent has nothing to release.
+        let control = MutationControl::default();
+        control.cancel();
+        assert!(
+            send_with_button_dwell(
+                "click_mouse",
+                &inputs,
+                &control,
+                || Ok(()),
+                |_| panic!("cancelled click must not dispatch"),
+                || Ok(()),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_partially_accepted_click_step_releases_only_what_was_accepted() {
+        let inputs = click_inputs(MouseButton::Left, 1, &[Key::Ctrl]);
+        let control = MutationControl::default();
+        let mut calls = Vec::new();
+        let result = send_with_button_dwell(
+            "click_mouse",
+            &inputs,
+            &control,
+            || Ok(()),
+            |batch| {
+                calls.push(event_kinds(batch));
+                // The first call accepts only the modifier press.
+                Ok(if calls.len() == 1 { 1 } else { batch.len() })
+            },
+            || Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, [vec!["key-down", "down"], vec!["key-up"]]);
+        assert_eq!(control.progress().cleanup, CleanupStatus::Succeeded);
+    }
+
+    #[test]
+    fn held_buttons_refuse_a_click_before_any_dispatch() {
+        let inputs = click_inputs(MouseButton::Left, 1, &[]);
+        let control = MutationControl::default();
+        let error = send_with_button_dwell_if_idle(
+            "click_mouse",
+            &inputs,
+            &control,
+            |_| true,
+            || Ok(()),
+            |_| panic!("held button must not dispatch"),
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("already held"));
+    }
+
+    #[test]
+    fn a_target_that_stops_being_valid_during_the_dwell_gets_no_second_press() {
+        // A double click is three batches. Validation turns false during the first dwell.
+        let inputs = click_inputs(MouseButton::Left, 2, &[Key::Ctrl]);
+        let control = MutationControl::default();
+        let mut sent = Vec::new();
+        let mut validations = 0;
+        let result = send_with_button_dwell(
+            "click_mouse",
+            &inputs,
+            &control,
+            || {
+                validations += 1;
+                Err(PlatformError::TargetInvalidated {
+                    reason: "the foreground changed during the dwell".into(),
+                })
+            },
+            |batch| {
+                sent.push(event_kinds(batch));
+                Ok(batch.len())
+            },
+            || Ok(()),
+        );
+        assert!(matches!(
+            result,
+            Err(PlatformError::TargetInvalidated { .. })
+        ));
+        assert_eq!(validations, 1);
+        // Only the acknowledged press and modifier are released; no new press follows.
+        assert_eq!(sent, [vec!["key-down", "down"], vec!["up", "key-up"]]);
+        assert_eq!(control.progress().cleanup, CleanupStatus::Succeeded);
+    }
+
+    #[test]
+    fn every_batch_with_new_input_is_validated_right_before_it_is_sent() {
+        let inputs = click_inputs(MouseButton::Left, 3, &[]);
+        let control = MutationControl::default();
+        let log = std::cell::RefCell::new(Vec::<&str>::new());
+        send_with_button_dwell(
+            "click_mouse",
+            &inputs,
+            &control,
+            || {
+                log.borrow_mut().push("validate");
+                Ok(())
+            },
+            |batch| {
+                log.borrow_mut().push("send");
+                Ok(batch.len())
+            },
+            || {
+                log.borrow_mut().push("dwell");
+                Ok(())
+            },
+        )
+        .unwrap();
+        // down | up down | up down | up (four batches): the caller validated the first batch
+        // itself, and the last batch only releases, so it is not validated.
+        assert_eq!(
+            *log.borrow(),
+            [
+                "send", "dwell", "validate", "send", "dwell", "validate", "send", "dwell", "send"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_release_only_batch_is_sent_even_when_validation_would_refuse() {
+        let inputs = click_inputs(MouseButton::Left, 1, &[Key::Ctrl]);
+        let control = MutationControl::default();
+        let mut sent = Vec::new();
+        send_with_button_dwell(
+            "click_mouse",
+            &inputs,
+            &control,
+            || panic!("a batch that only releases must not be validated"),
+            |batch| {
+                sent.push(batch.len());
+                Ok(batch.len())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        // Ctrl down + button down, then button up + Ctrl up.
+        assert_eq!(sent, [2, 2]);
+        assert_eq!(control.progress().cleanup, CleanupStatus::NotNeeded);
     }
 }

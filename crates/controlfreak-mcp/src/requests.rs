@@ -1,7 +1,11 @@
-use super::observations::PointerTarget;
+use super::observations::{PRIMARY_DISPLAY, PointerTarget};
 use controlfreak_core::{
     FindTextRequest, Key, MouseButton, ObservationMode, ObservationOptions, ObservationRegion,
     OcrRegionRequest, PlatformError, VirtualDesktopDirection,
+    limits::{
+        DEFAULT_CAPTURE_WIDTH, MAX_RUN_ACTIONS_TOTAL_WAIT_MS, MAX_RUN_ACTIONS_WAIT_MS,
+        MAX_SCROLL_DELTA, MAX_TEXT_UTF16_UNITS,
+    },
 };
 use rmcp::{ErrorData, model::JsonObject};
 use serde::Deserialize;
@@ -21,67 +25,170 @@ pub(super) struct BeginControlSessionInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct CaptureDisplayInput {
-    pub(super) display_id: String,
-    pub(super) max_width: Option<u32>,
+    display_id: Option<String>,
+    max_width: Option<u32>,
+    #[serde(default)]
+    native: bool,
     #[serde(default = "default_true")]
-    pub(super) include_cursor: bool,
+    include_cursor: bool,
+}
+
+impl CaptureDisplayInput {
+    pub(super) fn into_request(
+        self,
+    ) -> Result<controlfreak_core::CaptureDisplayRequest, PlatformError> {
+        Ok(controlfreak_core::CaptureDisplayRequest {
+            display_id: display_or_primary(self.display_id),
+            max_width: capture_width(self.max_width, self.native)?,
+            include_cursor: self.include_cursor,
+        })
+    }
+}
+
+/// The width an explicit capture is returned at: the caller's `max_width`, source resolution
+/// when `native` is set, and otherwise the same default width as an action screenshot.
+fn capture_width(max_width: Option<u32>, native: bool) -> Result<Option<u32>, PlatformError> {
+    match (max_width, native) {
+        (Some(_), true) => Err(PlatformError::InvalidArgument {
+            argument: "native".to_owned(),
+            reason: "native=true returns full resolution; leave max_width out".to_owned(),
+        }),
+        (None, true) => Ok(None),
+        (Some(width), false) => Ok(Some(width)),
+        (None, false) => Ok(Some(DEFAULT_CAPTURE_WIDTH)),
+    }
+}
+
+/// The display a request names, or the primary display when it names none.
+fn display_or_primary(display_id: Option<String>) -> String {
+    display_id.unwrap_or_else(|| PRIMARY_DISPLAY.to_owned())
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct CaptureRegionInput {
-    pub(super) display_id: String,
-    pub(super) x: u32,
-    pub(super) y: u32,
-    pub(super) width: u32,
-    pub(super) height: u32,
-    pub(super) max_width: Option<u32>,
+    display_id: Option<String>,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    max_width: Option<u32>,
+    #[serde(default)]
+    native: bool,
     #[serde(default = "default_true")]
-    pub(super) include_cursor: bool,
+    include_cursor: bool,
+}
+
+impl CaptureRegionInput {
+    pub(super) fn into_request(
+        self,
+    ) -> Result<controlfreak_core::CaptureRegionRequest, PlatformError> {
+        Ok(controlfreak_core::CaptureRegionRequest {
+            display_id: display_or_primary(self.display_id),
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+            max_width: capture_width(self.max_width, self.native)?,
+            include_cursor: self.include_cursor,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WaitForVisualChangeInput {
-    pub(super) display_id: String,
-    pub(super) x: u32,
-    pub(super) y: u32,
-    pub(super) width: u32,
-    pub(super) height: u32,
+    display_id: Option<String>,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
     #[serde(default = "default_wait_timeout_ms")]
-    pub(super) timeout_ms: u32,
-    #[serde(default = "default_stable_ms")]
-    pub(super) stable_ms: u32,
+    timeout_ms: u32,
+    stable_ms: Option<u32>,
     #[serde(default = "default_difference_threshold")]
-    pub(super) difference_threshold: f64,
+    difference_threshold: f64,
+}
+
+impl WaitForVisualChangeInput {
+    pub(super) fn into_request(self) -> controlfreak_core::WaitForVisualChangeRequest {
+        let (timeout_ms, stable_ms) = visual_wait_values(self.timeout_ms, self.stable_ms);
+        controlfreak_core::WaitForVisualChangeRequest {
+            display_id: display_or_primary(self.display_id),
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+            timeout_ms,
+            stable_ms,
+            difference_threshold: self.difference_threshold,
+        }
+    }
+}
+
+/// Every wait tool publishes the same lower bound of 0 ms, but the visual waits compare at least
+/// once over 1 ms. A zero timeout means one comparison, which needs no stability period. A
+/// stability period that was not given never exceeds the timeout, so a short timeout works alone.
+fn visual_wait_values(timeout_ms: u32, stable_ms: Option<u32>) -> (u32, u32) {
+    if timeout_ms == 0 {
+        (1, 0)
+    } else {
+        (
+            timeout_ms,
+            stable_ms.unwrap_or_else(|| default_stable_ms().min(timeout_ms)),
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct VisualBaselineInput {
-    pub(super) display_id: String,
-    pub(super) x: u32,
-    pub(super) y: u32,
-    pub(super) width: u32,
-    pub(super) height: u32,
+    display_id: Option<String>,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl VisualBaselineInput {
+    pub(super) fn into_request(self) -> controlfreak_core::VisualBaselineRequest {
+        controlfreak_core::VisualBaselineRequest {
+            display_id: display_or_primary(self.display_id),
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WaitForChangeSinceInput {
-    pub(super) baseline_id: String,
+    baseline_id: String,
     #[serde(default = "default_wait_timeout_ms")]
-    pub(super) timeout_ms: u32,
-    #[serde(default = "default_stable_ms")]
-    pub(super) stable_ms: u32,
+    timeout_ms: u32,
+    stable_ms: Option<u32>,
     #[serde(default = "default_difference_threshold")]
-    pub(super) difference_threshold: f64,
+    difference_threshold: f64,
+}
+
+impl WaitForChangeSinceInput {
+    pub(super) fn into_request(self) -> controlfreak_core::WaitForChangeSinceRequest {
+        let (timeout_ms, stable_ms) = visual_wait_values(self.timeout_ms, self.stable_ms);
+        controlfreak_core::WaitForChangeSinceRequest {
+            baseline_id: self.baseline_id,
+            timeout_ms,
+            stable_ms,
+            difference_threshold: self.difference_threshold,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct OcrRegionInput {
-    display_id: String,
+    display_id: Option<String>,
     x: u32,
     y: u32,
     width: u32,
@@ -92,7 +199,7 @@ pub(super) struct OcrRegionInput {
 impl OcrRegionInput {
     pub(super) fn into_request(self) -> OcrRegionRequest {
         OcrRegionRequest {
-            display_id: self.display_id,
+            display_id: display_or_primary(self.display_id),
             x: self.x,
             y: self.y,
             width: self.width,
@@ -105,7 +212,7 @@ impl OcrRegionInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct FindTextInput {
-    display_id: String,
+    display_id: Option<String>,
     x: u32,
     y: u32,
     width: u32,
@@ -126,12 +233,12 @@ pub(super) struct FindTextInput {
 #[serde(deny_unknown_fields)]
 pub(super) struct ClickTextInput {
     pub(super) target_ref: String,
-    pub(super) display_id: String,
-    pub(super) x: u32,
-    pub(super) y: u32,
-    pub(super) width: u32,
-    pub(super) height: u32,
-    pub(super) language: Option<String>,
+    display_id: Option<String>,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    language: Option<String>,
     pub(super) query: String,
     #[serde(default)]
     pub(super) case_sensitive: bool,
@@ -149,10 +256,24 @@ pub(super) struct ClickTextInput {
     pub(super) observation: ObservationInput,
 }
 
+impl ClickTextInput {
+    /// The OCR region, with an omitted display left as the primary-display alias.
+    pub(super) fn region(&self) -> OcrRegionRequest {
+        OcrRegionRequest {
+            display_id: display_or_primary(self.display_id.clone()),
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+            language: self.language.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WaitForTextInput {
-    display_id: String,
+    display_id: Option<String>,
     x: u32,
     y: u32,
     width: u32,
@@ -204,7 +325,7 @@ impl FindTextInput {
     pub(super) fn into_request(self) -> FindTextRequest {
         FindTextRequest {
             region: OcrRegionRequest {
-                display_id: self.display_id,
+                display_id: display_or_primary(self.display_id),
                 x: self.x,
                 y: self.y,
                 width: self.width,
@@ -234,7 +355,7 @@ pub(super) struct ObservationInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ObservationRegionInput {
-    display_id: String,
+    display_id: Option<String>,
     x: u32,
     y: u32,
     pub(super) width: u32,
@@ -259,7 +380,7 @@ impl From<ObservationInput> for ObservationOptions {
             max_width: input.max_width,
             include_cursor: input.include_cursor,
             region: input.region.map(|region| ObservationRegion {
-                display_id: region.display_id,
+                display_id: display_or_primary(region.display_id),
                 x: region.x,
                 y: region.y,
                 width: region.width,
@@ -307,6 +428,7 @@ pub(super) struct ClickMouseInput {
     image_x: Option<u32>,
     #[serde(default)]
     image_y: Option<u32>,
+    #[serde(default = "default_left_button")]
     pub(super) button: MouseButton,
     #[serde(default = "default_click_count")]
     pub(super) click_count: u8,
@@ -344,6 +466,7 @@ pub(super) struct DragMouseInput {
     end_image_x: Option<u32>,
     #[serde(default)]
     end_image_y: Option<u32>,
+    #[serde(default = "default_left_button")]
     pub(super) button: MouseButton,
     #[serde(default)]
     pub(super) modifiers: Vec<Key>,
@@ -383,15 +506,49 @@ pub(super) struct ScrollMouseInput {
 pub(super) struct FocusWindowInput {
     #[serde(default = "default_focus_timeout_ms")]
     pub(super) timeout_ms: u32,
-    pub(super) window_id: String,
+    window_id: Option<String>,
+    target_ref: Option<String>,
     #[serde(default)]
     pub(super) observation: ObservationInput,
+}
+
+impl FocusWindowInput {
+    pub(super) fn window_id(&self) -> Result<String, PlatformError> {
+        window_reference(self.window_id.as_deref(), self.target_ref.as_deref())?
+            .ok_or_else(missing_window_reference)
+    }
+}
+
+/// `target_ref` is an alias of `window_id`. Giving both is fine only when they agree.
+fn window_reference(
+    window_id: Option<&str>,
+    target_ref: Option<&str>,
+) -> Result<Option<String>, PlatformError> {
+    match (window_id, target_ref) {
+        (Some(window_id), Some(target_ref)) if window_id != target_ref => {
+            Err(PlatformError::InvalidArgument {
+                argument: "target_ref".to_owned(),
+                reason:
+                    "target_ref is an alias of window_id and the two values differ; give only one"
+                        .to_owned(),
+            })
+        }
+        (Some(reference), _) | (None, Some(reference)) => Ok(Some(reference.to_owned())),
+        (None, None) => Ok(None),
+    }
+}
+
+fn missing_window_reference() -> PlatformError {
+    PlatformError::InvalidArgument {
+        argument: "window_id".to_owned(),
+        reason: "give window_id (alias target_ref) from list_windows or a screenshot".to_owned(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SwitchVirtualDesktopInput {
-    pub(super) target_ref: String,
+    pub(super) target_ref: Option<String>,
     pub(super) direction: VirtualDesktopDirection,
     #[serde(default = "default_desktop_steps")]
     pub(super) steps: u8,
@@ -402,22 +559,55 @@ pub(super) struct SwitchVirtualDesktopInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct CaptureWindowInput {
-    pub(super) window_id: String,
-    pub(super) max_width: Option<u32>,
+    window_id: Option<String>,
+    target_ref: Option<String>,
+    max_width: Option<u32>,
+    #[serde(default)]
+    native: bool,
     #[serde(default = "default_true")]
-    pub(super) include_cursor: bool,
+    include_cursor: bool,
+}
+
+impl CaptureWindowInput {
+    pub(super) fn into_request(
+        self,
+    ) -> Result<controlfreak_core::CaptureWindowRequest, PlatformError> {
+        let window_id = window_reference(self.window_id.as_deref(), self.target_ref.as_deref())?
+            .ok_or_else(missing_window_reference)?;
+        Ok(controlfreak_core::CaptureWindowRequest {
+            window_id,
+            max_width: capture_width(self.max_width, self.native)?,
+            include_cursor: self.include_cursor,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WaitForWindowInput {
-    pub(super) window_id: Option<String>,
-    pub(super) title_contains: Option<String>,
-    pub(super) class_name: Option<String>,
-    pub(super) process_id: Option<u32>,
-    pub(super) is_foreground: Option<bool>,
+    window_id: Option<String>,
+    target_ref: Option<String>,
+    title_contains: Option<String>,
+    class_name: Option<String>,
+    process_id: Option<u32>,
+    is_foreground: Option<bool>,
     #[serde(default = "default_wait_timeout_ms")]
-    pub(super) timeout_ms: u32,
+    timeout_ms: u32,
+}
+
+impl WaitForWindowInput {
+    pub(super) fn into_request(
+        self,
+    ) -> Result<controlfreak_core::WaitForWindowRequest, PlatformError> {
+        Ok(controlfreak_core::WaitForWindowRequest {
+            window_id: window_reference(self.window_id.as_deref(), self.target_ref.as_deref())?,
+            title_contains: self.title_contains,
+            class_name: self.class_name,
+            process_id: self.process_id,
+            is_foreground: self.is_foreground,
+            timeout_ms: self.timeout_ms,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -475,9 +665,10 @@ where
     T: for<'de> Deserialize<'de>,
 {
     serde_json::from_value(Value::Object(arguments.unwrap_or_default())).map_err(|error| {
+        let reason = error.to_string();
         ErrorData::invalid_params(
-            format!("invalid tool arguments: {error}"),
-            Some(json!({ "reason": error.to_string() })),
+            format!("invalid tool arguments: {reason}"),
+            Some(json!({ "reason": reason })),
         )
     })
 }
@@ -597,6 +788,9 @@ pub(super) enum ActionStepInput {
     PressKeys {
         keys: Vec<Key>,
     },
+    Wait {
+        wait_ms: u32,
+    },
 }
 
 /// A batch step checked before any step runs. Image points are resolved later, on the worker,
@@ -620,6 +814,9 @@ pub(super) enum ActionStep {
     PressKeys {
         keys: Vec<Key>,
     },
+    Wait {
+        wait_ms: u32,
+    },
 }
 
 impl ActionStep {
@@ -629,6 +826,7 @@ impl ActionStep {
             Self::Scroll { .. } => "scroll",
             Self::TypeText { .. } => "type_text",
             Self::PressKeys { .. } => "press_keys",
+            Self::Wait { .. } => "wait",
         }
     }
 }
@@ -695,7 +893,7 @@ impl ActionStepInput {
                 delta_x,
                 delta_y,
             } => {
-                let limit = super::MAX_SCROLL_DELTA.unsigned_abs();
+                let limit = MAX_SCROLL_DELTA;
                 if (*delta_x == 0 && *delta_y == 0)
                     || delta_x.unsigned_abs() > limit
                     || delta_y.unsigned_abs() > limit
@@ -715,10 +913,9 @@ impl ActionStepInput {
             }
             Self::TypeText { text } => {
                 let units = text.encode_utf16().count();
-                if units == 0 || units > super::MAX_TEXT_UTF16_UNITS {
+                if units == 0 || units > MAX_TEXT_UTF16_UNITS {
                     return Err(format!(
-                        "text must contain 1 to {} UTF-16 code units",
-                        super::MAX_TEXT_UTF16_UNITS
+                        "text must contain 1 to {MAX_TEXT_UTF16_UNITS} UTF-16 code units"
                     ));
                 }
                 Ok(ActionStep::TypeText { text: text.clone() })
@@ -729,6 +926,14 @@ impl ActionStepInput {
                     return Err("keys must be 1 to 8 distinct keys".to_owned());
                 }
                 Ok(ActionStep::PressKeys { keys: keys.clone() })
+            }
+            Self::Wait { wait_ms } => {
+                if !(1..=MAX_RUN_ACTIONS_WAIT_MS).contains(wait_ms) {
+                    return Err(format!(
+                        "wait_ms must be between 1 and {MAX_RUN_ACTIONS_WAIT_MS}"
+                    ));
+                }
+                Ok(ActionStep::Wait { wait_ms: *wait_ms })
             }
         }
     }
@@ -743,7 +948,8 @@ impl RunActionsInput {
                 reason: format!("must contain between 1 and {MAX_RUN_ACTION_STEPS} steps"),
             });
         }
-        self.steps
+        let steps = self
+            .steps
             .iter()
             .enumerate()
             .map(|(index, step)| {
@@ -753,6 +959,29 @@ impl RunActionsInput {
                         reason,
                     })
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        // The final step supplies the observation, and only an input step can.
+        if matches!(steps.last(), Some(ActionStep::Wait { .. })) {
+            return Err(PlatformError::InvalidArgument {
+                argument: format!("steps[{}]", steps.len() - 1),
+                reason: "the last step cannot be a wait; end with an input step".to_owned(),
+            });
+        }
+        let total_wait: u32 = steps
+            .iter()
+            .filter_map(|step| match step {
+                ActionStep::Wait { wait_ms } => Some(*wait_ms),
+                _ => None,
+            })
+            .sum();
+        if total_wait > MAX_RUN_ACTIONS_TOTAL_WAIT_MS {
+            return Err(PlatformError::InvalidArgument {
+                argument: "steps".to_owned(),
+                reason: format!(
+                    "wait steps add up to {total_wait} ms; the total may not exceed {MAX_RUN_ACTIONS_TOTAL_WAIT_MS} ms"
+                ),
+            });
+        }
+        Ok(steps)
     }
 }

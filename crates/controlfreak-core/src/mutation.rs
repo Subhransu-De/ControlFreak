@@ -192,11 +192,11 @@ impl MutationControl {
 
     pub fn check(&self, operation: &str) -> Result<(), PlatformError> {
         if self.is_cancelled() {
-            Err(PlatformError::OperationFailed {
-                operation: operation.to_owned(),
-                reason: "the desktop operation was cancelled by a user/client stop, request cancellation, a closing control session, or because the safety indicator became unhealthy"
-                    .to_owned(),
-            })
+            Err(PlatformError::failed(
+                crate::FailureCause::Cancelled,
+                operation,
+                "the desktop operation was cancelled by a user/client stop, request cancellation, a closing control session, or because the safety indicator became unhealthy",
+            ))
         } else {
             Ok(())
         }

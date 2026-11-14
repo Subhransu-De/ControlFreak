@@ -71,7 +71,7 @@ async fn mutation_results_are_encoded_on_the_blocking_worker() {
     };
     let (result, _progress) = handlers::run_encoded_mutation(
         None,
-        "fixture".into(),
+        Some("target-00000000-0000-0000-0000-000000000003".to_owned()),
         Arc::new(stop_tests::WaitingBackend::idle()),
         move |_| Ok(probe),
     )

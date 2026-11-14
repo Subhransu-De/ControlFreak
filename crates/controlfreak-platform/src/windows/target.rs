@@ -1,8 +1,9 @@
 #![allow(unsafe_code)]
 
-use super::{desktop, environment::ensure_interactive_input_desktop, privilege};
-use controlfreak_core::{DisplayInfo, MutationControl, PlatformError};
+use super::{desktop, environment::ensure_interactive_input_desktop, privilege, shell};
+use controlfreak_core::{DisplayInfo, MutationControl, PlatformError, RefusalCause};
 use std::{
+    cell::RefCell,
     collections::VecDeque,
     os::windows::io::{FromRawHandle, OwnedHandle},
     sync::{
@@ -14,21 +15,26 @@ use std::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GUITHREADINFO, GetGUIThreadInfo};
 use windows::Win32::{
-    Foundation::{ERROR_SUCCESS, FILETIME, GetLastError, HWND, SetLastError},
+    Foundation::{ERROR_SUCCESS, FILETIME, GetLastError, HANDLE, HWND, SetLastError},
     System::{
         Com::CoCreateGuid,
-        Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        SystemInformation::GetSystemWindowsDirectoryW,
+        Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+            QueryFullProcessImageNameW,
+        },
     },
     UI::{
         Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
         WindowsAndMessaging::{
-            EVENT_OBJECT_DESTROY, EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_FOREGROUND, GA_ROOT,
-            GW_OWNER, GetAncestor, GetClassNameW, GetMessageW, GetWindow, GetWindowRect,
-            GetWindowThreadProcessId, IsWindow, MSG, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
-            WindowFromPoint,
+            EVENT_OBJECT_DESTROY, EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_FOREGROUND,
+            FindWindowExW, GA_ROOT, GA_ROOTOWNER, GW_OWNER, GetAncestor, GetClassNameW,
+            GetMessageW, GetWindow, GetWindowRect, GetWindowThreadProcessId, IsWindow, MSG,
+            OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WindowFromPoint,
         },
     },
 };
+use windows::core::PWSTR;
 
 const MAX_REFERENCES: usize = 512;
 const REFERENCE_TTL: Duration = Duration::from_mins(5);
@@ -41,7 +47,14 @@ struct Identity {
     created: u64,
     owner: usize,
     class: String,
+    /// The virtual desktop, or `shell::ALL_DESKTOPS` for a verified shell surface.
     desktop: String,
+    /// The owning process hosts unrelated applications (see `shell::is_shared_host_image`), or
+    /// its image cannot be read, so "same process" does not mean "same application".
+    shell_host: bool,
+    /// The owning process is `ApplicationFrameHost.exe`, so this window is the frame of a
+    /// packaged app whose content window belongs to the app's own process.
+    app_frame_host: bool,
 }
 
 #[derive(Clone)]
@@ -54,32 +67,139 @@ struct Reference {
     armed: bool,
 }
 
+/// What the same-process rule needs to know about one window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WindowFacts {
+    hwnd: usize,
+    pid: u32,
+    class: String,
+    /// The window at the top of the owner chain; the window itself if it is unowned.
+    root_owner: usize,
+}
+
+/// Class of the popup menus that Windows creates in the process that opens them.
+const POPUP_MENU_CLASS: &str = "#32768";
+
+/// Whether `window` may receive the session's input in place of the approved `target`.
+///
+/// The target itself always may. A window of the same process may too: the dialogs, popup menus
+/// and drop-downs an approved application opens are part of that application, and refusing them
+/// would make menus unreachable by pointer and every dialog end the session. Another process
+/// never may, whatever its window looks like. The checks on the actual window (integrity, and
+/// for pointer input the destination point) run separately and are unchanged.
+///
+/// Some processes are an exception to "same process is the same application": `explorer.exe`
+/// owns the taskbar, the desktop and every File Explorer window, and `ApplicationFrameHost.exe`
+/// owns the frame of every packaged app. For a target in such a shared host, and for a target
+/// whose process image cannot be read, only windows in the target's owner chain and popup menus
+/// count as part of it, so approving one File Explorer window does not approve the taskbar or
+/// another folder window, and approving one packaged app does not approve another's frame.
+fn accepts_same_process(target: &WindowFacts, shell_host: bool, window: &WindowFacts) -> bool {
+    if window.hwnd == target.hwnd {
+        return true;
+    }
+    if window.pid != target.pid {
+        return false;
+    }
+    if !shell_host {
+        return true;
+    }
+    window.root_owner == target.root_owner || window.class == POPUP_MENU_CLASS
+}
+
+/// A refused validation. Only a failure that cannot heal poisons the session's target; a
+/// foreground or destination that is wrong right now only refuses this action.
+#[derive(Debug)]
+enum Failure {
+    /// The target changed identity, geometry or desktop, or its own integrity cannot be
+    /// verified, or the input desktop is not usable.
+    Fatal(PlatformError),
+    /// The foreground window, the keyboard focus or the pointer destination is wrong. The target
+    /// is unchanged and the next action checks again, so a window that comes back is usable
+    /// without a new session. The error keeps its own code (a higher-integrity foreground is
+    /// still `higher_integrity_target`); it just does not end the session.
+    Recoverable(PlatformError),
+}
+
+impl From<PlatformError> for Failure {
+    fn from(error: PlatformError) -> Self {
+        Self::Fatal(error)
+    }
+}
+
+/// Marks a failure about a window other than the target as one that only refuses this action.
+fn recoverable<T>(result: Result<T, PlatformError>) -> Result<T, Failure> {
+    result.map_err(Failure::Recoverable)
+}
+
+/// The window that would receive a pointer event: the root of the window under the point, and
+/// the process of the window itself (a child can belong to another process than its root).
+struct Hit {
+    root: WindowFacts,
+    window_pid: u32,
+    /// For a packaged-app frame target: the process of the content window hosted inside the
+    /// target's own frame, read when the check runs. `None` for every other target.
+    hosted_pid: Option<u32>,
+}
+
+impl Hit {
+    /// Whether the window that would get the input belongs to the target's application. Its
+    /// process is the target's, or it is the content window of the packaged app that the
+    /// target's `ApplicationFrameHost.exe` frame displays: the frame and the content are one
+    /// application even though they run in two processes. Only a window inside that very frame
+    /// qualifies, and the integrity of the window actually hit is checked separately.
+    fn belongs_to(&self, target: &Identity, target_window: &WindowFacts) -> bool {
+        self.window_pid == target.pid
+            || (target.app_frame_host
+                && self.hosted_pid == Some(self.window_pid)
+                && self.root.hwnd == target_window.hwnd)
+    }
+}
+
 impl Reference {
+    /// The checks that do not depend on which window is in front or on which desktop is current:
+    /// the same live window, and unchanged bounds and display layout. Any change is permanent.
+    fn validate_unchanged(
+        &self,
+        current: &Identity,
+        bounds: [i32; 4],
+        displays: &[DisplayInfo],
+    ) -> Result<(), Failure> {
+        if &self.identity != current {
+            return Err(Failure::Fatal(invalid(
+                "window, process lifetime, owner, or desktop changed",
+            )));
+        }
+        if self.bounds != bounds || self.displays != displays {
+            return Err(Failure::Fatal(invalid(
+                "window bounds or display layout changed; end the session and observe again",
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_snapshot(
         &self,
         current: &Identity,
         bounds: [i32; 4],
         displays: &[DisplayInfo],
-        foreground: usize,
-        hit: Option<(usize, u32)>,
-    ) -> Result<(), PlatformError> {
-        if &self.identity != current {
-            return Err(invalid(
-                "window, process lifetime, owner, or desktop changed",
-            ));
+        target: &WindowFacts,
+        foreground: &WindowFacts,
+        hit: Option<&Hit>,
+    ) -> Result<(), Failure> {
+        self.validate_unchanged(current, bounds, displays)?;
+        let shell_host = current.shell_host;
+        if !accepts_same_process(target, shell_host, foreground) {
+            return Err(Failure::Recoverable(refused(
+                RefusalCause::NotForeground,
+                "approved target is no longer foreground; call focus_window to bring it back, or a window of another process now owns the foreground",
+            )));
         }
-        if foreground != current.hwnd {
-            return Err(invalid("approved target is no longer foreground"));
-        }
-        if self.bounds != bounds || self.displays != displays {
-            return Err(invalid(
-                "window bounds or display layout changed; end the session and observe again",
-            ));
-        }
-        if hit.is_some_and(|(root, pid)| root != current.hwnd || pid != current.pid) {
-            return Err(invalid(
-                "input destination belongs to a different window or process; owned popups require separate approval",
-            ));
+        if let Some(hit) = hit
+            && (!hit.belongs_to(current, target)
+                || !accepts_same_process(target, shell_host, &hit.root))
+        {
+            return Err(Failure::Recoverable(destination_refusal(hit)));
         }
         Ok(())
     }
@@ -93,6 +213,26 @@ pub(super) fn invalid(reason: &str) -> PlatformError {
     PlatformError::TargetInvalidated {
         reason: reason.into(),
     }
+}
+
+fn refused(cause: RefusalCause, reason: &str) -> PlatformError {
+    PlatformError::refused(cause, reason)
+}
+
+/// Why a pointer or keyboard destination in another process is refused. A window of this very
+/// process is the server's own indicator, which screenshots never show, so the message says
+/// so instead of blaming an unnamed other process.
+fn destination_refusal(hit: &Hit) -> PlatformError {
+    if hit.window_pid == std::process::id() {
+        return refused(
+            RefusalCause::OwnIndicator,
+            "this point is under ControlFreak's own indicator tab or Stop button, which screenshots do not show; choose another point or use the keyboard",
+        );
+    }
+    refused(
+        RefusalCause::ForeignDestination,
+        "input destination belongs to a window of a different process; only the approved window and windows of its own process (its dialogs and popups) receive input",
+    )
 }
 
 fn unavailable(reason: impl std::fmt::Display) -> PlatformError {
@@ -142,19 +282,117 @@ fn identity(hwnd: HWND) -> Result<Identity, PlatformError> {
         .filter(|length| *length > 0)
         .ok_or_else(|| invalid("window class cannot be verified"))?;
     let owner = window_owner(hwnd)?;
+    let class = String::from_utf16_lossy(&class[..length]);
+    let image = process_image(process);
+    let windows_directory = windows_directory();
+    // Failing to read the image must narrow the same-process rule, never widen it.
+    let shell_host = is_shared_host(image.as_deref(), windows_directory.as_deref());
+    let app_frame_host = matches!(
+        (&image, &windows_directory),
+        (Some(image), Some(directory)) if shell::is_app_frame_host_image(image, directory)
+    );
     let desktop = controlfreak_core::timing::time("identity_desktop", || {
         desktop::with_virtual_desktop_manager(|manager| desktop::window_desktop_id(manager, hwnd))
     })
-    .map_err(unavailable)?
-    .map_err(|_| invalid("window desktop cannot be verified"))?;
+    .map_err(unavailable)?;
+    let desktop = match desktop {
+        Ok(desktop) => format!("{desktop:?}"),
+        // The shell's own windows have no desktop identity because they are on every desktop.
+        // That exemption needs the class and the owning image together; a failure for any other
+        // window still means its desktop cannot be verified.
+        Err(_)
+            if matches!(
+                (&image, &windows_directory),
+                (Some(image), Some(directory)) if shell::is_shell_surface(&class, image, directory)
+            ) =>
+        {
+            shell::ALL_DESKTOPS.to_owned()
+        }
+        Err(_) => return Err(invalid("window desktop cannot be verified")),
+    };
     Ok(Identity {
         hwnd: hwnd.0 as usize,
         pid,
         thread,
         created: (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime),
         owner: owner.0 as usize,
+        class,
+        desktop,
+        shell_host,
+        app_frame_host,
+    })
+}
+
+/// Whether the target's process hosts unrelated applications. A process whose image or whose
+/// Windows directory cannot be read counts as one: failing to know narrows the same-process
+/// rule to the owner chain instead of widening it to everything the process owns.
+fn is_shared_host(image: Option<&str>, windows_directory: Option<&str>) -> bool {
+    match (image, windows_directory) {
+        (Some(image), Some(directory)) => shell::is_shared_host_image(image, directory),
+        _ => true,
+    }
+}
+
+/// The Win32 path of the executable a process runs, or `None` if it cannot be read, in which
+/// case no shell exemption applies.
+fn process_image(process: HANDLE) -> Option<String> {
+    let mut buffer = [0_u16; 1024];
+    let mut length = u32::try_from(buffer.len()).ok()?;
+    // SAFETY: `process` is a live handle with query rights; the buffer is writable for `length`
+    // units, and `length` is updated to the count written, excluding the terminator.
+    unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &raw mut length,
+        )
+    }
+    .ok()?;
+    Some(String::from_utf16_lossy(
+        &buffer[..usize::try_from(length).ok()?],
+    ))
+}
+
+/// The Windows directory, read from the system rather than from an environment variable that
+/// the user's process environment could change.
+fn windows_directory() -> Option<String> {
+    static DIRECTORY: OnceLock<Option<String>> = OnceLock::new();
+    DIRECTORY
+        .get_or_init(|| {
+            let mut buffer = [0_u16; 512];
+            // SAFETY: The buffer is writable for its full length; the call returns the number of
+            // units written excluding the terminator, or zero on failure.
+            let length = unsafe { GetSystemWindowsDirectoryW(Some(&mut buffer)) };
+            let length = usize::try_from(length).ok()?;
+            (length > 0 && length < buffer.len())
+                .then(|| String::from_utf16_lossy(&buffer[..length]))
+        })
+        .clone()
+}
+
+fn window_facts(hwnd: HWND) -> Result<WindowFacts, PlatformError> {
+    let mut pid = 0;
+    // SAFETY: pid is writable and the query retains no pointers.
+    let thread = unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
+    if thread == 0 || pid == 0 {
+        return Err(invalid("window identity is unavailable"));
+    }
+    let mut class = [0_u16; 256];
+    // SAFETY: class is writable and GetClassNameW does not retain the buffer.
+    let length = unsafe { GetClassNameW(hwnd, &mut class) };
+    let length = usize::try_from(length).unwrap_or(0);
+    // SAFETY: GetAncestor reads window metadata for a borrowed handle.
+    let root_owner = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
+    Ok(WindowFacts {
+        hwnd: hwnd.0 as usize,
+        pid,
         class: String::from_utf16_lossy(&class[..length]),
-        desktop: format!("{desktop:?}"),
+        root_owner: if root_owner.is_invalid() {
+            hwnd.0 as usize
+        } else {
+            root_owner.0 as usize
+        },
     })
 }
 
@@ -200,13 +438,10 @@ unsafe extern "system" fn destroyed(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
-    } else if event == EVENT_SYSTEM_FOREGROUND {
-        retire_foreground(
-            &mut REFERENCES
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            hwnd.0 as usize,
-        );
+    // A foreground change only advances the observation generation above. It deliberately keeps
+    // every reference: the session's target is re-checked against the live foreground window at
+    // each action, so a window that took the foreground briefly cannot widen what input may reach,
+    // and a window that gives it back does not cost the session its approval.
     } else if event == EVENT_OBJECT_DESTROY && object == OBJID_WINDOW.0 && child == 0 {
         OBSERVATION_GENERATION.fetch_add(1, Ordering::AcqRel);
         retire_window(
@@ -224,10 +459,6 @@ fn retire_window(references: &mut VecDeque<Reference>, hwnd: usize) {
             reference.identity.hwnd != hwnd && reference.identity.owner != hwnd
         });
     }
-}
-
-fn retire_foreground(references: &mut VecDeque<Reference>, foreground: usize) {
-    references.retain(|reference| !reference.armed || reference.identity.hwnd == foreground);
 }
 
 pub(super) fn ensure_available() -> Result<(), PlatformError> {
@@ -403,22 +634,55 @@ pub(super) fn resolve(id: &str) -> Result<(HWND, u32), PlatformError> {
     Ok((hwnd, reference.identity.pid))
 }
 
+/// Marks the reference as in use by a session when the target, or a window of its own process,
+/// holds the foreground. An armed reference is the last to be evicted. Not holding the
+/// foreground neither arms nor retires it; each action decides again from the live foreground.
 pub(super) fn arm_if_foreground(id: &str) -> Result<(), PlatformError> {
-    let mut references = REFERENCES
+    let snapshot = REFERENCES
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let reference = references
-        .iter_mut()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
         .find(|reference| reference.id == id)
+        .cloned()
         .ok_or_else(|| invalid("approved target reference was retired"))?;
-    let foreground = desktop::foreground_window_handle().0 as usize;
-    if reference.identity.hwnd == foreground {
+    if foreground_serves(&snapshot.identity)
+        && let Some(reference) = REFERENCES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter_mut()
+            .find(|reference| reference.id == id)
+    {
         reference.armed = true;
-    } else if reference.armed {
-        references.retain(|reference| reference.id != id);
-        return Err(invalid("approved target lost foreground ownership"));
     }
     Ok(())
+}
+
+/// Whether `window` is the approved target of reference `approved_id` or a window of its own
+/// process that may stand in for it (an owned dialog, a popup), by the same rule as the
+/// foreground and pointer checks. An unreadable window or reference is not.
+pub(super) fn window_serves_target(approved_id: &str, window: HWND) -> bool {
+    let Ok(reference) = lookup(approved_id) else {
+        return false;
+    };
+    let target = HWND(reference.identity.hwnd as *mut std::ffi::c_void);
+    let (Ok(target), Ok(window)) = (window_facts(target), window_facts(window)) else {
+        return false;
+    };
+    accepts_same_process(&target, reference.identity.shell_host, &window)
+}
+
+/// Whether the live foreground window is the target or a same-process window that may stand in
+/// for it. An unreadable foreground or target is not.
+fn foreground_serves(identity: &Identity) -> bool {
+    let target = HWND(identity.hwnd as *mut std::ffi::c_void);
+    let foreground = desktop::foreground_window_handle();
+    if foreground.is_invalid() {
+        return false;
+    }
+    let (Ok(target), Ok(foreground)) = (window_facts(target), window_facts(foreground)) else {
+        return false;
+    };
+    accepts_same_process(&target, identity.shell_host, &foreground)
 }
 
 pub(super) fn display(
@@ -450,50 +714,204 @@ pub(super) fn validate(
         .approved_target()
         .ok_or_else(|| invalid("an approved target reference is required"))?;
     let result = validate_reference(&id, operation, point);
-    if result.is_err() {
-        control.invalidate_target();
+    match result {
+        Ok(()) => Ok(()),
+        Err(Failure::Recoverable(error)) => Err(error),
+        Err(Failure::Fatal(error)) => {
+            control.invalidate_target();
+            Err(error)
+        }
     }
-    result
+}
+
+/// Validation for the second and later hops of `switch_virtual_desktop`. The first hop has
+/// already passed `validate`, so the approved window was foreground and on the current desktop.
+/// After a hop the approved window is on another desktop and a window of some other application
+/// holds the foreground, so the current-desktop and same-process rules cannot apply again. Every
+/// other check stays: cancellation and the session's target state, the unlocked Default input
+/// desktop, the approved window being the same live window with unchanged bounds and display
+/// layout, its integrity, and the integrity of whatever window holds the foreground and keyboard
+/// focus, since the shortcut goes to it. Anything unreadable refuses, so this fails closed.
+pub(super) fn validate_after_switch(control: &MutationControl) -> Result<(), PlatformError> {
+    let operation = super::input::DESKTOP_SWITCH_OPERATION;
+    control.check(operation)?;
+    control.check_target()?;
+    let id = control
+        .approved_target()
+        .ok_or_else(|| invalid("an approved target reference is required"))?;
+    match validate_switch_hop(&id, operation) {
+        Ok(()) => Ok(()),
+        Err(Failure::Recoverable(error)) => Err(error),
+        Err(Failure::Fatal(error)) => {
+            control.invalidate_target();
+            Err(error)
+        }
+    }
+}
+
+fn validate_switch_hop(id: &str, operation: &str) -> Result<(), Failure> {
+    ensure_interactive_input_desktop(operation)?;
+    let reference = lookup(id)?;
+    let hwnd = HWND(reference.identity.hwnd as *mut std::ffi::c_void);
+    let identity = cached_identity(hwnd)?;
+    let current_bounds = bounds(hwnd)?;
+    let displays = desktop::enumerate_displays()?;
+    reference.validate_unchanged(&identity, current_bounds, &displays)?;
+    cached_integrity(operation, hwnd).map_err(Failure::Fatal)?;
+    check_switch_foreground(
+        desktop::foreground_window_handle,
+        |window| privilege::ensure_window_integrity(operation, window),
+        || {
+            let mut gui = GUITHREADINFO {
+                cbSize: u32::try_from(std::mem::size_of::<GUITHREADINFO>())
+                    .map_err(|_| invalid("GUI thread record size is unavailable"))?,
+                ..Default::default()
+            };
+            // SAFETY: gui is a correctly sized writable record; zero queries the foreground
+            // thread.
+            unsafe { GetGUIThreadInfo(0, &raw mut gui) }.map_err(|_| {
+                refused(
+                    RefusalCause::DestinationUnidentified,
+                    "keyboard focus cannot be verified; observe again",
+                )
+            })?;
+            Ok(gui.hwndFocus)
+        },
+    )
+}
+
+/// The decision about the window that receives a later switch shortcut. With no foreground
+/// window the shortcut goes to the shell, which has nothing to check, and nothing else is read.
+/// Otherwise the foreground window and the keyboard-focus window must have a readable, acceptable
+/// integrity level, and a foreground that changed during the check is checked again.
+fn check_switch_foreground(
+    mut foreground: impl FnMut() -> HWND,
+    mut integrity: impl FnMut(HWND) -> Result<(), PlatformError>,
+    focus: impl FnOnce() -> Result<HWND, PlatformError>,
+) -> Result<(), Failure> {
+    let first = foreground();
+    if first.is_invalid() {
+        return Ok(());
+    }
+    recoverable(integrity(first))?;
+    let focused = recoverable(focus())?;
+    if !focused.is_invalid() {
+        recoverable(integrity(focused))?;
+    }
+    let after = foreground();
+    if after != first && !after.is_invalid() {
+        recoverable(integrity(after))?;
+    }
+    Ok(())
 }
 
 fn validate_reference(
     id: &str,
     operation: &str,
     point: Option<windows::Win32::Foundation::POINT>,
-) -> Result<(), PlatformError> {
+) -> Result<(), Failure> {
     controlfreak_core::timing::time("check_input_desktop", || {
         ensure_interactive_input_desktop(operation)
     })?;
-    let (hwnd, _) = resolve(id)?;
-    let foreground = desktop::foreground_window_handle();
-    controlfreak_core::timing::time("check_integrity", || {
-        privilege::ensure_window_integrity(operation, foreground)?;
-        privilege::ensure_window_integrity(operation, hwnd)
-    })?;
-    let on_current = controlfreak_core::timing::time("check_virtual_desktop", || {
-        desktop::with_virtual_desktop_manager(|manager| {
-            desktop::window_on_current_desktop(manager, hwnd)
-        })
-    })?
-    .unwrap_or(false);
-    if !on_current {
-        return Err(invalid("approved target left the current desktop"));
-    }
+    let hwnd = HWND(lookup(id)?.identity.hwnd as *mut std::ffi::c_void);
+    let current_identity = cached_identity(hwnd)?;
     let reference = lookup(id)?;
+    // SAFETY: IsWindow only inspects a borrowed handle.
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() || current_identity != reference.identity {
+        REFERENCES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|entry| entry.id != id);
+        return Err(Failure::Fatal(invalid(
+            "window, process lifetime, owner, or desktop changed",
+        )));
+    }
+    let foreground = desktop::foreground_window_handle();
+    // Integrity is checked on the actual windows involved: the foreground window, which may be
+    // a dialog or popup of the target's process rather than the target, and the target itself.
+    // A problem with the foreground window only refuses this action (the target is unchanged and
+    // the foreground can come back); a problem with the target itself ends the session.
+    if foreground.is_invalid() {
+        return Err(Failure::Recoverable(refused(
+            RefusalCause::NotForeground,
+            "no window holds the foreground right now; call focus_window to bring the target back",
+        )));
+    }
+    controlfreak_core::timing::time("check_integrity", || {
+        recoverable(cached_integrity(operation, foreground))?;
+        cached_integrity(operation, hwnd).map_err(Failure::Fatal)
+    })?;
+    // A shell surface is on every virtual desktop and has no desktop query result to compare.
+    if reference.identity.desktop != shell::ALL_DESKTOPS {
+        let on_current = controlfreak_core::timing::time("check_virtual_desktop", || {
+            desktop::with_virtual_desktop_manager(|manager| {
+                desktop::window_on_current_desktop(manager, hwnd)
+            })
+        })?
+        .unwrap_or(false);
+        if !on_current {
+            return Err(Failure::Fatal(invalid(
+                "approved target left the current desktop",
+            )));
+        }
+    }
     let current_bounds = bounds(hwnd)?;
     let displays =
         controlfreak_core::timing::time("enumerate_displays", desktop::enumerate_displays)?;
-    let current_identity = identity(hwnd)?;
-    let hit = if let Some(point) = point {
+    let target = window_facts(hwnd)?;
+    let foreground_facts = recoverable(window_facts(foreground).map_err(|_| {
+        refused(
+            RefusalCause::NotForeground,
+            "the foreground window cannot be identified; call focus_window to bring the target back",
+        )
+    }))?;
+    let mut hit = destination_hit(operation, point)?;
+    if let Some(hit) = &mut hit
+        && reference.identity.app_frame_host
+    {
+        hit.hosted_pid = hosted_content_pid(hwnd);
+    }
+    reference.validate_snapshot(
+        &current_identity,
+        current_bounds,
+        &displays,
+        &target,
+        &foreground_facts,
+        hit.as_ref(),
+    )?;
+    // A final foreground read follows the slower process, COM, and display queries. If a window
+    // appeared in between, it must pass the same integrity and process checks as the first.
+    let after = desktop::foreground_window_handle();
+    if after != foreground {
+        recoverable(cached_integrity(operation, after))?;
+        let after_facts = recoverable(window_facts(after).map_err(|_| {
+            refused(
+                RefusalCause::ForegroundChanged,
+                "foreground changed during target validation",
+            )
+        }))?;
+        if !accepts_same_process(&target, reference.identity.shell_host, &after_facts) {
+            return Err(Failure::Recoverable(refused(
+                RefusalCause::ForegroundChanged,
+                "foreground changed during target validation",
+            )));
+        }
+    }
+    Ok(arm_if_foreground(id)?)
+}
+
+/// The window that would receive this action's input: the one under the pointer, or the one
+/// with keyboard focus for keyboard operations, after its integrity check. `None` for operations
+/// that deliver no input to a destination.
+fn destination_hit(
+    operation: &str,
+    point: Option<windows::Win32::Foundation::POINT>,
+) -> Result<Option<Hit>, Failure> {
+    Ok(if let Some(point) = point {
         // SAFETY: These APIs inspect value coordinates and return borrowed window handles.
         let hit = unsafe { WindowFromPoint(point) };
-        // SAFETY: GetAncestor reads metadata for the borrowed hit window.
-        let root = unsafe { GetAncestor(hit, GA_ROOT) };
-        let mut pid = 0;
-        // SAFETY: pid is writable and this query retains no references to the hit window.
-        unsafe { GetWindowThreadProcessId(hit, Some(&raw mut pid)) };
-        privilege::ensure_point_integrity(operation, point)?;
-        Some((root.0 as usize, pid))
+        recoverable(privilege::ensure_point_integrity(operation, point))?;
+        Some(hit_facts(hit)?)
     } else if matches!(
         operation,
         "press_keys" | "type_text" | "switch_virtual_desktop"
@@ -504,30 +922,160 @@ fn validate_reference(
             ..Default::default()
         };
         // SAFETY: gui is a correctly sized writable record; zero queries the foreground thread.
-        unsafe { GetGUIThreadInfo(0, &raw mut gui) }
-            .map_err(|_| invalid("keyboard focus cannot be verified"))?;
-        privilege::ensure_window_integrity(operation, gui.hwndFocus)?;
-        // SAFETY: GetAncestor reads metadata for this borrowed focus window.
-        let root = unsafe { GetAncestor(gui.hwndFocus, GA_ROOT) };
-        let mut pid = 0;
-        // SAFETY: pid is writable and no pointers are retained.
-        unsafe { GetWindowThreadProcessId(gui.hwndFocus, Some(&raw mut pid)) };
-        Some((root.0 as usize, pid))
+        unsafe { GetGUIThreadInfo(0, &raw mut gui) }.map_err(|_| {
+            Failure::Recoverable(refused(
+                RefusalCause::DestinationUnidentified,
+                "keyboard focus cannot be verified; observe again",
+            ))
+        })?;
+        recoverable(privilege::ensure_window_integrity(operation, gui.hwndFocus))?;
+        Some(hit_facts(gui.hwndFocus)?)
     } else {
         None
+    })
+}
+
+/// The window an input event would reach, as the root window and the process of the window itself.
+/// A window that cannot be read is treated as belonging to a different process.
+fn hit_facts(window: HWND) -> Result<Hit, Failure> {
+    let unreadable = || {
+        Failure::Recoverable(refused(
+            RefusalCause::DestinationUnidentified,
+            "the input destination window cannot be identified; observe again",
+        ))
     };
-    reference.validate_snapshot(
-        &current_identity,
-        current_bounds,
-        &displays,
-        foreground.0 as usize,
-        hit,
-    )?;
-    // A final foreground read follows the slower process, COM, and display queries.
-    if desktop::foreground_window_handle() != hwnd {
-        return Err(invalid("foreground changed during target validation"));
+    if window.is_invalid() {
+        return Err(unreadable());
     }
-    arm_if_foreground(id)
+    // SAFETY: GetAncestor reads metadata for the borrowed window handle.
+    let root = unsafe { GetAncestor(window, GA_ROOT) };
+    let root = if root.is_invalid() { window } else { root };
+    let window = window_facts(window).map_err(|_| unreadable())?;
+    let root = window_facts(root).map_err(|_| unreadable())?;
+    Ok(Hit {
+        root,
+        window_pid: window.pid,
+        hosted_pid: None,
+    })
+}
+
+/// The process of the content window a packaged app hosts inside `frame`, if it has one.
+fn hosted_content_pid(frame: HWND) -> Option<u32> {
+    let class = windows::core::HSTRING::from(shell::CORE_WINDOW_CLASS);
+    // SAFETY: FindWindowExW only reads window metadata; `frame` is a handle value, a stale one
+    // simply finds nothing, and `class` outlives the synchronous call.
+    let content = unsafe { FindWindowExW(Some(frame), None, &class, None) }.ok()?;
+    let mut pid = 0;
+    // SAFETY: `pid` is writable for the synchronous call.
+    unsafe { GetWindowThreadProcessId(content, Some(&raw mut pid)) };
+    (pid != 0).then_some(pid)
+}
+
+/// Identity and integrity facts that cannot change within one input lock's scope in a way the
+/// per-frame checks would not catch. Validation runs for every frame of a timed move and every
+/// batch of typed text, and each identity query opens the process and asks the shell's virtual
+/// desktop manager, so those two results are reused for a short time inside one input lock.
+/// Foreground, hit-window, desktop-membership, bounds and display checks are never cached.
+const SCOPE_TTL: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct ScopeCache {
+    identity: Option<(usize, Identity, Instant)>,
+    integrity: Vec<(usize, u32, Instant)>,
+}
+
+impl ScopeCache {
+    fn fresh(at: Instant, now: Instant) -> bool {
+        now.saturating_duration_since(at) < SCOPE_TTL
+    }
+
+    fn identity(&self, hwnd: usize, now: Instant) -> Option<Identity> {
+        self.identity
+            .as_ref()
+            .filter(|(cached, _, at)| *cached == hwnd && Self::fresh(*at, now))
+            .map(|(_, identity, _)| identity.clone())
+    }
+
+    fn integrity_verified(&self, hwnd: usize, pid: u32, now: Instant) -> bool {
+        self.integrity
+            .iter()
+            .any(|(cached, owner, at)| *cached == hwnd && *owner == pid && Self::fresh(*at, now))
+    }
+
+    fn remember_integrity(&mut self, hwnd: usize, pid: u32, now: Instant) {
+        self.integrity.retain(|(_, _, at)| Self::fresh(*at, now));
+        self.integrity.push((hwnd, pid, now));
+    }
+}
+
+thread_local! {
+    static SCOPE: RefCell<Option<ScopeCache>> = const { RefCell::new(None) };
+}
+
+/// Enables the validation cache on this thread until dropped. Held by the input lock, so the
+/// cache never outlives one action's exclusive use of the desktop and is never shared by threads.
+pub(super) struct ValidationScope;
+
+impl ValidationScope {
+    pub(super) fn enter() -> Self {
+        SCOPE.with(|scope| *scope.borrow_mut() = Some(ScopeCache::default()));
+        Self
+    }
+}
+
+impl Drop for ValidationScope {
+    fn drop(&mut self) {
+        SCOPE.with(|scope| *scope.borrow_mut() = None);
+    }
+}
+
+fn cached_identity(hwnd: HWND) -> Result<Identity, PlatformError> {
+    let now = Instant::now();
+    let key = hwnd.0 as usize;
+    if let Some(identity) = SCOPE.with(|scope| {
+        scope
+            .borrow()
+            .as_ref()
+            .and_then(|cache| cache.identity(key, now))
+    }) {
+        return Ok(identity);
+    }
+    let identity = identity(hwnd)?;
+    SCOPE.with(|scope| {
+        if let Some(cache) = scope.borrow_mut().as_mut() {
+            cache.identity = Some((key, identity.clone(), now));
+        }
+    });
+    Ok(identity)
+}
+
+/// `privilege::ensure_window_integrity`, remembered per window and process within a scope.
+/// Only a pass is remembered; a refusal is always recomputed.
+fn cached_integrity(operation: &str, hwnd: HWND) -> Result<(), PlatformError> {
+    let now = Instant::now();
+    let key = hwnd.0 as usize;
+    let mut pid = 0;
+    // SAFETY: pid is writable and the query retains no pointers; an invalid handle reports zero.
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
+    if pid != 0
+        && SCOPE.with(|scope| {
+            scope
+                .borrow()
+                .as_ref()
+                .is_some_and(|cache| cache.integrity_verified(key, pid, now))
+        })
+    {
+        return Ok(());
+    }
+    privilege::ensure_window_integrity(operation, hwnd)?;
+    if pid != 0 {
+        SCOPE.with(|scope| {
+            if let Some(cache) = scope.borrow_mut().as_mut() {
+                cache.remember_integrity(key, pid, now);
+            }
+        });
+    }
+    Ok(())
 }
 
 /// Screen bounds of the approved window as observed when its reference was issued.
@@ -544,14 +1092,66 @@ pub(super) fn approved_window_bounds(
     })
 }
 
+/// Records after an action whether the approved target, or a window of its own process, still
+/// holds the foreground. A target that is gone or changed identity ends the session's approval;
+/// a target that merely lost the foreground to another process does not, because the next action
+/// checks the live foreground again.
 pub(super) fn evidence(control: &MutationControl) {
-    let remained = control.approved_target().is_some_and(|id| {
-        resolve(&id).is_ok_and(|(hwnd, _)| desktop::foreground_window_handle() == hwnd)
-    });
+    let approved = control.approved_target();
+    let target = approved.as_deref().and_then(|id| lookup(id).ok());
+    let intact = approved.as_deref().is_some_and(|id| resolve(id).is_ok());
+    let remained = intact
+        && target
+            .as_ref()
+            .is_some_and(|reference| foreground_serves(&reference.identity));
     control.target_foreground(remained);
-    if !remained {
+    if !intact {
         control.invalidate_target();
     }
+}
+
+/// The `click_text` check on the screen read: an observation that does not belong to the approved
+/// target generation is a retryable refusal, not a change of the target. The foreground or the
+/// window set moved while the screen was read, or the window in front cannot be identified; the
+/// session stays valid.
+pub(super) fn ensure_observation_matches(
+    approved: Option<&str>,
+    observed: Option<&str>,
+) -> Result<(), PlatformError> {
+    if approved.is_some_and(|approved| observation_matches_approved(approved, observed)) {
+        return Ok(());
+    }
+    Err(refused(
+        RefusalCause::ObservationStale,
+        "the foreground or the window set changed while the screen was read, or the window in front cannot be identified, so the text may belong to another window; call click_text again",
+    ))
+}
+
+/// Whether an observation's `target_ref` names the approved target or a window that may stand
+/// in for it (a same-process dialog or popup that was in front during the observation).
+fn observation_matches_approved(approved: &str, observed: Option<&str>) -> bool {
+    let Some(observed) = observed else {
+        return false;
+    };
+    if observed == approved {
+        return true;
+    }
+    let (Ok(approved), Ok(observed)) = (lookup(approved), lookup(observed)) else {
+        return false;
+    };
+    let (Ok(target), Ok(window)) = (
+        window_facts(HWND(approved.identity.hwnd as *mut std::ffi::c_void)),
+        window_facts(HWND(observed.identity.hwnd as *mut std::ffi::c_void)),
+    ) else {
+        return false;
+    };
+    accepts_same_process(&target, approved.identity.shell_host, &window)
+}
+
+/// Counts foreground changes, window destruction and desktop switches. Equal values at two
+/// moments mean none of those happened between them.
+pub(super) fn observation_generation() -> u64 {
+    OBSERVATION_GENERATION.load(Ordering::Acquire)
 }
 
 pub(super) fn observe() -> Option<(String, u64)> {
@@ -613,6 +1213,90 @@ mod tests {
         assert_eq!(window_owner(owned.0).unwrap(), parent.0);
     }
 
+    #[test]
+    fn hosted_content_pid_finds_only_a_direct_child_of_the_content_class_in_fixture_windows() {
+        use windows::{
+            Win32::{
+                System::LibraryLoader::GetModuleHandleW,
+                UI::WindowsAndMessaging::{
+                    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW,
+                    UnregisterClassW, WINDOW_EX_STYLE, WNDCLASSW, WS_CHILD, WS_POPUP,
+                },
+            },
+            core::{HSTRING, w},
+        };
+        struct Fixture(HWND);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                // SAFETY: The fixture owns this window, created and destroyed on this thread.
+                // Destroying a parent first destroys its children, which makes this a no-op error.
+                let _ = unsafe { DestroyWindow(self.0) };
+            }
+        }
+        unsafe extern "system" fn default_proc(
+            window: HWND,
+            message: u32,
+            wparam: windows::Win32::Foundation::WPARAM,
+            lparam: windows::Win32::Foundation::LPARAM,
+        ) -> windows::Win32::Foundation::LRESULT {
+            // SAFETY: The arguments are the ones the system passed to this window procedure.
+            unsafe { DefWindowProcW(window, message, wparam, lparam) }
+        }
+        // SAFETY: A null module name asks for this executable's handle; nothing is retained.
+        let instance = unsafe { GetModuleHandleW(None) }.unwrap();
+        let class = HSTRING::from(shell::CORE_WINDOW_CLASS);
+        let registration = WNDCLASSW {
+            lpfnWndProc: Some(default_proc),
+            hInstance: instance.into(),
+            lpszClassName: windows::core::PCWSTR(class.as_ptr()),
+            ..Default::default()
+        };
+        // SAFETY: The record and the class name outlive the call; the class is unregistered
+        // below once every window of it is gone.
+        assert_ne!(unsafe { RegisterClassW(&raw const registration) }, 0);
+        let create = |class: &windows::core::PCWSTR, style, parent: Option<HWND>| {
+            // SAFETY: Class and title strings outlive the call. Every window is created hidden,
+            // belongs to this test thread and never receives injected input or focus.
+            Fixture(
+                unsafe {
+                    CreateWindowExW(
+                        WINDOW_EX_STYLE::default(),
+                        *class,
+                        w!("ControlFreak hosted-content fixture"),
+                        style,
+                        0,
+                        0,
+                        10,
+                        10,
+                        parent,
+                        None,
+                        Some(instance.into()),
+                        None,
+                    )
+                }
+                .unwrap(),
+            )
+        };
+        let core = windows::core::PCWSTR(class.as_ptr());
+        let static_class = w!("STATIC");
+        let frame = create(&static_class, WS_POPUP, None);
+        assert_eq!(hosted_content_pid(frame.0), None);
+        // A window of the content class that is not inside the frame is not found.
+        let other_frame = create(&static_class, WS_POPUP, None);
+        let elsewhere = create(&core, WS_CHILD, Some(other_frame.0));
+        assert_eq!(hosted_content_pid(frame.0), None);
+        // Only a direct child counts, not a deeper descendant.
+        let wrapper = create(&static_class, WS_CHILD, Some(frame.0));
+        let nested = create(&core, WS_CHILD, Some(wrapper.0));
+        assert_eq!(hosted_content_pid(frame.0), None);
+        let content = create(&core, WS_CHILD, Some(frame.0));
+        assert_eq!(hosted_content_pid(frame.0), Some(std::process::id()));
+        assert_eq!(hosted_content_pid(other_frame.0), Some(std::process::id()));
+        drop((content, nested, wrapper, elsewhere, other_frame, frame));
+        // SAFETY: Every window of the class was destroyed above.
+        let _ = unsafe { UnregisterClassW(core, Some(instance.into())) };
+    }
+
     fn reference() -> Reference {
         Reference {
             id: "synthetic-reference".into(),
@@ -624,6 +1308,8 @@ mod tests {
                 owner: 0,
                 class: "fixture".into(),
                 desktop: "desktop-a".into(),
+                shell_host: false,
+                app_frame_host: false,
             },
             bounds: [-1920, -200, -920, 800],
             displays: vec![],
@@ -658,19 +1344,113 @@ mod tests {
                     is_primary: true,
                 }),
             }
+            // Every one of these is permanent: the session's target is gone or moved.
             assert!(
-                expected
-                    .validate_snapshot(
+                matches!(
+                    expected.validate_snapshot(
                         &current.identity,
                         current.bounds,
                         &current.displays,
-                        1,
+                        &target_facts(),
+                        &target_facts(),
                         None
-                    )
-                    .is_err(),
+                    ),
+                    Err(Failure::Fatal(_))
+                ),
                 "change {change}"
             );
         }
+    }
+
+    #[test]
+    fn a_later_switch_hop_still_refuses_changed_identity_bounds_and_display_layout() {
+        let expected = reference();
+        assert!(
+            expected
+                .validate_unchanged(&expected.identity, expected.bounds, &expected.displays)
+                .is_ok()
+        );
+        let mut moved = expected.bounds;
+        moved[0] += 1;
+        let mut other = expected.identity.clone();
+        other.created += 1;
+        let layout = [DisplayInfo {
+            id: "new".into(),
+            name: "synthetic".into(),
+            bounds: controlfreak_core::DisplayBounds {
+                left: 0,
+                top: 0,
+                width: 100,
+                height: 100,
+            },
+            is_primary: true,
+        }];
+        for result in [
+            expected.validate_unchanged(&expected.identity, moved, &expected.displays),
+            expected.validate_unchanged(&other, expected.bounds, &expected.displays),
+            expected.validate_unchanged(&expected.identity, expected.bounds, &layout),
+        ] {
+            assert!(matches!(result, Err(Failure::Fatal(_))));
+        }
+    }
+
+    fn window(value: isize) -> HWND {
+        HWND(value as *mut std::ffi::c_void)
+    }
+
+    fn denied() -> PlatformError {
+        refused(RefusalCause::DestinationUnidentified, "synthetic")
+    }
+
+    #[test]
+    fn a_later_switch_hop_checks_the_foreground_focus_and_a_foreground_that_changed() {
+        let none = window(0);
+        let accept = |_: HWND| Ok(());
+        let sequence = |values: Vec<HWND>| {
+            let mut values = values.into_iter();
+            move || values.next().unwrap_or(none)
+        };
+
+        // A foreign foreground of acceptable integrity is allowed, with or without focus.
+        assert!(
+            check_switch_foreground(sequence(vec![window(9), window(9)]), accept, || Ok(window(
+                10
+            )))
+            .is_ok()
+        );
+        assert!(
+            check_switch_foreground(sequence(vec![window(9), window(9)]), accept, || Ok(none))
+                .is_ok()
+        );
+        // No foreground window: the shortcut goes to the shell and nothing else is queried.
+        assert!(
+            check_switch_foreground(sequence(vec![none]), accept, || panic!("no focus query"))
+                .is_ok()
+        );
+        // Higher or unreadable integrity of any window involved refuses without ending approval.
+        for bad in [9, 10, 11] {
+            let result = check_switch_foreground(
+                sequence(vec![window(9), window(11)]),
+                |handle| {
+                    if handle == window(bad) {
+                        Err(denied())
+                    } else {
+                        Ok(())
+                    }
+                },
+                || Ok(window(10)),
+            );
+            assert!(matches!(result, Err(Failure::Recoverable(_))), "{bad}");
+        }
+        // A focus query that fails refuses.
+        assert!(matches!(
+            check_switch_foreground(sequence(vec![window(9)]), accept, || Err(denied())),
+            Err(Failure::Recoverable(_))
+        ));
+        // A foreground that changed to a window gone by the final read is not a refusal.
+        assert!(
+            check_switch_foreground(sequence(vec![window(9), none]), accept, || Ok(none)).is_ok()
+        );
     }
 
     #[test]
@@ -733,29 +1513,366 @@ mod tests {
         assert_eq!(cached[0].id, "other-2");
     }
 
-    #[test]
-    fn foreground_alone_does_not_authorize_pointer_dispatch() {
+    /// Window `hwnd` of process `pid`, unowned unless `root_owner` says otherwise.
+    fn facts(hwnd: usize, pid: u32, class: &str, root_owner: usize) -> WindowFacts {
+        WindowFacts {
+            hwnd,
+            pid,
+            class: class.into(),
+            root_owner,
+        }
+    }
+
+    /// The approved target of `reference()`: window 1 of process 2, unowned.
+    fn target_facts() -> WindowFacts {
+        facts(1, 2, "fixture", 1)
+    }
+
+    fn hit(root: WindowFacts, window_pid: u32) -> Hit {
+        Hit {
+            root,
+            window_pid,
+            hosted_pid: None,
+        }
+    }
+
+    fn check(foreground: &WindowFacts, point: Option<&Hit>) -> Result<(), Failure> {
         let expected = reference();
-        for hit in [None, Some((1, 2))] {
-            expected
-                .validate_snapshot(&expected.identity, expected.bounds, &[], 1, hit)
-                .unwrap();
-            assert!(
-                expected
-                    .validate_snapshot(&expected.identity, expected.bounds, &[], 99, hit)
-                    .is_err()
+        expected.validate_snapshot(
+            &expected.identity,
+            expected.bounds,
+            &[],
+            &target_facts(),
+            foreground,
+            point,
+        )
+    }
+
+    fn assert_recoverable(result: Result<(), Failure>, expect: &str) {
+        match result {
+            Err(Failure::Recoverable(error)) => {
+                assert!(error.to_string().contains(expect), "{error}");
+            }
+            Err(Failure::Fatal(error)) => {
+                panic!("expected a recoverable refusal, got fatal: {error}")
+            }
+            Ok(()) => panic!("expected a refusal"),
+        }
+    }
+
+    #[test]
+    fn the_target_and_its_own_process_may_hold_the_foreground() {
+        let target = target_facts();
+        check(&target, None).unwrap();
+        // An owned dialog, a popup menu and a drop-down of the same process.
+        for window in [
+            facts(10, 2, "#32770", 1),
+            facts(11, 2, POPUP_MENU_CLASS, 11),
+            facts(12, 2, "ComboLBox", 12),
+        ] {
+            check(&window, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn another_process_never_holds_the_foreground_whatever_it_looks_like() {
+        for window in [
+            facts(99, 3, "fixture", 99),
+            // Same class and an owner chain that reaches the target: still another process.
+            facts(98, 3, "fixture", 1),
+            facts(97, 3, POPUP_MENU_CLASS, 1),
+        ] {
+            assert_recoverable(check(&window, None), "no longer foreground");
+        }
+    }
+
+    #[test]
+    fn pointer_destinations_in_the_target_process_are_accepted_and_others_refused() {
+        let target = target_facts();
+        // The target itself, its dialog, and a popup menu opened by the target.
+        for root in [
+            facts(1, 2, "fixture", 1),
+            facts(10, 2, "#32770", 1),
+            facts(11, 2, POPUP_MENU_CLASS, 11),
+        ] {
+            check(&target, Some(&hit(root, 2))).unwrap();
+        }
+        // A foreign root window, even with the target in front.
+        assert_recoverable(
+            check(&target, Some(&hit(facts(99, 3, "fixture", 99), 3))),
+            "different process",
+        );
+        // A foreign child embedded in a window of the target's process.
+        assert_recoverable(
+            check(&target, Some(&hit(facts(1, 2, "fixture", 1), 3))),
+            "different process",
+        );
+        // A same-process dialog is no use if the foreground belongs to another process.
+        assert_recoverable(
+            check(
+                &facts(99, 3, "fixture", 99),
+                Some(&hit(facts(10, 2, "#32770", 1), 2)),
+            ),
+            "no longer foreground",
+        );
+    }
+
+    fn assert_refused_with(result: Result<(), Failure>, expected: RefusalCause) {
+        match result {
+            Err(Failure::Recoverable(PlatformError::TargetRefused { cause, .. })) => {
+                assert_eq!(cause, expected);
+                assert_eq!(
+                    PlatformError::refused(cause, "").retryable(),
+                    expected != RefusalCause::OwnIndicator
+                );
+            }
+            other => panic!("expected a typed refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recoverable_refusals_say_why_as_data() {
+        let target = target_facts();
+        assert_refused_with(
+            check(&facts(99, 3, "fixture", 99), None),
+            RefusalCause::NotForeground,
+        );
+        assert_refused_with(
+            check(&target, Some(&hit(facts(99, 3, "fixture", 99), 3))),
+            RefusalCause::ForeignDestination,
+        );
+        // A point under ControlFreak's own Stop button is named as such.
+        let own = std::process::id();
+        assert_refused_with(
+            check(&target, Some(&hit(facts(77, own, "Stop", 77), own))),
+            RefusalCause::OwnIndicator,
+        );
+    }
+
+    #[test]
+    fn an_unreadable_image_is_treated_as_a_shared_host() {
+        let windows = Some(r"C:\Windows");
+        assert!(is_shared_host(None, windows));
+        assert!(is_shared_host(Some(r"C:\Windows\explorer.exe"), None));
+        assert!(is_shared_host(
+            Some(r"C:\Windows\System32\ApplicationFrameHost.exe"),
+            windows
+        ));
+        assert!(!is_shared_host(Some(r"C:\Tools\app.exe"), windows));
+    }
+
+    #[test]
+    fn a_shared_host_target_does_not_accept_another_window_of_the_host_process() {
+        // Two packaged-app frames of one host process: only the owner chain is the same app.
+        let target = target_facts();
+        assert!(accepts_same_process(
+            &target,
+            false,
+            &facts(5, 2, "Frame", 5)
+        ));
+        assert!(!accepts_same_process(
+            &target,
+            true,
+            &facts(5, 2, "Frame", 5)
+        ));
+        assert!(accepts_same_process(
+            &target,
+            true,
+            &facts(6, 2, "#32770", 1)
+        ));
+    }
+
+    #[test]
+    fn losing_the_foreground_is_recoverable_and_a_changed_window_is_not() {
+        let expected = reference();
+        let foreign = facts(99, 3, "other", 99);
+        assert_recoverable(check(&foreign, None), "focus_window");
+        // The same reference passes again once the target is back in front.
+        check(&target_facts(), None).unwrap();
+        // Geometry, identity and desktop changes stay fatal even with the target in front.
+        let mut moved = expected.bounds;
+        moved[2] += 1;
+        assert!(matches!(
+            expected.validate_snapshot(
+                &expected.identity,
+                moved,
+                &[],
+                &target_facts(),
+                &target_facts(),
+                None
+            ),
+            Err(Failure::Fatal(_))
+        ));
+    }
+
+    #[test]
+    fn a_packaged_app_frame_accepts_its_own_hosted_content_window_and_nothing_else() {
+        // Frame window 1 runs in ApplicationFrameHost (process 2); its content window belongs to
+        // the app (process 9). Another app's content (process 8) sits in another frame.
+        let mut frame = reference();
+        frame.identity.shell_host = true;
+        frame.identity.app_frame_host = true;
+        let target = facts(1, 2, "ApplicationFrameWindow", 1);
+        let run = |frame_host: bool, point: Hit| {
+            let mut frame = frame.clone();
+            frame.identity.app_frame_host = frame_host;
+            frame.validate_snapshot(
+                &frame.identity,
+                frame.bounds,
+                &[],
+                &target,
+                &target,
+                Some(&point),
+            )
+        };
+        let content = |window_pid: u32, root: &WindowFacts, hosted: Option<u32>| Hit {
+            root: root.clone(),
+            window_pid,
+            hosted_pid: hosted,
+        };
+        // The frame's own content window, and the frame itself, receive input.
+        run(true, content(9, &target, Some(9))).unwrap();
+        run(true, content(2, &target, Some(9))).unwrap();
+        // A process that is not the hosted app's is refused, as is a hosted pid for a window in
+        // another frame, and a frame whose hosted content cannot be found.
+        let other_frame = facts(60, 2, "ApplicationFrameWindow", 60);
+        assert_recoverable(run(true, content(8, &target, Some(9))), "different process");
+        assert_recoverable(
+            run(true, content(9, &other_frame, Some(9))),
+            "different process",
+        );
+        assert_recoverable(run(true, content(9, &target, None)), "different process");
+        // Without the frame-host identity the same facts are refused: a hosted pid alone never
+        // widens the rule for an ordinary target.
+        assert_recoverable(
+            run(false, content(9, &target, Some(9))),
+            "different process",
+        );
+    }
+
+    #[test]
+    fn a_shell_hosted_target_does_not_approve_the_rest_of_the_shell() {
+        // File Explorer window 1 and the taskbar share explorer.exe (process 2).
+        let mut explorer = reference();
+        explorer.identity.shell_host = true;
+        let target = facts(1, 2, "CabinetWClass", 1);
+        let taskbar = facts(50, 2, "Shell_TrayWnd", 50);
+        let other_folder = facts(51, 2, "CabinetWClass", 51);
+        let desktop = facts(52, 2, "WorkerW", 52);
+        let dialog = facts(53, 2, "#32770", 1);
+        let menu = facts(54, 2, POPUP_MENU_CLASS, 54);
+        let run = |foreground: &WindowFacts, point: Option<&Hit>| {
+            explorer.validate_snapshot(
+                &explorer.identity,
+                explorer.bounds,
+                &[],
+                &target,
+                foreground,
+                point,
+            )
+        };
+        run(&target, None).unwrap();
+        run(&dialog, None).unwrap();
+        run(&menu, None).unwrap();
+        run(&target, Some(&hit(menu.clone(), 2))).unwrap();
+        for foreign in [&taskbar, &other_folder, &desktop] {
+            assert_recoverable(run(foreign, None), "no longer foreground");
+            assert_recoverable(
+                run(&target, Some(&hit(foreign.clone(), 2))),
+                "different process",
             );
         }
-        assert!(
-            expected
-                .validate_snapshot(&expected.identity, expected.bounds, &[], 1, Some((99, 2)))
-                .is_err()
+        // A taskbar target accepts the taskbar's own menus but not File Explorer windows.
+        let tray_target = facts(50, 2, "Shell_TrayWnd", 50);
+        let accepts = |window: &WindowFacts| accepts_same_process(&tray_target, true, window);
+        assert!(accepts(&tray_target) && accepts(&menu));
+        assert!(!accepts(&target) && !accepts(&other_folder));
+    }
+
+    #[test]
+    fn same_process_acceptance_is_a_pure_function_of_process_owner_and_menu_class() {
+        let target = target_facts();
+        assert!(accepts_same_process(&target, false, &facts(7, 2, "any", 7)));
+        assert!(!accepts_same_process(
+            &target,
+            false,
+            &facts(7, 3, "any", 1)
+        ));
+        assert!(accepts_same_process(&target, true, &target));
+        assert!(!accepts_same_process(&target, true, &facts(7, 2, "any", 7)));
+        assert!(accepts_same_process(&target, true, &facts(7, 2, "any", 1)));
+        assert!(!accepts_same_process(
+            &target,
+            true,
+            &facts(7, 3, POPUP_MENU_CLASS, 1)
+        ));
+    }
+
+    #[test]
+    fn foreground_changes_keep_references_and_desktop_switches_do_not() {
+        // The WinEvent callback no longer touches references on a foreground change; this
+        // pins the retained behaviour of the other two retirement paths.
+        let approved = reference();
+        let mut references = VecDeque::from([approved.clone()]);
+        retire_window(&mut references, 12345);
+        assert_eq!(
+            references.len(),
+            1,
+            "an unrelated window destruction keeps it"
         );
+        retire_window(&mut references, approved.identity.hwnd);
+        assert!(references.is_empty(), "the target's destruction retires it");
+        let mut owned = reference();
+        owned.identity.hwnd = 77;
+        owned.identity.owner = 5;
+        let mut references = VecDeque::from([owned]);
+        retire_window(&mut references, 5);
         assert!(
-            expected
-                .validate_snapshot(&expected.identity, expected.bounds, &[], 1, Some((1, 99)))
-                .is_err()
+            references.is_empty(),
+            "an owner's destruction retires its dialogs"
         );
+    }
+
+    #[test]
+    fn scope_cache_reuses_results_only_briefly_and_only_for_the_same_window() {
+        let start = Instant::now();
+        let mut cache = ScopeCache::default();
+        let fixture = reference().identity;
+        assert!(cache.identity(1, start).is_none());
+        cache.identity = Some((1, fixture.clone(), start));
+        assert!(cache.identity(1, start + SCOPE_TTL / 2).is_some());
+        assert!(
+            cache.identity(2, start + SCOPE_TTL / 2).is_none(),
+            "another window"
+        );
+        assert!(cache.identity(1, start + SCOPE_TTL).is_none(), "expired");
+
+        assert!(!cache.integrity_verified(1, 2, start));
+        cache.remember_integrity(1, 2, start);
+        assert!(cache.integrity_verified(1, 2, start + SCOPE_TTL / 2));
+        assert!(
+            !cache.integrity_verified(1, 3, start),
+            "a different process"
+        );
+        assert!(!cache.integrity_verified(9, 2, start), "a different window");
+        assert!(
+            !cache.integrity_verified(1, 2, start + SCOPE_TTL),
+            "expired"
+        );
+        // Expired entries are dropped when new ones are added.
+        cache.remember_integrity(4, 5, start + SCOPE_TTL * 2);
+        assert_eq!(cache.integrity.len(), 1);
+    }
+
+    #[test]
+    fn validation_scopes_are_per_thread_and_cleared_on_drop() {
+        let scope = ValidationScope::enter();
+        assert!(SCOPE.with(|cell| cell.borrow().is_some()));
+        std::thread::spawn(|| assert!(SCOPE.with(|cell| cell.borrow().is_none())))
+            .join()
+            .unwrap();
+        drop(scope);
+        assert!(SCOPE.with(|cell| cell.borrow().is_none()));
     }
 
     #[test]
@@ -788,15 +1905,12 @@ mod tests {
     }
 
     #[test]
-    fn focus_theft_retires_approval_even_if_focus_later_returns() {
-        let mut approved = reference();
-        approved.armed = true;
-        let mut discovered = reference();
-        discovered.id = "not-yet-approved".into();
-        let mut references = VecDeque::from([approved, discovered]);
-        retire_foreground(&mut references, 99);
-        retire_foreground(&mut references, 1);
-        assert_eq!(references.len(), 1);
-        assert_eq!(references[0].id, "not-yet-approved");
+    fn a_stale_text_observation_is_a_retryable_refusal_that_keeps_the_session() {
+        for (approved, observed) in [(Some("approved"), None), (None, Some("approved"))] {
+            let error = ensure_observation_matches(approved, observed).unwrap_err();
+            assert_eq!(error.reason_code(), Some("observation_stale"));
+            assert!(error.retryable());
+        }
+        assert!(ensure_observation_matches(Some("approved"), Some("approved")).is_ok());
     }
 }

@@ -22,26 +22,23 @@ use controlfreak_core::{
     MouseDragRequest, MouseMoveRequest, MousePosition, MouseScrollRequest, MutationControl,
     ObservationMode, ObservationOptions, OcrBackend, OcrLine, OcrRegionRequest, OcrResult, OcrWord,
     PermissionDescriptor, PermissionId, PermissionState, Platform, PlatformError,
-    PointerActionResult, PointerBackend, SecurityContext, TextInputRequest,
-    VirtualDesktopDirection, VirtualDesktopInfo, VirtualDesktopList, VirtualDesktopSwitchRequest,
-    VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest, VisualChangeResult,
-    WaitForChangeSinceRequest, WaitForVisualChangeRequest, WaitForWindowRequest, WindowBackend,
+    PointerActionResult, PointerBackend, SecurityContext, TextInputRequest, VirtualDesktopInfo,
+    VirtualDesktopList, VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult, VisualBaseline,
+    VisualBaselineRequest, VisualChangeResult, WaitForChangeSinceRequest, WaitForTextRequest,
+    WaitForTextResult, WaitForVisualChangeRequest, WaitForWindowRequest, WindowBackend,
     WindowBounds, WindowFocusResult, WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
 };
 use windows::Win32::{
-    Foundation::{E_ACCESSDENIED, HWND, LPARAM, POINT, RECT, RPC_E_CHANGED_MODE},
+    Foundation::{HWND, LPARAM, POINT, RECT},
     Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
     Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
-        CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC,
-        GetDIBits, GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONEAREST,
-        MONITORINFOEXW, MonitorFromWindow, ReleaseDC, SRCCOPY, SelectObject,
+        CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits,
+        GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW,
+        MonitorFromWindow, ReleaseDC, SRCCOPY, SelectObject,
     },
-    System::Com::{
-        CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
-    },
+    System::Com::{CLSCTX_ALL, CoCreateInstance},
     UI::{
-        HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
         Input::KeyboardAndMouse::{
             INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
             KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSE_EVENT_FLAGS,
@@ -54,8 +51,7 @@ use windows::Win32::{
             EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetCursorPos, GetForegroundWindow,
             GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
             GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, MONITORINFOF_PRIMARY,
-            SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindowAsync, WS_EX_APPWINDOW,
-            WS_EX_TOOLWINDOW,
+            SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindowAsync, WS_EX_TOOLWINDOW,
         },
     },
 };
@@ -65,7 +61,7 @@ mod activation;
 mod ocr;
 mod target;
 pub(crate) use ocr::serve_ocr_helper;
-use ocr::{OcrHelperPool, recognize_text_with_helper};
+use ocr::{OcrHelperPool, recognize_text_with_helper_fingerprinted};
 mod arbitration;
 mod capture;
 mod desktop;
@@ -75,7 +71,9 @@ mod indicator;
 mod input;
 mod privilege;
 mod process;
+mod shell;
 mod stop;
+mod win32;
 pub use stop::{SessionSignals, UserStop};
 
 pub use arbitration::DesktopArbitrator;
@@ -102,16 +100,17 @@ pub(crate) fn server_security_context(
     privilege::current_security_context(elevated_operation_allowed)
 }
 use capture::{
-    baseline_process_nonce, capture_bounds, capture_comparison_frame, capture_display_bounds,
-    capture_display_image, display_bounds_from_window, display_region_bounds, frame_fingerprint,
-    observe_display, observe_foreground, recognize_text as recognize_text_in_process,
-    validate_max_width, validate_visual_wait, validate_wait_values, wait_for_change,
+    baseline_process_nonce, capture_comparison_frame, capture_display_bounds,
+    capture_display_image, capture_window_bounds, display_bounds_from_window,
+    display_region_bounds, frame_fingerprint, observe_display, observe_foreground,
+    recognize_text_fingerprinted, validate_max_width, validate_visual_wait, validate_wait_values,
+    wait_for_change,
 };
 use desktop::{
-    ComApartment, activate_window, current_cursor_position, current_virtual_desktop_id,
-    ensure_dpi_awareness, enumerate_displays, enumerate_window_candidates, enumerate_windows,
-    find_display, find_display_at_point, find_window, foreground_window_handle, issue_candidate,
-    parse_window_id, restore_window, validate_window_wait, virtual_desktop_manager,
+    activate_window, current_cursor_position, current_virtual_desktop_id, ensure_dpi_awareness,
+    enumerate_displays, enumerate_window_candidates, enumerate_windows, find_display,
+    find_display_at_point, find_window, foreground_window_handle, initialize_com, issue_candidate,
+    resolve_window_reference, restore_window, validate_window_wait, virtual_desktop_manager,
     window_desktop_id, window_info, window_is_on_current_desktop, window_matches,
 };
 use environment::ensure_interactive_input_desktop;
@@ -128,20 +127,19 @@ use windows::{
     core::HSTRING,
 };
 
+use controlfreak_core::limits::{
+    MAX_CAPTURE_WIDTH, MAX_MOVE_DURATION_MS, MAX_SCROLL_DELTA, MAX_TEXT_UTF16_UNITS, MAX_WAIT_MS,
+};
+
 const MAX_CAPTURE_BYTES: usize = 512 * 1024 * 1024;
-const MAX_MOVE_DURATION_MS: u32 = 10_000;
-const MAX_SCROLL_DELTA: u32 = 12_000;
 const MOVE_FRAME_MS: u64 = 16;
 const POST_INPUT_SETTLE_MS: u64 = 75;
 const POST_FOCUS_SETTLE_MS: u64 = 150;
 const MAX_ACTION_IMAGE_WIDTH: u32 = 1_280;
-const MAX_TEXT_UTF16_UNITS: usize = 4_000;
 const MAX_CHORD_KEYS: usize = 8;
 const MAX_WINDOWS: usize = 200;
 const MAX_WINDOW_TITLE_UTF16_UNITS: usize = 512;
 const MAX_CLICK_COUNT: u8 = 3;
-const MAX_CAPTURE_WIDTH: u32 = 7_680;
-const MAX_WAIT_MS: u32 = 30_000;
 const VISUAL_POLL_MS: u64 = 100;
 const VISUAL_COMPARE_WIDTH: u32 = 320;
 const MAX_DESKTOP_SWITCH_STEPS: u8 = 10;
@@ -183,9 +181,14 @@ pub struct Backend {
 }
 
 struct NativeActivation<'a> {
+    /// The session's approved target. The window being activated is `window_id`, which is the
+    /// target itself or a window of the same process (a dialog of the approved application).
+    approved_id: &'a str,
     window_id: &'a str,
     hwnd: HWND,
-    initial_foreground: String,
+    /// The window in front when activation began, kept as a plain handle: that window may be one
+    /// that cannot be given a target reference, and the refusal below needs only its identity.
+    initial_foreground: HWND,
     minimized: bool,
     control: &'a MutationControl,
     started: Instant,
@@ -198,18 +201,39 @@ impl activation::Activation for NativeActivation<'_> {
             .activation_progress(self.attempts, self.elapsed_ms());
         self.control.check_target()?;
         self.control.check("focus_window")?;
-        find_window(self.window_id).map_err(|_| PlatformError::TargetInvalidated {
-            reason: "the approved window no longer exists".into(),
+        find_window(self.window_id).map_err(|_| {
+            if self.window_id == self.approved_id {
+                PlatformError::TargetInvalidated {
+                    reason: "the approved window no longer exists".into(),
+                }
+            } else {
+                PlatformError::InvalidArgument {
+                    argument: "window_id".into(),
+                    reason: "the window no longer exists".into(),
+                }
+            }
         })?;
         Backend::ensure_window_input_target("focus_window", self.hwnd)?;
         let foreground = foreground_window_handle();
-        Backend::ensure_window_input_target("focus_window", foreground)?;
-        if foreground != self.hwnd && foreground != target::resolve(&self.initial_foreground)?.0 {
-            return Err(PlatformError::TargetInvalidated {
-                reason: "foreground ownership changed during activation".into(),
-            });
+        if foreground.is_invalid() {
+            // Windows briefly has no foreground window while it hands activation over.
+            return Ok(false);
         }
-        Ok(foreground == self.hwnd)
+        Backend::ensure_window_input_target("focus_window", foreground)?;
+        if foreground == self.hwnd {
+            return Ok(true);
+        }
+        // Another window of the approved application (it opened a dialog, or Windows handed it
+        // activation) is not a change of owner; only another process taking the foreground is.
+        if foreground != self.initial_foreground
+            && !target::window_serves_target(self.approved_id, foreground)
+        {
+            return Err(PlatformError::refused(
+                controlfreak_core::RefusalCause::ForegroundChanged,
+                "another process took the foreground during activation; try again, or ask the user to click the target window",
+            ));
+        }
+        Ok(false)
     }
 
     fn activate(&mut self) -> Result<bool, PlatformError> {
@@ -236,7 +260,7 @@ impl activation::Activation for NativeActivation<'_> {
         let accepted = activate_window(self.hwnd);
         if accepted {
             self.control.dispatch_accepted(0);
-            target::arm_if_foreground(self.window_id)?;
+            target::arm_if_foreground(self.approved_id)?;
         } else {
             self.control.dispatch_rejected(previous);
         }
@@ -298,13 +322,71 @@ impl Backend {
         request: &OcrRegionRequest,
         control: &MutationControl,
     ) -> Result<OcrResult, PlatformError> {
+        self.recognize_text_fingerprinted(request, control)
+            .map(|(result, _)| result)
+    }
+
+    /// Recognizes text and returns the fingerprint of the exact frame that was recognized, if
+    /// the recognizer reported one.
+    fn recognize_text_fingerprinted(
+        &self,
+        request: &OcrRegionRequest,
+        control: &MutationControl,
+    ) -> Result<(OcrResult, Option<u64>), PlatformError> {
         let target_before = target::observe();
-        let mut result = self.ocr_helper.as_ref().map_or_else(
-            || recognize_text_in_process(request, control),
-            |command| recognize_text_with_helper(command, &self.ocr_helpers, request, control),
+        let (mut result, fingerprint) = self.ocr_helper.as_ref().map_or_else(
+            || {
+                recognize_text_fingerprinted(request, control)
+                    .map(|(result, fingerprint)| (result, Some(fingerprint)))
+            },
+            |command| {
+                recognize_text_with_helper_fingerprinted(
+                    command,
+                    &self.ocr_helpers,
+                    request,
+                    control,
+                )
+            },
         )?;
         result.target_ref = target::finish_observation(target_before);
-        Ok(result)
+        Ok((result, fingerprint))
+    }
+
+    fn find_text_fingerprinted(
+        &self,
+        request: &FindTextRequest,
+        control: &MutationControl,
+    ) -> Result<(FindTextResult, Option<u64>), PlatformError> {
+        control.check("find_text_on_screen")?;
+        controlfreak_core::validate_text_discovery(
+            &request.query,
+            request.match_mode,
+            request.ocr_confusions,
+            request.max_results,
+        )?;
+        let (ocr, fingerprint) = self.recognize_text_fingerprinted(&request.region, control)?;
+        let details = controlfreak_core::discover_text(
+            &ocr.lines,
+            &request.region,
+            &request.query,
+            request.case_sensitive,
+            request.match_mode,
+            request.ocr_confusions,
+            request.max_results,
+        )?;
+        let matches = details.candidates.clone();
+        Ok((
+            FindTextResult {
+                target_ref: ocr.target_ref,
+                query: request.query.clone(),
+                display: ocr.display,
+                source_bounds: ocr.source_bounds,
+                language: ocr.language,
+                matches,
+                details,
+            },
+            fingerprint,
+        ))
     }
 }
 
@@ -407,7 +489,10 @@ impl DisplayBackend for Backend {
         &self,
         request: &WaitForVisualChangeRequest,
     ) -> Result<VisualChangeResult, PlatformError> {
-        self.wait_for_visual_change_controlled(request, &MutationControl::default())
+        self.wait_for_visual_change_controlled(
+            request,
+            &controlfreak_core::MutationControl::default(),
+        )
     }
 
     fn wait_for_visual_change_controlled(
@@ -490,7 +575,10 @@ impl DisplayBackend for Backend {
         &self,
         request: &WaitForChangeSinceRequest,
     ) -> Result<VisualChangeResult, PlatformError> {
-        self.wait_for_change_since_controlled(request, &MutationControl::default())
+        self.wait_for_change_since_controlled(
+            request,
+            &controlfreak_core::MutationControl::default(),
+        )
     }
 
     fn wait_for_change_since_controlled(
@@ -540,6 +628,78 @@ impl DisplayBackend for Backend {
     }
 }
 
+/// The result of the previous `wait_for_text` pass, tied to the fingerprint of the exact frame
+/// that recognition read and to the foreground, window set and desktop it was taken under.
+struct PassCache<T> {
+    last: Option<(T, u64, u64)>,
+}
+
+impl<T> Default for PassCache<T> {
+    fn default() -> Self {
+        Self { last: None }
+    }
+}
+
+impl<T: Clone> PassCache<T> {
+    /// Runs one pass. `frame` is the fingerprint of a fresh read of the region, or `None` if it
+    /// could not be read. The previous result stands only if that read matches the frame the
+    /// previous result was recognized from and the generation is unchanged, so nothing on
+    /// screen could have changed the text. Otherwise `recognize` runs, and its result is kept
+    /// only if the recognizer reported the fingerprint of the frame it read. A comparison read
+    /// is never the key for a result computed from another read.
+    fn pass(
+        &mut self,
+        frame: Option<u64>,
+        generation: u64,
+        recognize: impl FnOnce() -> Result<(T, Option<u64>), PlatformError>,
+    ) -> Result<T, PlatformError> {
+        if let (Some((result, recognized, observed)), Some(frame)) = (&self.last, frame)
+            && *recognized == frame
+            && *observed == generation
+        {
+            return Ok(result.clone());
+        }
+        self.last = None;
+        let (result, recognized) = recognize()?;
+        self.last = recognized.map(|recognized| (result.clone(), recognized, generation));
+        Ok(result)
+    }
+}
+
+/// Where the requested region is on screen right now, or `None` if it cannot be resolved.
+fn current_region_bounds(region: &OcrRegionRequest) -> Option<controlfreak_core::DisplayBounds> {
+    ensure_dpi_awareness().ok()?;
+    let display = find_display(&region.display_id).ok()?;
+    display_region_bounds(&display, region.x, region.y, region.width, region.height).ok()
+}
+
+/// Keeps a pixel watch and its cache tied to where the region is now. A cached result is only
+/// reused while the watch still covers the region's current rectangle; when the region moved or
+/// cannot be resolved (the display layout changed mid-wait) the cache is dropped and the watch
+/// rebuilt, so the next pass recognizes text again and reports any layout error truthfully.
+fn reconcile_watch<W, T>(
+    watch: &mut Option<(W, controlfreak_core::DisplayBounds)>,
+    cache: &mut PassCache<T>,
+    current: Option<controlfreak_core::DisplayBounds>,
+    rebuild: impl FnOnce() -> Option<(W, controlfreak_core::DisplayBounds)>,
+) {
+    if watch.as_ref().map(|(_, bounds)| *bounds) != current {
+        *cache = PassCache::default();
+        *watch = if current.is_some() { rebuild() } else { None };
+    }
+}
+
+/// A pixel watch over an OCR region, or `None` if the region cannot be watched, in which case
+/// every pass recognizes text.
+fn region_change_watch(
+    region: &OcrRegionRequest,
+) -> Option<(capture::RegionChange, controlfreak_core::DisplayBounds)> {
+    let bounds = current_region_bounds(region)?;
+    capture::RegionChange::new(bounds)
+        .ok()
+        .map(|watch| (watch, bounds))
+}
+
 /// Refuses a stored baseline whose display moved, resized, or disappeared since capture.
 fn ensure_baseline_display(
     captured: &DisplayInfo,
@@ -560,7 +720,7 @@ fn ensure_baseline_display(
 
 impl OcrBackend for Backend {
     fn read_text_in_region(&self, request: &OcrRegionRequest) -> Result<OcrResult, PlatformError> {
-        self.read_text_in_region_controlled(request, &MutationControl::default())
+        self.read_text_in_region_controlled(request, &controlfreak_core::MutationControl::default())
     }
 
     fn read_text_in_region_controlled(
@@ -576,7 +736,7 @@ impl OcrBackend for Backend {
         &self,
         request: &FindTextRequest,
     ) -> Result<FindTextResult, PlatformError> {
-        self.find_text_on_screen_controlled(request, &MutationControl::default())
+        self.find_text_on_screen_controlled(request, &controlfreak_core::MutationControl::default())
     }
 
     fn find_text_on_screen_controlled(
@@ -584,37 +744,43 @@ impl OcrBackend for Backend {
         request: &FindTextRequest,
         control: &MutationControl,
     ) -> Result<FindTextResult, PlatformError> {
-        control.check("find_text_on_screen")?;
-        controlfreak_core::validate_text_discovery(
-            &request.query,
-            request.match_mode,
-            request.ocr_confusions,
-            request.max_results,
-        )?;
-        let ocr = self.recognize_text(&request.region, control)?;
-        let details = controlfreak_core::discover_text(
-            &ocr.lines,
-            &request.region,
-            &request.query,
-            request.case_sensitive,
-            request.match_mode,
-            request.ocr_confusions,
-            request.max_results,
-        )?;
-        let matches = details.candidates.clone();
-        Ok(FindTextResult {
-            target_ref: ocr.target_ref,
-            query: request.query.clone(),
-            display: ocr.display,
-            source_bounds: ocr.source_bounds,
-            language: ocr.language,
-            matches,
-            details,
-        })
+        self.find_text_fingerprinted(request, control)
+            .map(|(result, _)| result)
     }
 
-    fn click_text(&self, request: &ClickTextRequest) -> Result<ClickTextResult, PlatformError> {
-        self.click_text_controlled(request, &MutationControl::default())
+    /// Waits for text with a pixel check in front of each recognition pass. If every pixel of
+    /// the region matches the previous pass and the foreground has not changed, nothing on screen
+    /// could have changed the text, so the previous result stands and recognition (the expensive
+    /// part) is skipped. Any doubt, such as a region that cannot be read, runs recognition.
+    fn wait_for_text_controlled(
+        &self,
+        request: &WaitForTextRequest,
+        control: &MutationControl,
+    ) -> Result<WaitForTextResult, PlatformError> {
+        let mut watch = region_change_watch(&request.find.region);
+        let mut cache = PassCache::default();
+        controlfreak_core::wait_for_text_with(request, control, || {
+            reconcile_watch(
+                &mut watch,
+                &mut cache,
+                current_region_bounds(&request.find.region),
+                || region_change_watch(&request.find.region),
+            );
+            let generation = target::observation_generation();
+            let frame = watch
+                .as_mut()
+                .and_then(|(watch, _)| watch.fingerprint().ok());
+            cache.pass(frame, generation, || {
+                let (result, fingerprint) = self.find_text_fingerprinted(&request.find, control)?;
+                // Recognition resolves the display again on every pass. If it read another
+                // rectangle than the watch does (the layout changed mid-wait), two frames of
+                // the same colour could look equal, so the result is not kept.
+                let same_rectangle = watch
+                    .as_ref()
+                    .is_some_and(|(_, bounds)| *bounds == result.source_bounds);
+                Ok((result, fingerprint.filter(|_| same_rectangle)))
+            })
+        })
     }
 
     fn click_text_controlled(
@@ -633,12 +799,14 @@ impl OcrBackend for Backend {
         let input_generation = self.input_generation.load(Ordering::Acquire);
         let ocr = self.recognize_text(&request.region, control)?;
         target::validate(control, "click_text", None)?;
-        if ocr.target_ref != control.approved_target() {
-            control.invalidate_target();
-            return Err(target::invalid(
-                "OCR observation no longer belongs to the approved target generation",
-            ));
-        }
+        // The observation must have been taken with the approved window, or a window of its own
+        // process such as a dialog, in front and unchanged. If not, the text may belong to
+        // something else, so this click is refused; the session itself stays valid because every
+        // action re-checks the live foreground.
+        target::ensure_observation_matches(
+            control.approved_target().as_deref(),
+            ocr.target_ref.as_deref(),
+        )?;
         // Search result limits must not hide eligible lines from the uniqueness check.
         let candidate = controlfreak_core::select_text_candidate(
             &ocr.lines,
@@ -681,13 +849,13 @@ impl WindowBackend for Backend {
 
     fn list_virtual_desktops(&self) -> Result<VirtualDesktopList, PlatformError> {
         ensure_dpi_awareness()?;
-        let _apartment = ComApartment::initialize()?;
+        let _apartment = initialize_com()?;
         let manager = virtual_desktop_manager()?;
         let current_id = current_virtual_desktop_id(&manager);
         let mut current_ids = std::collections::BTreeSet::<String>::new();
         let mut grouped = std::collections::BTreeMap::<String, Vec<WindowInfo>>::new();
         for window in enumerate_windows()?.0 {
-            let Ok((hwnd, _)) = parse_window_id(&window.id) else {
+            let Ok((hwnd, _)) = resolve_window_reference(&window.id) else {
                 continue;
             };
             let Ok(desktop_id) = window_desktop_id(&manager, hwnd) else {
@@ -724,13 +892,6 @@ impl WindowBackend for Backend {
         })
     }
 
-    fn switch_virtual_desktop(
-        &self,
-        request: &VirtualDesktopSwitchRequest,
-    ) -> Result<VirtualDesktopSwitchResult, PlatformError> {
-        self.switch_virtual_desktop_controlled(request, &MutationControl::default())
-    }
-
     fn switch_virtual_desktop_controlled(
         &self,
         request: &VirtualDesktopSwitchRequest,
@@ -744,27 +905,28 @@ impl WindowBackend for Backend {
                 reason: format!("must be between 1 and {MAX_DESKTOP_SWITCH_STEPS}"),
             });
         }
-        let _apartment = ComApartment::initialize()?;
+        let _apartment = initialize_com()?;
         let manager = virtual_desktop_manager()?;
         let before = current_virtual_desktop_id(&manager);
-        let arrow = match request.direction {
-            VirtualDesktopDirection::Left => Key::ArrowLeft,
-            VirtualDesktopDirection::Right => Key::ArrowRight,
-        };
         let _guard = self.lock_input(control)?;
         ensure_interactive_input_desktop("switch_virtual_desktop")?;
-        for _ in 0..request.steps {
-            control.check("switch_virtual_desktop")?;
-            send_key_chord(
-                "switch_virtual_desktop",
-                &[Key::Ctrl, Key::Win, arrow],
-                control,
-                || target::validate(control, "switch_virtual_desktop", None),
-            )?;
-            controlfreak_core::timing::time("settle", || {
-                thread::sleep(Duration::from_millis(DESKTOP_SWITCH_SETTLE_MS));
-            });
-        }
+        input::send_desktop_switch_hops(
+            request.direction,
+            request.steps,
+            control,
+            |hop| {
+                if hop == 0 {
+                    target::validate(control, "switch_virtual_desktop", None)
+                } else {
+                    target::validate_after_switch(control)
+                }
+            },
+            || {
+                controlfreak_core::timing::time("settle", || {
+                    thread::sleep(Duration::from_millis(DESKTOP_SWITCH_SETTLE_MS));
+                });
+            },
+        )?;
         control.input_complete();
         target::evidence(control);
         let after = current_virtual_desktop_id(&manager);
@@ -778,13 +940,6 @@ impl WindowBackend for Backend {
         })
     }
 
-    fn focus_window(
-        &self,
-        request: &FocusWindowRequest,
-    ) -> Result<WindowFocusResult, PlatformError> {
-        self.focus_window_controlled(request, &MutationControl::default())
-    }
-
     fn focus_window_controlled(
         &self,
         request: &FocusWindowRequest,
@@ -795,20 +950,26 @@ impl WindowBackend for Backend {
         let _guard = self.lock_input(control)?;
         ensure_interactive_input_desktop("focus_window")?;
         control.check("focus_window")?;
-        if control.approved_target().as_deref() != Some(request.window_id.as_str()) {
+        let approved = control
+            .approved_target()
+            .ok_or_else(|| target::invalid("an approved target reference is required"))?;
+        let window = find_window(&request.window_id)?;
+        let (hwnd, _) = resolve_window_reference(&request.window_id)?;
+        // The approved window, or a window of its own process (one of its dialogs), by the same
+        // rule as the foreground and pointer checks; anything else needs a new session.
+        if approved != request.window_id && !target::window_serves_target(&approved, hwnd) {
             return Err(target::invalid(
-                "focus target differs from the approved session target",
+                "focus target differs from the approved session target; focus_window accepts the approved window or a dialog of the same application",
             ));
         }
-        let window = find_window(&request.window_id)?;
-        let (hwnd, _) = parse_window_id(&request.window_id)?;
         Self::ensure_window_input_target("focus_window", hwnd)?;
 
         let mut driver = NativeActivation {
+            approved_id: &approved,
             attempts: 0,
             window_id: &request.window_id,
             hwnd,
-            initial_foreground: target::issue(foreground_window_handle())?,
+            initial_foreground: foreground_window_handle(),
             minimized: window.is_minimized,
             control,
             started: Instant::now(),
@@ -816,13 +977,15 @@ impl WindowBackend for Backend {
         let activation = controlfreak_core::timing::time("activate", || {
             activation::focus(&mut driver, request.timeout_ms)
         });
-        if activation.is_err() {
+        // A refused or timed-out activation leaves the target as it was, and its error says
+        // the request is retryable, so only a change of the target itself ends the session.
+        if matches!(activation, Err(PlatformError::TargetInvalidated { .. })) {
             control.invalidate_target();
         }
         let (_, elapsed_ms) = activation?;
         let attempts = driver.attempts;
         control.activation_progress(attempts, elapsed_ms);
-        target::arm_if_foreground(&request.window_id)?;
+        target::arm_if_foreground(&approved)?;
         control.input_complete();
         target::evidence(control);
 
@@ -854,9 +1017,11 @@ impl WindowBackend for Backend {
             });
         }
         let bounds = display_bounds_from_window(window.bounds);
-        let (png, image_width, image_height, downscale_factor, cursor_marker) =
-            capture_bounds(bounds, request.max_width, request.include_cursor)?;
-        let (hwnd, _) = parse_window_id(&request.window_id)?;
+        let (hwnd, _) = resolve_window_reference(&request.window_id)?;
+        // The window renders itself, so a window covered by others is captured as itself; a
+        // window that cannot is copied from the screen, and `capture_method` says which.
+        let capture =
+            capture_window_bounds(hwnd, bounds, request.max_width, request.include_cursor)?;
         if target::issue(hwnd)? != window.id {
             return Err(target::invalid(
                 "window geometry changed during capture; observe again",
@@ -865,11 +1030,12 @@ impl WindowBackend for Backend {
         Ok(WindowScreenshot {
             source_bounds: window.bounds,
             window,
-            png,
-            image_width,
-            image_height,
-            downscale_factor,
-            cursor_marker,
+            png: capture.png,
+            image_width: capture.image_width,
+            image_height: capture.image_height,
+            downscale_factor: capture.downscale_factor,
+            cursor_marker: capture.cursor_marker,
+            capture_method: capture.capture_method,
         })
     }
 
@@ -877,7 +1043,7 @@ impl WindowBackend for Backend {
         &self,
         request: &WaitForWindowRequest,
     ) -> Result<WindowWaitResult, PlatformError> {
-        self.wait_for_window_controlled(request, &MutationControl::default())
+        self.wait_for_window_controlled(request, &controlfreak_core::MutationControl::default())
     }
 
     fn wait_for_window_controlled(
@@ -893,7 +1059,7 @@ impl WindowBackend for Backend {
         loop {
             // A window_id names one handle; matching it never depends on the list_windows cap.
             let target = match &request.window_id {
-                Some(id) => match parse_window_id(id) {
+                Some(id) => match resolve_window_reference(id) {
                     Ok((hwnd, _)) => Some(hwnd),
                     Err(_) => None,
                 },
@@ -985,6 +1151,149 @@ mod tests {
         input::{click_inputs, interpolate, key_chord_inputs, scroll_inputs},
         window_matches,
     };
+
+    /// Drives `PassCache` with synthetic frames. Each pass reads a comparison frame, then (when it
+    /// recognizes) the recognizer reads its own frame. Returns what each pass answered.
+    fn run_passes(
+        passes: &[(Option<u64>, u64)],
+        recognizer_frames: &[Option<u64>],
+    ) -> (Vec<String>, usize) {
+        let mut cache = super::PassCache::<String>::default();
+        let mut recognitions = 0;
+        let answers = passes
+            .iter()
+            .map(|(frame, generation)| {
+                cache
+                    .pass(*frame, *generation, || {
+                        let seen = recognizer_frames[recognitions];
+                        recognitions += 1;
+                        Ok((format!("text of frame {seen:?}"), seen))
+                    })
+                    .unwrap()
+            })
+            .collect();
+        (answers, recognitions)
+    }
+
+    #[test]
+    fn a_text_wait_reuses_its_previous_pass_only_for_the_frame_it_recognized() {
+        let (answers, recognitions) = run_passes(
+            &[(Some(1), 7), (Some(1), 7), (Some(1), 7)],
+            &[Some(1), Some(1), Some(1)],
+        );
+        assert_eq!(recognitions, 1);
+        assert!(
+            answers
+                .iter()
+                .all(|answer| answer == "text of frame Some(1)")
+        );
+    }
+
+    #[test]
+    fn a_result_recognized_from_a_different_frame_than_the_comparison_is_never_reused() {
+        // Comparison frames are A, A, A (1) but the first recognition read a transient frame B
+        // (2). The second pass must recognize again and get the answer for A.
+        let (answers, recognitions) = run_passes(
+            &[(Some(1), 7), (Some(1), 7), (Some(1), 7)],
+            &[Some(2), Some(1), Some(1)],
+        );
+        assert_eq!(recognitions, 2);
+        assert_eq!(answers[0], "text of frame Some(2)");
+        assert_eq!(answers[1], "text of frame Some(1)");
+        assert_eq!(answers[2], "text of frame Some(1)");
+    }
+
+    #[test]
+    fn a_changed_frame_a_changed_generation_or_an_unreadable_comparison_recognizes_again() {
+        for passes in [
+            [(Some(1), 7), (Some(2), 7)],
+            [(Some(1), 7), (Some(1), 8)],
+            [(Some(1), 7), (None, 7)],
+        ] {
+            let (_, recognitions) = run_passes(&passes, &[Some(1), Some(1)]);
+            assert_eq!(recognitions, 2, "{passes:?}");
+        }
+        // A recognizer that cannot say which frame it read is never cached.
+        let (_, recognitions) = run_passes(&[(Some(1), 7), (Some(1), 7)], &[None, None]);
+        assert_eq!(recognitions, 2);
+    }
+
+    #[test]
+    fn a_failed_recognition_drops_the_cached_result() {
+        let mut cache = super::PassCache::<u8>::default();
+        cache.pass(Some(1), 7, || Ok((1, Some(1)))).unwrap();
+        let failed = cache.pass(Some(2), 7, || {
+            Err(PlatformError::Unavailable {
+                reason: "synthetic".into(),
+            })
+        });
+        assert!(failed.is_err());
+        let mut recognized = false;
+        cache
+            .pass(Some(1), 7, || {
+                recognized = true;
+                Ok((2, Some(1)))
+            })
+            .unwrap();
+        assert!(
+            recognized,
+            "the earlier result must not survive a failed pass"
+        );
+    }
+
+    #[test]
+    fn a_relocated_or_unresolvable_region_drops_the_cache_and_rebuilds_the_watch() {
+        use controlfreak_core::DisplayBounds;
+        let at = |left| DisplayBounds {
+            left,
+            top: 0,
+            width: 10,
+            height: 10,
+        };
+        let mut cache = super::PassCache::<u8>::default();
+        cache.pass(Some(1), 7, || Ok((1, Some(1)))).unwrap();
+        let mut watch = Some(("old", at(0)));
+
+        // Same rectangle: the watch and the cached result stand.
+        super::reconcile_watch(&mut watch, &mut cache, Some(at(0)), || panic!("no rebuild"));
+        assert_eq!(watch.map(|(name, _)| name), Some("old"));
+        let mut recognized = false;
+        cache
+            .pass(Some(1), 7, || {
+                recognized = true;
+                Ok((2, Some(1)))
+            })
+            .unwrap();
+        assert!(!recognized);
+
+        // The region moved with the old pixels and generation unchanged: recognize again.
+        super::reconcile_watch(&mut watch, &mut cache, Some(at(5)), || Some(("new", at(5))));
+        assert_eq!(watch, Some(("new", at(5))));
+        cache
+            .pass(Some(1), 7, || {
+                recognized = true;
+                Ok((2, Some(1)))
+            })
+            .unwrap();
+        assert!(recognized);
+
+        // A region that cannot be resolved is not watched at all.
+        super::reconcile_watch(&mut watch, &mut cache, None, || panic!("no rebuild"));
+        assert!(watch.is_none());
+    }
+
+    #[test]
+    fn an_unreadable_text_region_is_not_watched_so_every_pass_recognizes() {
+        let region = OcrRegionRequest {
+            display_id: "no-such-display-must-not-be-captured".into(),
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            language: None,
+        };
+        assert!(super::region_change_watch(&region).is_none());
+    }
 
     #[test]
     fn queued_input_cancels_while_another_worker_still_owns_the_input_lock() {
@@ -1316,6 +1625,7 @@ mod tests {
             display_id: "display".to_owned(),
             is_foreground: true,
             is_minimized: false,
+            owner: None,
         };
         let request = WaitForWindowRequest {
             window_id: None,
@@ -1398,11 +1708,17 @@ mod tests {
         };
 
         assert!(matches!(
-            backend.scroll_mouse(&request(0, 0)),
+            backend.scroll_mouse_controlled(
+                &request(0, 0),
+                &controlfreak_core::MutationControl::default()
+            ),
             Err(PlatformError::InvalidArgument { .. })
         ));
         assert!(matches!(
-            backend.scroll_mouse(&request(12_001, 0)),
+            backend.scroll_mouse_controlled(
+                &request(12_001, 0),
+                &controlfreak_core::MutationControl::default()
+            ),
             Err(PlatformError::InvalidArgument { .. })
         ));
     }
@@ -1510,62 +1826,80 @@ mod tests {
         };
         let requests = [
             backend
-                .move_mouse(&MouseMoveRequest {
-                    display_id: "synthetic".into(),
-                    x: 0,
-                    y: 0,
-                    duration_ms: 0,
-                    observation: observation.clone(),
-                })
+                .move_mouse_controlled(
+                    &MouseMoveRequest {
+                        display_id: "synthetic".into(),
+                        x: 0,
+                        y: 0,
+                        duration_ms: 0,
+                        observation: observation.clone(),
+                    },
+                    &controlfreak_core::MutationControl::default(),
+                )
                 .map(|_| ()),
             backend
-                .click_mouse(&MouseClickRequest {
-                    display_id: "synthetic".into(),
-                    x: 0,
-                    y: 0,
-                    duration_ms: 0,
-                    button: MouseButton::Left,
-                    click_count: 1,
-                    modifiers: vec![],
-                    observation: observation.clone(),
-                })
+                .click_mouse_controlled(
+                    &MouseClickRequest {
+                        display_id: "synthetic".into(),
+                        x: 0,
+                        y: 0,
+                        duration_ms: 0,
+                        button: MouseButton::Left,
+                        click_count: 1,
+                        modifiers: vec![],
+                        observation: observation.clone(),
+                    },
+                    &controlfreak_core::MutationControl::default(),
+                )
                 .map(|_| ()),
             backend
-                .scroll_mouse(&MouseScrollRequest {
-                    display_id: "synthetic".into(),
-                    x: 0,
-                    y: 0,
-                    duration_ms: 0,
-                    delta_x: 0,
-                    delta_y: 120,
-                    observation: observation.clone(),
-                })
+                .scroll_mouse_controlled(
+                    &MouseScrollRequest {
+                        display_id: "synthetic".into(),
+                        x: 0,
+                        y: 0,
+                        duration_ms: 0,
+                        delta_x: 0,
+                        delta_y: 120,
+                        observation: observation.clone(),
+                    },
+                    &controlfreak_core::MutationControl::default(),
+                )
                 .map(|_| ()),
             backend
-                .drag_mouse(&MouseDragRequest {
-                    start_display_id: "synthetic".into(),
-                    end_display_id: "synthetic".into(),
-                    start_x: 0,
-                    start_y: 0,
-                    end_x: 1,
-                    end_y: 1,
-                    duration_ms: 0,
-                    button: MouseButton::Left,
-                    modifiers: vec![],
-                    observation: observation.clone(),
-                })
+                .drag_mouse_controlled(
+                    &MouseDragRequest {
+                        start_display_id: "synthetic".into(),
+                        end_display_id: "synthetic".into(),
+                        start_x: 0,
+                        start_y: 0,
+                        end_x: 1,
+                        end_y: 1,
+                        duration_ms: 0,
+                        button: MouseButton::Left,
+                        modifiers: vec![],
+                        observation: observation.clone(),
+                    },
+                    &controlfreak_core::MutationControl::default(),
+                )
                 .map(|_| ()),
             backend
-                .press_keys(&KeyChordRequest {
-                    keys: vec![Key::Enter],
-                    observation: observation.clone(),
-                })
+                .press_keys_controlled(
+                    &KeyChordRequest {
+                        keys: vec![Key::Enter],
+                        observation: observation.clone(),
+                    },
+                    &controlfreak_core::MutationControl::default(),
+                )
                 .map(|_| ()),
             backend
-                .type_text(&TextInputRequest {
-                    text: "synthetic".into(),
-                    observation,
-                })
+                .type_text_controlled(
+                    &TextInputRequest {
+                        text: "synthetic".into(),
+                        observation,
+                    },
+                    &controlfreak_core::MutationControl::default(),
+                )
                 .map(|_| ()),
         ];
         for result in requests {

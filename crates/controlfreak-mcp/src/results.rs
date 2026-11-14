@@ -85,6 +85,7 @@ fn screenshot_metadata(screenshot: &DisplayScreenshot) -> Value {
             screenshot.source_bounds,
             screenshot.image_width,
             screenshot.image_height,
+            None,
         ),
     })
 }
@@ -136,7 +137,7 @@ pub(super) fn window_screenshot_result(screenshot: Encoded<WindowScreenshot>) ->
             "source_bounds": screenshot.source_bounds,
             "mime_type": "image/png",
             "byte_length": screenshot.png.len(),
-            "capture_method": "windows_gdi",
+            "capture_method": screenshot.capture_method,
             "image_width": screenshot.image_width,
             "image_height": screenshot.image_height,
             "downscale_factor": screenshot.downscale_factor,
@@ -156,6 +157,7 @@ pub(super) fn window_screenshot_result(screenshot: Encoded<WindowScreenshot>) ->
                 },
                 screenshot.image_width,
                 screenshot.image_height,
+                Some(screenshot.window.id.clone()),
             ),
         }),
     )
@@ -328,7 +330,9 @@ pub(super) fn tool_error(error: &PlatformError) -> CallToolResult {
                 "retry_action": false,
             }));
         }
-        PlatformError::TargetInvalidated { .. } => "target_invalidated",
+        PlatformError::TargetInvalidated { .. } | PlatformError::TargetRefused { .. } => {
+            "target_invalidated"
+        }
         PlatformError::ActivationFailed { reason, .. } => reason.as_str(),
         PlatformError::OcrNoMatch { .. } => "ocr_no_match",
         PlatformError::OcrAmbiguousMatch { .. } => "ocr_ambiguous_match",
@@ -337,11 +341,18 @@ pub(super) fn tool_error(error: &PlatformError) -> CallToolResult {
         PlatformError::HigherIntegrityTarget { .. } => "higher_integrity_target",
         PlatformError::TargetIntegrityUnavailable { .. } => "target_integrity_unavailable",
         PlatformError::InvalidArgument { .. } => "invalid_argument",
-        PlatformError::OperationFailed { .. } | PlatformError::Unavailable { .. } => {
-            "platform_operation_failed"
-        }
+        PlatformError::OperationFailed { .. }
+        | PlatformError::Failed { .. }
+        | PlatformError::Unavailable { .. } => "platform_operation_failed",
     };
-    let mut value = json!({"error": {"code": code, "message": error.to_string()}});
+    let mut value = json!({"error": {
+        "code": code,
+        "message": error.to_string(),
+        "retryable": error.retryable(),
+    }});
+    if let Some(reason) = error.reason_code() {
+        value["error"]["reason"] = json!(reason);
+    }
     if let PlatformError::ActivationFailed {
         attempts,
         elapsed_ms,
@@ -407,16 +418,36 @@ pub(super) fn with_progress(
     super::CallToolResponse::Complete(result)
 }
 
+/// Whether an input tool's response says any input was sent, fully or in part.
+pub(super) fn input_was_sent(response: &super::CallToolResponse) -> bool {
+    let super::CallToolResponse::Complete(result) = response else {
+        return false;
+    };
+    result
+        .structured_content
+        .as_ref()
+        .and_then(|content| content["status"].as_str())
+        .is_some_and(|status| status != "not_started")
+}
+
 pub(super) fn tool_execution_error(error: &ErrorData) -> CallToolResult {
     let code = if error.code == ErrorCode::INVALID_PARAMS {
         "invalid_arguments"
     } else {
         "tool_execution_failed"
     };
+    // A detail that says whether repeating helps (the indicator's `starting` or `failed` states
+    // are transient) is the envelope's answer too, so the two never disagree.
+    let retryable = error
+        .data
+        .as_ref()
+        .and_then(|data| data["retryable"].as_bool())
+        .unwrap_or(false);
     CallToolResult::structured_error(json!({
         "error": {
             "code": code,
             "message": error.message,
+            "retryable": retryable,
             "details": error.data,
         }
     }))

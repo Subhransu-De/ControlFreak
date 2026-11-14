@@ -134,7 +134,17 @@ mod tests {
     use super::*;
     #[test]
     fn running_test_executable_is_identified_without_stopping_it() {
-        let blockers = installer_blockers(&[std::env::current_exe().unwrap()]).unwrap();
+        // OCR tests in this binary start and end copies of this executable, so the Restart
+        // Manager list can change while it is read. Retry that one error, as its message asks.
+        let blockers = (0..20)
+            .find_map(
+                |_| match installer_blockers(&[std::env::current_exe().unwrap()]) {
+                    Ok(blockers) => Some(blockers),
+                    Err(error) if error.to_string().contains("retry inspection") => None,
+                    Err(error) => panic!("{error}"),
+                },
+            )
+            .expect("process list kept changing for 20 attempts");
         assert!(
             blockers
                 .iter()

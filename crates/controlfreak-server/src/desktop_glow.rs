@@ -22,11 +22,39 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often the actor looks at the helper while a lamp is shown or a command is in flight.
 const ACTOR_POLL: Duration = Duration::from_millis(50);
+/// While the lamp is hidden and nothing is pending the actor only waits for a request; this is
+/// how soon it notices that an idle helper died.
+const ACTOR_IDLE_POLL: Duration = Duration::from_millis(500);
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Whether debug builds under test run without the desktop indicator.
+pub(crate) fn disabled_for_tests() -> bool {
+    cfg!(debug_assertions) && std::env::var_os(TEST_DISABLE_ENV).is_some()
+}
+
+/// How long the actor waits for the helper before it looks again.
+fn actor_poll(lamp_visible: bool, pending: bool, shutting_down: bool) -> Duration {
+    if lamp_visible || pending || shutting_down {
+        ACTOR_POLL
+    } else {
+        ACTOR_IDLE_POLL
+    }
+}
+
+/// Whether a level change must wait for the helper's acknowledgement. Moving to `Acting` always
+/// does: the acknowledgement authorizes input. The first level of a session does too, so the
+/// lamp is on screen when the session starts. Settling back to `Armed` while the lamp is already
+/// shown is only a visual change, so it is sent without a second round trip.
+fn level_needs_acknowledgement(level: IndicatorLevel, lamp_shown: bool) -> bool {
+    !(matches!(level, IndicatorLevel::Armed) && lamp_shown)
+}
 
 /// Owns one hidden, reusable desktop-glow actor for an MCP server.
 pub(crate) struct DesktopGlow {
+    /// Whether the lamp was on screen at the last acknowledged level.
+    lamp_shown: bool,
     actor: Option<GlowActor>,
     /// Acknowledged levels, read by the session tab to say whether the agent is acting.
     signals: Arc<SessionSignals>,
@@ -87,8 +115,9 @@ impl DesktopGlow {
     ) -> Result<Self, String> {
         let health = Arc::new(Mutex::new(IndicatorHealth::Healthy));
         let cancellation = MutationControl::default();
-        if cfg!(debug_assertions) && std::env::var_os(TEST_DISABLE_ENV).is_some() {
+        if disabled_for_tests() {
             return Ok(Self {
+                lamp_shown: false,
                 actor: None,
                 signals,
                 draining: None,
@@ -130,6 +159,7 @@ impl DesktopGlow {
             })
             .map_err(|error| format!("desktop glow actor could not start: {error}"))?;
         Ok(Self {
+            lamp_shown: false,
             draining: None,
             shutdown_failure: None,
             signals,
@@ -151,7 +181,10 @@ impl DesktopGlow {
         result
     }
 
-    fn command(&self, command: GlowCommand) -> Result<(), String> {
+    /// Sends `command` to the helper. With `wait`, returns once the helper acknowledged it;
+    /// without, once it is queued: the helper handles commands in order, and a failure marks it
+    /// unhealthy, which the next level change or hide reports.
+    fn command(&self, command: GlowCommand, wait: bool) -> Result<(), String> {
         if self.draining.is_some() || self.shutdown_failure.is_some() {
             return Err("desktop glow actor is still draining".to_owned());
         }
@@ -166,6 +199,9 @@ impl DesktopGlow {
                 reply: reply_tx,
             })
             .map_err(|error| format!("desktop glow actor stopped: {error}"))?;
+        if !wait {
+            return Ok(());
+        }
         reply_rx
             .recv_timeout(COMMAND_TIMEOUT + Duration::from_secs(1))
             .map_err(|error| format!("desktop glow command reply timed out: {error}"))?
@@ -174,7 +210,9 @@ impl DesktopGlow {
 
 impl ActivityIndicator for DesktopGlow {
     fn set_level(&mut self, level: IndicatorLevel) -> Result<(), String> {
-        self.command(GlowCommand::Level(level))?;
+        let wait = level_needs_acknowledgement(level, self.lamp_shown);
+        self.command(GlowCommand::Level(level), wait)?;
+        self.lamp_shown = true;
         self.signals
             .set_acting(matches!(level, IndicatorLevel::Acting));
         Ok(())
@@ -182,7 +220,8 @@ impl ActivityIndicator for DesktopGlow {
 
     fn hide(&mut self) -> Result<(), String> {
         self.signals.clear();
-        self.command(GlowCommand::Hide)
+        self.lamp_shown = false;
+        self.command(GlowCommand::Hide, true)
     }
 
     fn shutdown(&mut self) -> Result<(), String> {
@@ -350,7 +389,8 @@ fn actor_loop(
             }
         }
 
-        match next_process_event(&process, requests, pending.is_empty(), &mut deferred) {
+        let poll = actor_poll(visible, !pending.is_empty(), shutdown_requested);
+        match next_process_event(&process, requests, pending.is_empty(), poll, &mut deferred) {
             Ok(ProcessEvent::Line(Ok(line))) => match parse_marker(&line) {
                 Ok(marker) if marker.generation != generation => {}
                 Ok(marker) => {
@@ -496,15 +536,16 @@ fn next_process_event(
     process: &ActorProcess,
     requests: &mpsc::Receiver<ActorRequest>,
     idle: bool,
+    poll: Duration,
     deferred: &mut Option<ActorRequest>,
 ) -> Result<ProcessEvent, mpsc::RecvTimeoutError> {
     if idle {
-        match requests.recv_timeout(ACTOR_POLL) {
+        match requests.recv_timeout(poll) {
             Ok(request) => *deferred = Some(request),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             // Without a requester, keep observing the helper at the normal interval.
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return process.events.recv_timeout(ACTOR_POLL);
+                return process.events.recv_timeout(poll);
             }
         }
         return process.events.try_recv().map_err(|error| match error {
@@ -512,7 +553,7 @@ fn next_process_event(
             mpsc::TryRecvError::Disconnected => mpsc::RecvTimeoutError::Disconnected,
         });
     }
-    process.events.recv_timeout(ACTOR_POLL)
+    process.events.recv_timeout(poll)
 }
 
 fn await_startup(mut process: ActorProcess, generation: u64) -> io::Result<ActorProcess> {
@@ -656,10 +697,24 @@ fn fail_pending(pending: &mut HashMap<u64, PendingCommand>, reason: &str) {
 }
 
 // Keep the process and pipe handles in the actor until exit is confirmed.
-// Callers wait only for the bounded shutdown attempt and can retry later.
-fn drain_until_stopped(mut stop: impl FnMut() -> Result<(), String>) {
-    while stop().is_err() {
-        thread::sleep(ACTOR_POLL);
+// Callers wait only for the bounded shutdown attempt and can retry later. The retries back off
+// and give up after a bound, so a helper that cannot be stopped does not keep a thread spinning
+// for the life of the server; the failure is logged to stderr.
+fn drain_until_stopped(stop: impl FnMut() -> Result<(), String>) {
+    drain_with(controlfreak_core::Backoff::TEARDOWN, stop, thread::sleep);
+}
+
+fn drain_with(
+    backoff: controlfreak_core::Backoff,
+    stop: impl FnMut() -> Result<(), String>,
+    sleep: impl FnMut(Duration),
+) {
+    if let Err(reason) = controlfreak_core::retry_with_backoff(backoff, stop, sleep) {
+        record_glow_event(&format!("shutdown gave up: {reason}"));
+        eprintln!(
+            "{}",
+            serde_json::json!({"event": "desktop_glow_shutdown_gave_up", "reason": reason})
+        );
     }
 }
 
@@ -856,6 +911,7 @@ mod tests {
             });
         });
         let mut glow = DesktopGlow {
+            lamp_shown: false,
             actor: None,
             signals: Arc::new(controlfreak_platform::SessionSignals::new(false)),
             health: Arc::new(std::sync::Mutex::new(IndicatorHealth::Healthy)),
@@ -877,6 +933,106 @@ mod tests {
         glow.shutdown().unwrap();
         glow.shutdown().unwrap();
         assert!(glow.draining.is_none());
+    }
+
+    #[test]
+    fn a_helper_that_cannot_be_stopped_is_retried_with_backoff_then_given_up() {
+        use controlfreak_core::Backoff;
+        use std::time::Duration;
+        let backoff = Backoff {
+            first: Duration::from_millis(10),
+            cap: Duration::from_millis(40),
+            attempts: 6,
+        };
+        let mut attempts = 0;
+        let mut pauses = Vec::new();
+        super::drain_with(
+            backoff,
+            || {
+                attempts += 1;
+                Err("helper did not exit".to_owned())
+            },
+            |pause| pauses.push(pause.as_millis()),
+        );
+        assert_eq!(attempts, 6, "bounded, not forever");
+        assert_eq!(pauses, [10, 20, 40, 40, 40], "doubling up to the cap");
+
+        let mut attempts = 0;
+        super::drain_with(
+            backoff,
+            || {
+                attempts += 1;
+                if attempts == 2 {
+                    Ok(())
+                } else {
+                    Err("not yet".to_owned())
+                }
+            },
+            |_| {},
+        );
+        assert_eq!(attempts, 2, "stops as soon as the helper is gone");
+    }
+
+    #[test]
+    fn only_the_acknowledgement_that_authorizes_input_is_always_waited_for() {
+        use controlfreak_mcp::IndicatorLevel::{Acting, Armed};
+        assert!(super::level_needs_acknowledgement(Acting, false));
+        assert!(
+            super::level_needs_acknowledgement(Acting, true),
+            "input always waits for the helper"
+        );
+        assert!(
+            super::level_needs_acknowledgement(Armed, false),
+            "the first level of a session is on screen before the session starts"
+        );
+        assert!(
+            !super::level_needs_acknowledgement(Armed, true),
+            "settling back after an action is a second round trip nothing waits for"
+        );
+    }
+
+    #[test]
+    fn an_idle_actor_waits_for_requests_instead_of_polling_the_helper() {
+        use std::time::Duration;
+        assert_eq!(
+            super::actor_poll(false, false, false),
+            Duration::from_millis(500)
+        );
+        for (visible, pending, shutting_down) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert_eq!(
+                super::actor_poll(visible, pending, shutting_down),
+                Duration::from_millis(50),
+                "a shown lamp, a command in flight or a shutdown is watched closely"
+            );
+        }
+    }
+
+    #[test]
+    fn settling_back_to_armed_does_not_wait_for_the_helper() {
+        use controlfreak_mcp::IndicatorLevel::{Acting, Armed};
+        // No actor: commands are accepted without a helper, so only the lamp bookkeeping and
+        // the signals are observable here.
+        let signals = std::sync::Arc::new(controlfreak_platform::SessionSignals::new(false));
+        let mut glow = DesktopGlow {
+            lamp_shown: false,
+            actor: None,
+            signals,
+            health: std::sync::Arc::new(std::sync::Mutex::new(IndicatorHealth::Healthy)),
+            cancellation: controlfreak_core::MutationControl::default(),
+            containment: ("unavailable", None),
+            draining: None,
+            shutdown_failure: None,
+        };
+        glow.set_level(Armed).unwrap();
+        assert!(glow.lamp_shown, "the first level shows the lamp");
+        glow.set_level(Acting).unwrap();
+        glow.set_level(Armed).unwrap();
+        glow.hide().unwrap();
+        assert!(!glow.lamp_shown, "hiding resets the first-level rule");
     }
 
     #[test]

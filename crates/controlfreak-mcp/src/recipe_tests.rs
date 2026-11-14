@@ -41,7 +41,7 @@ fn bounds() -> DisplayBounds {
 
 fn screenshot() -> DisplayScreenshot {
     DisplayScreenshot {
-        target_ref: Some("fixture-target".into()),
+        target_ref: Some("target-00000000-0000-0000-0000-000000000003".into()),
         display: display(),
         source_bounds: bounds(),
         png: include_bytes!("../../../examples/fixture.png").to_vec(),
@@ -193,7 +193,7 @@ impl OcrBackend for Fixture {
             request.max_results,
         )?;
         Ok(controlfreak_core::FindTextResult {
-            target_ref: Some("fixture-target".into()),
+            target_ref: Some("target-00000000-0000-0000-0000-000000000003".into()),
             query: request.query.clone(),
             display: display(),
             source_bounds: bounds(),
@@ -204,7 +204,7 @@ impl OcrBackend for Fixture {
     }
     fn read_text_in_region(&self, _: &OcrRegionRequest) -> Result<OcrResult, PlatformError> {
         Ok(OcrResult {
-            target_ref: Some("fixture-target".into()),
+            target_ref: Some("target-00000000-0000-0000-0000-000000000003".into()),
             display: display(),
             source_bounds: bounds(),
             language: "en-US".into(),
@@ -289,7 +289,7 @@ async fn published_recipes_validate_and_run_on_a_synthetic_desktop() {
     for recipe in recipes.as_array().unwrap() {
         let backend = Arc::new(Fixture::default());
         let indicator = SafetyIndicator::dormant();
-        let runtime = Arc::new(IndicatorRuntime::new_with_timing(
+        let runtime = Arc::new(SessionRuntime::new_with_timing(
             indicator.clone(),
             || Ok(FixtureIndicator),
             Arc::new(LocalArbitrator),
@@ -378,7 +378,7 @@ async fn published_recipes_validate_and_run_on_a_synthetic_desktop() {
 async fn image_points_from_a_cropped_screenshot_reach_the_same_display_pixel() {
     let backend = Arc::new(Fixture::default());
     let indicator = SafetyIndicator::dormant();
-    let runtime = Arc::new(IndicatorRuntime::new_with_timing(
+    let runtime = Arc::new(SessionRuntime::new_with_timing(
         indicator.clone(),
         || Ok(FixtureIndicator),
         Arc::new(LocalArbitrator),
@@ -430,7 +430,7 @@ async fn image_points_from_a_cropped_screenshot_reach_the_same_display_pixel() {
         call(
             3,
             CLICK_MOUSE,
-            json!({"target_ref":"fixture-target","observation_id":observation_id,
+            json!({"target_ref":"target-00000000-0000-0000-0000-000000000003","observation_id":observation_id,
                    "image_x":50,"image_y":25,"button":"left","observation":{"mode":"none"}}),
         ),
     )
@@ -443,21 +443,21 @@ async fn image_points_from_a_cropped_screenshot_reach_the_same_display_pixel() {
     for (id, arguments, reason) in [
         (
             4,
-            json!({"target_ref":"fixture-target","observation_id":observation_id,
+            json!({"target_ref":"target-00000000-0000-0000-0000-000000000003","observation_id":observation_id,
                    "image_x":200,"image_y":25,"button":"left"}),
             "inside the 200x100 image",
         ),
         (
             5,
-            json!({"target_ref":"fixture-target","observation_id":"obs-unknown",
+            json!({"target_ref":"target-00000000-0000-0000-0000-000000000003","observation_id":"obs-unknown",
                    "image_x":1,"image_y":1,"button":"left"}),
             "not found or has expired",
         ),
         (
             6,
-            json!({"target_ref":"fixture-target","display_id":"fixture","x":1,"y":1,
+            json!({"target_ref":"target-00000000-0000-0000-0000-000000000003","display_id":"fixture","x":1,"y":1,
                    "observation_id":observation_id,"image_x":1,"image_y":1,"button":"left"}),
-            "provide either",
+            "provide x and y",
         ),
     ] {
         let refused = exchange(&mut client, call(id, CLICK_MOUSE, arguments)).await;

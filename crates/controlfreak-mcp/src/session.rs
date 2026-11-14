@@ -18,6 +18,8 @@ const DEFAULT_SESSION_HOLD: Duration = Duration::from_secs(45);
 const DEFAULT_MAX_HOLD: Duration = Duration::from_mins(2);
 const MIN_SESSION_HOLD: Duration = Duration::from_secs(20);
 const MAX_INDICATOR_RESTARTS: u8 = 2;
+/// Longest a session waits for the Esc keyboard hook to be confirmed before it is refused.
+const ESC_HOOK_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct SafetyIndicator {
@@ -45,6 +47,12 @@ impl SafetyIndicator {
         let indicator = Self::starting();
         indicator.mark_visible();
         indicator
+    }
+
+    /// Records a failure the server found outside a session, such as the session tab ending, so
+    /// `get_server_status` reports the indicator as failed with the reason.
+    pub fn report_failure(&self, reason: impl Into<String>) {
+        self.mark_failed(reason);
     }
 
     pub(super) fn mark_visible(&self) {
@@ -170,8 +178,10 @@ pub trait ActivityArbitrator: Send + Sync {
     fn release(&self);
 }
 
+#[cfg(test)]
 pub(super) struct LocalArbitrator;
 
+#[cfg(test)]
 impl ActivityArbitrator for LocalArbitrator {
     fn try_acquire(&self) -> Result<(), ArbitrationError> {
         Ok(())
@@ -216,11 +226,9 @@ impl From<ArbitrationError> for SessionError {
 impl SessionError {
     /// The stop latch is set: by Esc, `stop_desktop_work`, or failed cleanup.
     pub(super) fn stopped(stop: &controlfreak_core::StopController) -> Self {
-        Self::Stopped(
-            stop.stop_message()
-                .unwrap_or("desktop work is stopped; only the user may restart the server")
-                .to_owned(),
-        )
+        Self::Stopped(stop.refusal_message().unwrap_or_else(|| {
+            "desktop work is stopped; only the user may restart the server".to_owned()
+        }))
     }
 
     pub(super) fn into_tool_result(self, safety_indicator: &SafetyIndicator) -> CallToolResult {
@@ -341,7 +349,7 @@ impl ControlSession {
     }
 }
 
-pub(super) struct IndicatorRuntimeState {
+pub(super) struct SessionRuntimeState {
     control: Option<IndicatorControl>,
     active_mutations: usize,
     pub(super) generation: u64,
@@ -351,9 +359,9 @@ pub(super) struct IndicatorRuntimeState {
     pub(super) session: ControlSession,
 }
 
-pub(super) struct IndicatorRuntime {
+pub(super) struct SessionRuntime {
     pub(super) stop: controlfreak_core::StopController,
-    pub(super) state: Mutex<IndicatorRuntimeState>,
+    pub(super) state: Mutex<SessionRuntimeState>,
     lifecycle: Mutex<()>,
     pub(super) idle_worker: Mutex<Option<IdleWorker>>,
     safety_indicator: SafetyIndicator,
@@ -378,7 +386,7 @@ pub(super) struct IdleWorker {
     pub(super) thread: Option<thread::JoinHandle<()>>,
 }
 
-impl IndicatorRuntime {
+impl SessionRuntime {
     #[cfg(test)]
     pub(super) fn new_with_idle_delay<F, G>(
         safety_indicator: SafetyIndicator,
@@ -413,7 +421,7 @@ impl IndicatorRuntime {
     {
         Self {
             stop: controlfreak_core::StopController::default(),
-            state: Mutex::new(IndicatorRuntimeState {
+            state: Mutex::new(SessionRuntimeState {
                 control: None,
                 active_mutations: 0,
                 generation: 0,
@@ -517,6 +525,15 @@ impl IndicatorRuntime {
                 .with_cancellation(state.cancellation.clone())
                 .for_operation(),
         })
+    }
+
+    /// Whether a control session is owned, which is when the session worker polls.
+    fn session_owned(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .session
+            .owns_arbitration
     }
 
     fn bind_target(&self, target: &str) -> Result<(), controlfreak_core::PlatformError> {
@@ -836,7 +853,7 @@ impl IndicatorRuntime {
                 }
             });
             match result {
-                Ok(()) => return Ok(()),
+                Ok(()) => return self.confirm_escape_hook(),
                 Err(reason) => {
                     let (retired, can_restart) = self.retire_failed_control(&reason);
                     if let Some(mut retired) = retired
@@ -860,6 +877,26 @@ impl IndicatorRuntime {
                 }
             }
         }
+    }
+
+    /// A session is admitted only once a physical Esc can stop it: the hook is installed
+    /// asynchronously, so an Esc in the first milliseconds would otherwise be missed. Without an
+    /// Esc monitor (no indicator process) there is nothing to wait for.
+    fn confirm_escape_hook(&self) -> Result<(), String> {
+        let reason = match self.stop.wait_for_esc_hook(ESC_HOOK_WAIT) {
+            controlfreak_core::EscHook::Installed | controlfreak_core::EscHook::NotMonitored => {
+                return Ok(());
+            }
+            controlfreak_core::EscHook::Failed(reason) => format!(
+                "the Esc stop key could not be armed ({reason}), so no control session is allowed"
+            ),
+            controlfreak_core::EscHook::TimedOut => format!(
+                "the Esc stop key was not armed within {} seconds, so no control session is allowed",
+                ESC_HOOK_WAIT.as_secs()
+            ),
+        };
+        let _ = self.close_session_locked("esc_unavailable", false);
+        Err(reason)
     }
 
     fn retire_failed_control(&self, reason: &str) -> (Option<IndicatorControl>, bool) {
@@ -1025,7 +1062,7 @@ impl IndicatorRuntime {
         Self::status_snapshot(&state)
     }
 
-    fn status_snapshot(state: &IndicatorRuntimeState) -> Value {
+    fn status_snapshot(state: &SessionRuntimeState) -> Value {
         let remaining_ms = state.session.close_deadline.map(|deadline| {
             u64::try_from(
                 deadline
@@ -1096,18 +1133,63 @@ fn indicator_failure_reason(control: &dyn ActivityIndicator) -> Option<String> {
     }
 }
 
+/// While a session is owned, the worker looks at the environment this often: a locked screen or
+/// a switch away from the Default desktop during a hold ends the session within this time, which
+/// is a safety invariant. With no session there is nothing to watch.
+const LIFECYCLE_POLL: Duration = Duration::from_millis(50);
+
+/// How long the session worker sleeps before it must look again, or `None` to sleep until a
+/// command arrives. Polling happens only while a session is owned.
+fn worker_wait(deadline: Option<Instant>, owned: bool, now: Instant) -> Option<Duration> {
+    let until_deadline = deadline.map(|deadline| deadline.saturating_duration_since(now));
+    match (until_deadline, owned) {
+        (Some(wait), true) => Some(wait.min(LIFECYCLE_POLL)),
+        (Some(wait), false) => Some(wait),
+        (None, true) => Some(LIFECYCLE_POLL),
+        (None, false) => None,
+    }
+}
+
+/// Tools that read pixels from the screen. They claim no session; the indicator only shows a
+/// brief "reading the screen" state for them.
+pub(super) fn reads_the_screen(tool: &str) -> bool {
+    use super::{
+        CAPTURE_DISPLAY, CAPTURE_REGION, CAPTURE_VISUAL_BASELINE, CAPTURE_WINDOW,
+        FIND_TEXT_ON_SCREEN, READ_TEXT_IN_REGION, WAIT_FOR_CHANGE_SINCE, WAIT_FOR_TEXT,
+        WAIT_FOR_VISUAL_CHANGE,
+    };
+    matches!(
+        tool,
+        CAPTURE_DISPLAY
+            | CAPTURE_REGION
+            | CAPTURE_WINDOW
+            | CAPTURE_VISUAL_BASELINE
+            | WAIT_FOR_VISUAL_CHANGE
+            | WAIT_FOR_CHANGE_SINCE
+            | READ_TEXT_IN_REGION
+            | FIND_TEXT_ON_SCREEN
+            | WAIT_FOR_TEXT
+    )
+}
+
 fn idle_worker_loop(
-    runtime: &std::sync::Weak<IndicatorRuntime>,
+    runtime: &std::sync::Weak<SessionRuntime>,
     receiver: &mpsc::Receiver<IdleCommand>,
 ) {
     let mut pending: Option<(u64, Instant)> = None;
     loop {
-        let delay = pending.map_or(Duration::from_millis(50), |(_, deadline)| {
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(50))
-        });
-        match receiver.recv_timeout(delay) {
+        let owned = runtime
+            .upgrade()
+            .is_some_and(|runtime| runtime.session_owned());
+        let incoming =
+            match worker_wait(pending.map(|(_, deadline)| deadline), owned, Instant::now()) {
+                Some(delay) => receiver.recv_timeout(delay),
+                // Nothing is owned and nothing is scheduled: sleep until a session schedules a close.
+                None => receiver
+                    .recv()
+                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+            };
+        match incoming {
             Ok(IdleCommand::Schedule {
                 generation,
                 deadline,
@@ -1132,7 +1214,7 @@ fn idle_worker_loop(
 }
 
 pub(super) struct OperationLease {
-    runtime: Arc<IndicatorRuntime>,
+    runtime: Arc<SessionRuntime>,
     control: MutationControl,
 }
 
@@ -1153,7 +1235,7 @@ impl Drop for OperationLease {
  * above. Keep all teardown after this point outside the state mutex.
  */
 
-impl Drop for IndicatorRuntime {
+impl Drop for SessionRuntime {
     fn drop(&mut self) {
         if let Some(mut worker) = self
             .idle_worker
@@ -1181,11 +1263,22 @@ impl Drop for IndicatorRuntime {
             let arbitrator = Arc::clone(&self.arbitrator);
             let stop = self.stop.clone();
             thread::spawn(move || {
-                while control.shutdown().is_err() {
-                    thread::sleep(Duration::from_millis(50));
+                let result = controlfreak_core::retry_with_backoff(
+                    controlfreak_core::Backoff::TEARDOWN,
+                    || control.shutdown(),
+                    thread::sleep,
+                );
+                match result {
+                    Ok(()) => {
+                        arbitrator.release();
+                        stop.set_session_active(false);
+                    }
+                    // Ownership stays: cleanup could not be verified. The process is exiting.
+                    Err(reason) => eprintln!(
+                        "{}",
+                        json!({"event": "indicator_shutdown_gave_up", "reason": reason})
+                    ),
                 }
-                arbitrator.release();
-                stop.set_session_active(false);
             });
             return;
         }
@@ -1208,4 +1301,69 @@ pub(super) fn indicator_unavailable(safety_indicator: &SafetyIndicator, reason: 
             "retryable": matches!(status, "starting" | "failed"),
         })),
     )
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+
+    #[test]
+    fn the_session_worker_polls_only_while_a_session_is_owned() {
+        let now = Instant::now();
+        let soon = now + Duration::from_secs(30);
+        assert_eq!(
+            worker_wait(None, false, now),
+            None,
+            "dormant: sleep until told"
+        );
+        assert_eq!(worker_wait(None, true, now), Some(LIFECYCLE_POLL));
+        assert_eq!(
+            worker_wait(Some(soon), true, now),
+            Some(LIFECYCLE_POLL),
+            "an owned hold keeps watching for a lock or desktop switch"
+        );
+        assert_eq!(
+            worker_wait(Some(now + Duration::from_millis(10)), true, now),
+            Some(Duration::from_millis(10)),
+            "a deadline nearer than the poll wins"
+        );
+        assert_eq!(
+            worker_wait(Some(soon), false, now),
+            Some(Duration::from_secs(30)),
+            "a stale deadline is waited out without polling"
+        );
+        assert_eq!(
+            worker_wait(Some(now), true, now + Duration::from_secs(1)),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn only_tools_that_read_pixels_show_the_reading_state() {
+        for tool in [
+            "capture_display",
+            "capture_region",
+            "capture_window",
+            "capture_visual_baseline",
+            "wait_for_visual_change",
+            "wait_for_change_since",
+            "read_text_in_region",
+            "find_text_on_screen",
+            "wait_for_text",
+        ] {
+            assert!(reads_the_screen(tool), "{tool}");
+        }
+        for tool in [
+            "list_displays",
+            "list_windows",
+            "get_server_status",
+            "begin_control_session",
+            "click_mouse",
+            "type_text",
+            "stop_desktop_work",
+            "wait_for_window",
+        ] {
+            assert!(!reads_the_screen(tool), "{tool}");
+        }
+    }
 }
