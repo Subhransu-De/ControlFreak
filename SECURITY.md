@@ -57,6 +57,34 @@ A bounded five-minute cache and Windows destroy-event watcher prevent raw HWND/P
 and retire destroyed-window references, including same-process handle reuse. Watcher failure
 refuses target resolution. Desktop-switch events retire existing references.
 
+The approved target stands in for its own process, not for the desktop. The foreground window,
+the keyboard-focus window and the window that would receive a pointer event are each accepted if
+they are the target itself or belong to the target's process, so the dialogs, popup menus and
+drop-downs that an approved application opens keep working. A window of any other process is
+refused, however it is classed or owned. Integrity is checked on the actual window that holds the
+foreground or receives the event, not only on the target, and a pointer destination must also be a
+window of the target's process at the child level, so a foreign window embedded in the target's
+window is refused. A multi-window application's other top-level windows are part of the same
+process and are accepted. `explorer.exe` hosts the taskbar, the desktop and every File Explorer
+window, so a shell-hosted target accepts only windows in its own owner chain and popup menus, not
+the taskbar or another folder window.
+
+A foreground or destination that belongs to another process refuses that one action. It does not
+retire the reference and does not end the session, because every action reads the live foreground
+again; a window that gives the foreground back is usable at once. Changes that cannot heal still
+end the session's approval: a different window, process, owner or desktop, changed bounds or
+display layout, a destroyed window, an unverifiable integrity level, or a locked or non-default
+input desktop.
+
+The taskbar, secondary taskbars, the desktop and the Start and Search surfaces can be approved as
+targets. Windows does not report a virtual desktop for them because they are on every desktop, so
+they are treated as present on every desktop. This exemption needs both a shell window class and a
+verified owning image: `explorer.exe` in the Windows directory for the taskbars and desktop, or
+`StartMenuExperienceHost.exe`, `SearchHost.exe` or `SearchApp.exe` in their package folder under
+`SystemApps` in the Windows directory. The class alone never qualifies, any other window that
+lacks a desktop identity is still refused, and every other check, including integrity, still
+applies to the window. ControlFreak still has no tool that launches applications.
+
 Focus acquisition uses only documented restoration and foreground APIs with a bounded retry
 budget. It validates on every poll and stops on competing foreground ownership. A mismatch
 invalidates session approval. Release-only cleanup remains permitted after earlier dispatch.

@@ -57,6 +57,9 @@ pub struct WindowScreenshot {
     pub image_height: u32,
     pub downscale_factor: u32,
     pub cursor_marker: bool,
+    /// How the pixels were produced, for example `windows_print_window` when the window rendered
+    /// itself or `windows_gdi` when its screen rectangle was copied.
+    pub capture_method: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

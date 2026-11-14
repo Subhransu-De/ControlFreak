@@ -337,13 +337,10 @@ const fn oem_character(key: Key) -> Option<char> {
     })
 }
 
-/// Maps a key to a virtual key. `layout` answers which unshifted virtual key types a character on
-/// the active layout. A named punctuation key means "the key that types this character", so a
-/// layout that types it unshifted decides the code. A layout that cannot (it needs Shift or
-/// AltGr, or lacks the character) falls back to the US virtual key, which is the same physical
-/// key position, rather than sending a different symbol.
-fn virtual_key_with(key: Key, layout: impl FnOnce(char) -> Option<u16>) -> (VIRTUAL_KEY, bool) {
-    let code = match key {
+/// Virtual keys of the punctuation, numpad, system and media keys; zero for any other key, which
+/// `every_key_has_its_own_virtual_key` rules out. The punctuation codes are the US ones.
+const fn symbol_and_system_code(key: Key) -> u16 {
+    match key {
         Key::Semicolon => 0xBA,
         Key::Slash => 0xBF,
         Key::Backtick => 0xC0,
@@ -383,6 +380,17 @@ fn virtual_key_with(key: Key, layout: impl FnOnce(char) -> Option<u16>) -> (VIRT
         Key::MediaPrevious => 0xB1,
         Key::MediaStop => 0xB2,
         Key::MediaPlayPause => 0xB3,
+        _ => 0,
+    }
+}
+
+/// Maps a key to a virtual key. `layout` answers which unshifted virtual key types a character on
+/// the active layout. A named punctuation key means "the key that types this character", so a
+/// layout that types it unshifted decides the code. A layout that cannot (it needs Shift or
+/// `AltGr`, or lacks the character) falls back to the US virtual key, which is the same physical
+/// key position, rather than sending a different symbol.
+fn virtual_key_with(key: Key, layout: impl FnOnce(char) -> Option<u16>) -> (VIRTUAL_KEY, bool) {
+    let code = match key {
         Key::Backspace => 0x08,
         Key::Tab => 0x09,
         Key::Enter => 0x0D,
@@ -450,6 +458,7 @@ fn virtual_key_with(key: Key, layout: impl FnOnce(char) -> Option<u16>) -> (VIRT
         Key::F10 => 0x79,
         Key::F11 => 0x7A,
         Key::F12 => 0x7B,
+        other => symbol_and_system_code(other),
     };
     let code = oem_character(key).and_then(layout).unwrap_or(code);
     let extended = matches!(
@@ -651,8 +660,8 @@ fn send_with_button_dwell(
     let steps = split_after_button_down(inputs);
     let mut accepted = 0;
     for (index, step) in steps.iter().enumerate() {
-        let sent = match dispatch_inputs(step, control, &mut send) {
-            Ok(sent) => sent,
+        let delivered = match dispatch_inputs(step, control, &mut send) {
+            Ok(count) => count,
             Err(error) => {
                 if accepted > 0 {
                     release_sent(&inputs[..accepted], control, &mut send);
@@ -660,8 +669,8 @@ fn send_with_button_dwell(
                 return Err(error);
             }
         };
-        accepted += sent;
-        if sent != step.len() {
+        accepted += delivered;
+        if delivered != step.len() {
             release_sent(&inputs[..accepted], control, &mut send);
             return Err(incomplete_input_error(operation, accepted, inputs.len()));
         }
@@ -677,11 +686,11 @@ fn send_with_button_dwell(
 }
 
 fn release_sent(
-    sent: &[INPUT],
+    acknowledged: &[INPUT],
     control: &MutationControl,
     send: impl FnOnce(&[INPUT]) -> Result<usize, PlatformError>,
 ) {
-    let owned = owned_releases(sent);
+    let owned = owned_releases(acknowledged);
     if owned.is_empty() {
         control.cleanup_status(controlfreak_core::CleanupStatus::NotNeeded);
     } else {

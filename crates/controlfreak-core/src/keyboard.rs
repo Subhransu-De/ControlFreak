@@ -14,7 +14,7 @@ macro_rules! keys {
             /// Every key, in the order documented to clients.
             pub const ALL: &'static [Self] = &[$(Self::$variant,)*];
 
-            /// The stable snake_case name used in schemas and serialized results.
+            /// The stable `snake_case` name used in schemas and serialized results.
             #[must_use]
             pub const fn canonical_name(self) -> &'static str {
                 match self {
@@ -397,10 +397,10 @@ mod tests {
 
     #[test]
     fn unknown_key_errors_suggest_the_nearest_name_or_list_the_valid_ones() {
-        let error = serde_json::from_str::<Key>("\"escpae\"")
+        let error = serde_json::from_str::<Key>("\"pagedwn\"")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("did you mean 'escape'"), "{error}");
+        assert!(error.contains("did you mean 'page_down'"), "{error}");
         let error = serde_json::from_str::<Key>("\"launch_browser\"")
             .unwrap_err()
             .to_string();

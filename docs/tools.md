@@ -13,8 +13,8 @@ desktop and run inside a [control session](sessions.md).
 | `list_displays` | Observe | Active displays with IDs, primary flag and bounds in physical pixels. |
 | `capture_display` | Observe | Screenshot of a display. |
 | `capture_region` | Observe | Screenshot of a rectangle, at native resolution unless `max_width` is set. |
-| `capture_window` | Observe | Screenshot of a window's visible frame, without focusing it. |
-| `list_windows` | Observe | Visible titled top-level windows, foreground first. At most 200. |
+| `capture_window` | Observe | Screenshot of a window's visible frame, without focusing it. The window renders itself (`capture_method` `windows_print_window`), so windows covering it do not appear; if it cannot, the screen is copied (`windows_gdi`). |
+| `list_windows` | Observe | Visible titled windows, including owned dialogs (with an `owner` field), foreground first. At most 200. |
 | `wait_for_window` | Observe | Wait for a window that matches title, class or process. |
 | `list_virtual_desktops` | Observe | Windows grouped by virtual desktop, with the current one marked. |
 | `read_text_in_region` | Observe | OCR lines and words with bounds. |
@@ -30,11 +30,11 @@ desktop and run inside a [control session](sessions.md).
 | `focus_window` | Input | Restore and focus a window, then verify it is in the foreground. |
 | `move_mouse` | Input | Move the pointer. |
 | `click_mouse` | Input | Click, with optional modifiers. |
-| `drag_mouse` | Input | Press, move and release in one call. |
+| `drag_mouse` | Input | Press, move and release in one call. The pointer travels in several steps over at least 120 ms, holding the button for 20 ms before and after the move. |
 | `scroll_mouse` | Input | Scroll vertically or horizontally at a point. |
-| `press_keys` | Input | Send a key or key chord. |
-| `type_text` | Input | Type Unicode text without the clipboard. |
-| `click_text` | Input | Click a unique line of OCR text. |
+| `press_keys` | Input | Send a key or key chord. Letters, digits, F1 to F12, punctuation, the numpad, system keys and media keys; see Keys below. |
+| `type_text` | Input | Type Unicode text without the clipboard. Line breaks and tabs are pressed as Enter and Tab. |
+| `click_text` | Input | Click the unique OCR text that matches, at the matched words. |
 | `switch_virtual_desktop` | Input | Switch one virtual desktop left or right. |
 | `run_actions` | Input | Up to 16 clicks, scrolls, keys and text steps in one call. |
 
@@ -47,14 +47,28 @@ desktop and run inside a [control session](sessions.md).
 - A screenshot or OCR result includes `target_ref` only when the foreground window stayed the
   same during the capture. A null `target_ref` does not approve input.
 - References expire 5 minutes after the last matching observation.
-- Before each input, the server checks that the target is the same process and window, is in the
-  foreground, is on the current desktop, has the same bounds and display layout, and does not
-  run at a higher integrity level. Pointer input must land on the approved window. Owned popups
-  are not approved automatically.
-- If a check fails, the action is refused and the session target is cleared. Observe again and
-  approve the new target. Do not repeat the input or refocus on your own.
+- Before each input, the server checks that the target is the same process and window, is on the
+  current desktop, has the same bounds and display layout, and does not run at a higher integrity
+  level, and that the target or a window of its own process is in the foreground.
+- The target's own dialogs, popup menus and drop-downs belong to the same process, so they may
+  hold the foreground and receive pointer input without a new session. A window of another
+  process never does. For `explorer.exe` targets (File Explorer, the taskbar, the desktop) only
+  the target's own dialogs and popup menus count, not the rest of the shell.
+- If the foreground or the pointer destination belongs to another process, that action is
+  refused and the session keeps its target. Bring the target back with `focus_window` and try
+  again; nothing else needs to be observed.
+- If the window itself changes (a different window or process, a move or resize, another virtual
+  desktop, destruction), the action is refused and the session target is cleared. Observe again
+  and approve the new target. Do not repeat the input on your own.
 - Moving, restoring or switching desktops invalidates a target. Capture again and approve the new
   reference.
+- `list_windows` also lists visible owned windows such as dialogs. Their `owner` field is the
+  target reference of the window that owns them. `focus_window` and `capture_window` accept them,
+  and a dialog can be approved as a target of its own.
+- The taskbar, secondary taskbars, the desktop and the Start and Search surfaces can be approved
+  too, even though Windows reports no virtual desktop for them: they are treated as present on
+  every desktop. They are recognized by window class and by the program that owns them, never by
+  class alone. A screenshot taken while one of them is in front returns its `target_ref`.
 
 `focus_window`:
 
@@ -84,8 +98,15 @@ no confidence scores.
 
 `click_text`:
 
-- Zero matches return `ocr_no_match`. More than one returns `ocr_ambiguous_match`. Neither sends
-  input or falls back to coordinates.
+- Matching works on the words inside each OCR line, so a label in the middle of a line can be
+  clicked. `exact` needs the query's words to equal consecutive whole words of a line
+  (`Edit` matches in `File Edit View`, `Edi` does not). `exact_match=false` needs the query to
+  occur in the line's words and selects every word it touches. The click lands on the centre of
+  the box that covers the matched words, not on the centre of the line. A line without word
+  boxes is matched as a whole line.
+- `find_text_on_screen` returns the same matched-word box for each match, in display-local pixels.
+- Zero matches return `ocr_no_match`. More than one returns `ocr_ambiguous_match`, including two
+  matches inside one line. Neither sends input or falls back to coordinates.
 - `error.details` lists up to 20 candidates of up to 256 characters each, with `candidate_count`
   and truncation flags.
 - To recover, narrow the region, use the recognized text as the query, or use discovery.
@@ -104,9 +125,32 @@ Tolerant results never approve a click. Use them to pick a strict query and regi
 
 - `timeout_ms` defaults to 5000. The maximum is 30000.
 - Returns `satisfied`, `timed_out`, `attempts`, `elapsed_ms` and the last matches.
-- Each pass is a full OCR pass, so a smaller region is faster.
+- Each pass is a full OCR pass, so a smaller region is faster. If every pixel of the region and
+  the foreground are unchanged since the previous pass, that pass is reused and OCR is skipped.
 
 OCR text and checkbox glyphs do not prove the state of a control.
+
+## Keys
+
+`press_keys` names are case-insensitive, and `-`, `_` and spaces are ignored (`Page-Up` is
+`page_up`). Common aliases work: `esc`, `del`, `return`, `up`, `down`, `left`, `right`, `pgup`.
+
+- Punctuation: `comma`, `period`, `slash`, `semicolon`, `quote`, `left_bracket`, `right_bracket`,
+  `backslash`, `minus`, `equals`, `backtick`, or the character itself (`,` `.` `/` `;` `'` `[` `]`
+  `\` `-` `=` and the backtick). These name the key that types that character without Shift. The
+  active keyboard layout of the foreground window decides which key that is; on a layout that
+  needs Shift or AltGr for it, the US key position is used.
+- Numpad: `numpad_0` to `numpad_9`, `numpad_add`, `numpad_subtract`, `numpad_multiply`,
+  `numpad_divide`, `numpad_decimal`, `num_lock`.
+- System: `print_screen`, `caps_lock`, `scroll_lock`, `pause`, `menu` (also `apps`).
+- Media: `volume_mute`, `volume_down`, `volume_up`, `media_next`, `media_previous`, `media_stop`,
+  `media_play_pause`.
+
+An unknown name is refused with the nearest valid name, or the full list.
+
+`type_text` sends text as Unicode characters, except that `\n`, `\r\n`, a lone `\r` and `\t` are
+pressed as Enter and Tab keys, because a control that ignores those characters still reacts to
+the keys. Each Enter or Tab is checked against the target like a text batch.
 
 ## Waiting for changes
 

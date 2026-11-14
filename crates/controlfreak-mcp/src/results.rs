@@ -136,7 +136,7 @@ pub(super) fn window_screenshot_result(screenshot: Encoded<WindowScreenshot>) ->
             "source_bounds": screenshot.source_bounds,
             "mime_type": "image/png",
             "byte_length": screenshot.png.len(),
-            "capture_method": "windows_gdi",
+            "capture_method": screenshot.capture_method,
             "image_width": screenshot.image_width,
             "image_height": screenshot.image_height,
             "downscale_factor": screenshot.downscale_factor,

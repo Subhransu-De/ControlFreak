@@ -1,6 +1,11 @@
 #![allow(unsafe_code)]
 
 use controlfreak_core::timing;
+use windows::Win32::{
+    Foundation::{HWND, RECT},
+    Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow},
+    UI::WindowsAndMessaging::GetWindowRect,
+};
 
 use super::{
     ActionObservation, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, BitmapPixelFormat, CAPTUREBLT,
@@ -284,19 +289,20 @@ fn foreground_window_info() -> Option<WindowInfo> {
         .flatten()
 }
 
-fn capture_rgba(bounds: DisplayBounds) -> Result<Vec<u8>, PlatformError> {
-    let width = i32::try_from(bounds.width).map_err(|_| PlatformError::OperationFailed {
+/// Bitmap dimensions and byte count of a 32-bit capture, refused beyond Win32 and safety limits.
+fn capture_geometry(width: u32, height: u32) -> Result<(i32, i32, usize), PlatformError> {
+    let signed_width = i32::try_from(width).map_err(|_| PlatformError::OperationFailed {
         operation: "capture_display".to_owned(),
         reason: "display width exceeds the Win32 bitmap limit".to_owned(),
     })?;
-    let height = i32::try_from(bounds.height).map_err(|_| PlatformError::OperationFailed {
+    let signed_height = i32::try_from(height).map_err(|_| PlatformError::OperationFailed {
         operation: "capture_display".to_owned(),
         reason: "display height exceeds the Win32 bitmap limit".to_owned(),
     })?;
-    let byte_count = usize::try_from(bounds.width)
+    let byte_count = usize::try_from(width)
         .ok()
         .and_then(|width| {
-            usize::try_from(bounds.height)
+            usize::try_from(height)
                 .ok()
                 .and_then(|height| width.checked_mul(height))
         })
@@ -306,31 +312,17 @@ fn capture_rgba(bounds: DisplayBounds) -> Result<Vec<u8>, PlatformError> {
             operation: "capture_display".to_owned(),
             reason: format!("capture buffer exceeds the {MAX_CAPTURE_BYTES}-byte safety limit"),
         })?;
+    Ok((signed_width, signed_height, byte_count))
+}
 
-    let screen_dc = ScreenDc::acquire()?;
-    let memory_dc = MemoryDc::create(screen_dc.0)?;
-    let bitmap = Bitmap::create(screen_dc.0, width, height)?;
-
-    {
-        let _selection = SelectedObject::select(memory_dc.0, bitmap.0.into())?;
-        // SAFETY: Both DCs and the selected bitmap are live, coordinates/dimensions were validated,
-        // and BitBlt retains no Rust references after returning.
-        unsafe {
-            BitBlt(
-                memory_dc.0,
-                0,
-                0,
-                width,
-                height,
-                Some(screen_dc.0),
-                bounds.left,
-                bounds.top,
-                SRCCOPY | CAPTUREBLT,
-            )
-        }
-        .map_err(|error| win32_error("BitBlt", &error))?;
-    }
-
+/// Reads a bitmap that is not selected into any DC as top-down 32-bit BGRA into `buffer`.
+fn read_bitmap_bgra(
+    memory_dc: &MemoryDc,
+    bitmap: &Bitmap,
+    width: i32,
+    height: i32,
+    buffer: &mut [u8],
+) -> Result<(), PlatformError> {
     let mut bitmap_info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: u32::try_from(size_of::<BITMAPINFOHEADER>()).map_err(|_| {
@@ -348,32 +340,243 @@ fn capture_rgba(bounds: DisplayBounds) -> Result<Vec<u8>, PlatformError> {
         },
         ..Default::default()
     };
-    let mut bgra = vec![0_u8; byte_count];
-    // SAFETY: `bgra` has the checked size required for the requested 32-bit image, BITMAPINFO is
-    // initialized for that layout, and all GDI handles remain live through the call.
+    debug_assert_eq!(
+        buffer.len(),
+        usize::try_from(width).unwrap_or(0) * usize::try_from(height).unwrap_or(0) * 4
+    );
+    // SAFETY: `buffer` has exactly the size of the requested 32-bit image (checked by
+    // `capture_geometry` for the callers), BITMAPINFO is initialized for that layout, the bitmap
+    // is not selected into a DC, and all GDI handles remain live through the call.
     let copied_lines = unsafe {
         GetDIBits(
             memory_dc.0,
             bitmap.0,
             0,
-            bounds.height,
-            Some(bgra.as_mut_ptr().cast::<c_void>()),
+            u32::try_from(height).unwrap_or(0),
+            Some(buffer.as_mut_ptr().cast::<c_void>()),
             &raw mut bitmap_info,
             DIB_RGB_COLORS,
         )
     };
-    if copied_lines != height {
-        return Err(PlatformError::OperationFailed {
+    if copied_lines == height {
+        Ok(())
+    } else {
+        Err(PlatformError::OperationFailed {
             operation: "GetDIBits".to_owned(),
             reason: format!("copied {copied_lines} of {height} scan lines"),
-        });
+        })
+    }
+}
+
+/// Reads one screen rectangle repeatedly. The device contexts, the bitmap and the pixel buffer
+/// are created once, so each further read is one `BitBlt` and one `GetDIBits` with no allocation.
+struct FrameGrabber {
+    screen_dc: ScreenDc,
+    memory_dc: MemoryDc,
+    bitmap: Bitmap,
+    bounds: DisplayBounds,
+    width: i32,
+    height: i32,
+    /// The latest read: top-down BGRA, the byte after each pixel's red byte unspecified.
+    buffer: Vec<u8>,
+}
+
+impl FrameGrabber {
+    fn new(bounds: DisplayBounds) -> Result<Self, PlatformError> {
+        let (width, height, byte_count) = capture_geometry(bounds.width, bounds.height)?;
+        let screen_dc = ScreenDc::acquire()?;
+        let memory_dc = MemoryDc::create(screen_dc.0)?;
+        let bitmap = Bitmap::create(screen_dc.0, width, height)?;
+        Ok(Self {
+            screen_dc,
+            memory_dc,
+            bitmap,
+            bounds,
+            width,
+            height,
+            buffer: vec![0_u8; byte_count],
+        })
     }
 
-    for pixel in bgra.chunks_exact_mut(4) {
+    /// Replaces `self.buffer` with the rectangle's current pixels.
+    fn grab(&mut self) -> Result<(), PlatformError> {
+        {
+            // GetDIBits needs the bitmap unselected, so it is selected only around the copy.
+            let _selection = SelectedObject::select(self.memory_dc.0, self.bitmap.0.into())?;
+            // SAFETY: Both DCs and the selected bitmap are live, coordinates and dimensions were
+            // validated when the grabber was created, and BitBlt retains no Rust references.
+            unsafe {
+                BitBlt(
+                    self.memory_dc.0,
+                    0,
+                    0,
+                    self.width,
+                    self.height,
+                    Some(self.screen_dc.0),
+                    self.bounds.left,
+                    self.bounds.top,
+                    SRCCOPY | CAPTUREBLT,
+                )
+            }
+            .map_err(|error| win32_error("BitBlt", &error))?;
+        }
+        read_bitmap_bgra(
+            &self.memory_dc,
+            &self.bitmap,
+            self.width,
+            self.height,
+            &mut self.buffer,
+        )
+    }
+}
+
+/// Converts a BGRA frame to opaque RGBA in place.
+fn bgra_to_rgba(frame: &mut [u8]) {
+    for pixel in frame.chunks_exact_mut(4) {
         pixel.swap(0, 2);
         pixel[3] = u8::MAX;
     }
-    Ok(bgra)
+}
+
+fn capture_rgba(bounds: DisplayBounds) -> Result<Vec<u8>, PlatformError> {
+    let mut grabber = FrameGrabber::new(bounds)?;
+    grabber.grab()?;
+    let mut frame = std::mem::take(&mut grabber.buffer);
+    bgra_to_rgba(&mut frame);
+    Ok(frame)
+}
+
+/// How a window screenshot was produced; reported to clients as `capture_method`.
+pub(super) const CAPTURE_METHOD_PRINT_WINDOW: &str = "windows_print_window";
+pub(super) const CAPTURE_METHOD_SCREEN: &str = "windows_gdi";
+
+/// `PW_RENDERFULLCONTENT`: ask the window (and DWM) to render all of its content, including
+/// layered and hardware-accelerated child content, even when it is covered by other windows.
+const PW_RENDERFULLCONTENT: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(2);
+
+/// Copies the part of a window-sized BGRA frame that starts at (`left`, `top`) and is
+/// `width` x `height` as opaque RGBA. `None` if that part is not inside the frame.
+fn crop_bgra_to_rgba(
+    frame: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    left: i64,
+    top: i64,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    let right = left.checked_add(i64::from(width))?;
+    let bottom = top.checked_add(i64::from(height))?;
+    if left < 0
+        || top < 0
+        || right > i64::from(frame_width)
+        || bottom > i64::from(frame_height)
+        || frame.len()
+            != usize::try_from(u64::from(frame_width) * u64::from(frame_height) * 4).ok()?
+    {
+        return None;
+    }
+    let stride = usize::try_from(frame_width).ok()? * 4;
+    let row_bytes = usize::try_from(width).ok()? * 4;
+    let mut rgba = Vec::with_capacity(row_bytes * usize::try_from(height).ok()?);
+    for row in 0..usize::try_from(height).ok()? {
+        let start = (usize::try_from(top).ok()? + row) * stride + usize::try_from(left).ok()? * 4;
+        rgba.extend_from_slice(&frame[start..start + row_bytes]);
+    }
+    bgra_to_rgba(&mut rgba);
+    Some(rgba)
+}
+
+/// A window that failed to render itself comes back fully black; real windows are not.
+fn is_blank_frame(rgba: &[u8]) -> bool {
+    rgba.chunks_exact(4)
+        .all(|pixel| pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0)
+}
+
+/// Renders the window itself into a bitmap, so what covers it on screen is irrelevant, and
+/// returns the part inside `visible` (the frame bounds that coordinates are reported in) as
+/// RGBA. `None` when the window cannot render itself, returns nothing, or its pixels do not line
+/// up with `visible`; the caller then copies the screen instead.
+fn print_window_rgba(hwnd: HWND, visible: DisplayBounds) -> Option<Vec<u8>> {
+    let mut rect = RECT::default();
+    // SAFETY: rect is writable for the synchronous call, which retains no references.
+    unsafe { GetWindowRect(hwnd, &raw mut rect) }.ok()?;
+    let full_width = u32::try_from(rect.right.checked_sub(rect.left)?).ok()?;
+    let full_height = u32::try_from(rect.bottom.checked_sub(rect.top)?).ok()?;
+    if full_width == 0 || full_height == 0 {
+        return None;
+    }
+    let (width, height, byte_count) = capture_geometry(full_width, full_height).ok()?;
+    let screen_dc = ScreenDc::acquire().ok()?;
+    let memory_dc = MemoryDc::create(screen_dc.0).ok()?;
+    let bitmap = Bitmap::create(screen_dc.0, width, height).ok()?;
+    {
+        let _selection = SelectedObject::select(memory_dc.0, bitmap.0.into()).ok()?;
+        // SAFETY: hwnd is a window handle checked by the caller, the memory DC has the bitmap
+        // selected, and PrintWindow retains no references after returning.
+        if !unsafe { PrintWindow(hwnd, memory_dc.0, PW_RENDERFULLCONTENT) }.as_bool() {
+            return None;
+        }
+    }
+    let mut frame = vec![0_u8; byte_count];
+    read_bitmap_bgra(&memory_dc, &bitmap, width, height, &mut frame).ok()?;
+    let rgba = crop_bgra_to_rgba(
+        &frame,
+        full_width,
+        full_height,
+        i64::from(visible.left) - i64::from(rect.left),
+        i64::from(visible.top) - i64::from(rect.top),
+        visible.width,
+        visible.height,
+    )?;
+    (!is_blank_frame(&rgba)).then_some(rgba)
+}
+
+/// Picks the pixels for a window screenshot: the window's own rendering if there is one, else a
+/// copy of its screen rectangle.
+fn window_pixels(
+    printed: Option<Vec<u8>>,
+    copy_screen: impl FnOnce() -> Result<Vec<u8>, PlatformError>,
+) -> Result<(Vec<u8>, &'static str), PlatformError> {
+    match printed {
+        Some(rgba) => Ok((rgba, CAPTURE_METHOD_PRINT_WINDOW)),
+        None => copy_screen().map(|rgba| (rgba, CAPTURE_METHOD_SCREEN)),
+    }
+}
+
+/// A window screenshot ready to return.
+pub(super) struct WindowCapture {
+    pub(super) png: Vec<u8>,
+    pub(super) image_width: u32,
+    pub(super) image_height: u32,
+    pub(super) downscale_factor: u32,
+    pub(super) cursor_marker: bool,
+    pub(super) capture_method: &'static str,
+}
+
+/// Captures `hwnd` by rendering the window, so an occluded window shows its own content rather
+/// than whatever covers it, and falls back to a screen copy of `bounds` if it cannot. Either way
+/// the image covers exactly `bounds`, so mapping image points to screen points is unchanged.
+pub(super) fn capture_window_bounds(
+    hwnd: HWND,
+    bounds: DisplayBounds,
+    max_width: Option<u32>,
+    include_cursor_marker: bool,
+) -> Result<WindowCapture, PlatformError> {
+    let printed = timing::time("capture_print_window", || print_window_rgba(hwnd, bounds));
+    let (rgba, capture_method) = window_pixels(printed, || {
+        timing::time("capture_gdi", || capture_rgba(bounds))
+    })?;
+    let (png, image_width, image_height, downscale_factor, cursor_marker) =
+        finish_image(rgba, bounds, max_width, include_cursor_marker)?;
+    Ok(WindowCapture {
+        png,
+        image_width,
+        image_height,
+        downscale_factor,
+        cursor_marker,
+        capture_method,
+    })
 }
 
 pub(super) fn capture_bounds(
@@ -381,7 +584,17 @@ pub(super) fn capture_bounds(
     max_width: Option<u32>,
     include_cursor_marker: bool,
 ) -> Result<(Vec<u8>, u32, u32, u32, bool), PlatformError> {
-    let bgra = timing::time("capture_gdi", || capture_rgba(bounds))?;
+    let rgba = timing::time("capture_gdi", || capture_rgba(bounds))?;
+    finish_image(rgba, bounds, max_width, include_cursor_marker)
+}
+
+/// Resizes, marks the cursor on and PNG-encodes a captured frame of `bounds`.
+fn finish_image(
+    bgra: Vec<u8>,
+    bounds: DisplayBounds,
+    max_width: Option<u32>,
+    include_cursor_marker: bool,
+) -> Result<(Vec<u8>, u32, u32, u32, bool), PlatformError> {
     let (image_width, image_height, downscale_factor) =
         scaled_dimensions(bounds.width, bounds.height, max_width);
     let mut rgba = if image_width == bounds.width && image_height == bounds.height {
@@ -459,7 +672,9 @@ const SETTLE_STABLE: Duration = Duration::from_millis(60);
 /// Watches the approved window across an input action, so the action returns as soon as the
 /// window has visibly responded and stopped changing, instead of always sleeping the full cap.
 pub(super) struct SettleWatch {
-    bounds: DisplayBounds,
+    /// Reads the window with reused GDI objects and one pixel buffer.
+    grabber: FrameGrabber,
+    /// The window before input, as BGRA.
     before: Vec<u8>,
 }
 
@@ -483,15 +698,21 @@ impl SettleWatch {
         {
             return None;
         }
-        let before = timing::time("settle_capture", || capture_rgba(bounds)).ok()?;
-        Some(Self { bounds, before })
+        let mut grabber = FrameGrabber::new(bounds).ok()?;
+        timing::time("settle_capture", || grabber.grab()).ok()?;
+        let before = grabber.buffer.clone();
+        Some(Self { grabber, before })
     }
 
     /// Waits until the window changed and then stayed identical for at least `SETTLE_STABLE`,
-    /// or until `cap`.
-    pub(super) fn wait(self, cap: Duration) -> SettleOutcome {
+    /// or until `cap`. Frames are compared as the BGRA the screen read produces, with no
+    /// conversion or allocation per read.
+    pub(super) fn wait(mut self, cap: Duration) -> SettleOutcome {
         let started = Instant::now();
-        let mut changed: Option<(Vec<u8>, Instant)> = None;
+        // The latest frame that differed from its predecessor, and when it was read. Swapping
+        // it with the grabber's buffer keeps both buffers at full size without copying.
+        let mut held = vec![0_u8; self.before.len()];
+        let mut changed_at: Option<Instant> = None;
         loop {
             let remaining = cap.saturating_sub(started.elapsed());
             if remaining.is_zero() {
@@ -499,21 +720,26 @@ impl SettleWatch {
             }
             std::thread::sleep(SETTLE_POLL.min(remaining));
             let read_at = Instant::now();
-            let Ok(frame) = timing::time("settle_capture", || capture_rgba(self.bounds)) else {
+            if timing::time("settle_capture", || self.grabber.grab()).is_err() {
                 std::thread::sleep(cap.saturating_sub(started.elapsed()));
                 return SettleOutcome::Capped;
-            };
-            match &changed {
-                Some((last, since)) if changed_pixels(last, &frame, 1) == 0 => {
-                    if read_at.saturating_duration_since(*since) >= SETTLE_STABLE {
+            }
+            let frame = &self.grabber.buffer;
+            match changed_at {
+                Some(since) if changed_pixels(&held, frame, 1) == 0 => {
+                    if read_at.saturating_duration_since(since) >= SETTLE_STABLE {
                         return SettleOutcome::Settled;
                     }
                 }
-                Some(_) => changed = Some((frame, read_at)),
-                None if changed_pixels(&self.before, &frame, SETTLE_MIN_CHANGED_PIXELS)
+                Some(_) => {
+                    std::mem::swap(&mut held, &mut self.grabber.buffer);
+                    changed_at = Some(read_at);
+                }
+                None if changed_pixels(&self.before, frame, SETTLE_MIN_CHANGED_PIXELS)
                     >= SETTLE_MIN_CHANGED_PIXELS =>
                 {
-                    changed = Some((frame, read_at));
+                    std::mem::swap(&mut held, &mut self.grabber.buffer);
+                    changed_at = Some(read_at);
                 }
                 None => {}
             }
@@ -521,16 +747,55 @@ impl SettleWatch {
     }
 }
 
-/// Counts RGBA pixels that differ between two equally sized frames, stopping at `limit`.
+/// Counts pixels whose three colour bytes differ between two equally sized 4-byte-per-pixel
+/// frames, stopping at `limit`. The fourth byte is ignored: a screen read leaves it unspecified,
+/// so BGRA frames and RGBA frames with a constant alpha both compare correctly.
 fn changed_pixels(left: &[u8], right: &[u8], limit: usize) -> usize {
     if left.len() != right.len() {
         return limit;
     }
     left.chunks_exact(4)
         .zip(right.chunks_exact(4))
-        .filter(|(left, right)| left != right)
+        .filter(|(left, right)| left[..3] != right[..3])
         .take(limit)
         .count()
+}
+
+/// Tells whether a screen region has changed since the previous check, comparing every pixel.
+/// The GDI objects and both pixel buffers are created once and reused for every check.
+pub(super) struct RegionChange {
+    grabber: FrameGrabber,
+    previous: Vec<u8>,
+    have_previous: bool,
+}
+
+impl RegionChange {
+    pub(super) fn new(bounds: DisplayBounds) -> Result<Self, PlatformError> {
+        let grabber = FrameGrabber::new(bounds)?;
+        let previous = vec![0_u8; grabber.buffer.len()];
+        Ok(Self {
+            grabber,
+            previous,
+            have_previous: false,
+        })
+    }
+
+    /// Reads the region and reports whether it is identical to the previous read. The first
+    /// read has nothing to match and always reports a change.
+    pub(super) fn unchanged_since_last(&mut self) -> Result<bool, PlatformError> {
+        self.grabber.grab()?;
+        let unchanged = self.have_previous && frames_match(&self.grabber.buffer, &self.previous);
+        if !unchanged {
+            std::mem::swap(&mut self.previous, &mut self.grabber.buffer);
+            self.have_previous = true;
+        }
+        Ok(unchanged)
+    }
+}
+
+/// Whether two frames hold the same colours; see `changed_pixels` for the ignored byte.
+fn frames_match(left: &[u8], right: &[u8]) -> bool {
+    changed_pixels(left, right, 1) == 0
 }
 
 pub(super) fn capture_comparison_frame(bounds: DisplayBounds) -> Result<Vec<u8>, PlatformError> {
@@ -1021,12 +1286,24 @@ fn set_marker_pixel(rgba: &mut [u8], width: u32, height: u32, x: i64, y: i64) {
 }
 
 /// Encodes opaque RGBA pixels as an RGB PNG; dropping the constant alpha channel makes the image
-/// smaller and faster to encode without changing what the client sees.
+/// smaller and faster to encode without changing what the client sees. Rows are converted one at
+/// a time as they are written, so no second full-frame buffer is built.
 pub(super) fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, PlatformError> {
-    let rgb: Vec<u8> = rgba
-        .chunks_exact(4)
-        .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
-        .collect();
+    use std::io::Write as _;
+    let failed = |reason: String| PlatformError::OperationFailed {
+        operation: "encode_png".to_owned(),
+        reason,
+    };
+    let row_pixels = usize::try_from(width).map_err(|error| failed(error.to_string()))?;
+    if rgba.len()
+        != row_pixels
+            .saturating_mul(4)
+            .saturating_mul(usize::try_from(height).map_err(|error| failed(error.to_string()))?)
+    {
+        return Err(failed(
+            "pixel data does not match the image dimensions".to_owned(),
+        ));
+    }
     let mut output = Vec::new();
     let mut encoder = png::Encoder::new(&mut output, width, height);
     encoder.set_color(png::ColorType::Rgb);
@@ -1036,22 +1313,28 @@ pub(super) fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>
     encoder.set_deflate_compression(png::DeflateCompression::Level(2));
     let mut writer = encoder
         .write_header()
-        .map_err(|error| PlatformError::OperationFailed {
-            operation: "encode_png".to_owned(),
-            reason: error.to_string(),
-        })?;
-    writer
-        .write_image_data(&rgb)
-        .map_err(|error| PlatformError::OperationFailed {
-            operation: "encode_png".to_owned(),
-            reason: error.to_string(),
-        })?;
-    writer
-        .finish()
-        .map_err(|error| PlatformError::OperationFailed {
-            operation: "encode_png".to_owned(),
-            reason: error.to_string(),
-        })?;
+        .map_err(|error| failed(error.to_string()))?;
+    {
+        let mut stream = writer
+            .stream_writer()
+            .map_err(|error| failed(error.to_string()))?;
+        let mut row = Vec::with_capacity(row_pixels * 3);
+        if row_pixels > 0 {
+            for source in rgba.chunks_exact(row_pixels * 4) {
+                row.clear();
+                row.extend(
+                    source
+                        .chunks_exact(4)
+                        .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]),
+                );
+                stream
+                    .write_all(&row)
+                    .map_err(|error| failed(error.to_string()))?;
+            }
+        }
+        stream.finish().map_err(|error| failed(error.to_string()))?;
+    }
+    writer.finish().map_err(|error| failed(error.to_string()))?;
     Ok(output)
 }
 
@@ -1368,5 +1651,123 @@ mod live_encode_benchmarks {
             "{width}x{height}: shipped {:.1}ms {} bytes; balanced default {:.1}ms {} bytes",
             shipped.0, shipped.1, previous.0, previous.1
         );
+    }
+}
+
+#[cfg(test)]
+mod window_capture_tests {
+    use super::*;
+
+    /// A 4x3 BGRA frame whose pixel (x, y) is blue = x, green = y, red = 100 + x + y.
+    fn gradient() -> Vec<u8> {
+        let mut frame = Vec::new();
+        for y in 0..3_u8 {
+            for x in 0..4_u8 {
+                frame.extend_from_slice(&[x, y, 100 + x + y, 0]);
+            }
+        }
+        frame
+    }
+
+    #[test]
+    fn cropping_keeps_the_visible_frame_and_converts_bgra_to_opaque_rgba() {
+        // The window is 4x3; the visible frame is the 2x2 block at offset (1, 1), as when the
+        // window has invisible resize borders.
+        let rgba = crop_bgra_to_rgba(&gradient(), 4, 3, 1, 1, 2, 2).unwrap();
+        assert_eq!(
+            rgba,
+            [
+                102, 1, 1, 255, // x=1, y=1
+                103, 1, 2, 255, // x=2, y=1
+                103, 2, 1, 255, // x=1, y=2
+                104, 2, 2, 255, // x=2, y=2
+            ]
+        );
+        let whole = crop_bgra_to_rgba(&gradient(), 4, 3, 0, 0, 4, 3).unwrap();
+        assert_eq!(whole.len(), 48);
+        assert_eq!(&whole[..4], [100, 0, 0, 255]);
+    }
+
+    #[test]
+    fn cropping_refuses_a_visible_frame_that_does_not_line_up_with_the_pixels() {
+        let frame = gradient();
+        for (left, top, width, height) in [
+            (-1, 0, 2, 2),
+            (0, -1, 2, 2),
+            (3, 0, 2, 2),
+            (0, 2, 2, 2),
+            (0, 0, 5, 3),
+            (i64::MAX, 0, 2, 2),
+        ] {
+            assert!(
+                crop_bgra_to_rgba(&frame, 4, 3, left, top, width, height).is_none(),
+                "{left},{top},{width},{height}"
+            );
+        }
+        // A frame of the wrong length is never trusted.
+        assert!(crop_bgra_to_rgba(&frame[..40], 4, 3, 0, 0, 2, 2).is_none());
+    }
+
+    #[test]
+    fn only_a_fully_black_render_counts_as_a_failed_print() {
+        assert!(is_blank_frame(&[0, 0, 0, 255, 0, 0, 0, 0]));
+        assert!(!is_blank_frame(&[0, 0, 0, 255, 0, 1, 0, 255]));
+        assert!(is_blank_frame(&[]));
+    }
+
+    #[test]
+    fn the_window_is_rendered_itself_and_the_screen_copy_is_only_a_fallback() {
+        let rendered = vec![1, 2, 3, 255];
+        let (pixels, method) = window_pixels(Some(rendered.clone()), || {
+            panic!("an occluded window must not be copied from the screen")
+        })
+        .unwrap();
+        assert_eq!((pixels, method), (rendered, "windows_print_window"));
+        let (pixels, method) = window_pixels(None, || Ok(vec![9, 9, 9, 255])).unwrap();
+        assert_eq!((pixels, method), (vec![9, 9, 9, 255], "windows_gdi"));
+        assert!(
+            window_pixels(None, || Err(PlatformError::OperationFailed {
+                operation: "BitBlt".into(),
+                reason: "synthetic".into(),
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn frames_match_ignores_the_unspecified_fourth_byte_but_not_any_colour() {
+        let mut left = vec![10, 20, 30, 0, 40, 50, 60, 0];
+        let mut right = vec![10, 20, 30, 255, 40, 50, 60, 7];
+        assert!(frames_match(&left, &right));
+        right[5] = 51;
+        assert!(!frames_match(&left, &right));
+        left.pop();
+        assert!(!frames_match(&left, &right), "different sizes never match");
+    }
+
+    #[test]
+    fn png_rows_are_written_without_a_full_frame_rgb_copy_and_round_trip() {
+        let (width, height) = (5_u32, 4_u32);
+        let rgba: Vec<u8> = (0..width * height)
+            .flat_map(|index| {
+                let value = u8::try_from(index * 11).unwrap();
+                [value, value / 2, 255 - value, 255]
+            })
+            .collect();
+        let encoded = encode_png(width, height, &rgba).unwrap();
+        let mut reader = png::Decoder::new(std::io::Cursor::new(encoded))
+            .read_info()
+            .unwrap();
+        let mut pixels = vec![0_u8; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!((info.width, info.height), (width, height));
+        let expected: Vec<u8> = rgba
+            .chunks_exact(4)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect();
+        assert_eq!(pixels, expected);
+        // Mismatched pixel data is refused instead of writing a corrupt image.
+        assert!(encode_png(width, height, &rgba[..rgba.len() - 4]).is_err());
+        assert!(encode_png(width + 1, height, &rgba).is_err());
     }
 }

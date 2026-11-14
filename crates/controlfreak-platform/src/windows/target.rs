@@ -569,15 +569,14 @@ pub(super) fn arm_if_foreground(id: &str) -> Result<(), PlatformError> {
         .find(|reference| reference.id == id)
         .cloned()
         .ok_or_else(|| invalid("approved target reference was retired"))?;
-    if foreground_serves(&snapshot.identity) {
-        if let Some(reference) = REFERENCES
+    if foreground_serves(&snapshot.identity)
+        && let Some(reference) = REFERENCES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter_mut()
             .find(|reference| reference.id == id)
-        {
-            reference.armed = true;
-        }
+    {
+        reference.armed = true;
     }
     Ok(())
 }
@@ -909,6 +908,12 @@ pub(super) fn observation_matches_approved(approved: &str, observed: Option<&str
     accepts_same_process(&target, approved.identity.shell_host, &window)
 }
 
+/// Counts foreground changes, window destruction and desktop switches. Equal values at two
+/// moments mean none of those happened between them.
+pub(super) fn observation_generation() -> u64 {
+    OBSERVATION_GENERATION.load(Ordering::Acquire)
+}
+
 pub(super) fn observe() -> Option<(String, u64)> {
     let generation = OBSERVATION_GENERATION.load(Ordering::Acquire);
     Some((issue(desktop::foreground_window_handle()).ok()?, generation))
@@ -1126,7 +1131,7 @@ mod tests {
     fn assert_recoverable(result: Result<(), Failure>, expect: &str) {
         match result {
             Err(Failure::Recoverable(error)) => {
-                assert!(error.to_string().contains(expect), "{error}")
+                assert!(error.to_string().contains(expect), "{error}");
             }
             Err(Failure::Fatal(error)) => {
                 panic!("expected a recoverable refusal, got fatal: {error}")
