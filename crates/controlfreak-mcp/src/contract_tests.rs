@@ -710,12 +710,13 @@ async fn switch_virtual_desktop_defaults_its_target_and_ends_the_session() {
         "the switch must end the session: {status}"
     );
     // A session on another window supplies the target, and an explicit one is still validated.
-    call(
+    let begun = call(
         &mut harness,
         BEGIN_CONTROL_SESSION,
         json!({"target_ref": "target-00000000-0000-0000-0000-000000000002"}),
     )
     .await;
+    assert_ne!(begun["isError"], true, "{begun}");
     let again = call(
         &mut harness,
         SWITCH_VIRTUAL_DESKTOP,

@@ -547,7 +547,7 @@ const RENDER_SLOT_POLL: Duration = Duration::from_millis(5);
 /// never answers therefore costs one parked thread and its GDI objects rather than one per call,
 /// two captures in parallel both get their window's own rendering, and a hung window does not
 /// make every later capture wait out the deadline.
-pub(super) struct RenderSlot {
+struct RenderSlot {
     state: std::sync::Mutex<SlotState>,
 }
 
@@ -1870,22 +1870,22 @@ mod window_capture_tests {
             atomic::{AtomicUsize, Ordering},
             mpsc,
         };
-        static OUTSTANDING: RenderSlot = RenderSlot::new();
+        static TEST_SLOT: RenderSlot = RenderSlot::new();
         let (release, hold) = mpsc::channel::<()>();
         let started = Instant::now();
         // A renderer that never answers until released, like a window that stops pumping messages.
-        let result = render_within(Duration::from_millis(100), &OUTSTANDING, move || {
+        let result = render_within(Duration::from_millis(100), &TEST_SLOT, move || {
             let _ = hold.recv();
             Some(vec![1_u8])
         });
         assert!(result.is_none());
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(OUTSTANDING.is_busy());
+        assert!(TEST_SLOT.is_busy());
 
         // While it is parked no second render starts at all.
         let attempts = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&attempts);
-        let second = render_within(Duration::from_millis(100), &OUTSTANDING, move || {
+        let second = render_within(Duration::from_millis(100), &TEST_SLOT, move || {
             counter.fetch_add(1, Ordering::SeqCst);
             Some(vec![2_u8])
         });
@@ -1895,14 +1895,14 @@ mod window_capture_tests {
         // Once the parked render returns, rendering works again.
         release.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while OUTSTANDING.is_busy() {
+        while TEST_SLOT.is_busy() {
             assert!(
                 Instant::now() < deadline,
                 "the abandoned render never finished"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-        let third = render_within(Duration::from_secs(5), &OUTSTANDING, || Some(vec![3_u8]));
+        let third = render_within(Duration::from_secs(5), &TEST_SLOT, || Some(vec![3_u8]));
         assert_eq!(third, Some(vec![3_u8]));
     }
 
@@ -1939,11 +1939,11 @@ mod window_capture_tests {
     #[test]
     fn a_second_render_waits_for_the_slot_instead_of_giving_up() {
         use std::sync::mpsc;
-        static OUTSTANDING: RenderSlot = RenderSlot::new();
+        static TEST_SLOT: RenderSlot = RenderSlot::new();
         let (release, hold) = mpsc::channel::<()>();
         let (started, running) = mpsc::channel::<()>();
         let first = std::thread::spawn(move || {
-            render_within(Duration::from_secs(10), &OUTSTANDING, move || {
+            render_within(Duration::from_secs(10), &TEST_SLOT, move || {
                 started.send(()).unwrap();
                 let _ = hold.recv();
                 Some(1_u8)
@@ -1951,7 +1951,7 @@ mod window_capture_tests {
         });
         running.recv().unwrap();
         let second = std::thread::spawn(|| {
-            render_within(Duration::from_secs(10), &OUTSTANDING, || Some(2_u8))
+            render_within(Duration::from_secs(10), &TEST_SLOT, || Some(2_u8))
         });
         // The second capture has to be waiting, not already answered or abandoned.
         std::thread::sleep(Duration::from_millis(100));
@@ -1963,31 +1963,31 @@ mod window_capture_tests {
 
     #[test]
     fn a_render_that_answers_in_time_is_returned_and_a_failed_one_is_not() {
-        static OUTSTANDING: RenderSlot = RenderSlot::new();
+        static TEST_SLOT: RenderSlot = RenderSlot::new();
         assert_eq!(
-            render_within(Duration::from_secs(5), &OUTSTANDING, || Some(7_u8)),
+            render_within(Duration::from_secs(5), &TEST_SLOT, || Some(7_u8)),
             Some(7)
         );
         assert_eq!(
-            render_within::<u8>(Duration::from_secs(5), &OUTSTANDING, || None),
+            render_within::<u8>(Duration::from_secs(5), &TEST_SLOT, || None),
             None
         );
     }
 
     #[test]
     fn a_render_that_panics_still_frees_the_render_slot() {
-        static OUTSTANDING: RenderSlot = RenderSlot::new();
-        let panicked = render_within::<u8>(Duration::from_secs(5), &OUTSTANDING, || {
+        static TEST_SLOT: RenderSlot = RenderSlot::new();
+        let panicked = render_within::<u8>(Duration::from_secs(5), &TEST_SLOT, || {
             panic!("synthetic render failure")
         });
         assert_eq!(panicked, None);
         // The worker clears the slot while unwinding; allow it a moment to finish doing so.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while OUTSTANDING.is_busy() && std::time::Instant::now() < deadline {
+        while TEST_SLOT.is_busy() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(
-            render_within(Duration::from_secs(5), &OUTSTANDING, || Some(9_u8)),
+            render_within(Duration::from_secs(5), &TEST_SLOT, || Some(9_u8)),
             Some(9)
         );
     }

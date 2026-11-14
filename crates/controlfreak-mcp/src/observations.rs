@@ -24,7 +24,9 @@ use std::{
 /// The alias every `display_id` parameter accepts for the primary display.
 pub(super) const PRIMARY_DISPLAY: &str = "primary";
 
-const MAX_OBSERVATIONS: usize = 64;
+/// Unit tests share one process-wide store across parallel threads, so they get headroom that
+/// no burst of registrations from other tests can use up before a test reads its own.
+const MAX_OBSERVATIONS: usize = if cfg!(test) { 4096 } else { 64 };
 const OBSERVATION_TTL: Duration = Duration::from_mins(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,21 +73,29 @@ pub(super) fn register(
     let mut observations = OBSERVATIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    observations.retain(|observation| observation.created.elapsed() < OBSERVATION_TTL);
+    remember(
+        &mut observations,
+        Observation {
+            id: id.clone(),
+            created: Instant::now(),
+            mapping: ImageMapping {
+                source,
+                image_width,
+                image_height,
+            },
+            window_id,
+        },
+    );
+    id
+}
+
+/// Drops expired entries, then the oldest ones, so the store never holds more than the bound.
+fn remember(observations: &mut VecDeque<Observation>, observation: Observation) {
+    observations.retain(|kept| kept.created.elapsed() < OBSERVATION_TTL);
     while observations.len() >= MAX_OBSERVATIONS {
         observations.pop_front();
     }
-    observations.push_back(Observation {
-        id: id.clone(),
-        created: Instant::now(),
-        mapping: ImageMapping {
-            source,
-            image_width,
-            image_height,
-        },
-        window_id,
-    });
-    id
+    observations.push_back(observation);
 }
 
 fn invalid(argument: &str, reason: impl Into<String>) -> PlatformError {
@@ -342,12 +352,25 @@ mod tests {
 
     #[test]
     fn observations_are_bounded_and_unknown_ids_are_refused() {
-        let first = register(bounds(0, 0, 10, 10), 10, 10, None);
-        assert!(mapping(&first).is_ok());
-        for _ in 0..MAX_OBSERVATIONS {
-            register(bounds(0, 0, 10, 10), 10, 10, None);
+        // A local store: the process-wide one is shared with every parallel test, and filling it
+        // here would evict their observations.
+        let mut store = VecDeque::new();
+        let entry = |id: String| Observation {
+            id,
+            created: Instant::now(),
+            mapping: ImageMapping {
+                source: bounds(0, 0, 10, 10),
+                image_width: 10,
+                image_height: 10,
+            },
+            window_id: None,
+        };
+        remember(&mut store, entry("first".to_owned()));
+        for number in 0..MAX_OBSERVATIONS {
+            remember(&mut store, entry(number.to_string()));
         }
-        assert!(mapping(&first).is_err());
+        assert_eq!(store.len(), MAX_OBSERVATIONS);
+        assert!(store.iter().all(|kept| kept.id != "first"));
         assert!(mapping("obs-not-issued").is_err());
     }
 

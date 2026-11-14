@@ -27,12 +27,13 @@ use windows::{
                 D2D1_ANTIALIAS_MODE_ALIASED, D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_SMALL,
                 D2D1_CAP_STYLE_ROUND, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
                 D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
-                D2D1_LINE_JOIN_ROUND, D2D1_RENDER_TARGET_PROPERTIES,
-                D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
-                D2D1_STROKE_STYLE_PROPERTIES, D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
-                D2D1CreateFactory, ID2D1Brush, ID2D1DCRenderTarget, ID2D1Factory,
-                ID2D1PathGeometry, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+                D2D1_LINE_JOIN_ROUND, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE,
+                D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+                D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES,
+                D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Brush,
+                ID2D1DCRenderTarget, ID2D1Factory, ID2D1PathGeometry, ID2D1SolidColorBrush,
+                ID2D1StrokeStyle,
             },
             DirectWrite::{
                 DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -1785,9 +1786,18 @@ fn system_fonts(factory: &IDWriteFactory) -> io::Result<IDWriteFontCollection> {
     collection.ok_or_else(|| io::Error::other("Windows returned no system font collection"))
 }
 
+/// Unit tests draw on the CPU. Many painters are created and dropped on parallel test threads,
+/// and some GPU user-mode drivers crash when their devices are torn down concurrently. The tests
+/// compare text and geometry, which the rasterizer does not change; the server uses the default.
+const RENDER_TARGET_TYPE: D2D1_RENDER_TARGET_TYPE = if cfg!(test) {
+    D2D1_RENDER_TARGET_TYPE_SOFTWARE
+} else {
+    D2D1_RENDER_TARGET_TYPE_DEFAULT
+};
+
 fn create_target(d2d: &ID2D1Factory) -> io::Result<ID2D1DCRenderTarget> {
     let properties = D2D1_RENDER_TARGET_PROPERTIES {
-        r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        r#type: RENDER_TARGET_TYPE,
         pixelFormat: D2D1_PIXEL_FORMAT {
             format: DXGI_FORMAT_B8G8R8A8_UNORM,
             alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,

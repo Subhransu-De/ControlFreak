@@ -66,7 +66,7 @@ One exception to the desktop, foreground and same-process rules is `switch_virtu
 
 A double or triple click is sent as separate batches with a 20 ms dwell after each press. The target, foreground, input desktop, integrity, hit window and cursor position are validated again immediately before every batch that carries new input, and a refusal releases only the input that the system acknowledged; cleanup never sends a new press.
 
-Window capture renders the window itself with `PrintWindow`. That call can wait for the target program, so it runs on a watchdog thread with a 2-second deadline, is skipped for windows that Windows flags as hung, and runs one render at a time. A second capture waits for the slot within the same deadline; after a timeout the screen is copied and `capture_method` says `windows_gdi`.
+Window capture renders the window itself with `PrintWindow`. That call can wait for the target program, so it runs on a watchdog thread with a 2-second deadline, is skipped for windows that Windows flags as hung, and runs one render at a time. A second capture waits for the slot while its render is live, within the same deadline; after a timeout, or behind a render that was already given up on, the screen is copied at once and `capture_method` says `windows_gdi`.
 
 The taskbar, secondary taskbars, the desktop and the Start and Search surfaces can be approved as
 targets. Windows does not report a virtual desktop for them because they are on every desktop, so

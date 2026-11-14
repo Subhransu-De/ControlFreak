@@ -157,7 +157,7 @@ impl SessionSignals {
     }
 
     fn wake(&self) {
-        let thread = self.ui_thread.load(Ordering::Acquire);
+        let thread = self.ui_thread.load(Ordering::SeqCst);
         if thread != 0 {
             // SAFETY: Posts a value-only message to a thread ID; a thread that has exited only
             // makes the call fail, which is harmless because its next poll picks up the change.
@@ -245,7 +245,7 @@ impl UserStop {
 
 impl Drop for UserStop {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Release);
+        self.shutdown.store(true, Ordering::SeqCst);
         self.signals.wake();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -368,8 +368,10 @@ impl EscapeMonitor {
 
 impl Drop for EscapeMonitor {
     fn drop(&mut self) {
-        self.exiting.store(true, Ordering::Release);
-        post_wake(self.thread_id.load(Ordering::Acquire));
+        // SeqCst pairs this store and the thread ID load with the monitor's mirror-image
+        // store of its thread ID and load of this flag, so one of them always sees the other.
+        self.exiting.store(true, Ordering::SeqCst);
+        post_wake(self.thread_id.load(Ordering::SeqCst));
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -388,7 +390,7 @@ fn post_wake(thread: u32) {
 
 fn escape_loop(
     controller: &StopController,
-    mut hook: Box<dyn KeyboardHook>,
+    hook: Box<dyn KeyboardHook>,
     thread_id: &AtomicU32,
     exiting: &AtomicBool,
 ) {
@@ -396,10 +398,32 @@ fn escape_loop(
     // Create this thread's message queue before announcing it, so a wake-up is never lost.
     drain_messages();
     // SAFETY: Takes no arguments and returns this thread's ID.
-    thread_id.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+    thread_id.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
+    escape_loop_with(controller, hook, exiting, drain_messages, || {
+        wait_for_input(ESCAPE_SAFETY_MS).map(|_| ())
+    });
+    CONTROLLER.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// The longest the Esc monitor sleeps without a wake-up. Posted wake-ups end the wait at once;
+/// this only bounds the damage if one is ever consumed unseen, so shutdown cannot hang.
+const ESCAPE_SAFETY_MS: u32 = 2_000;
+
+fn escape_loop_with(
+    controller: &StopController,
+    mut hook: Box<dyn KeyboardHook>,
+    exiting: &AtomicBool,
+    mut drain: impl FnMut(),
+    mut wait: impl FnMut() -> windows::core::Result<()>,
+) {
     let mut installed = false;
-    while !exiting.load(Ordering::Acquire) {
-        drain_messages();
+    loop {
+        // Drain first and read the flag after it: a shutdown wake-up that the drain consumes is
+        // then still seen through the flag it follows, instead of being lost before the wait.
+        drain();
+        if exiting.load(Ordering::SeqCst) {
+            break;
+        }
         // One failed install per session is reported; the controller forgets the failure when the
         // next session starts, so retrying on every wake-up would only spam.
         let failed = controller.esc_install_failed();
@@ -436,7 +460,7 @@ fn escape_loop(
         // The wait dispatches nothing itself. It returns when any message is queued for this
         // thread, including a pending hook call, and `drain_messages` at the top of the loop
         // answers it. A session change, or shutdown, posts a message that ends the wait too.
-        if wait_for_input(u32::MAX).is_err() {
+        if wait().is_err() {
             break;
         }
     }
@@ -444,7 +468,6 @@ fn escape_loop(
         controller.set_esc_stop_available(false);
         hook.uninstall();
     }
-    CONTROLLER.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// What the Esc monitor does next.
@@ -1369,7 +1392,7 @@ fn run(
     // SAFETY: Takes no arguments and returns this thread's ID.
     signals
         .ui_thread
-        .store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+        .store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
     started.set(true);
     let _ = ready.send(Ok(()));
     let result = tab_loop(
@@ -1380,7 +1403,7 @@ fn run(
         presenter,
         desktops.as_ref(),
     );
-    signals.ui_thread.store(0, Ordering::Release);
+    signals.ui_thread.store(0, Ordering::SeqCst);
     result
 }
 
@@ -1402,8 +1425,13 @@ fn tab_loop(
         signals.announce_read.swap(false, Ordering::AcqRel),
     ));
     let mut reading_until: Option<Instant> = None;
-    while !exiting.load(Ordering::Acquire) {
+    loop {
+        // Drain first and read the flag after it, so a shutdown wake-up consumed by the drain is
+        // still seen. The wait below is bounded as well.
         drain_messages();
+        if exiting.load(Ordering::SeqCst) {
+            break;
+        }
         let now = Instant::now();
         let mut repaint = false;
         let observations = controller.observation_count();
@@ -1836,7 +1864,7 @@ mod tests {
         );
         // SAFETY: Remove the wake-up messages so the queue is left empty.
         while unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }.as_bool() {}
-        signals.ui_thread.store(0, Ordering::Release);
+        signals.ui_thread.store(0, Ordering::SeqCst);
     }
 
     #[test]
@@ -2008,6 +2036,29 @@ mod tests {
     }
 
     #[test]
+    fn a_shutdown_whose_wake_up_the_drain_consumed_still_ends_the_monitor() {
+        let controller = StopController::default();
+        let exiting = AtomicBool::new(false);
+        let waits = Cell::new(0_u32);
+        // The shutdown arrives while the queue is drained, which swallows its only wake-up.
+        escape_loop_with(
+            &controller,
+            Box::new(FakeHook(HookCounts::default())),
+            &exiting,
+            || exiting.store(true, Ordering::SeqCst),
+            || {
+                waits.set(waits.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            waits.get(),
+            0,
+            "the loop must not sleep after the flag was set"
+        );
+    }
+
+    #[test]
     fn the_keyboard_hook_exists_only_while_a_session_is_owned() {
         let controller = StopController::default();
         let counts = HookCounts::default();
@@ -2028,10 +2079,12 @@ mod tests {
         assert_eq!(counts.installs.load(Ordering::SeqCst), 1);
 
         controller.set_session_active(false);
+        // The monitor announces that Esc is unavailable before it removes the hook, so wait for
+        // the removal itself.
         eventually("the hook to be removed", || {
-            !controller.esc_stop_available()
+            counts.removals.load(Ordering::SeqCst) == 1
         });
-        assert_eq!(counts.removals.load(Ordering::SeqCst), 1);
+        assert!(!controller.esc_stop_available());
 
         controller.set_session_active(true);
         eventually("the hook to be installed again", || {

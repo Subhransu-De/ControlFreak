@@ -11,13 +11,29 @@ pub(super) struct Harness {
     serving: tokio::task::JoinHandle<()>,
 }
 
+/// A short hold, for tests that are about a session expiring.
 async fn harness(owned: Arc<AtomicBool>) -> Harness {
-    harness_with_backend(Arc::new(WaitingBackend::idle()), owned).await
+    harness_with_hold(
+        Arc::new(WaitingBackend::idle()),
+        owned,
+        Duration::from_millis(20),
+    )
+    .await
 }
 
+/// A hold that cannot expire inside a test, however loaded the machine is, for tests that make
+/// several calls and expect the session to still be there between them.
 pub(super) async fn harness_with_backend(
     backend: Arc<dyn PlatformBackend>,
     owned: Arc<AtomicBool>,
+) -> Harness {
+    harness_with_hold(backend, owned, Duration::from_secs(30)).await
+}
+
+async fn harness_with_hold(
+    backend: Arc<dyn PlatformBackend>,
+    owned: Arc<AtomicBool>,
+    hold: Duration,
 ) -> Harness {
     let runtime = Arc::new(SessionRuntime::new_with_timing(
         SafetyIndicator::dormant(),
@@ -29,9 +45,9 @@ pub(super) async fn harness_with_backend(
         },
         Arc::new(ExclusiveArbitrator { owned }),
         GlowTiming {
-            short_hold: Duration::from_millis(20),
-            session_hold: Duration::from_millis(20),
-            max_hold: Duration::from_secs(5),
+            short_hold: hold,
+            session_hold: hold,
+            max_hold: hold.max(Duration::from_secs(5)),
         },
     ));
     let server = ControlFreakServer::with_indicator(

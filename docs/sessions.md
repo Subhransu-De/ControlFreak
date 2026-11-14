@@ -77,7 +77,7 @@ lamps that show an automated system is driving a car.
 
 The lamp follows the virtual desktop of the foreground window. Windows reports no desktop for the taskbar, the desktop and the Start surfaces, which belong to every desktop. The lamp helper and the tab then stay where they are instead of failing, so a shell window in front never ends the helper or blocks a session.
 
-The indicator is event driven. An idle server has no polling loop for it: the tab thread, the Esc monitor and the stop notification sleep until a session, stop, observation or Windows message wakes them, with a slow safety check. While a session is owned, the session worker looks at the lock state and the input desktop every 50 ms, because ending the session on a lock or desktop switch during a hold is a safety invariant. A helper that cannot be stopped is retried with a growing delay and abandoned after about a minute, with the reason on standard error.
+The indicator is event driven. An idle server has no polling loop for it: the tab thread, the Esc monitor and the stop notification sleep until a session, stop, observation or Windows message wakes them, with a safety check that wakes them at least every 2 to 5 seconds. While a session is owned, the session worker looks at the lock state and the input desktop every 50 ms, because ending the session on a lock or desktop switch during a hold is a safety invariant. A helper that cannot be stopped is retried with a growing delay and abandoned after about a minute, with the reason on standard error.
 
 ## Stopping
 
