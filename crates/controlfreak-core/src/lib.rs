@@ -42,7 +42,7 @@ pub use outcome::{CleanupStatus, InputOutcome, MutationProgress};
 pub use permission::{PermissionDescriptor, PermissionId, PermissionState};
 pub use platform::{
     BackendIdentity, BackendMetadata, DisplayBackend, DisplayServer, KeyboardBackend, OcrBackend,
-    Platform, PlatformBackend, PointerBackend, WindowBackend,
+    Platform, PlatformBackend, PointerBackend, WindowBackend, wait_for_text_with,
 };
 pub use report::CapabilityReport;
 pub use security::{IntegrityLevel, SecurityContext};

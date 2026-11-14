@@ -25,8 +25,9 @@ use controlfreak_core::{
     PointerActionResult, PointerBackend, SecurityContext, TextInputRequest,
     VirtualDesktopDirection, VirtualDesktopInfo, VirtualDesktopList, VirtualDesktopSwitchRequest,
     VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest, VisualChangeResult,
-    WaitForChangeSinceRequest, WaitForVisualChangeRequest, WaitForWindowRequest, WindowBackend,
-    WindowBounds, WindowFocusResult, WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
+    WaitForChangeSinceRequest, WaitForTextRequest, WaitForTextResult, WaitForVisualChangeRequest,
+    WaitForWindowRequest, WindowBackend, WindowBounds, WindowFocusResult, WindowInfo, WindowList,
+    WindowScreenshot, WindowWaitResult,
 };
 use windows::Win32::{
     Foundation::{E_ACCESSDENIED, HWND, LPARAM, POINT, RECT, RPC_E_CHANGED_MODE},
@@ -54,8 +55,7 @@ use windows::Win32::{
             EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetCursorPos, GetForegroundWindow,
             GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
             GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, MONITORINFOF_PRIMARY,
-            SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindowAsync, WS_EX_APPWINDOW,
-            WS_EX_TOOLWINDOW,
+            SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindowAsync, WS_EX_TOOLWINDOW,
         },
     },
 };
@@ -75,6 +75,7 @@ mod indicator;
 mod input;
 mod privilege;
 mod process;
+mod shell;
 mod stop;
 pub use stop::{SessionSignals, UserStop};
 
@@ -102,10 +103,11 @@ pub(crate) fn server_security_context(
     privilege::current_security_context(elevated_operation_allowed)
 }
 use capture::{
-    baseline_process_nonce, capture_bounds, capture_comparison_frame, capture_display_bounds,
-    capture_display_image, display_bounds_from_window, display_region_bounds, frame_fingerprint,
-    observe_display, observe_foreground, recognize_text as recognize_text_in_process,
-    validate_max_width, validate_visual_wait, validate_wait_values, wait_for_change,
+    baseline_process_nonce, capture_comparison_frame, capture_display_bounds,
+    capture_display_image, capture_window_bounds, display_bounds_from_window,
+    display_region_bounds, frame_fingerprint, observe_display, observe_foreground,
+    recognize_text as recognize_text_in_process, validate_max_width, validate_visual_wait,
+    validate_wait_values, wait_for_change,
 };
 use desktop::{
     ComApartment, activate_window, current_cursor_position, current_virtual_desktop_id,
@@ -539,6 +541,27 @@ impl DisplayBackend for Backend {
     }
 }
 
+/// Whether the text found by the previous `wait_for_text` pass is still the answer: every pixel
+/// of the region is the same and the foreground, window set and desktop have not changed since
+/// that pass was taken.
+const fn previous_pass_still_valid(
+    region_unchanged: bool,
+    observed_generation: u64,
+    current_generation: u64,
+) -> bool {
+    region_unchanged && observed_generation == current_generation
+}
+
+/// A pixel watch over an OCR region, or `None` if the region cannot be watched, in which case
+/// every pass recognizes text.
+fn region_change_watch(region: &OcrRegionRequest) -> Option<capture::RegionChange> {
+    ensure_dpi_awareness().ok()?;
+    let display = find_display(&region.display_id).ok()?;
+    let bounds =
+        display_region_bounds(&display, region.x, region.y, region.width, region.height).ok()?;
+    capture::RegionChange::new(bounds).ok()
+}
+
 /// Refuses a stored baseline whose display moved, resized, or disappeared since capture.
 fn ensure_baseline_display(
     captured: &DisplayInfo,
@@ -612,6 +635,33 @@ impl OcrBackend for Backend {
         })
     }
 
+    /// Waits for text with a pixel check in front of each recognition pass. If every pixel of
+    /// the region matches the previous pass and the foreground has not changed, nothing on screen
+    /// could have changed the text, so the previous result stands and recognition (the expensive
+    /// part) is skipped. Any doubt, such as a region that cannot be read, runs recognition.
+    fn wait_for_text_controlled(
+        &self,
+        request: &WaitForTextRequest,
+        control: &MutationControl,
+    ) -> Result<WaitForTextResult, PlatformError> {
+        let mut watch = region_change_watch(&request.find.region);
+        let mut last: Option<(FindTextResult, u64)> = None;
+        controlfreak_core::wait_for_text_with(request, control, || {
+            let generation = target::observation_generation();
+            let unchanged = watch
+                .as_mut()
+                .is_some_and(|watch| watch.unchanged_since_last().unwrap_or(false));
+            if let Some((result, observed)) = &last
+                && previous_pass_still_valid(unchanged, *observed, generation)
+            {
+                return Ok(result.clone());
+            }
+            let result = self.find_text_on_screen_controlled(&request.find, control)?;
+            last = Some((result.clone(), generation));
+            Ok(result)
+        })
+    }
+
     fn click_text(&self, request: &ClickTextRequest) -> Result<ClickTextResult, PlatformError> {
         self.click_text_controlled(request, &MutationControl::default())
     }
@@ -632,10 +682,15 @@ impl OcrBackend for Backend {
         let input_generation = self.input_generation.load(Ordering::Acquire);
         let ocr = self.recognize_text(&request.region, control)?;
         target::validate(control, "click_text", None)?;
-        if ocr.target_ref != control.approved_target() {
-            control.invalidate_target();
+        // The observation must have been taken with the approved window, or a window of its own
+        // process such as a dialog, in front and unchanged. If not, the text may belong to
+        // something else, so this click is refused; the session itself stays valid because every
+        // action re-checks the live foreground.
+        if !control.approved_target().is_some_and(|approved| {
+            target::observation_matches_approved(&approved, ocr.target_ref.as_deref())
+        }) {
             return Err(target::invalid(
-                "OCR observation no longer belongs to the approved target generation",
+                "OCR observation no longer belongs to the approved target generation; the foreground or window layout changed while reading the screen, find the text again",
             ));
         }
         // Search result limits must not hide eligible lines from the uniqueness check.
@@ -853,9 +908,11 @@ impl WindowBackend for Backend {
             });
         }
         let bounds = display_bounds_from_window(window.bounds);
-        let (png, image_width, image_height, downscale_factor, cursor_marker) =
-            capture_bounds(bounds, request.max_width, request.include_cursor)?;
         let (hwnd, _) = parse_window_id(&request.window_id)?;
+        // The window renders itself, so a window covered by others is captured as itself; a
+        // window that cannot is copied from the screen, and `capture_method` says which.
+        let capture =
+            capture_window_bounds(hwnd, bounds, request.max_width, request.include_cursor)?;
         if target::issue(hwnd)? != window.id {
             return Err(target::invalid(
                 "window geometry changed during capture; observe again",
@@ -864,11 +921,12 @@ impl WindowBackend for Backend {
         Ok(WindowScreenshot {
             source_bounds: window.bounds,
             window,
-            png,
-            image_width,
-            image_height,
-            downscale_factor,
-            cursor_marker,
+            png: capture.png,
+            image_width: capture.image_width,
+            image_height: capture.image_height,
+            downscale_factor: capture.downscale_factor,
+            cursor_marker: capture.cursor_marker,
+            capture_method: capture.capture_method,
         })
     }
 
@@ -984,6 +1042,28 @@ mod tests {
         input::{click_inputs, interpolate, key_chord_inputs, scroll_inputs},
         window_matches,
     };
+
+    #[test]
+    fn a_text_wait_reuses_its_previous_pass_only_when_nothing_could_have_changed() {
+        use super::previous_pass_still_valid as valid;
+        assert!(valid(true, 7, 7));
+        assert!(!valid(false, 7, 7), "a pixel changed");
+        assert!(!valid(true, 7, 8), "the foreground or window set changed");
+        assert!(!valid(false, 7, 8));
+    }
+
+    #[test]
+    fn an_unreadable_text_region_is_not_watched_so_every_pass_recognizes() {
+        let region = OcrRegionRequest {
+            display_id: "no-such-display-must-not-be-captured".into(),
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            language: None,
+        };
+        assert!(super::region_change_watch(&region).is_none());
+    }
 
     #[test]
     fn queued_input_cancels_while_another_worker_still_owns_the_input_lock() {
@@ -1315,6 +1395,7 @@ mod tests {
             display_id: "display".to_owned(),
             is_foreground: true,
             is_minimized: false,
+            owner: None,
         };
         let request = WaitForWindowRequest {
             window_id: None,

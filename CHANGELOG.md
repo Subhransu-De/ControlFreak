@@ -9,8 +9,22 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Added
+
+- `press_keys` accepts punctuation (`comma`, `period`, `slash`, `semicolon`, `quote`, `left_bracket`, `right_bracket`, `backslash`, `minus`, `equals`, `backtick`, or the character itself), numpad keys, `print_screen`, `caps_lock`, `scroll_lock`, `num_lock`, `pause`, `menu`, volume and media keys, and the aliases `up`, `down`, `left`, `right`. An unknown key is refused with the nearest valid name.
+- `list_windows` lists visible owned windows such as dialogs, with an `owner` field holding the owner's target reference. `focus_window` and `capture_window` accept them.
+- The taskbar, secondary taskbars, the desktop and the Start and Search surfaces can be approved as targets. They are recognized by window class and by the verified program that owns them, and treated as present on every virtual desktop.
+- `capture_window` reports `capture_method` `windows_print_window` when the window rendered itself and `windows_gdi` when its screen rectangle was copied.
+
 ### Changed
 
+- A window of the approved target's own process (its dialogs, popup menus and drop-downs) may hold the foreground and receive pointer input, with the integrity check applied to that window. A window of another process is still refused. For `explorer.exe` targets only the target's own dialogs and popup menus count.
+- A foreground or pointer destination in another process now refuses only that action. The reference and the session target are kept, and the next action checks the live foreground again. Changes to the window itself still end the session's approval.
+- `type_text` presses Enter for `\n`, `\r\n` and `\r` and Tab for `\t`, instead of sending them as Unicode characters.
+- `click_text` matches words inside OCR lines and clicks the centre of the matched words instead of the centre of the whole line. `find_text_on_screen` reports the matched-word box. Two matches in one line are ambiguous.
+- `capture_window` renders the window itself, so a covered window is captured as itself, and falls back to a screen copy.
+- Mouse clicks hold the button for 20 ms. `drag_mouse` always travels in several steps over at least 120 ms.
+- Target validation reuses identity and integrity results for 250 ms within one input lock, the settle watcher and `wait_for_text` reuse their GDI objects and pixel buffers, screenshots are encoded without a second full-frame RGB copy, and `wait_for_text` skips OCR while the region and foreground are unchanged.
 - Apps & Features and `winget list` now show the app as `ControlFreak` instead of `ControlFreak version <version>`. The version stays in its own column.
 - The control indicator is redesigned. The 230-pixel blue glow around every display and the navy
   bar are replaced by a steady 4-pixel turquoise lamp along the top of every display, and a tab
