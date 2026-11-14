@@ -12,6 +12,7 @@
 //!                      [--with-dialog] [--lifetime-secs N]
 //! controlfreak-fixture --stop-button-rect     # print the screen rectangle of the Stop agent button
 //! controlfreak-fixture --activate-taskbar     # try to bring the shell taskbar to the foreground
+//! controlfreak-fixture --inject-click X,Y     # SendInput a left click at a screen point
 //! ```
 //!
 //! Log lines, screen coordinates in physical pixels:
@@ -39,6 +40,7 @@ mod win {
         ffi::c_void,
         fs::OpenOptions,
         io::Write,
+        mem::size_of,
         path::PathBuf,
         sync::{
             Mutex, OnceLock,
@@ -60,18 +62,21 @@ mod win {
                 HiDpi::{
                     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
                 },
-                Input::KeyboardAndMouse::SetFocus,
+                Input::KeyboardAndMouse::{
+                    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+                    MOUSEINPUT, SendInput, SetFocus,
+                },
                 WindowsAndMessaging::{
                     AdjustWindowRectEx, BN_CLICKED, BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW,
                     DestroyWindow, DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW,
                     GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowTextW, HMENU,
                     IDC_ARROW, IsWindowVisible, LoadCursorW, MSG, PostQuitMessage, RegisterClassW,
-                    SW_SHOWNORMAL, SetForegroundWindow, SetTimer, ShowWindow, TranslateMessage,
-                    WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_COMMAND,
-                    WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-                    WM_PAINT, WM_PRINTCLIENT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
-                    WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_TOPMOST,
-                    WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+                    SW_SHOWNORMAL, SetCursorPos, SetForegroundWindow, SetTimer, ShowWindow,
+                    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CHAR,
+                    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP,
+                    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT, WM_PRINTCLIENT, WM_RBUTTONDOWN,
+                    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CAPTION,
+                    WS_CHILD, WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
                 },
             },
         },
@@ -154,6 +159,7 @@ mod win {
             match arg.as_str() {
                 "--stop-button-rect" => return print_stop_button_rect(),
                 "--activate-taskbar" => return activate_taskbar(),
+                "--inject-click" => return inject_click(&args.next().unwrap_or_default()),
                 "--title" => options.title = args.next().unwrap_or_default(),
                 "--log" => options.log = args.next().map(PathBuf::from),
                 "--color" => {
@@ -614,6 +620,42 @@ mod win {
                 0
             }
             None => 1,
+        }
+    }
+
+    /// Sends one real `SendInput` left click at a screen point (physical pixels), the way any
+    /// automation tool would. The live Stop-button test uses it to check that injected input
+    /// cannot press the button. Exit code 0 only if Windows accepted every event.
+    fn inject_click(point: &str) -> i32 {
+        let Some((x, y)) = point
+            .split_once(',')
+            .and_then(|(x, y)| Some((x.parse::<i32>().ok()?, y.parse::<i32>().ok()?)))
+        else {
+            eprintln!("--inject-click needs X,Y");
+            return 2;
+        };
+        let event = |flags| INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dwFlags: flags,
+                    ..Default::default()
+                },
+            },
+        };
+        let size = i32::try_from(size_of::<INPUT>()).unwrap_or(0);
+        // SAFETY: Moving the cursor and sending one locally built INPUT retain no pointers; each
+        // slice is valid for its synchronous call and `size` is the size of INPUT.
+        unsafe {
+            if SetCursorPos(x, y).is_err() {
+                return 1;
+            }
+            thread::sleep(Duration::from_millis(50));
+            if SendInput(&[event(MOUSEEVENTF_LEFTDOWN)], size) != 1 {
+                return 1;
+            }
+            thread::sleep(Duration::from_millis(40));
+            i32::from(SendInput(&[event(MOUSEEVENTF_LEFTUP)], size) != 1)
         }
     }
 

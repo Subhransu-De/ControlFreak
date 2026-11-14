@@ -538,7 +538,12 @@ fn capture_window_sees_an_occluded_fixture_through_print_window() {
     let cover_id = server.window_id(&cover);
     assert_ne!(id, cover_id);
 
-    let result = server.call("capture_window", json!({"window_id": id, "native": true}));
+    // No cursor marker: it is drawn in the same magenta as the covering window, so a cursor
+    // left inside the window by an earlier test would look like a leak.
+    let result = server.call(
+        "capture_window",
+        json!({"window_id": id, "native": true, "include_cursor": false}),
+    );
     assert_eq!(result["isError"], false, "{result}");
     let metadata = &result["structuredContent"];
     assert_eq!(
@@ -647,10 +652,11 @@ fn a_foreign_process_window_is_refused_without_poisoning_the_session() {
 
     let refused = server.click(&id, foreign.center("edit"));
     assert_eq!(refused["isError"], true, "{refused}");
-    assert_eq!(
-        refused["structuredContent"]["error"]["code"], "target_invalidated",
-        "{refused}"
-    );
+    let error = &refused["structuredContent"]["error"];
+    assert_eq!(error["code"], "target_invalidated", "{refused}");
+    // The agent can tell this recoverable refusal from a fatal one without reading prose.
+    assert_eq!(error["reason"], "foreign_destination", "{refused}");
+    assert_eq!(error["retryable"], true, "{refused}");
     assert_eq!(
         refused["structuredContent"]["input"]["input_outcome"],
         "not_started"
@@ -735,9 +741,28 @@ fn an_injected_click_on_the_stop_button_does_not_stop_control() {
     let center = (rect[0].midpoint(rect[2]), rect[1].midpoint(rect[3]));
     let (x, y) = display_local(center);
     let result = server.click(&id, (i32::try_from(x).unwrap(), i32::try_from(y).unwrap()));
-    // The server refuses this itself: the window under the point is not the approved target's.
-    // Either way the injected click must not stop control.
+    // The server refuses this itself: the window under the point is its own Stop button, not
+    // the approved target. This is the boundary check; it never reaches the button's filter.
     assert_eq!(result["isError"], true, "{result}");
+    let error = &result["structuredContent"]["error"];
+    assert_eq!(error["reason"], "own_indicator", "{result}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Stop button"),
+        "{result}"
+    );
+
+    // The filter itself: real injected input, sent by the fixture straight to the button and
+    // never through an MCP tool. SendInput reports an injected origin, so the button must ignore
+    // it and control must continue.
+    let status = Command::new(FIXTURE)
+        .args(["--inject-click", &format!("{},{}", center.0, center.1)])
+        .status()
+        .expect("run the fixture's injected click");
+    assert!(status.success(), "the fixture could not inject the click");
+    thread::sleep(Duration::from_millis(500));
 
     let status = server.ok("get_server_status", json!({}));
     assert_eq!(status["stop_state"], "ready", "{status}");
