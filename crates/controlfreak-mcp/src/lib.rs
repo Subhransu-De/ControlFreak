@@ -4,9 +4,13 @@
 mod cleanup_tests;
 #[cfg(test)]
 mod contract_tests;
+#[cfg(test)]
+mod desktop_recipe_tests;
 mod diagnostics;
 #[cfg(test)]
 mod encoding_tests;
+#[cfg(test)]
+mod fake_desktop;
 mod handlers;
 mod observations;
 mod requests;
