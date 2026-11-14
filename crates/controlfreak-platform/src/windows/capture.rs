@@ -538,64 +538,130 @@ fn print_window_rgba(hwnd: HWND, visible: DisplayBounds) -> Option<Vec<u8>> {
 /// on its own thread and the caller waits at most this long before copying the screen instead.
 pub(super) const PRINT_WINDOW_DEADLINE: Duration = Duration::from_secs(2);
 
-/// Set while a render thread has not returned yet. At most one render exists at a time: another
-/// window capture waits for the slot, within the same deadline as its own render, and copies the
-/// screen only if the slot does not come free in time. A window that never answers therefore
-/// costs one parked thread and its GDI objects rather than one per call, and two captures in
-/// parallel both get their window's own rendering.
 /// How often a capture that is waiting for the render slot looks again.
 const RENDER_SLOT_POLL: Duration = Duration::from_millis(5);
 
-static RENDER_OUTSTANDING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// The single render slot. At most one render thread exists at a time: another window capture
+/// waits for the slot, within the same deadline as its own render, while that render is still
+/// in flight, and copies the screen at once if the render was already abandoned. A window that
+/// never answers therefore costs one parked thread and its GDI objects rather than one per call,
+/// two captures in parallel both get their window's own rendering, and a hung window does not
+/// make every later capture wait out the deadline.
+pub(super) struct RenderSlot {
+    state: std::sync::Mutex<SlotState>,
+}
 
-/// Marks the single outstanding render finished when dropped, on success, failure or unwinding.
-struct OutstandingRender(&'static std::sync::atomic::AtomicBool);
+#[derive(Clone, Copy)]
+struct SlotState {
+    busy: bool,
+    /// The waiter gave up on the render in the slot; it is parked until the application answers.
+    abandoned: bool,
+    /// Identifies the render that holds the slot, so a late timeout or finish never touches a
+    /// later render.
+    generation: u64,
+}
 
-impl Drop for OutstandingRender {
+impl RenderSlot {
+    const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(SlotState {
+                busy: false,
+                abandoned: false,
+                generation: 0,
+            }),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, SlotState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Takes the slot. `Ok(None)` means wait and try again, `Err(())` means the render in the
+    /// slot was abandoned and will not finish soon.
+    fn try_take(&self) -> Result<Option<u64>, ()> {
+        let mut state = self.state();
+        if !state.busy {
+            state.busy = true;
+            state.abandoned = false;
+            state.generation += 1;
+            return Ok(Some(state.generation));
+        }
+        if state.abandoned { Err(()) } else { Ok(None) }
+    }
+
+    fn abandon(&self, generation: u64) {
+        let mut state = self.state();
+        if state.busy && state.generation == generation {
+            state.abandoned = true;
+        }
+    }
+
+    fn release(&self, generation: u64) {
+        let mut state = self.state();
+        if state.busy && state.generation == generation {
+            state.busy = false;
+            state.abandoned = false;
+        }
+    }
+
+    #[cfg(test)]
+    fn is_busy(&self) -> bool {
+        self.state().busy
+    }
+}
+
+static RENDER_SLOT: RenderSlot = RenderSlot::new();
+
+/// Frees the render slot when dropped, on success, failure or unwinding.
+struct HeldRender(&'static RenderSlot, u64);
+
+impl Drop for HeldRender {
     fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::Release);
+        self.0.release(self.1);
     }
 }
 
 /// Runs `render` on a worker thread and waits at most `deadline` for its answer. `None` means
-/// the render failed, or the slot and the render together took too long, because `outstanding`
-/// says an earlier render still has not returned. The worker owns everything it creates and clears `outstanding`
-/// only when it really finishes, so an abandoned render cleans up after itself whenever the
-/// application finally answers.
+/// the render failed, the slot and the render together took too long, or an earlier render was
+/// already abandoned and still has not returned. The worker owns everything it creates and
+/// frees the slot only when it really finishes, so an abandoned render cleans up after itself
+/// whenever the application finally answers.
 fn render_within<T: Send + 'static>(
     deadline: Duration,
-    outstanding: &'static std::sync::atomic::AtomicBool,
+    slot: &'static RenderSlot,
     render: impl FnOnce() -> Option<T> + Send + 'static,
 ) -> Option<T> {
-    use std::sync::atomic::Ordering;
     let started = Instant::now();
-    while outstanding.swap(true, Ordering::AcqRel) {
-        if started.elapsed() >= deadline {
-            return None;
+    let generation = loop {
+        match slot.try_take() {
+            Ok(Some(generation)) => break generation,
+            Ok(None) if started.elapsed() < deadline => std::thread::sleep(RENDER_SLOT_POLL),
+            Ok(None) | Err(()) => return None,
         }
-        std::thread::sleep(RENDER_SLOT_POLL);
-    }
+    };
     let (sender, receiver) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("controlfreak-print-window".to_owned())
         .spawn(move || {
-            // Clears the flag even if `render` panics, so one failed render never turns every
+            // Frees the slot even if `render` panics, so one failed render never turns every
             // later window capture into a screen copy.
-            let slot = OutstandingRender(outstanding);
+            let held = HeldRender(slot, generation);
             let rendered = render();
-            drop(slot);
+            drop(held);
             // The receiver is gone after a timeout; the result is then dropped here.
             let _ = sender.send(rendered);
         });
     if spawned.is_err() {
-        outstanding.store(false, Ordering::Release);
+        slot.release(generation);
         return None;
     }
-    receiver
-        .recv_timeout(deadline.saturating_sub(started.elapsed()))
-        .ok()
-        .flatten()
+    let answer = receiver.recv_timeout(deadline.saturating_sub(started.elapsed()));
+    if answer.is_err() {
+        slot.abandon(generation);
+    }
+    answer.ok().flatten()
 }
 
 /// `print_window_rgba` with the bounds described on [`PRINT_WINDOW_DEADLINE`].
@@ -607,7 +673,7 @@ fn print_window_bounded(hwnd: HWND, visible: DisplayBounds) -> Option<Vec<u8>> {
     // A raw handle value crosses the thread boundary; the worker re-validates it through the
     // window APIs, which fail for a handle that no longer exists.
     let raw = hwnd.0 as isize;
-    render_within(PRINT_WINDOW_DEADLINE, &RENDER_OUTSTANDING, move || {
+    render_within(PRINT_WINDOW_DEADLINE, &RENDER_SLOT, move || {
         print_window_rgba(HWND(raw as *mut c_void), visible)
     })
 }
@@ -1801,10 +1867,10 @@ mod window_capture_tests {
     fn a_hung_renderer_is_given_up_on_and_only_one_render_can_be_outstanding() {
         use std::sync::{
             Arc,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicUsize, Ordering},
             mpsc,
         };
-        static OUTSTANDING: AtomicBool = AtomicBool::new(false);
+        static OUTSTANDING: RenderSlot = RenderSlot::new();
         let (release, hold) = mpsc::channel::<()>();
         let started = Instant::now();
         // A renderer that never answers until released, like a window that stops pumping messages.
@@ -1814,7 +1880,7 @@ mod window_capture_tests {
         });
         assert!(result.is_none());
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(OUTSTANDING.load(Ordering::Acquire));
+        assert!(OUTSTANDING.is_busy());
 
         // While it is parked no second render starts at all.
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -1829,7 +1895,7 @@ mod window_capture_tests {
         // Once the parked render returns, rendering works again.
         release.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while OUTSTANDING.load(Ordering::Acquire) {
+        while OUTSTANDING.is_busy() {
             assert!(
                 Instant::now() < deadline,
                 "the abandoned render never finished"
@@ -1841,9 +1907,39 @@ mod window_capture_tests {
     }
 
     #[test]
+    fn a_capture_behind_an_abandoned_render_falls_back_at_once() {
+        use std::sync::mpsc;
+        static SLOT: RenderSlot = RenderSlot::new();
+        let (release, hold) = mpsc::channel::<()>();
+        assert!(
+            render_within(Duration::from_millis(50), &SLOT, move || {
+                let _ = hold.recv();
+                Some(1_u8)
+            })
+            .is_none()
+        );
+        let started = Instant::now();
+        assert!(render_within(Duration::from_secs(30), &SLOT, || Some(2_u8)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while SLOT.is_busy() {
+            assert!(
+                Instant::now() < deadline,
+                "the abandoned render never finished"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            render_within(Duration::from_secs(5), &SLOT, || Some(3_u8)),
+            Some(3)
+        );
+    }
+
+    #[test]
     fn a_second_render_waits_for_the_slot_instead_of_giving_up() {
-        use std::sync::{atomic::AtomicBool, mpsc};
-        static OUTSTANDING: AtomicBool = AtomicBool::new(false);
+        use std::sync::mpsc;
+        static OUTSTANDING: RenderSlot = RenderSlot::new();
         let (release, hold) = mpsc::channel::<()>();
         let (started, running) = mpsc::channel::<()>();
         let first = std::thread::spawn(move || {
@@ -1867,8 +1963,7 @@ mod window_capture_tests {
 
     #[test]
     fn a_render_that_answers_in_time_is_returned_and_a_failed_one_is_not() {
-        static OUTSTANDING: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
+        static OUTSTANDING: RenderSlot = RenderSlot::new();
         assert_eq!(
             render_within(Duration::from_secs(5), &OUTSTANDING, || Some(7_u8)),
             Some(7)
@@ -1881,17 +1976,14 @@ mod window_capture_tests {
 
     #[test]
     fn a_render_that_panics_still_frees_the_render_slot() {
-        static OUTSTANDING: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
+        static OUTSTANDING: RenderSlot = RenderSlot::new();
         let panicked = render_within::<u8>(Duration::from_secs(5), &OUTSTANDING, || {
             panic!("synthetic render failure")
         });
         assert_eq!(panicked, None);
         // The worker clears the slot while unwinding; allow it a moment to finish doing so.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while OUTSTANDING.load(std::sync::atomic::Ordering::Acquire)
-            && std::time::Instant::now() < deadline
-        {
+        while OUTSTANDING.is_busy() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(

@@ -1,5 +1,7 @@
 #![allow(unsafe_code)]
 
+use controlfreak_core::VirtualDesktopDirection;
+
 use super::{
     Duration, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, Instant, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, Key, KeyChordRequest,
@@ -193,23 +195,29 @@ where
     send_releasing_native(operation, &inputs, control)
 }
 
+/// The operation name of the desktop switch in refusals and cancellation.
+pub(super) const DESKTOP_SWITCH_OPERATION: &str = "switch_virtual_desktop";
+
 /// Sends the desktop-switch shortcut `steps` times. `validate` runs before every hop with the
 /// zero-based hop number: the first hop checks the approved target in full, later hops check
 /// only what still applies once the desktop has changed (see `target::validate_after_switch`).
 /// Progress is cumulative, so a failure or cancellation after some hops leaves
 /// `PartiallySent` with the events of the completed hops.
 pub(super) fn send_desktop_switch_hops(
-    operation: &str,
-    keys: &[Key],
+    direction: VirtualDesktopDirection,
     steps: u8,
     control: &MutationControl,
     validate: impl FnMut(u8) -> Result<(), PlatformError>,
     settle: impl FnMut(),
 ) -> Result<(), PlatformError> {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    let arrow = match direction {
+        VirtualDesktopDirection::Left => Key::ArrowLeft,
+        VirtualDesktopDirection::Right => Key::ArrowRight,
+    };
     send_desktop_switch_hops_with(
-        operation,
-        &key_chord_inputs(keys),
+        DESKTOP_SWITCH_OPERATION,
+        &key_chord_inputs(&[Key::Ctrl, Key::Win, arrow]),
         steps,
         control,
         validate,
@@ -1675,7 +1683,7 @@ mod progress_tests {
             let control = MutationControl::default();
             let mut batches = 0;
             let error = send_text_checking_held_keys(
-                &utf16("ab	c"),
+                &utf16("ab\tc"),
                 &control,
                 || Ok(()),
                 |inputs| {

@@ -38,7 +38,7 @@ desktop and run inside a [control session](sessions.md).
 | `press_keys` | Input | Send a key or key chord. Letters, digits, F1 to F12, punctuation, the numpad, system keys and media keys; see Keys below. |
 | `type_text` | Input | Type Unicode text without the clipboard. Line breaks and tabs are pressed as Enter and Tab. |
 | `click_text` | Input | Click the unique OCR text that matches, at the matched words. |
-| `switch_virtual_desktop` | Input | Switch one virtual desktop left or right. |
+| `switch_virtual_desktop` | Input | Switch one or more virtual desktops (`steps`) left or right. |
 | `run_actions` | Input | Up to 16 clicks, scrolls, keys, text and wait steps in one call. |
 
 ## Targets
@@ -48,7 +48,7 @@ desktop and run inside a [control session](sessions.md).
   `begin_control_session` and to every input tool. `focus_window`, `capture_window` and `wait_for_window`
   take it as `window_id`, and also accept `target_ref` as an alias. Giving both is fine only when they
   are equal.
-- `switch_virtual_desktop` takes `target_ref` as an optional field. When it is missing, the session's approved window is used, or the foreground window when no session has one. The switch ends the session, because the approved window is no longer on screen. Begin a new session on a window of the new desktop. With `steps` above 1, the first shortcut is checked like any other input, and later shortcuts are checked only for what still applies once the desktop has changed: cancellation, the unlocked Default input desktop, the approved window still being the same live window, and the integrity of the window that now holds the foreground and keyboard focus. The approved window is not required to be on the new desktop or in the foreground. A failure or cancellation part-way reports the shortcuts already sent as partial input.
+- `switch_virtual_desktop` takes `target_ref` as an optional field. When it is missing, the session's approved window is used, or the foreground window when no session has one. The switch ends the session, because the approved window is no longer on screen. Begin a new session on a window of the new desktop. With `steps` above 1, the first shortcut is checked like any other input, and later shortcuts are checked only for what still applies once the desktop has changed: cancellation, the unlocked Default input desktop, the approved window still being the same live window with unchanged bounds and display layout, and the integrity of the window that now holds the foreground and keyboard focus. The approved window is not required to be on the new desktop or in the foreground. A failure or cancellation part-way reports the shortcuts already sent as partial input.
 - One session approves one target. End the session before approving another.
 - A screenshot or OCR result includes `target_ref` only when the foreground window stayed the
   same during the capture. A null `target_ref` does not approve input.
@@ -216,7 +216,7 @@ Every error also has `error.retryable`. It says whether repeating the same reque
 | --- | --- | --- |
 | `not_foreground` | The target (or a window of its process) is not in front, or nothing is. Call `focus_window`. The session is kept. | Yes |
 | `foreground_changed` | The foreground changed while the action was checked. The session is kept. | Yes |
-| `observation_stale` | The foreground or the window set changed while `click_text` read the screen, so the text may belong to another window. Call `click_text` again. The session is kept. | Yes |
+| `observation_stale` | The foreground or the window set changed while `click_text` read the screen, or the window in front cannot be identified, so the text may belong to another window. Call `click_text` again. The session is kept. | Yes |
 | `foreign_destination` | The point or the keyboard focus is in a window of another process. The session is kept. | Yes |
 | `destination_unidentified` | The window that would get the input cannot be identified. The session is kept. | Yes |
 | `own_indicator` | The point is under ControlFreak's own Stop button. Choose another point. The session is kept. | No |

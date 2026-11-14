@@ -22,12 +22,11 @@ use controlfreak_core::{
     MouseDragRequest, MouseMoveRequest, MousePosition, MouseScrollRequest, MutationControl,
     ObservationMode, ObservationOptions, OcrBackend, OcrLine, OcrRegionRequest, OcrResult, OcrWord,
     PermissionDescriptor, PermissionId, PermissionState, Platform, PlatformError,
-    PointerActionResult, PointerBackend, SecurityContext, TextInputRequest,
-    VirtualDesktopDirection, VirtualDesktopInfo, VirtualDesktopList, VirtualDesktopSwitchRequest,
-    VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest, VisualChangeResult,
-    WaitForChangeSinceRequest, WaitForTextRequest, WaitForTextResult, WaitForVisualChangeRequest,
-    WaitForWindowRequest, WindowBackend, WindowBounds, WindowFocusResult, WindowInfo, WindowList,
-    WindowScreenshot, WindowWaitResult,
+    PointerActionResult, PointerBackend, SecurityContext, TextInputRequest, VirtualDesktopInfo,
+    VirtualDesktopList, VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult, VisualBaseline,
+    VisualBaselineRequest, VisualChangeResult, WaitForChangeSinceRequest, WaitForTextRequest,
+    WaitForTextResult, WaitForVisualChangeRequest, WaitForWindowRequest, WindowBackend,
+    WindowBounds, WindowFocusResult, WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
 };
 use windows::Win32::{
     Foundation::{HWND, LPARAM, POINT, RECT},
@@ -667,15 +666,35 @@ impl<T: Clone> PassCache<T> {
     }
 }
 
+/// Where the requested region is on screen right now, or `None` if it cannot be resolved.
+fn current_region_bounds(region: &OcrRegionRequest) -> Option<controlfreak_core::DisplayBounds> {
+    ensure_dpi_awareness().ok()?;
+    let display = find_display(&region.display_id).ok()?;
+    display_region_bounds(&display, region.x, region.y, region.width, region.height).ok()
+}
+
+/// Keeps a pixel watch and its cache tied to where the region is now. A cached result is only
+/// reused while the watch still covers the region's current rectangle; when the region moved or
+/// cannot be resolved (the display layout changed mid-wait) the cache is dropped and the watch
+/// rebuilt, so the next pass recognizes text again and reports any layout error truthfully.
+fn reconcile_watch<W, T>(
+    watch: &mut Option<(W, controlfreak_core::DisplayBounds)>,
+    cache: &mut PassCache<T>,
+    current: Option<controlfreak_core::DisplayBounds>,
+    rebuild: impl FnOnce() -> Option<(W, controlfreak_core::DisplayBounds)>,
+) {
+    if watch.as_ref().map(|(_, bounds)| *bounds) != current {
+        *cache = PassCache::default();
+        *watch = if current.is_some() { rebuild() } else { None };
+    }
+}
+
 /// A pixel watch over an OCR region, or `None` if the region cannot be watched, in which case
 /// every pass recognizes text.
 fn region_change_watch(
     region: &OcrRegionRequest,
 ) -> Option<(capture::RegionChange, controlfreak_core::DisplayBounds)> {
-    ensure_dpi_awareness().ok()?;
-    let display = find_display(&region.display_id).ok()?;
-    let bounds =
-        display_region_bounds(&display, region.x, region.y, region.width, region.height).ok()?;
+    let bounds = current_region_bounds(region)?;
     capture::RegionChange::new(bounds)
         .ok()
         .map(|watch| (watch, bounds))
@@ -741,6 +760,12 @@ impl OcrBackend for Backend {
         let mut watch = region_change_watch(&request.find.region);
         let mut cache = PassCache::default();
         controlfreak_core::wait_for_text_with(request, control, || {
+            reconcile_watch(
+                &mut watch,
+                &mut cache,
+                current_region_bounds(&request.find.region),
+                || region_change_watch(&request.find.region),
+            );
             let generation = target::observation_generation();
             let frame = watch
                 .as_mut()
@@ -883,22 +908,17 @@ impl WindowBackend for Backend {
         let _apartment = initialize_com()?;
         let manager = virtual_desktop_manager()?;
         let before = current_virtual_desktop_id(&manager);
-        let arrow = match request.direction {
-            VirtualDesktopDirection::Left => Key::ArrowLeft,
-            VirtualDesktopDirection::Right => Key::ArrowRight,
-        };
         let _guard = self.lock_input(control)?;
         ensure_interactive_input_desktop("switch_virtual_desktop")?;
         input::send_desktop_switch_hops(
-            "switch_virtual_desktop",
-            &[Key::Ctrl, Key::Win, arrow],
+            request.direction,
             request.steps,
             control,
             |hop| {
                 if hop == 0 {
                     target::validate(control, "switch_virtual_desktop", None)
                 } else {
-                    target::validate_after_switch(control, "switch_virtual_desktop")
+                    target::validate_after_switch(control)
                 }
             },
             || {
@@ -1219,6 +1239,47 @@ mod tests {
             recognized,
             "the earlier result must not survive a failed pass"
         );
+    }
+
+    #[test]
+    fn a_relocated_or_unresolvable_region_drops_the_cache_and_rebuilds_the_watch() {
+        use controlfreak_core::DisplayBounds;
+        let at = |left| DisplayBounds {
+            left,
+            top: 0,
+            width: 10,
+            height: 10,
+        };
+        let mut cache = super::PassCache::<u8>::default();
+        cache.pass(Some(1), 7, || Ok((1, Some(1)))).unwrap();
+        let mut watch = Some(("old", at(0)));
+
+        // Same rectangle: the watch and the cached result stand.
+        super::reconcile_watch(&mut watch, &mut cache, Some(at(0)), || panic!("no rebuild"));
+        assert_eq!(watch.map(|(name, _)| name), Some("old"));
+        let mut recognized = false;
+        cache
+            .pass(Some(1), 7, || {
+                recognized = true;
+                Ok((2, Some(1)))
+            })
+            .unwrap();
+        assert!(!recognized);
+
+        // The region moved with the old pixels and generation unchanged: recognize again.
+        super::reconcile_watch(&mut watch, &mut cache, Some(at(5)), || Some(("new", at(5))));
+        assert_eq!(watch, Some(("new", at(5))));
+        cache
+            .pass(Some(1), 7, || {
+                recognized = true;
+                Ok((2, Some(1)))
+            })
+            .unwrap();
+        assert!(recognized);
+
+        // A region that cannot be resolved is not watched at all.
+        super::reconcile_watch(&mut watch, &mut cache, None, || panic!("no rebuild"));
+        assert!(watch.is_none());
     }
 
     #[test]

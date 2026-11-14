@@ -157,14 +157,13 @@ impl Hit {
 }
 
 impl Reference {
-    fn validate_snapshot(
+    /// The checks that do not depend on which window is in front or on which desktop is current:
+    /// the same live window, and unchanged bounds and display layout. Any change is permanent.
+    fn validate_unchanged(
         &self,
         current: &Identity,
         bounds: [i32; 4],
         displays: &[DisplayInfo],
-        target: &WindowFacts,
-        foreground: &WindowFacts,
-        hit: Option<&Hit>,
     ) -> Result<(), Failure> {
         if &self.identity != current {
             return Err(Failure::Fatal(invalid(
@@ -176,6 +175,19 @@ impl Reference {
                 "window bounds or display layout changed; end the session and observe again",
             )));
         }
+        Ok(())
+    }
+
+    fn validate_snapshot(
+        &self,
+        current: &Identity,
+        bounds: [i32; 4],
+        displays: &[DisplayInfo],
+        target: &WindowFacts,
+        foreground: &WindowFacts,
+        hit: Option<&Hit>,
+    ) -> Result<(), Failure> {
+        self.validate_unchanged(current, bounds, displays)?;
         let shell_host = current.shell_host;
         if !accepts_same_process(target, shell_host, foreground) {
             return Err(Failure::Recoverable(refused(
@@ -715,14 +727,13 @@ pub(super) fn validate(
 /// Validation for the second and later hops of `switch_virtual_desktop`. The first hop has
 /// already passed `validate`, so the approved window was foreground and on the current desktop.
 /// After a hop the approved window is on another desktop and a window of some other application
-/// holds the foreground, so the placement and same-process rules cannot apply again. What still
-/// must hold: cancellation and the session's target state, the unlocked Default input desktop,
-/// the approved window being the same live window, and the integrity of whatever window now
-/// holds the foreground and keyboard focus, since the shortcut goes to it.
-pub(super) fn validate_after_switch(
-    control: &MutationControl,
-    operation: &str,
-) -> Result<(), PlatformError> {
+/// holds the foreground, so the current-desktop and same-process rules cannot apply again. Every
+/// other check stays: cancellation and the session's target state, the unlocked Default input
+/// desktop, the approved window being the same live window with unchanged bounds and display
+/// layout, its integrity, and the integrity of whatever window holds the foreground and keyboard
+/// focus, since the shortcut goes to it. Anything unreadable refuses, so this fails closed.
+pub(super) fn validate_after_switch(control: &MutationControl) -> Result<(), PlatformError> {
+    let operation = super::input::DESKTOP_SWITCH_OPERATION;
     control.check(operation)?;
     control.check_target()?;
     let id = control
@@ -742,32 +753,54 @@ fn validate_switch_hop(id: &str, operation: &str) -> Result<(), Failure> {
     ensure_interactive_input_desktop(operation)?;
     let reference = lookup(id)?;
     let hwnd = HWND(reference.identity.hwnd as *mut std::ffi::c_void);
-    if cached_identity(hwnd)? != reference.identity {
-        return Err(Failure::Fatal(invalid(
-            "the approved window changed during the desktop switch",
-        )));
-    }
+    let identity = cached_identity(hwnd)?;
+    let current_bounds = bounds(hwnd)?;
+    let displays = desktop::enumerate_displays()?;
+    reference.validate_unchanged(&identity, current_bounds, &displays)?;
     cached_integrity(operation, hwnd).map_err(Failure::Fatal)?;
-    // An empty desktop can leave no foreground window or focus; the shortcut then goes to the
-    // shell, which has nothing to check.
-    let foreground = desktop::foreground_window_handle();
-    if !foreground.is_invalid() {
-        recoverable(cached_integrity(operation, foreground))?;
+    check_switch_foreground(
+        desktop::foreground_window_handle,
+        |window| privilege::ensure_window_integrity(operation, window),
+        || {
+            let mut gui = GUITHREADINFO {
+                cbSize: u32::try_from(std::mem::size_of::<GUITHREADINFO>())
+                    .map_err(|_| invalid("GUI thread record size is unavailable"))?,
+                ..Default::default()
+            };
+            // SAFETY: gui is a correctly sized writable record; zero queries the foreground
+            // thread.
+            unsafe { GetGUIThreadInfo(0, &raw mut gui) }.map_err(|_| {
+                refused(
+                    RefusalCause::DestinationUnidentified,
+                    "keyboard focus cannot be verified; observe again",
+                )
+            })?;
+            Ok(gui.hwndFocus)
+        },
+    )
+}
+
+/// The decision about the window that receives a later switch shortcut. With no foreground
+/// window the shortcut goes to the shell, which has nothing to check, and nothing else is read.
+/// Otherwise the foreground window and the keyboard-focus window must have a readable, acceptable
+/// integrity level, and a foreground that changed during the check is checked again.
+fn check_switch_foreground(
+    mut foreground: impl FnMut() -> HWND,
+    mut integrity: impl FnMut(HWND) -> Result<(), PlatformError>,
+    focus: impl FnOnce() -> Result<HWND, PlatformError>,
+) -> Result<(), Failure> {
+    let first = foreground();
+    if first.is_invalid() {
+        return Ok(());
     }
-    let mut gui = GUITHREADINFO {
-        cbSize: u32::try_from(std::mem::size_of::<GUITHREADINFO>())
-            .map_err(|_| invalid("GUI thread record size is unavailable"))?,
-        ..Default::default()
-    };
-    // SAFETY: gui is a correctly sized writable record; zero queries the foreground thread.
-    unsafe { GetGUIThreadInfo(0, &raw mut gui) }.map_err(|_| {
-        Failure::Recoverable(refused(
-            RefusalCause::DestinationUnidentified,
-            "keyboard focus cannot be verified; observe again",
-        ))
-    })?;
-    if !gui.hwndFocus.is_invalid() {
-        recoverable(privilege::ensure_window_integrity(operation, gui.hwndFocus))?;
+    recoverable(integrity(first))?;
+    let focused = recoverable(focus())?;
+    if !focused.is_invalid() {
+        recoverable(integrity(focused))?;
+    }
+    let after = foreground();
+    if after != first && !after.is_invalid() {
+        recoverable(integrity(after))?;
     }
     Ok(())
 }
@@ -1077,11 +1110,10 @@ pub(super) fn evidence(control: &MutationControl) {
     }
 }
 
-/// Whether an observation's `target_ref` names the approved target or a window that may stand
-/// in for it (a same-process dialog or popup that was in front during the observation).
 /// The `click_text` check on the screen read: an observation that does not belong to the approved
 /// target generation is a retryable refusal, not a change of the target. The foreground or the
-/// window set moved while the screen was read; the session stays valid.
+/// window set moved while the screen was read, or the window in front cannot be identified; the
+/// session stays valid.
 pub(super) fn ensure_observation_matches(
     approved: Option<&str>,
     observed: Option<&str>,
@@ -1091,10 +1123,12 @@ pub(super) fn ensure_observation_matches(
     }
     Err(refused(
         RefusalCause::ObservationStale,
-        "the foreground or the window set changed while the screen was read, so the text may belong to another window; call click_text again",
+        "the foreground or the window set changed while the screen was read, or the window in front cannot be identified, so the text may belong to another window; call click_text again",
     ))
 }
 
+/// Whether an observation's `target_ref` names the approved target or a window that may stand
+/// in for it (a same-process dialog or popup that was in front during the observation).
 pub(super) fn observation_matches_approved(approved: &str, observed: Option<&str>) -> bool {
     let Some(observed) = observed else {
         return false;
@@ -1326,6 +1360,97 @@ mod tests {
                 "change {change}"
             );
         }
+    }
+
+    #[test]
+    fn a_later_switch_hop_still_refuses_changed_identity_bounds_and_display_layout() {
+        let expected = reference();
+        assert!(
+            expected
+                .validate_unchanged(&expected.identity, expected.bounds, &expected.displays)
+                .is_ok()
+        );
+        let mut moved = expected.bounds;
+        moved[0] += 1;
+        let mut other = expected.identity.clone();
+        other.created += 1;
+        let layout = [DisplayInfo {
+            id: "new".into(),
+            name: "synthetic".into(),
+            bounds: controlfreak_core::DisplayBounds {
+                left: 0,
+                top: 0,
+                width: 100,
+                height: 100,
+            },
+            is_primary: true,
+        }];
+        for result in [
+            expected.validate_unchanged(&expected.identity, moved, &expected.displays),
+            expected.validate_unchanged(&other, expected.bounds, &expected.displays),
+            expected.validate_unchanged(&expected.identity, expected.bounds, &layout),
+        ] {
+            assert!(matches!(result, Err(Failure::Fatal(_))));
+        }
+    }
+
+    fn window(value: isize) -> HWND {
+        HWND(value as *mut std::ffi::c_void)
+    }
+
+    fn denied() -> PlatformError {
+        refused(RefusalCause::DestinationUnidentified, "synthetic")
+    }
+
+    #[test]
+    fn a_later_switch_hop_checks_the_foreground_focus_and_a_foreground_that_changed() {
+        let none = window(0);
+        let accept = |_: HWND| Ok(());
+        let sequence = |values: Vec<HWND>| {
+            let mut values = values.into_iter();
+            move || values.next().unwrap_or(none)
+        };
+
+        // A foreign foreground of acceptable integrity is allowed, with or without focus.
+        assert!(
+            check_switch_foreground(sequence(vec![window(9), window(9)]), accept, || Ok(window(
+                10
+            )))
+            .is_ok()
+        );
+        assert!(
+            check_switch_foreground(sequence(vec![window(9), window(9)]), accept, || Ok(none))
+                .is_ok()
+        );
+        // No foreground window: the shortcut goes to the shell and nothing else is queried.
+        assert!(
+            check_switch_foreground(sequence(vec![none]), accept, || panic!("no focus query"))
+                .is_ok()
+        );
+        // Higher or unreadable integrity of any window involved refuses without ending approval.
+        for bad in [9, 10, 11] {
+            let result = check_switch_foreground(
+                sequence(vec![window(9), window(11)]),
+                |handle| {
+                    if handle == window(bad) {
+                        Err(denied())
+                    } else {
+                        Ok(())
+                    }
+                },
+                || Ok(window(10)),
+            );
+            assert!(matches!(result, Err(Failure::Recoverable(_))), "{bad}");
+        }
+        // A focus query that fails refuses.
+        assert!(matches!(
+            check_switch_foreground(sequence(vec![window(9)]), accept, || Err(denied())),
+            Err(Failure::Recoverable(_))
+        ));
+        // A foreground that changed to a window gone by the final read is not a refusal.
+        assert!(
+            check_switch_foreground(sequence(vec![window(9), none]), accept, || Ok(none)).is_ok()
+        );
     }
 
     #[test]

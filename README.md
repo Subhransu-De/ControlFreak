@@ -29,7 +29,7 @@ and click, scroll and type in one window that it chose.
 - List, focus, capture, and wait for application windows.
 - Read, find, wait for, and click on-screen text using the local Windows OCR engine. `click_text` clicks the box around the matched words, so a label in the middle of a line can be clicked.
 - Run up to 16 clicks, scrolls and keystrokes on one window in a single call.
-- Inspect and switch between discoverable Windows virtual desktops. `switch_virtual_desktop` moves one desktop left or right and ends the session, because the approved window is no longer on screen.
+- Inspect and switch between discoverable Windows virtual desktops. `switch_virtual_desktop` moves one or more desktops (`steps`) left or right and ends the session, because the approved window is no longer on screen.
 - Work in the approved window's own dialogs and popup menus. A window of another process is refused.
 - Target the taskbar, the desktop and the Start and Search surfaces. They are checked by window class and by the program that owns them, and there is still no tool that launches applications.
 
