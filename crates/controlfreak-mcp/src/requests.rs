@@ -47,10 +47,7 @@ impl CaptureDisplayInput {
 
 /// The width an explicit capture is returned at: the caller's `max_width`, source resolution
 /// when `native` is set, and otherwise the same default width as an action screenshot.
-pub(super) fn capture_width(
-    max_width: Option<u32>,
-    native: bool,
-) -> Result<Option<u32>, PlatformError> {
+fn capture_width(max_width: Option<u32>, native: bool) -> Result<Option<u32>, PlatformError> {
     match (max_width, native) {
         (Some(_), true) => Err(PlatformError::InvalidArgument {
             argument: "native".to_owned(),
@@ -132,7 +129,7 @@ impl WaitForVisualChangeInput {
 /// Every wait tool publishes the same lower bound of 0 ms, but the visual waits compare at least
 /// once over 1 ms. A zero timeout means one comparison, which needs no stability period. A
 /// stability period that was not given never exceeds the timeout, so a short timeout works alone.
-pub(super) fn visual_wait_values(timeout_ms: u32, stable_ms: Option<u32>) -> (u32, u32) {
+fn visual_wait_values(timeout_ms: u32, stable_ms: Option<u32>) -> (u32, u32) {
     if timeout_ms == 0 {
         (1, 0)
     } else {
@@ -523,7 +520,7 @@ impl FocusWindowInput {
 }
 
 /// `target_ref` is an alias of `window_id`. Giving both is fine only when they agree.
-pub(super) fn window_reference(
+fn window_reference(
     window_id: Option<&str>,
     target_ref: Option<&str>,
 ) -> Result<Option<String>, PlatformError> {

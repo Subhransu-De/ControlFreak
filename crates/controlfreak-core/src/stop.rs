@@ -278,11 +278,6 @@ impl StopController {
         self.notify();
     }
 
-    /// Why admission is closed, or `None` while work is still admitted.
-    pub fn stop_message(&self) -> Option<&'static str> {
-        stop_message(self.state().stop_reason)
-    }
-
     /// The refusal text, including the recorded failure reason when there is one.
     pub fn refusal_message(&self) -> Option<String> {
         let state = self.state();
@@ -387,7 +382,7 @@ impl Backoff {
     };
 
     /// The pause after the `failed`-th failure, counting from one.
-    pub fn delay(self, failed: u32) -> Duration {
+    pub(crate) fn delay(self, failed: u32) -> Duration {
         let doublings = failed.saturating_sub(1).min(16);
         self.first.saturating_mul(1 << doublings).min(self.cap)
     }

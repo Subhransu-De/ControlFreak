@@ -97,7 +97,7 @@ pub(super) struct OcrHelperPool {
 }
 
 #[cfg(test)]
-pub(super) fn recognize_text_with_helper(
+fn recognize_text_with_helper(
     command: &OcrHelperCommand,
     pool: &OcrHelperPool,
     request: &OcrRegionRequest,

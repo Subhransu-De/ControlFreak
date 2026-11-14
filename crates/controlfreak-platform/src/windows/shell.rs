@@ -67,7 +67,7 @@ fn below_windows(image: &str, windows_directory: &str) -> Option<Vec<String>> {
 }
 
 /// Whether `image` is the Windows shell host, `explorer.exe` in the Windows directory itself.
-pub(super) fn is_shell_host_image(image: &str, windows_directory: &str) -> bool {
+fn is_shell_host_image(image: &str, windows_directory: &str) -> bool {
     below_windows(image, windows_directory).is_some_and(|rest| rest == [EXPLORER])
 }
 

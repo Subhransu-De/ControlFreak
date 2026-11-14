@@ -419,7 +419,7 @@ impl Backend {
 const MIN_DRAG_DURATION_MS: u32 = 120;
 
 /// The travel time actually used for a requested `duration_ms`, which can be zero.
-pub(super) const fn effective_drag_duration_ms(requested: u32) -> u32 {
+const fn effective_drag_duration_ms(requested: u32) -> u32 {
     if requested < MIN_DRAG_DURATION_MS {
         MIN_DRAG_DURATION_MS
     } else {

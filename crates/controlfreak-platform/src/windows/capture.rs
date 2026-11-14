@@ -447,8 +447,8 @@ fn capture_rgba(bounds: DisplayBounds) -> Result<Vec<u8>, PlatformError> {
 }
 
 /// How a window screenshot was produced; reported to clients as `capture_method`.
-pub(super) const CAPTURE_METHOD_PRINT_WINDOW: &str = "windows_print_window";
-pub(super) const CAPTURE_METHOD_SCREEN: &str = "windows_gdi";
+const CAPTURE_METHOD_PRINT_WINDOW: &str = "windows_print_window";
+const CAPTURE_METHOD_SCREEN: &str = "windows_gdi";
 
 /// `PW_RENDERFULLCONTENT`: ask the window (and DWM) to render all of its content, including
 /// layered and hardware-accelerated child content, even when it is covered by other windows.
@@ -536,7 +536,7 @@ fn print_window_rgba(hwnd: HWND, visible: DisplayBounds) -> Option<Vec<u8>> {
 /// to handle `WM_PRINT`, and an application that stops pumping messages would hold the call
 /// forever. A window that is flagged as hung is not asked at all; for any other, the render runs
 /// on its own thread and the caller waits at most this long before copying the screen instead.
-pub(super) const PRINT_WINDOW_DEADLINE: Duration = Duration::from_secs(2);
+const PRINT_WINDOW_DEADLINE: Duration = Duration::from_secs(2);
 
 /// How often a capture that is waiting for the render slot looks again.
 const RENDER_SLOT_POLL: Duration = Duration::from_millis(5);
@@ -727,7 +727,7 @@ pub(super) fn capture_window_bounds(
     })
 }
 
-pub(super) fn capture_bounds(
+fn capture_bounds(
     bounds: DisplayBounds,
     max_width: Option<u32>,
     include_cursor_marker: bool,
@@ -933,7 +933,7 @@ impl RegionChange {
 /// Hashes the three colour bytes of every pixel and ignores the fourth, which a screen read
 /// leaves unspecified. `red_first` selects RGBA input; otherwise the frame is BGRA, so both
 /// layouts of the same pixels give the same value.
-pub(super) fn pixel_fingerprint(frame: &[u8], red_first: bool) -> u64 {
+fn pixel_fingerprint(frame: &[u8], red_first: bool) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for pixel in frame.chunks_exact(4) {

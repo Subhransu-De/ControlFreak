@@ -215,7 +215,7 @@ pub(super) fn invalid(reason: &str) -> PlatformError {
     }
 }
 
-pub(super) fn refused(cause: RefusalCause, reason: &str) -> PlatformError {
+fn refused(cause: RefusalCause, reason: &str) -> PlatformError {
     PlatformError::refused(cause, reason)
 }
 
@@ -1129,7 +1129,7 @@ pub(super) fn ensure_observation_matches(
 
 /// Whether an observation's `target_ref` names the approved target or a window that may stand
 /// in for it (a same-process dialog or popup that was in front during the observation).
-pub(super) fn observation_matches_approved(approved: &str, observed: Option<&str>) -> bool {
+fn observation_matches_approved(approved: &str, observed: Option<&str>) -> bool {
     let Some(observed) = observed else {
         return false;
     };
