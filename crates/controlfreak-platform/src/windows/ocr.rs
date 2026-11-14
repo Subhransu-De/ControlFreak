@@ -6,7 +6,7 @@
 //! request in progress and ends it. A helper is retired after an error, timeout, cancellation, or
 //! `MAX_REQUESTS_PER_HELPER` requests, and exits by itself when idle for `HELPER_IDLE_EXIT`.
 
-use super::recognize_text_in_process as recognize_text_fingerprinted;
+use super::recognize_text_fingerprinted;
 use crate::OcrHelperCommand;
 use controlfreak_core::{MutationControl, OcrRegionRequest, OcrResult, PlatformError};
 use serde::{Deserialize, Serialize};

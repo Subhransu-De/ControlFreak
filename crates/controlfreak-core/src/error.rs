@@ -71,6 +71,9 @@ pub enum RefusalCause {
     NotForeground,
     /// The foreground changed while the action was being validated.
     ForegroundChanged,
+    /// The screen read for a text click was taken while the foreground or the window set changed,
+    /// so the text may belong to another window. Reading and clicking again is safe.
+    ObservationStale,
     /// The point or keyboard focus is in a window of another process.
     ForeignDestination,
     /// The point is under the server's own indicator or Stop button.
@@ -85,6 +88,7 @@ impl RefusalCause {
         match self {
             Self::NotForeground => "not_foreground",
             Self::ForegroundChanged => "foreground_changed",
+            Self::ObservationStale => "observation_stale",
             Self::ForeignDestination => "foreign_destination",
             Self::OwnIndicator => "own_indicator",
             Self::DestinationUnidentified => "destination_unidentified",
@@ -279,6 +283,11 @@ mod tests {
             (
                 PlatformError::refused(RefusalCause::ForegroundChanged, "x"),
                 "foreground_changed",
+                true,
+            ),
+            (
+                PlatformError::refused(RefusalCause::ObservationStale, "x"),
+                "observation_stale",
                 true,
             ),
             (

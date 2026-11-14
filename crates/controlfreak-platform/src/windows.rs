@@ -104,8 +104,8 @@ use capture::{
     baseline_process_nonce, capture_comparison_frame, capture_display_bounds,
     capture_display_image, capture_window_bounds, display_bounds_from_window,
     display_region_bounds, frame_fingerprint, observe_display, observe_foreground,
-    recognize_text_fingerprinted as recognize_text_in_process, validate_max_width,
-    validate_visual_wait, validate_wait_values, wait_for_change,
+    recognize_text_fingerprinted, validate_max_width, validate_visual_wait, validate_wait_values,
+    wait_for_change,
 };
 use desktop::{
     activate_window, current_cursor_position, current_virtual_desktop_id, ensure_dpi_awareness,
@@ -337,7 +337,7 @@ impl Backend {
         let target_before = target::observe();
         let (mut result, fingerprint) = self.ocr_helper.as_ref().map_or_else(
             || {
-                recognize_text_in_process(request, control)
+                recognize_text_fingerprinted(request, control)
                     .map(|(result, fingerprint)| (result, Some(fingerprint)))
             },
             |command| {
@@ -669,12 +669,16 @@ impl<T: Clone> PassCache<T> {
 
 /// A pixel watch over an OCR region, or `None` if the region cannot be watched, in which case
 /// every pass recognizes text.
-fn region_change_watch(region: &OcrRegionRequest) -> Option<capture::RegionChange> {
+fn region_change_watch(
+    region: &OcrRegionRequest,
+) -> Option<(capture::RegionChange, controlfreak_core::DisplayBounds)> {
     ensure_dpi_awareness().ok()?;
     let display = find_display(&region.display_id).ok()?;
     let bounds =
         display_region_bounds(&display, region.x, region.y, region.width, region.height).ok()?;
-    capture::RegionChange::new(bounds).ok()
+    capture::RegionChange::new(bounds)
+        .ok()
+        .map(|watch| (watch, bounds))
 }
 
 /// Refuses a stored baseline whose display moved, resized, or disappeared since capture.
@@ -738,9 +742,18 @@ impl OcrBackend for Backend {
         let mut cache = PassCache::default();
         controlfreak_core::wait_for_text_with(request, control, || {
             let generation = target::observation_generation();
-            let frame = watch.as_mut().and_then(|watch| watch.fingerprint().ok());
+            let frame = watch
+                .as_mut()
+                .and_then(|(watch, _)| watch.fingerprint().ok());
             cache.pass(frame, generation, || {
-                self.find_text_fingerprinted(&request.find, control)
+                let (result, fingerprint) = self.find_text_fingerprinted(&request.find, control)?;
+                // Recognition resolves the display again on every pass. If it read another
+                // rectangle than the watch does (the layout changed mid-wait), two frames of
+                // the same colour could look equal, so the result is not kept.
+                let same_rectangle = watch
+                    .as_ref()
+                    .is_some_and(|(_, bounds)| *bounds == result.source_bounds);
+                Ok((result, fingerprint.filter(|_| same_rectangle)))
             })
         })
     }
@@ -765,13 +778,10 @@ impl OcrBackend for Backend {
         // process such as a dialog, in front and unchanged. If not, the text may belong to
         // something else, so this click is refused; the session itself stays valid because every
         // action re-checks the live foreground.
-        if !control.approved_target().is_some_and(|approved| {
-            target::observation_matches_approved(&approved, ocr.target_ref.as_deref())
-        }) {
-            return Err(target::invalid(
-                "OCR observation no longer belongs to the approved target generation; the foreground or window layout changed while reading the screen, find the text again",
-            ));
-        }
+        target::ensure_observation_matches(
+            control.approved_target().as_deref(),
+            ocr.target_ref.as_deref(),
+        )?;
         // Search result limits must not hide eligible lines from the uniqueness check.
         let candidate = controlfreak_core::select_text_candidate(
             &ocr.lines,
@@ -879,18 +889,24 @@ impl WindowBackend for Backend {
         };
         let _guard = self.lock_input(control)?;
         ensure_interactive_input_desktop("switch_virtual_desktop")?;
-        for _ in 0..request.steps {
-            control.check("switch_virtual_desktop")?;
-            send_key_chord(
-                "switch_virtual_desktop",
-                &[Key::Ctrl, Key::Win, arrow],
-                control,
-                || target::validate(control, "switch_virtual_desktop", None),
-            )?;
-            controlfreak_core::timing::time("settle", || {
-                thread::sleep(Duration::from_millis(DESKTOP_SWITCH_SETTLE_MS));
-            });
-        }
+        input::send_desktop_switch_hops(
+            "switch_virtual_desktop",
+            &[Key::Ctrl, Key::Win, arrow],
+            request.steps,
+            control,
+            |hop| {
+                if hop == 0 {
+                    target::validate(control, "switch_virtual_desktop", None)
+                } else {
+                    target::validate_after_switch(control, "switch_virtual_desktop")
+                }
+            },
+            || {
+                controlfreak_core::timing::time("settle", || {
+                    thread::sleep(Duration::from_millis(DESKTOP_SWITCH_SETTLE_MS));
+                });
+            },
+        )?;
         control.input_complete();
         target::evidence(control);
         let after = current_virtual_desktop_id(&manager);

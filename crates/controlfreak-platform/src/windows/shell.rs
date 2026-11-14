@@ -21,7 +21,8 @@ const EXPLORER_CLASSES: [&str; 4] = [
     "Progman",
     "WorkerW",
 ];
-const CORE_WINDOW_CLASS: &str = "Windows.UI.Core.CoreWindow";
+/// Class of the content window a packaged app hosts inside its frame.
+pub(super) const CORE_WINDOW_CLASS: &str = "Windows.UI.Core.CoreWindow";
 /// Start and Search hosts: executable name and the prefix of the package folder that holds it
 /// under `SystemApps`.
 const SYSTEM_APP_HOSTS: [(&str, &str); 3] = [
@@ -82,11 +83,6 @@ pub(super) fn is_shared_host_image(image: &str, windows_directory: &str) -> bool
 /// packaged (UWP) app while the app's own process owns the content window hosted inside it.
 pub(super) fn is_app_frame_host_image(image: &str, windows_directory: &str) -> bool {
     below_windows(image, windows_directory).is_some_and(|rest| rest == APP_FRAME_HOST)
-}
-
-/// Class of the content window a packaged app hosts inside its frame.
-pub(super) const fn core_window_class() -> &'static str {
-    CORE_WINDOW_CLASS
 }
 
 /// Whether a window with this class, owned by a process running `image`, is a shell surface.

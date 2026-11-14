@@ -193,6 +193,55 @@ where
     send_releasing_native(operation, &inputs, control)
 }
 
+/// Sends the desktop-switch shortcut `steps` times. `validate` runs before every hop with the
+/// zero-based hop number: the first hop checks the approved target in full, later hops check
+/// only what still applies once the desktop has changed (see `target::validate_after_switch`).
+/// Progress is cumulative, so a failure or cancellation after some hops leaves
+/// `PartiallySent` with the events of the completed hops.
+pub(super) fn send_desktop_switch_hops(
+    operation: &str,
+    keys: &[Key],
+    steps: u8,
+    control: &MutationControl,
+    validate: impl FnMut(u8) -> Result<(), PlatformError>,
+    settle: impl FnMut(),
+) -> Result<(), PlatformError> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    send_desktop_switch_hops_with(
+        operation,
+        &key_chord_inputs(keys),
+        steps,
+        control,
+        validate,
+        |key| {
+            // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
+            unsafe { GetAsyncKeyState(key) < 0 }
+        },
+        native_send_inputs,
+        settle,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_desktop_switch_hops_with(
+    operation: &str,
+    inputs: &[INPUT],
+    steps: u8,
+    control: &MutationControl,
+    mut validate: impl FnMut(u8) -> Result<(), PlatformError>,
+    mut is_down: impl FnMut(i32) -> bool,
+    mut send: impl FnMut(&[INPUT]) -> Result<usize, PlatformError>,
+    mut settle: impl FnMut(),
+) -> Result<(), PlatformError> {
+    for hop in 0..steps {
+        control.check(operation)?;
+        validate(hop)?;
+        send_releasing_if_idle(operation, inputs, control, &mut is_down, &mut send)?;
+        settle();
+    }
+    Ok(())
+}
+
 pub(super) fn key_chord_inputs(keys: &[Key]) -> Vec<INPUT> {
     let mut inputs = Vec::with_capacity(keys.len() * 2);
     inputs.extend(keys.iter().copied().map(|key| keyboard_input(key, false)));
@@ -234,6 +283,9 @@ where
     send_text_checking_held_keys(utf16, control, validate_target, send, |_| false)
 }
 
+/// Virtual keys of the four modifiers: Shift, Ctrl, Alt, and the left and right Win keys.
+const HELD_MODIFIER_KEYS: [i32; 5] = [0x10, 0x11, 0x12, 0x5B, 0x5C];
+
 /// Unicode packets carry no virtual key, so only the Enter and Tab segments can repeat a key the
 /// person already holds. Those go through the same held-key refusal as `press_keys`, before
 /// any input of that segment is sent.
@@ -268,7 +320,11 @@ where
             TextSegment::Key(key) => {
                 control.check("type_text")?;
                 let inputs = [keyboard_input(key, false), keyboard_input(key, true)];
-                if any_requested_input_held(&inputs, &mut is_down) {
+                // A held modifier would turn the key into a shortcut (Alt+Tab, Ctrl+Enter), which
+                // the Unicode text before it never could be, so it is refused like the key itself.
+                if any_requested_input_held(&inputs, &mut is_down)
+                    || HELD_MODIFIER_KEYS.iter().any(|key| is_down(*key))
+                {
                     return Err(PlatformError::failed(
                         controlfreak_core::FailureCause::KeyHeld,
                         "type_text",
@@ -1210,6 +1266,120 @@ mod progress_tests {
         assert!(owned_releases(&clicks).is_empty());
     }
 
+    /// A fake desktop for the switch shortcut: each accepted hop moves the approved window off
+    /// the current desktop, as the real shortcut does.
+    struct FakeDesktops {
+        target_on_current: std::cell::Cell<bool>,
+        sent: std::cell::Cell<u32>,
+    }
+
+    fn run_switch(
+        steps: u8,
+        control: &MutationControl,
+        world: &FakeDesktops,
+        fail_send_on: Option<u32>,
+        cancel_after_hop: Option<u8>,
+    ) -> Result<(), PlatformError> {
+        let inputs = key_chord_inputs(&[Key::Ctrl, Key::Win, Key::ArrowRight]);
+        send_desktop_switch_hops_with(
+            "switch_virtual_desktop",
+            &inputs,
+            steps,
+            control,
+            |hop| {
+                if hop == 0 {
+                    // The full validation: the approved window must be on the current desktop.
+                    assert!(world.target_on_current.get(), "first hop needs the target");
+                } else if cancel_after_hop == Some(hop) {
+                    control.cancel();
+                }
+                Ok(())
+            },
+            |_| false,
+            |batch| {
+                if fail_send_on == Some(world.sent.get()) {
+                    return Err(failure());
+                }
+                world.sent.set(world.sent.get() + 1);
+                world.target_on_current.set(false);
+                Ok(batch.len())
+            },
+            || {},
+        )
+    }
+
+    #[test]
+    fn a_multi_step_switch_continues_after_the_target_leaves_the_current_desktop() {
+        let control = MutationControl::default();
+        let world = FakeDesktops {
+            target_on_current: true.into(),
+            sent: 0.into(),
+        };
+        run_switch(3, &control, &world, None, None).unwrap();
+        assert_eq!(world.sent.get(), 3);
+        assert_eq!(control.progress().sent_events, 18);
+        assert_eq!(control.progress().cleanup, CleanupStatus::NotNeeded);
+    }
+
+    #[test]
+    fn a_failed_later_hop_keeps_the_completed_hops_and_reports_its_own_delivery_unknown() {
+        let control = MutationControl::default();
+        let world = FakeDesktops {
+            target_on_current: true.into(),
+            sent: 0.into(),
+        };
+        assert!(run_switch(4, &control, &world, Some(2), None).is_err());
+        assert_eq!(world.sent.get(), 2);
+        let progress = control.progress();
+        // The two completed hops are counted; the hop whose send failed is honestly unknown.
+        assert_eq!(progress.sent_events, 12);
+        assert_eq!(progress.input_outcome, InputOutcome::Unknown);
+    }
+
+    #[test]
+    fn a_failed_validation_after_the_first_hop_keeps_the_first_hop_progress() {
+        let control = MutationControl::default();
+        let inputs = key_chord_inputs(&[Key::Ctrl, Key::Win, Key::ArrowLeft]);
+        let mut sent = 0;
+        let result = send_desktop_switch_hops_with(
+            "switch_virtual_desktop",
+            &inputs,
+            3,
+            &control,
+            |hop| if hop == 1 { Err(failure()) } else { Ok(()) },
+            |_| false,
+            |batch| {
+                sent += 1;
+                Ok(batch.len())
+            },
+            || {},
+        );
+        assert!(result.is_err());
+        assert_eq!(sent, 1);
+        assert_eq!(control.progress().sent_events, 6);
+        assert_eq!(
+            control.progress().input_outcome,
+            InputOutcome::PartiallySent
+        );
+    }
+
+    #[test]
+    fn cancellation_after_the_first_hop_stops_before_the_next_shortcut() {
+        let control = MutationControl::default();
+        let world = FakeDesktops {
+            target_on_current: true.into(),
+            sent: 0.into(),
+        };
+        let error = run_switch(5, &control, &world, None, Some(1)).unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(world.sent.get(), 1);
+        assert_eq!(control.progress().sent_events, 6);
+        assert_eq!(
+            control.progress().input_outcome,
+            InputOutcome::PartiallySent
+        );
+    }
+
     #[test]
     fn held_input_refusal_reports_no_dispatch_or_cleanup() {
         for inputs in [
@@ -1500,6 +1670,37 @@ mod progress_tests {
     }
 
     #[test]
+    fn a_held_modifier_refuses_enter_and_tab_but_not_plain_text() {
+        for modifier in HELD_MODIFIER_KEYS {
+            let control = MutationControl::default();
+            let mut batches = 0;
+            let error = send_text_checking_held_keys(
+                &utf16("ab	c"),
+                &control,
+                || Ok(()),
+                |inputs| {
+                    batches += 1;
+                    Ok(inputs.len())
+                },
+                |key| key == modifier,
+            )
+            .expect_err("a held modifier must refuse the key segment");
+            assert_eq!(error.reason_code(), Some("key_held"), "{modifier:#x}");
+            // The text before the key went out; the key itself did not.
+            assert_eq!((batches, control.progress().sent_events), (1, 4));
+        }
+        let control = MutationControl::default();
+        send_text_checking_held_keys(
+            &utf16("abc"),
+            &control,
+            || Ok(()),
+            |inputs| Ok(inputs.len()),
+            |_| true,
+        )
+        .expect("Unicode text carries no virtual key and is not affected by a held modifier");
+    }
+
+    #[test]
     fn a_key_that_becomes_held_after_earlier_text_is_refused_at_its_segment() {
         let control = MutationControl::default();
         let mut sent_batches = 0;
@@ -1512,7 +1713,10 @@ mod progress_tests {
                 sent_batches += 1;
                 Ok(inputs.len())
             },
-            |_| {
+            |key| {
+                if key != 0x0D {
+                    return false;
+                }
                 queries += 1;
                 queries > 1
             },

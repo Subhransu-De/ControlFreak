@@ -712,6 +712,66 @@ pub(super) fn validate(
     }
 }
 
+/// Validation for the second and later hops of `switch_virtual_desktop`. The first hop has
+/// already passed `validate`, so the approved window was foreground and on the current desktop.
+/// After a hop the approved window is on another desktop and a window of some other application
+/// holds the foreground, so the placement and same-process rules cannot apply again. What still
+/// must hold: cancellation and the session's target state, the unlocked Default input desktop,
+/// the approved window being the same live window, and the integrity of whatever window now
+/// holds the foreground and keyboard focus, since the shortcut goes to it.
+pub(super) fn validate_after_switch(
+    control: &MutationControl,
+    operation: &str,
+) -> Result<(), PlatformError> {
+    control.check(operation)?;
+    control.check_target()?;
+    let id = control
+        .approved_target()
+        .ok_or_else(|| invalid("an approved target reference is required"))?;
+    match validate_switch_hop(&id, operation) {
+        Ok(()) => Ok(()),
+        Err(Failure::Recoverable(error)) => Err(error),
+        Err(Failure::Fatal(error)) => {
+            control.invalidate_target();
+            Err(error)
+        }
+    }
+}
+
+fn validate_switch_hop(id: &str, operation: &str) -> Result<(), Failure> {
+    ensure_interactive_input_desktop(operation)?;
+    let reference = lookup(id)?;
+    let hwnd = HWND(reference.identity.hwnd as *mut std::ffi::c_void);
+    if cached_identity(hwnd)? != reference.identity {
+        return Err(Failure::Fatal(invalid(
+            "the approved window changed during the desktop switch",
+        )));
+    }
+    cached_integrity(operation, hwnd).map_err(Failure::Fatal)?;
+    // An empty desktop can leave no foreground window or focus; the shortcut then goes to the
+    // shell, which has nothing to check.
+    let foreground = desktop::foreground_window_handle();
+    if !foreground.is_invalid() {
+        recoverable(cached_integrity(operation, foreground))?;
+    }
+    let mut gui = GUITHREADINFO {
+        cbSize: u32::try_from(std::mem::size_of::<GUITHREADINFO>())
+            .map_err(|_| invalid("GUI thread record size is unavailable"))?,
+        ..Default::default()
+    };
+    // SAFETY: gui is a correctly sized writable record; zero queries the foreground thread.
+    unsafe { GetGUIThreadInfo(0, &raw mut gui) }.map_err(|_| {
+        Failure::Recoverable(refused(
+            RefusalCause::DestinationUnidentified,
+            "keyboard focus cannot be verified; observe again",
+        ))
+    })?;
+    if !gui.hwndFocus.is_invalid() {
+        recoverable(privilege::ensure_window_integrity(operation, gui.hwndFocus))?;
+    }
+    Ok(())
+}
+
 fn validate_reference(
     id: &str,
     operation: &str,
@@ -868,7 +928,7 @@ fn hit_facts(window: HWND) -> Result<Hit, Failure> {
 
 /// The process of the content window a packaged app hosts inside `frame`, if it has one.
 fn hosted_content_pid(frame: HWND) -> Option<u32> {
-    let class = windows::core::HSTRING::from(shell::core_window_class());
+    let class = windows::core::HSTRING::from(shell::CORE_WINDOW_CLASS);
     // SAFETY: FindWindowExW only reads window metadata; `frame` is a handle value, a stale one
     // simply finds nothing, and `class` outlives the synchronous call.
     let content = unsafe { FindWindowExW(Some(frame), None, &class, None) }.ok()?;
@@ -1019,6 +1079,22 @@ pub(super) fn evidence(control: &MutationControl) {
 
 /// Whether an observation's `target_ref` names the approved target or a window that may stand
 /// in for it (a same-process dialog or popup that was in front during the observation).
+/// The `click_text` check on the screen read: an observation that does not belong to the approved
+/// target generation is a retryable refusal, not a change of the target. The foreground or the
+/// window set moved while the screen was read; the session stays valid.
+pub(super) fn ensure_observation_matches(
+    approved: Option<&str>,
+    observed: Option<&str>,
+) -> Result<(), PlatformError> {
+    if approved.is_some_and(|approved| observation_matches_approved(approved, observed)) {
+        return Ok(());
+    }
+    Err(refused(
+        RefusalCause::ObservationStale,
+        "the foreground or the window set changed while the screen was read, so the text may belong to another window; call click_text again",
+    ))
+}
+
 pub(super) fn observation_matches_approved(approved: &str, observed: Option<&str>) -> bool {
     let Some(observed) = observed else {
         return false;
@@ -1101,6 +1177,90 @@ mod tests {
         assert!(window_owner(parent.0).unwrap().is_invalid());
         let owned = create(Some(parent.0));
         assert_eq!(window_owner(owned.0).unwrap(), parent.0);
+    }
+
+    #[test]
+    fn hosted_content_pid_finds_only_a_direct_child_of_the_content_class_in_fixture_windows() {
+        use windows::{
+            Win32::{
+                System::LibraryLoader::GetModuleHandleW,
+                UI::WindowsAndMessaging::{
+                    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW,
+                    UnregisterClassW, WINDOW_EX_STYLE, WNDCLASSW, WS_CHILD, WS_POPUP,
+                },
+            },
+            core::{HSTRING, w},
+        };
+        struct Fixture(HWND);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                // SAFETY: The fixture owns this window, created and destroyed on this thread.
+                // Destroying a parent first destroys its children, which makes this a no-op error.
+                let _ = unsafe { DestroyWindow(self.0) };
+            }
+        }
+        unsafe extern "system" fn default_proc(
+            window: HWND,
+            message: u32,
+            wparam: windows::Win32::Foundation::WPARAM,
+            lparam: windows::Win32::Foundation::LPARAM,
+        ) -> windows::Win32::Foundation::LRESULT {
+            // SAFETY: The arguments are the ones the system passed to this window procedure.
+            unsafe { DefWindowProcW(window, message, wparam, lparam) }
+        }
+        // SAFETY: A null module name asks for this executable's handle; nothing is retained.
+        let instance = unsafe { GetModuleHandleW(None) }.unwrap();
+        let class = HSTRING::from(shell::CORE_WINDOW_CLASS);
+        let registration = WNDCLASSW {
+            lpfnWndProc: Some(default_proc),
+            hInstance: instance.into(),
+            lpszClassName: windows::core::PCWSTR(class.as_ptr()),
+            ..Default::default()
+        };
+        // SAFETY: The record and the class name outlive the call; the class is unregistered
+        // below once every window of it is gone.
+        assert_ne!(unsafe { RegisterClassW(&raw const registration) }, 0);
+        let create = |class: &windows::core::PCWSTR, style, parent: Option<HWND>| {
+            // SAFETY: Class and title strings outlive the call. Every window is created hidden,
+            // belongs to this test thread and never receives injected input or focus.
+            Fixture(
+                unsafe {
+                    CreateWindowExW(
+                        WINDOW_EX_STYLE::default(),
+                        *class,
+                        w!("ControlFreak hosted-content fixture"),
+                        style,
+                        0,
+                        0,
+                        10,
+                        10,
+                        parent,
+                        None,
+                        Some(instance.into()),
+                        None,
+                    )
+                }
+                .unwrap(),
+            )
+        };
+        let core = windows::core::PCWSTR(class.as_ptr());
+        let static_class = w!("STATIC");
+        let frame = create(&static_class, WS_POPUP, None);
+        assert_eq!(hosted_content_pid(frame.0), None);
+        // A window of the content class that is not inside the frame is not found.
+        let other_frame = create(&static_class, WS_POPUP, None);
+        let elsewhere = create(&core, WS_CHILD, Some(other_frame.0));
+        assert_eq!(hosted_content_pid(frame.0), None);
+        // Only a direct child counts, not a deeper descendant.
+        let wrapper = create(&static_class, WS_CHILD, Some(frame.0));
+        let nested = create(&core, WS_CHILD, Some(wrapper.0));
+        assert_eq!(hosted_content_pid(frame.0), None);
+        let content = create(&core, WS_CHILD, Some(frame.0));
+        assert_eq!(hosted_content_pid(frame.0), Some(std::process::id()));
+        assert_eq!(hosted_content_pid(other_frame.0), Some(std::process::id()));
+        drop((content, nested, wrapper, elsewhere, other_frame, frame));
+        // SAFETY: Every window of the class was destroyed above.
+        let _ = unsafe { UnregisterClassW(core, Some(instance.into())) };
     }
 
     fn reference() -> Reference {
@@ -1617,5 +1777,15 @@ mod tests {
                 .iter()
                 .all(|entry| entry.id != "synthetic-reference" && entry.id != "later-observation")
         );
+    }
+
+    #[test]
+    fn a_stale_text_observation_is_a_retryable_refusal_that_keeps_the_session() {
+        for (approved, observed) in [(Some("approved"), None), (None, Some("approved"))] {
+            let error = ensure_observation_matches(approved, observed).unwrap_err();
+            assert_eq!(error.reason_code(), Some("observation_stale"));
+            assert!(error.retryable());
+        }
+        assert!(ensure_observation_matches(Some("approved"), Some("approved")).is_ok());
     }
 }

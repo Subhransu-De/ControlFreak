@@ -16,7 +16,7 @@ desktop and run inside a [control session](sessions.md).
 | `list_displays` | Observe | Active displays with IDs, primary flag and bounds in physical pixels. |
 | `capture_display` | Observe | Screenshot of a display. |
 | `capture_region` | Observe | Screenshot of a rectangle, 1280 px wide unless `max_width` or `native` is set. |
-| `capture_window` | Observe | Screenshot of a window's visible frame, without focusing it. The window renders itself (`capture_method` `windows_print_window`), so windows covering it do not appear. The render is bounded: a window that Windows flags as hung is not asked, and one that does not answer within 2 seconds is given up on. The screen rectangle is then copied (`windows_gdi`), which shows whatever covers the window, so `capture_method` says which one you got. Only one abandoned render can exist at a time; while it is outstanding, further window captures copy the screen. Every screenshot result reports `capture_method` as one of `windows_print_window` or `windows_gdi`; display and region captures always report `windows_gdi`. |
+| `capture_window` | Observe | Screenshot of a window's visible frame, without focusing it. The window renders itself (`capture_method` `windows_print_window`), so windows covering it do not appear. The render is bounded: a window that Windows flags as hung is not asked, and one that does not answer within 2 seconds is given up on. The screen rectangle is then copied (`windows_gdi`), which shows whatever covers the window, so `capture_method` says which one you got. Only one render runs at a time: a second `capture_window` call made meanwhile waits for it, within the same 2 seconds, and copies the screen only if that time runs out (for example behind an abandoned render). Every screenshot result reports `capture_method` as one of `windows_print_window` or `windows_gdi`; display and region captures always report `windows_gdi`. |
 | `list_windows` | Observe | Visible titled windows, including owned dialogs (with an `owner` field), foreground first. At most 200. |
 | `wait_for_window` | Observe | Wait for a window that matches title, class or process. |
 | `list_virtual_desktops` | Observe | Windows grouped by virtual desktop, with the current one marked. |
@@ -48,7 +48,7 @@ desktop and run inside a [control session](sessions.md).
   `begin_control_session` and to every input tool. `focus_window`, `capture_window` and `wait_for_window`
   take it as `window_id`, and also accept `target_ref` as an alias. Giving both is fine only when they
   are equal.
-- `switch_virtual_desktop` takes `target_ref` as an optional field. When it is missing, the session's approved window is used, or the foreground window when no session has one. The switch ends the session, because the approved window is no longer on screen. Begin a new session on a window of the new desktop.
+- `switch_virtual_desktop` takes `target_ref` as an optional field. When it is missing, the session's approved window is used, or the foreground window when no session has one. The switch ends the session, because the approved window is no longer on screen. Begin a new session on a window of the new desktop. With `steps` above 1, the first shortcut is checked like any other input, and later shortcuts are checked only for what still applies once the desktop has changed: cancellation, the unlocked Default input desktop, the approved window still being the same live window, and the integrity of the window that now holds the foreground and keyboard focus. The approved window is not required to be on the new desktop or in the foreground. A failure or cancellation part-way reports the shortcuts already sent as partial input.
 - One session approves one target. End the session before approving another.
 - A screenshot or OCR result includes `target_ref` only when the foreground window stayed the
   same during the capture. A null `target_ref` does not approve input.
@@ -63,7 +63,7 @@ desktop and run inside a [control session](sessions.md).
 - If the foreground, the keyboard focus or the pointer destination belongs to another process, cannot be identified, or does not exist at that instant, that action is refused and the session keeps its target. The error is `target_invalidated` with a `reason` that tells it from a fatal change (see Errors). Bring the target back with `focus_window` and try again; nothing else needs to be observed.
 - If that window runs at a higher integrity level, or its integrity cannot be read, the action is refused with `higher_integrity_target` or `target_integrity_unavailable`, there is no `reason`, `retryable` is false, and the session keeps its target. `focus_window` is refused for such a window too, so it cannot take the foreground back; the user has to close or leave that window first.
 - A point under the ControlFreak session tab's **Stop agent** button is refused with reason `own_indicator`. Screenshots do not show the button, which sits under the tab at the top centre of every display (104 by 32 device-independent pixels, a small gap below the tab). Pick another point, or use the keyboard.
-- A packaged app's content window belongs to the app, not to the `ApplicationFrameHost.exe` frame that holds it. For a target that is such a frame, the content window hosted inside that very frame counts as the target for pointer and keyboard destinations. Its integrity is checked like any other window's. No other window of the app's process is accepted this way.
+- A packaged app's content window belongs to the app, not to the `ApplicationFrameHost.exe` frame that holds it. For a target that is such a frame, a window inside that very frame that belongs to the process of the frame's hosted content window counts as the target for pointer and keyboard destinations. Its integrity is checked like any other window's. Top-level windows of that process, and windows inside any other frame, are not accepted this way.
 - `explorer.exe`, `ApplicationFrameHost.exe` (the frame of every packaged app) and any process whose program file cannot be read host unrelated windows, so for those targets only the target's own dialogs and popup menus count as the same application.
 - If the window itself changes (a different window or process, a move or resize, another virtual
   desktop, destruction), the action is refused and the session target is cleared. Observe again
@@ -159,7 +159,7 @@ An unknown name is refused with the nearest valid name, or the full list.
 
 `type_text` sends text as Unicode characters, except that `\n`, `\r\n`, a lone `\r` and `\t` are
 pressed as Enter and Tab keys, because a control that ignores those characters still reacts to
-the keys. Each Enter or Tab is checked against the target like a text batch.
+the keys. Each Enter or Tab is checked against the target like a text batch, and is refused before it is sent if Enter or Tab itself, or any of Ctrl, Alt, Shift or Win, is held down at that moment, so a held modifier cannot turn it into a shortcut such as Alt+Tab.
 
 ## Waiting for changes
 
@@ -216,12 +216,13 @@ Every error also has `error.retryable`. It says whether repeating the same reque
 | --- | --- | --- |
 | `not_foreground` | The target (or a window of its process) is not in front, or nothing is. Call `focus_window`. The session is kept. | Yes |
 | `foreground_changed` | The foreground changed while the action was checked. The session is kept. | Yes |
+| `observation_stale` | The foreground or the window set changed while `click_text` read the screen, so the text may belong to another window. Call `click_text` again. The session is kept. | Yes |
 | `foreign_destination` | The point or the keyboard focus is in a window of another process. The session is kept. | Yes |
 | `destination_unidentified` | The window that would get the input cannot be identified. The session is kept. | Yes |
 | `own_indicator` | The point is under ControlFreak's own Stop button. Choose another point. The session is kept. | No |
 | `target_changed` | The target changed (window, process, bounds, display layout or desktop), or an earlier change ended the approval. End the session and observe again. | No |
 
-`higher_integrity_target` and `target_integrity_unavailable` have no `reason`, are not retryable and keep the session. Retrying cannot help until the user changes which window is in front.
+`higher_integrity_target` and `target_integrity_unavailable` have no `reason` and are not retryable. When the code is about the foreground window, the keyboard focus or the pointer destination, the session is kept, and retrying cannot help until the user changes which window is in front. When it is about the target window itself, the session ends.
 
 A failed foreground activation (`focus_window`) is retryable and keeps the session. Ask the user to click the window first, because Windows can refuse focus changes from a background process.
 

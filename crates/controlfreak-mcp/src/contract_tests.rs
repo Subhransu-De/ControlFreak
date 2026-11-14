@@ -1156,7 +1156,7 @@ fn click_mouse_defaults_to_the_left_button() {
 #[test]
 fn tool_list_stays_compact() {
     let list = serde_json::to_string(&tools()).unwrap();
-    // Measured with `--print-tools`: 115,810 bytes before the compaction, 99,427 after. The
+    // Measured with `--print-tools`: 115,810 bytes before the compaction, 99,477 after. The
     // limit leaves about 3% of headroom, so a reworded description does not fail this test but
     // a schema that is pasted into every tool does.
     assert!(list.len() < 102_400, "tools/list is {} bytes", list.len());

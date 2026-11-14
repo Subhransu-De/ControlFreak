@@ -538,9 +538,14 @@ fn print_window_rgba(hwnd: HWND, visible: DisplayBounds) -> Option<Vec<u8>> {
 /// on its own thread and the caller waits at most this long before copying the screen instead.
 pub(super) const PRINT_WINDOW_DEADLINE: Duration = Duration::from_secs(2);
 
-/// Set while a render thread has not returned yet. At most one abandoned render can exist: while
-/// it is outstanding, new window captures skip `PrintWindow` and copy the screen, so a window
-/// that never answers costs one parked thread and its GDI objects rather than one per call.
+/// Set while a render thread has not returned yet. At most one render exists at a time: another
+/// window capture waits for the slot, within the same deadline as its own render, and copies the
+/// screen only if the slot does not come free in time. A window that never answers therefore
+/// costs one parked thread and its GDI objects rather than one per call, and two captures in
+/// parallel both get their window's own rendering.
+/// How often a capture that is waiting for the render slot looks again.
+const RENDER_SLOT_POLL: Duration = Duration::from_millis(5);
+
 static RENDER_OUTSTANDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -554,8 +559,8 @@ impl Drop for OutstandingRender {
 }
 
 /// Runs `render` on a worker thread and waits at most `deadline` for its answer. `None` means
-/// the render failed, took too long, or was not attempted because `outstanding` says an earlier
-/// render still has not returned. The worker owns everything it creates and clears `outstanding`
+/// the render failed, or the slot and the render together took too long, because `outstanding`
+/// says an earlier render still has not returned. The worker owns everything it creates and clears `outstanding`
 /// only when it really finishes, so an abandoned render cleans up after itself whenever the
 /// application finally answers.
 fn render_within<T: Send + 'static>(
@@ -564,8 +569,12 @@ fn render_within<T: Send + 'static>(
     render: impl FnOnce() -> Option<T> + Send + 'static,
 ) -> Option<T> {
     use std::sync::atomic::Ordering;
-    if outstanding.swap(true, Ordering::AcqRel) {
-        return None;
+    let started = Instant::now();
+    while outstanding.swap(true, Ordering::AcqRel) {
+        if started.elapsed() >= deadline {
+            return None;
+        }
+        std::thread::sleep(RENDER_SLOT_POLL);
     }
     let (sender, receiver) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
@@ -583,7 +592,10 @@ fn render_within<T: Send + 'static>(
         outstanding.store(false, Ordering::Release);
         return None;
     }
-    receiver.recv_timeout(deadline).ok().flatten()
+    receiver
+        .recv_timeout(deadline.saturating_sub(started.elapsed()))
+        .ok()
+        .flatten()
 }
 
 /// `print_window_rgba` with the bounds described on [`PRINT_WINDOW_DEADLINE`].
@@ -1826,6 +1838,31 @@ mod window_capture_tests {
         }
         let third = render_within(Duration::from_secs(5), &OUTSTANDING, || Some(vec![3_u8]));
         assert_eq!(third, Some(vec![3_u8]));
+    }
+
+    #[test]
+    fn a_second_render_waits_for_the_slot_instead_of_giving_up() {
+        use std::sync::{atomic::AtomicBool, mpsc};
+        static OUTSTANDING: AtomicBool = AtomicBool::new(false);
+        let (release, hold) = mpsc::channel::<()>();
+        let (started, running) = mpsc::channel::<()>();
+        let first = std::thread::spawn(move || {
+            render_within(Duration::from_secs(10), &OUTSTANDING, move || {
+                started.send(()).unwrap();
+                let _ = hold.recv();
+                Some(1_u8)
+            })
+        });
+        running.recv().unwrap();
+        let second = std::thread::spawn(|| {
+            render_within(Duration::from_secs(10), &OUTSTANDING, || Some(2_u8))
+        });
+        // The second capture has to be waiting, not already answered or abandoned.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!second.is_finished());
+        release.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), Some(1));
+        assert_eq!(second.join().unwrap(), Some(2));
     }
 
     #[test]
