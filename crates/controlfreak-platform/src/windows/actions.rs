@@ -1,4 +1,5 @@
 use super::capture::{SettleOutcome, SettleWatch};
+use super::input::BUTTON_DWELL;
 use super::{
     Backend, Duration, HWND, KeyChordRequest, KeyboardActionResult, KeyboardBackend,
     MAX_SCROLL_DELTA, MAX_TEXT_UTF16_UNITS, MouseClickRequest, MouseDragRequest, MouseMoveRequest,
@@ -97,17 +98,24 @@ impl PointerBackend for Backend {
             super::target::validate(control, "drag_mouse", Some(current_cursor_position()?))
         })?;
         control.cleanup_status(controlfreak_core::CleanupStatus::Unknown);
-        let movement = move_cursor(
-            "drag_mouse",
-            POINT {
-                x: start_x,
-                y: start_y,
-            },
-            POINT { x: end_x, y: end_y },
-            request.duration_ms,
-            control,
-            |point| super::target::validate(control, "drag_mouse", Some(point)),
-        );
+        // The button is held from here to the release below; a failure or cancellation in the
+        // dwell or the travel is reported after the release cleanup has run.
+        let movement = control
+            .wait("drag_mouse", BUTTON_DWELL)
+            .and_then(|()| {
+                move_cursor(
+                    "drag_mouse",
+                    POINT {
+                        x: start_x,
+                        y: start_y,
+                    },
+                    POINT { x: end_x, y: end_y },
+                    effective_drag_duration_ms(request.duration_ms),
+                    control,
+                    |point| super::target::validate(control, "drag_mouse", Some(point)),
+                )
+            })
+            .and_then(|()| control.wait("drag_mouse", BUTTON_DWELL));
         let release = send_drag_release(
             request.button,
             &request.modifiers,
@@ -251,6 +259,8 @@ impl KeyboardBackend for Backend {
 pub(super) struct InputGuard<'a> {
     _lock: std::sync::MutexGuard<'a, ()>,
     generation: &'a std::sync::atomic::AtomicU64,
+    /// Lets target validation reuse identity and integrity results while this lock is held.
+    _validation: super::target::ValidationScope,
 }
 
 impl Drop for InputGuard<'_> {
@@ -317,6 +327,7 @@ impl Backend {
             return Ok(InputGuard {
                 _lock: lock,
                 generation: &self.input_generation,
+                _validation: super::target::ValidationScope::enter(),
             });
         }
     }
@@ -431,6 +442,21 @@ impl Backend {
     }
 }
 
+/// Shortest time a drag spends travelling from press to release. Applications that start a drag
+/// only after the pointer has moved while the button is down need intermediate moves; a drag
+/// that jumps in one step is a click at a different place to them. The travel is stepped at
+/// `MOVE_FRAME_MS` intervals by `move_cursor`.
+const MIN_DRAG_DURATION_MS: u32 = 120;
+
+/// The travel time actually used for a requested `duration_ms`, which can be zero.
+pub(super) const fn effective_drag_duration_ms(requested: u32) -> u32 {
+    if requested < MIN_DRAG_DURATION_MS {
+        MIN_DRAG_DURATION_MS
+    } else {
+        requested
+    }
+}
+
 /// Gives the target application time to process input before evidence is captured. With a
 /// watch, returns once the approved window has responded and stopped changing; otherwise, or if
 /// it never visibly responds, waits the full cap as before.
@@ -506,6 +532,19 @@ mod tests {
         assert!(ensure_input_generation("click_text", Some(before), after).is_err());
         assert!(ensure_input_generation("click_text", Some(after), after).is_ok());
         assert!(ensure_input_generation("click_mouse", None, after).is_ok());
+    }
+
+    #[test]
+    fn drags_always_travel_in_several_steps() {
+        assert_eq!(effective_drag_duration_ms(0), MIN_DRAG_DURATION_MS);
+        assert_eq!(effective_drag_duration_ms(1), MIN_DRAG_DURATION_MS);
+        assert_eq!(
+            effective_drag_duration_ms(MIN_DRAG_DURATION_MS),
+            MIN_DRAG_DURATION_MS
+        );
+        assert_eq!(effective_drag_duration_ms(2_000), 2_000);
+        // `move_cursor` makes one move per frame, so the default travel is a real path.
+        assert!(u64::from(MIN_DRAG_DURATION_MS).div_ceil(super::super::MOVE_FRAME_MS) >= 4);
     }
 
     #[test]

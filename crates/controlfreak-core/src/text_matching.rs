@@ -1,7 +1,7 @@
 use unicode_normalization::UnicodeNormalization;
 
 use crate::{
-    OcrLine, OcrMatchDetails, OcrRegionRequest, PlatformError, TextMatch, TextMatchMode,
+    OcrLine, OcrMatchDetails, OcrRegionRequest, OcrWord, PlatformError, TextMatch, TextMatchMode,
     TextMatchTier,
 };
 
@@ -50,6 +50,124 @@ fn candidate(line: &OcrLine) -> TextMatch {
         y: line.y,
         width: line.width,
         height: line.height,
+    }
+}
+
+/// Smallest box containing every word, in the words' own coordinates.
+fn word_box(words: &[OcrWord]) -> Option<(u32, u32, u32, u32)> {
+    let left = words.iter().map(|word| word.x).min()?;
+    let top = words.iter().map(|word| word.y).min()?;
+    let right = words
+        .iter()
+        .map(|word| word.x.saturating_add(word.width))
+        .max()?;
+    let bottom = words
+        .iter()
+        .map(|word| word.y.saturating_add(word.height))
+        .max()?;
+    Some((
+        left,
+        top,
+        right.saturating_sub(left),
+        bottom.saturating_sub(top),
+    ))
+}
+
+fn span_match(words: &[OcrWord]) -> Option<TextMatch> {
+    let (x, y, width, height) = word_box(words)?;
+    Some(TextMatch {
+        text: words
+            .iter()
+            .map(|word| word.text.trim())
+            .collect::<Vec<_>>()
+            .join(" "),
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+/// Word-sequence ranges `start..end` of one line that satisfy the query.
+///
+/// Exact mode needs the query's whitespace-separated tokens to equal consecutive whole words.
+/// Substring mode needs the query to occur in the words joined by single spaces, and selects
+/// every word the occurrence touches, so a partial word still selects that whole word.
+fn word_ranges(
+    words: &[OcrWord],
+    query: &str,
+    case_sensitive: bool,
+    exact: bool,
+) -> Vec<std::ops::Range<usize>> {
+    let folded_words: Vec<String> = words
+        .iter()
+        .map(|word| folded(&word.text, case_sensitive))
+        .collect();
+    let mut ranges = Vec::new();
+    if exact {
+        let tokens: Vec<&str> = query.split_whitespace().collect();
+        if tokens.is_empty() || tokens.len() > words.len() {
+            return ranges;
+        }
+        for start in 0..=words.len() - tokens.len() {
+            if folded_words[start..start + tokens.len()]
+                .iter()
+                .zip(&tokens)
+                .all(|(word, token)| word == token)
+            {
+                ranges.push(start..start + tokens.len());
+            }
+        }
+        return ranges;
+    }
+    let mut joined = String::new();
+    let mut offsets = Vec::with_capacity(words.len());
+    for word in &folded_words {
+        if !joined.is_empty() {
+            joined.push(' ');
+        }
+        offsets.push(joined.len()..joined.len() + word.len());
+        joined.push_str(word);
+    }
+    for (found, _) in joined.match_indices(query) {
+        let end = found + query.len();
+        let touched: Vec<usize> = offsets
+            .iter()
+            .enumerate()
+            .filter(|(_, range)| range.start < end && range.end > found)
+            .map(|(index, _)| index)
+            .collect();
+        if let (Some(first), Some(last)) = (touched.first(), touched.last()) {
+            let range = *first..*last + 1;
+            if !ranges.contains(&range) {
+                ranges.push(range);
+            }
+        }
+    }
+    ranges
+}
+
+/// Matches of an exact or substring query inside one OCR line, as the boxes of the matched words.
+///
+/// A line without word boxes, or one whose word list cannot reproduce a match its text has, is
+/// matched as a whole line and reported with the line's box, as before word spans existed.
+fn line_matches(line: &OcrLine, query: &str, case_sensitive: bool, exact: bool) -> Vec<TextMatch> {
+    let text = folded(&line.text, case_sensitive);
+    let whole_line = if exact {
+        text == query
+    } else {
+        text.contains(query)
+    };
+    let spans: Vec<TextMatch> = word_ranges(&line.words, query, case_sensitive, exact)
+        .into_iter()
+        .filter_map(|range| span_match(&line.words[range]))
+        .collect();
+    if !spans.is_empty() {
+        spans
+    } else if whole_line {
+        vec![candidate(line)]
+    } else {
+        Vec::new()
     }
 }
 
@@ -143,8 +261,7 @@ fn matching(
     let query = folded(query, case_sensitive);
     let exact: Vec<_> = lines
         .iter()
-        .filter(|line| folded(&line.text, case_sensitive) == query)
-        .map(|line| candidate(line))
+        .flat_map(|line| line_matches(line, &query, case_sensitive, true))
         .collect();
     if mode != TextMatchMode::Substring && !exact.is_empty() {
         return (exact, Some(TextMatchTier::Exact));
@@ -152,8 +269,7 @@ fn matching(
     if mode == TextMatchMode::Substring {
         let matches = lines
             .iter()
-            .filter(|line| folded(&line.text, case_sensitive).contains(&query))
-            .map(|line| candidate(line))
+            .flat_map(|line| line_matches(line, &query, case_sensitive, false))
             .collect::<Vec<_>>();
         let tier = (!matches.is_empty()).then_some(TextMatchTier::Substring);
         return (matches, tier);
@@ -313,6 +429,115 @@ mod tests {
             20,
         )
         .unwrap()
+    }
+
+    /// A line whose words sit 60 pixels apart, each 50 wide, starting at `x`.
+    fn word_line(text: &str, x: u32, y: u32) -> OcrLine {
+        let words: Vec<OcrWord> = text
+            .split_whitespace()
+            .enumerate()
+            .map(|(index, word)| OcrWord {
+                text: word.into(),
+                x: x + 60 * u32::try_from(index).unwrap(),
+                y,
+                width: 50,
+                height: 20,
+            })
+            .collect();
+        let width = words.last().map_or(0, |last| last.x + last.width - x);
+        OcrLine {
+            text: text.into(),
+            x,
+            y,
+            width,
+            height: 20,
+            words,
+        }
+    }
+
+    fn box_of(found: &TextMatch) -> (u32, u32, u32, u32) {
+        (found.x, found.y, found.width, found.height)
+    }
+
+    #[test]
+    fn exact_matches_a_whole_word_sequence_and_returns_only_its_box() {
+        let menu = [word_line("File Edit View Help", 10, 10)];
+        let edit = select_text_candidate(&menu, &region(), "edit", false, true).unwrap();
+        assert_eq!(
+            (box_of(&edit), edit.text.as_str()),
+            ((70, 10, 50, 20), "Edit")
+        );
+        let two = select_text_candidate(&menu, &region(), " Edit  View ", false, true).unwrap();
+        assert_eq!(box_of(&two), (70, 10, 110, 20));
+        assert_eq!(two.text, "Edit View");
+        // A partial word and a non-adjacent pair are not whole-word sequences.
+        for query in ["Edi", "File View"] {
+            assert!(matches!(
+                select_text_candidate(&menu, &region(), query, false, true),
+                Err(PlatformError::OcrNoMatch { .. })
+            ));
+        }
+        // The whole line still matches as one span.
+        let all =
+            select_text_candidate(&menu, &region(), "File Edit View Help", false, true).unwrap();
+        assert_eq!(box_of(&all), (10, 10, 230, 20));
+    }
+
+    #[test]
+    fn substring_selects_every_word_the_occurrence_touches() {
+        let line = [word_line("Save changes now", 10, 10)];
+        let partial = select_text_candidate(&line, &region(), "han", false, false).unwrap();
+        assert_eq!(
+            (box_of(&partial), partial.text.as_str()),
+            ((70, 10, 50, 20), "changes")
+        );
+        let across = select_text_candidate(&line, &region(), "ve chan", false, false).unwrap();
+        assert_eq!(box_of(&across), (10, 10, 110, 20));
+        assert_eq!(across.text, "Save changes");
+    }
+
+    #[test]
+    fn repeated_words_in_one_line_stay_ambiguous() {
+        let lines = [word_line("Save Save as", 10, 10)];
+        assert!(matches!(
+            select_text_candidate(&lines, &region(), "Save", false, true),
+            Err(PlatformError::OcrAmbiguousMatch { .. })
+        ));
+        // The same word on two lines is ambiguous too, and a span in one line is unique.
+        let lines = [word_line("Open Save", 10, 10), word_line("Save as", 10, 40)];
+        assert!(matches!(
+            select_text_candidate(&lines, &region(), "Save", false, true),
+            Err(PlatformError::OcrAmbiguousMatch { .. })
+        ));
+        assert_eq!(
+            box_of(&select_text_candidate(&lines, &region(), "Save as", false, true).unwrap()),
+            (10, 40, 110, 20)
+        );
+    }
+
+    #[test]
+    fn discovery_reports_the_matched_span_not_the_line() {
+        let lines = [word_line("Sign in with SSO", 10, 10)];
+        let result = discover_text(
+            &lines,
+            &region(),
+            "sso",
+            false,
+            TextMatchMode::Exact,
+            false,
+            20,
+        )
+        .unwrap();
+        assert_eq!(result.match_tier, Some(TextMatchTier::Exact));
+        assert_eq!(box_of(&result.candidates[0]), (190, 10, 50, 20));
+    }
+
+    #[test]
+    fn lines_without_usable_words_match_as_whole_lines() {
+        let no_words = [line("Save changes", 10, 10)];
+        assert!(select_text_candidate(&no_words, &region(), "Save", false, true).is_err());
+        let found = select_text_candidate(&no_words, &region(), "Save", false, false).unwrap();
+        assert_eq!(box_of(&found), (10, 10, 100, 20));
     }
 
     #[test]

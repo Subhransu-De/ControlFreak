@@ -154,6 +154,57 @@ pub trait DisplayBackend {
     }
 }
 
+/// Gap between text-wait passes.
+const TEXT_POLL_GAP: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Repeats `pass` until the text condition holds or the timeout elapses, returning the final
+/// pass. A backend can pass a closure that skips recognition when it knows nothing changed.
+///
+/// # Errors
+///
+/// Returns the first failing pass, a cancellation, or an invalid `timeout_ms`.
+pub fn wait_for_text_with(
+    request: &WaitForTextRequest,
+    control: &MutationControl,
+    mut pass: impl FnMut() -> Result<FindTextResult, PlatformError>,
+) -> Result<WaitForTextResult, PlatformError> {
+    if request.timeout_ms > crate::ocr::MAX_TEXT_WAIT_MS {
+        return Err(PlatformError::InvalidArgument {
+            argument: "timeout_ms".to_owned(),
+            reason: format!("must be at most {}", crate::ocr::MAX_TEXT_WAIT_MS),
+        });
+    }
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_millis(u64::from(request.timeout_ms));
+    let mut attempts = 0_u32;
+    loop {
+        let last = pass()?;
+        attempts = attempts.saturating_add(1);
+        let visible = !last.matches.is_empty();
+        let satisfied = match request.condition {
+            crate::TextCondition::Appears => visible,
+            crate::TextCondition::Disappears => !visible,
+        };
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        // Never start a pass after the deadline: a recognition pass can take far longer
+        // than the gap, so finish the wait on the last pass instead.
+        if !satisfied && remaining <= TEXT_POLL_GAP {
+            control.wait("wait_for_text", remaining)?;
+        }
+        if satisfied || remaining <= TEXT_POLL_GAP {
+            return Ok(WaitForTextResult {
+                condition: request.condition,
+                satisfied,
+                timed_out: !satisfied,
+                elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                attempts,
+                last,
+            });
+        }
+        control.wait("wait_for_text", TEXT_POLL_GAP)?;
+    }
+}
+
 /// Performs local OCR and semantic text interaction.
 pub trait OcrBackend {
     fn read_text_in_region_controlled(
@@ -192,42 +243,9 @@ pub trait OcrBackend {
         request: &WaitForTextRequest,
         control: &MutationControl,
     ) -> Result<WaitForTextResult, PlatformError> {
-        const POLL_GAP: std::time::Duration = std::time::Duration::from_millis(100);
-        if request.timeout_ms > crate::ocr::MAX_TEXT_WAIT_MS {
-            return Err(PlatformError::InvalidArgument {
-                argument: "timeout_ms".to_owned(),
-                reason: format!("must be at most {}", crate::ocr::MAX_TEXT_WAIT_MS),
-            });
-        }
-        let started = std::time::Instant::now();
-        let deadline = started + std::time::Duration::from_millis(u64::from(request.timeout_ms));
-        let mut attempts = 0_u32;
-        loop {
-            let last = self.find_text_on_screen_controlled(&request.find, control)?;
-            attempts = attempts.saturating_add(1);
-            let visible = !last.matches.is_empty();
-            let satisfied = match request.condition {
-                crate::TextCondition::Appears => visible,
-                crate::TextCondition::Disappears => !visible,
-            };
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            // Never start a pass after the deadline: a recognition pass can take far longer
-            // than the gap, so finish the wait on the last pass instead.
-            if !satisfied && remaining <= POLL_GAP {
-                control.wait("wait_for_text", remaining)?;
-            }
-            if satisfied || remaining <= POLL_GAP {
-                return Ok(WaitForTextResult {
-                    condition: request.condition,
-                    satisfied,
-                    timed_out: !satisfied,
-                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    attempts,
-                    last,
-                });
-            }
-            control.wait("wait_for_text", POLL_GAP)?;
-        }
+        wait_for_text_with(request, control, || {
+            self.find_text_on_screen_controlled(&request.find, control)
+        })
     }
 
     fn find_text_on_screen(

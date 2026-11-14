@@ -54,8 +54,7 @@ use windows::Win32::{
             EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetCursorPos, GetForegroundWindow,
             GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
             GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, MONITORINFOF_PRIMARY,
-            SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindowAsync, WS_EX_APPWINDOW,
-            WS_EX_TOOLWINDOW,
+            SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindowAsync, WS_EX_TOOLWINDOW,
         },
     },
 };
@@ -75,6 +74,7 @@ mod indicator;
 mod input;
 mod privilege;
 mod process;
+mod shell;
 mod stop;
 pub use stop::{SessionSignals, UserStop};
 
@@ -633,10 +633,15 @@ impl OcrBackend for Backend {
         let input_generation = self.input_generation.load(Ordering::Acquire);
         let ocr = self.recognize_text(&request.region, control)?;
         target::validate(control, "click_text", None)?;
-        if ocr.target_ref != control.approved_target() {
-            control.invalidate_target();
+        // The observation must have been taken with the approved window, or a window of its own
+        // process such as a dialog, in front and unchanged. If not, the text may belong to
+        // something else, so this click is refused; the session itself stays valid because every
+        // action re-checks the live foreground.
+        if !control.approved_target().is_some_and(|approved| {
+            target::observation_matches_approved(&approved, ocr.target_ref.as_deref())
+        }) {
             return Err(target::invalid(
-                "OCR observation no longer belongs to the approved target generation",
+                "OCR observation no longer belongs to the approved target generation; the foreground or window layout changed while reading the screen, find the text again",
             ));
         }
         // Search result limits must not hide eligible lines from the uniqueness check.
@@ -1316,6 +1321,7 @@ mod tests {
             display_id: "display".to_owned(),
             is_foreground: true,
             is_minimized: false,
+            owner: None,
         };
         let request = WaitForWindowRequest {
             window_id: None,

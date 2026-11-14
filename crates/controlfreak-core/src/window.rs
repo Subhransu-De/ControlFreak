@@ -20,6 +20,10 @@ pub struct WindowInfo {
     pub display_id: String,
     pub is_foreground: bool,
     pub is_minimized: bool,
+    /// Target reference of the window that owns this one, set only for an owned window such as a
+    /// dialog. Absent for ordinary top-level windows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

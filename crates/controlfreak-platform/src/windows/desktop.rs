@@ -11,9 +11,8 @@ use super::{
     MAX_WINDOW_TITLE_UTF16_UNITS, MAX_WINDOWS, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW,
     MONITORINFOF_PRIMARY, MonitorFromWindow, OnceLock, POINT, PlatformError, RECT,
     RPC_E_CHANGED_MODE, SW_RESTORE, SetForegroundWindow, SetProcessDpiAwarenessContext,
-    ShowWindowAsync, VirtualDesktopManager, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
-    WaitForWindowRequest, WindowBounds, WindowInfo, c_void, catch_unwind, last_win32_error,
-    size_of, win32_error,
+    ShowWindowAsync, VirtualDesktopManager, WS_EX_TOOLWINDOW, WaitForWindowRequest, WindowBounds,
+    WindowInfo, c_void, catch_unwind, last_win32_error, size_of, win32_error,
 };
 
 pub(super) fn foreground_window_handle() -> HWND {
@@ -459,6 +458,7 @@ pub(super) fn issue_candidate(
     match super::target::issue(candidate.hwnd) {
         Ok(id) => Ok(Some(WindowInfo {
             id,
+            owner: owner_reference(candidate.hwnd),
             ..candidate.window
         })),
         Err(error @ PlatformError::Unavailable { .. }) => Err(error),
@@ -486,6 +486,7 @@ pub(super) fn window_info(hwnd: HWND) -> Result<WindowInfo, PlatformError> {
     let window = describe_window(hwnd)?;
     Ok(WindowInfo {
         id: super::target::issue(hwnd)?,
+        owner: owner_reference(hwnd),
         ..window
     })
 }
@@ -537,6 +538,7 @@ fn describe_window(hwnd: HWND) -> Result<WindowInfo, PlatformError> {
         is_foreground: foreground_window_handle() == hwnd,
         // SAFETY: `hwnd` was validated as a visible Windows-owned handle above.
         is_minimized: unsafe { IsIconic(hwnd) }.as_bool(),
+        owner: None,
     })
 }
 
@@ -568,17 +570,27 @@ fn ensure_window_target(hwnd: HWND) -> Result<(), PlatformError> {
     // SAFETY: `hwnd` was validated above and GWL_EXSTYLE requests a pointer-sized integer value.
     let extended_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
     let tool_window_mask = isize::try_from(WS_EX_TOOLWINDOW.0).unwrap_or(isize::MAX);
-    let app_window_mask = isize::try_from(WS_EX_APPWINDOW.0).unwrap_or(isize::MAX);
     let is_tool_window = extended_style & tool_window_mask != 0;
-    let is_app_window = extended_style & app_window_mask != 0;
-    // SAFETY: `hwnd` was validated above; GW_OWNER returns another Windows-owned opaque handle.
-    let has_owner = unsafe { GetWindow(hwnd, GW_OWNER) }
-        .ok()
-        .is_some_and(|owner| !owner.is_invalid());
-    if is_tool_window || (has_owner && !is_app_window) {
-        return Err(window_not_available("window is an owned or tool window"));
+    // Owned windows are eligible: the dialogs of an application are owned by its main window, and
+    // an agent must be able to find, capture and focus them. Tool windows (tooltips, palettes,
+    // taskbar-hidden helpers) are not. `describe_window` still requires a title, which rules out
+    // the untitled popups and tracking windows that owned windows also include.
+    if is_tool_window {
+        return Err(window_not_available("window is a tool window"));
     }
     Ok(())
+}
+
+/// The target reference of the window that owns `hwnd`, for an owned window such as a dialog.
+/// `None` for an unowned window, and when the owner cannot be given a reference (it is gone or
+/// is not a window the server can verify), so a listed dialog never fails because of its owner.
+fn owner_reference(hwnd: HWND) -> Option<String> {
+    // SAFETY: GetWindow only reads a borrowed handle; GW_OWNER returns another opaque handle.
+    let owner = unsafe { GetWindow(hwnd, GW_OWNER) }.ok()?;
+    if owner.is_invalid() {
+        return None;
+    }
+    super::target::issue(owner).ok()
 }
 
 fn window_title(hwnd: HWND) -> Result<String, PlatformError> {
@@ -767,6 +779,7 @@ mod enumeration_tests {
             display_id: "display".into(),
             is_foreground: false,
             is_minimized: false,
+            owner: None,
         };
         let mut enumeration = WindowEnumeration::default();
         for _ in 0..MAX_WINDOW_CANDIDATES {

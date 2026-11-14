@@ -226,6 +226,7 @@ fn synthetic_window() -> controlfreak_core::WindowInfo {
         display_id: "synthetic".into(),
         is_foreground: true,
         is_minimized: false,
+        owner: None,
     }
 }
 
