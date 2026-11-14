@@ -27,9 +27,11 @@ and click, scroll and type in one window that it chose.
 - Move, click, drag, and scroll the mouse across multiple displays.
 - Send keyboard shortcuts and type Unicode text without using the clipboard.
 - List, focus, capture, and wait for application windows.
-- Read, find, wait for, and click on-screen text using the local Windows OCR engine.
+- Read, find, wait for, and click on-screen text using the local Windows OCR engine. `click_text` clicks the box around the matched words, so a label in the middle of a line can be clicked.
 - Run up to 16 clicks, scrolls and keystrokes on one window in a single call.
-- Inspect and switch between discoverable Windows virtual desktops.
+- Inspect and switch between discoverable Windows virtual desktops. `switch_virtual_desktop` moves one desktop left or right and ends the session, because the approved window is no longer on screen.
+- Work in the approved window's own dialogs and popup menus. A window of another process is refused.
+- Target the taskbar, the desktop and the Start and Search surfaces. They are checked by window class and by the program that owns them, and there is still no tool that launches applications.
 
 See all 27 tools in the [tool reference](https://github.com/Subhransu-De/ControlFreak/blob/main/docs/tools.md).
 
@@ -53,7 +55,7 @@ See all 27 tools in the [tool reference](https://github.com/Subhransu-De/Control
 | Work across monitors and desktops | Finds windows on every display and switches virtual desktops. |
 
 While an agent is in control, a turquoise line runs along the top of every display with a tab
-that says "An agent is using this PC". Press Esc to stop it.
+that says "An agent is using this PC". Press Esc, or click the **Stop agent** button on the tab, to stop it. The agent cannot press either: ControlFreak ignores injected input for both.
 
 ## Install
 

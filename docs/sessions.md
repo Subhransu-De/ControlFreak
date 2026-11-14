@@ -7,9 +7,8 @@ and shows the user that an agent is in control.
 
 - The first input tool starts a session on its own. A one-shot action closes it after 8 seconds.
 - For a longer task, call `begin_control_session` with the `target_ref` before the first action,
-  and `end_control_session` after the last one. `expected_seconds` sets the hold, up to
-  `CONTROLFREAK_GLOW_MAX_HOLD_MS`.
-- The hold is a backstop. If a client forgets to end the session, it closes when the hold ends.
+  and `end_control_session` after the last one. `expected_seconds` sets the hold. It defaults to 45 seconds and is capped at 120 seconds, or at `CONTROLFREAK_GLOW_MAX_HOLD_MS` when the operator set it.
+- The hold is a backstop. If a client forgets to end the session, it closes when the hold ends. A session that starts on its own and keeps working holds for at least 20 seconds after its second action, and grows with the gaps between actions, within the same cap.
 - Only one ControlFreak server can own the desktop. A second server gets `desktop_in_use`.
 - Observation tools never start a session. Tools that read the screen (captures, OCR and the waits) make the tab show "ControlFreak is reading the screen" for about 1.5 seconds. That state owns nothing: no lamp, no Esc, no Stop button, and it never hides an owned session or a warning.
 - The session tab, its Stop button and the Esc monitor start with the first session, not with the server. If they cannot start, the server still runs and read-only tools work; the session is refused with `indicator_unavailable` and the reason, and the next session tries again.
