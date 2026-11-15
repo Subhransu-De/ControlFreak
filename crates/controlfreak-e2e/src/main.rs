@@ -1,6 +1,6 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use controlfreak_e2e::{
-    Tier, github,
+    github,
     host::{self, Binaries},
     report,
     runner::{self, Environment, Plan},
@@ -22,15 +22,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Print the suites and tasks a tier would run. Touches nothing.
-    List {
-        #[arg(long, value_enum, default_value_t = TierArg::Nightly)]
-        tier: TierArg,
-    },
+    /// Print the suites and tasks. Touches nothing.
+    List,
     /// Run the suites. Needs `CONTROLFREAK_LIVE_DESKTOP=1` on a disposable desktop.
     Run {
-        #[arg(long, value_enum, default_value_t = TierArg::Pr)]
-        tier: TierArg,
         /// Run only these suites (repeatable).
         #[arg(long = "suite")]
         suites: Vec<String>,
@@ -68,21 +63,6 @@ enum Command {
     },
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum TierArg {
-    Pr,
-    Nightly,
-}
-
-impl From<TierArg> for Tier {
-    fn from(tier: TierArg) -> Self {
-        match tier {
-            TierArg::Pr => Self::Pr,
-            TierArg::Nightly => Self::Nightly,
-        }
-    }
-}
-
 fn main() -> ExitCode {
     match Cli::parse().command {
         Command::PrReport {
@@ -100,19 +80,17 @@ fn main() -> ExitCode {
             work_dir: &work_dir,
             post: !no_post,
         }),
-        Command::List { tier } => {
-            list(tier.into());
+        Command::List => {
+            list();
             ExitCode::SUCCESS
         }
         Command::Run {
-            tier,
             suites,
             strict,
             out,
             bin_dir,
         } => {
             let plan = Plan {
-                tier: tier.into(),
                 strict,
                 suites,
                 out_dir: out,
@@ -145,10 +123,9 @@ fn pr_report(request: &github::Request<'_>) -> ExitCode {
     }
 }
 
-fn list(tier: Tier) {
+fn list() {
     let all = suites::all();
     let plan = Plan {
-        tier,
         strict: false,
         suites: Vec::new(),
         out_dir: PathBuf::new(),
@@ -161,9 +138,8 @@ fn list(tier: Tier) {
         for task in tasks {
             let needs: Vec<&str> = task.requires.iter().map(|c| c.name()).collect();
             println!(
-                "  {:<36} {:<8} {:<14} {}",
+                "  {:<36} {:<14} {}",
                 task.name,
-                task.tier.name(),
                 task.scene.unwrap_or("-"),
                 if needs.is_empty() {
                     String::new()
@@ -181,8 +157,7 @@ fn run(plan: &Plan, bin_dir: Option<&Path>) -> Result<bool, String> {
     host::require_live_desktop()?;
     let mut environment = Environment::windows(Binaries::locate(bin_dir)?);
     println!(
-        "controlfreak-e2e {} run, reports in {}",
-        plan.tier.name(),
+        "controlfreak-e2e run, reports in {}",
         plan.out_dir.display()
     );
     let report = runner::run(&all, plan, &mut environment, &mut |record| {

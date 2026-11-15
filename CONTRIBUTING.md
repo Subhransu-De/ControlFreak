@@ -21,7 +21,7 @@ capture tests and `stdio_capture_display_returns_png_image_content` with `--igno
 in an explicitly approved disposable desktop. The default suite uses synthetic data and hidden
 fixture windows for target-policy coverage and never needs a personal application as a fixture.
 
-The live end-to-end suites drive the real server against disposable fixture windows. They run in CI on every pull request. To run them yourself, use a disposable desktop only, set `CONTROLFREAK_LIVE_DESKTOP=1` and run `cargo xtask e2e --tier pr --strict`. [docs/scene-e2e.md](docs/scene-e2e.md) describes each scene and task. After CI finishes, a bot comment on the pull request summarizes the workspace tests and the e2e run.
+The live end-to-end suites drive the real server against disposable fixture windows. They run in CI on every pull request and on every push to `main`. To run them yourself, use a disposable desktop only, set `CONTROLFREAK_LIVE_DESKTOP=1` and run `cargo xtask e2e --strict`. [docs/scene-e2e.md](docs/scene-e2e.md) describes each scene and task. After CI finishes, a bot comment on the pull request summarizes the workspace tests and the e2e run.
 
 ## Architecture
 

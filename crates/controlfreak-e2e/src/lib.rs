@@ -9,4 +9,4 @@ pub mod scene;
 pub mod suites;
 pub mod workflow;
 
-pub use workflow::{Capability, Ctx, Failure, Suite, Task, Tier};
+pub use workflow::{Capability, Ctx, Failure, Suite, Task};

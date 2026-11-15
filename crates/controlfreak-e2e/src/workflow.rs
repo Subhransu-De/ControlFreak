@@ -15,28 +15,6 @@ use std::{
 const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_BUDGET: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Tier {
-    Pr,
-    Nightly,
-}
-
-impl Tier {
-    pub(crate) const fn includes(self, task: Self) -> bool {
-        match self {
-            Self::Nightly => true,
-            Self::Pr => matches!(task, Self::Pr),
-        }
-    }
-
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Pr => "pr",
-            Self::Nightly => "nightly",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capability {
     Ocr,
@@ -140,7 +118,6 @@ pub type Body = fn(&mut Ctx<'_>) -> Result<(), Failure>;
 #[derive(Debug, Clone, Copy)]
 pub struct Task {
     pub name: &'static str,
-    pub tier: Tier,
     pub scene: Option<&'static str>,
     pub requires: &'static [Capability],
     pub(crate) budget: Duration,
@@ -150,7 +127,6 @@ pub struct Task {
 pub const fn task(name: &'static str, body: Body) -> Task {
     Task {
         name,
-        tier: Tier::Pr,
         scene: None,
         requires: &[],
         budget: DEFAULT_BUDGET,
@@ -168,12 +144,6 @@ impl Task {
     #[must_use]
     pub const fn requires(mut self, capabilities: &'static [Capability]) -> Self {
         self.requires = capabilities;
-        self
-    }
-
-    #[must_use]
-    pub const fn nightly(mut self) -> Self {
-        self.tier = Tier::Nightly;
         self
     }
 
@@ -423,25 +393,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_nightly_run_includes_pr_tasks_but_not_the_reverse() {
-        assert!(Tier::Nightly.includes(Tier::Pr));
-        assert!(Tier::Nightly.includes(Tier::Nightly));
-        assert!(Tier::Pr.includes(Tier::Pr));
-        assert!(!Tier::Pr.includes(Tier::Nightly));
-    }
-
-    #[test]
     fn the_builder_sets_every_field() {
         const CAPS: &[Capability] = &[Capability::Ocr];
         let built = task("t", |_| Ok(()))
             .scene("single")
             .requires(CAPS)
-            .nightly()
             .budget_secs(5);
         assert_eq!(built.name, "t");
         assert_eq!(built.scene, Some("single"));
         assert_eq!(built.requires, CAPS);
-        assert_eq!(built.tier, Tier::Nightly);
         assert_eq!(built.budget, Duration::from_secs(5));
     }
 
