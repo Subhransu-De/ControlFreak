@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) const GATE: &str = "CONTROLFREAK_LIVE_DESKTOP";
+const GATE: &str = "CONTROLFREAK_LIVE_DESKTOP";
 const SERVER_EXE: &str = "controlfreak.exe";
 const FIXTURE_EXE: &str = "controlfreak-fixture.exe";
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -27,8 +27,8 @@ pub fn require_live_desktop() -> Result<(), String> {
 
 #[derive(Debug, Clone)]
 pub struct Binaries {
-    pub(crate) server: PathBuf,
-    pub(crate) fixture: PathBuf,
+    server: PathBuf,
+    fixture: PathBuf,
 }
 
 impl Binaries {

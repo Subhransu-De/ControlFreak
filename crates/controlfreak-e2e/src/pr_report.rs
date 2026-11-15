@@ -2,8 +2,8 @@ use serde_json::Value;
 use std::fmt::Write as _;
 
 pub(crate) const MARKER: &str = "<!-- controlfreak-test-report -->";
-pub(crate) const WORKSPACE_JOB: &str = "Tests";
-pub(crate) const E2E_JOB: &str = "Live desktop tests";
+const WORKSPACE_JOB: &str = "Tests";
+const E2E_JOB: &str = "Live desktop tests";
 const LIMIT: usize = 60_000;
 const MAX_FAILURES: usize = 5;
 const MAX_TEST_NAMES: usize = 20;
@@ -11,14 +11,14 @@ const STEP_TAIL: usize = 8;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CargoTests {
-    pub(crate) passed: u64,
-    pub(crate) failed: u64,
-    pub(crate) ignored: u64,
-    pub(crate) failures: Vec<String>,
+    passed: u64,
+    failed: u64,
+    ignored: u64,
+    failures: Vec<String>,
 }
 
 impl CargoTests {
-    pub(crate) fn total(&self) -> u64 {
+    fn total(&self) -> u64 {
         self.passed + self.failed
     }
 }
@@ -80,22 +80,22 @@ fn strip_ansi(text: &str) -> String {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct E2eRun {
-    pub(crate) strict: bool,
-    pub(crate) tools: Vec<String>,
-    pub(crate) tasks: Vec<E2eTask>,
-    pub(crate) calls: Vec<(String, u64)>,
+    strict: bool,
+    tools: Vec<String>,
+    tasks: Vec<E2eTask>,
+    calls: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct E2eTask {
-    pub(crate) suite: String,
-    pub(crate) task: String,
-    pub(crate) outcome: String,
-    pub(crate) took_ms: u64,
-    pub(crate) failure_kind: String,
-    pub(crate) failure_message: String,
-    pub(crate) missing: Vec<String>,
-    pub(crate) steps: Vec<String>,
+    suite: String,
+    task: String,
+    outcome: String,
+    took_ms: u64,
+    failure_kind: String,
+    failure_message: String,
+    missing: Vec<String>,
+    steps: Vec<String>,
 }
 
 impl E2eRun {
@@ -218,9 +218,9 @@ fn seconds(ms: u64) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
-    pub(crate) name: String,
-    pub(crate) conclusion: Option<String>,
-    pub(crate) seconds: Option<u64>,
+    name: String,
+    conclusion: Option<String>,
+    seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -758,7 +758,7 @@ fn duration(seconds: u64) -> String {
     }
 }
 
-pub(crate) fn parse_timestamp(text: &str) -> Option<i64> {
+fn parse_timestamp(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
     if bytes.len() < 20 || bytes[4] != b'-' || bytes[10] != b'T' {
         return None;

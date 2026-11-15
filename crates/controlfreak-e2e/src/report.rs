@@ -19,7 +19,7 @@ pub fn write(report: &RunReport, dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn summary_json(report: &RunReport) -> String {
+fn summary_json(report: &RunReport) -> String {
     let line = json!({
         "tier": report.tier.name(),
         "strict": report.strict,
@@ -30,7 +30,7 @@ pub(crate) fn summary_json(report: &RunReport) -> String {
     format!("{line}\n")
 }
 
-pub(crate) fn timeline(report: &RunReport) -> String {
+fn timeline(report: &RunReport) -> String {
     let mut out = String::new();
     for record in &report.records {
         for step in &record.steps {
@@ -87,7 +87,7 @@ pub(crate) fn timeline(report: &RunReport) -> String {
     out
 }
 
-pub(crate) fn junit(report: &RunReport) -> String {
+fn junit(report: &RunReport) -> String {
     let mut suites: Vec<(&str, Vec<&TaskRecord>)> = Vec::new();
     for record in &report.records {
         match suites.iter_mut().find(|(name, _)| *name == record.suite) {

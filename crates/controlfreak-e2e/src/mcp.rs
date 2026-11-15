@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) const PROTOCOL_VERSION: &str = "2025-11-25";
+const PROTOCOL_VERSION: &str = "2025-11-25";
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +37,7 @@ impl std::error::Error for McpError {}
 pub struct ToolResult {
     pub(crate) is_error: bool,
     pub(crate) structured: Value,
-    pub(crate) content: Vec<Value>,
+    content: Vec<Value>,
 }
 
 impl ToolResult {
@@ -221,7 +221,7 @@ impl McpClient {
         self.write(&json!({"jsonrpc": "2.0", "method": method}))
     }
 
-    pub(crate) fn request(&mut self, method: &str, params: Value) -> Result<Value, McpError> {
+    fn request(&mut self, method: &str, params: Value) -> Result<Value, McpError> {
         let id = self.next_id;
         self.next_id += 1;
         let mut message = json!({"jsonrpc": "2.0", "id": id, "method": method});

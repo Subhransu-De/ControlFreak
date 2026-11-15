@@ -53,7 +53,7 @@ pub enum Event {
 }
 
 impl Event {
-    pub(crate) fn parse(line: &str) -> Self {
+    fn parse(line: &str) -> Self {
         let parts: Vec<&str> = line.split_whitespace().collect();
         let parsed = match parts.as_slice() {
             ["ready", fields @ ..] => Some(Self::Ready(parse_regions(fields))),

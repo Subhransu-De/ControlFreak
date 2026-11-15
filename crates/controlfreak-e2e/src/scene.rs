@@ -14,7 +14,7 @@ const BUILTIN: &[(&str, &str)] = &[
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Scene {
-    pub(crate) description: String,
+    description: String,
     #[serde(rename = "window")]
     pub(crate) windows: Vec<WindowSpec>,
 }
@@ -48,7 +48,7 @@ const fn default_lifetime() -> u32 {
 }
 
 impl Scene {
-    pub(crate) fn parse(text: &str) -> Result<Self, String> {
+    fn parse(text: &str) -> Result<Self, String> {
         let scene: Self = toml::from_str(text).map_err(|error| error.to_string())?;
         scene.validate()?;
         Ok(scene)
