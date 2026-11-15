@@ -21,7 +21,6 @@ pub fn write(report: &RunReport, dir: &Path) -> Result<(), String> {
 
 fn summary_json(report: &RunReport) -> String {
     let line = json!({
-        "tier": report.tier.name(),
         "strict": report.strict,
         "succeeded": report.succeeded(),
         "elapsed_ms": millis(report.elapsed),
@@ -98,8 +97,7 @@ fn junit(report: &RunReport) -> String {
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     let _ = writeln!(
         out,
-        "<testsuites name=\"controlfreak-e2e {}\" tests=\"{}\" time=\"{:.3}\">",
-        report.tier.name(),
+        "<testsuites name=\"controlfreak-e2e\" tests=\"{}\" time=\"{:.3}\">",
         report.records.len(),
         report.elapsed.as_secs_f64()
     );
@@ -188,9 +186,8 @@ pub fn summary(report: &RunReport) -> String {
     let verdict = if report.succeeded() { "ok" } else { "FAILED" };
     let strict = if report.strict { ", strict" } else { "" };
     format!(
-        "e2e {} ({}{strict}): {verdict}. {passed} passed, {failed} failed, {blocked} blocked \
+        "e2e ({} tasks{strict}): {verdict}. {passed} passed, {failed} failed, {blocked} blocked \
          in {:.1}s",
-        report.tier.name(),
         report.records.len(),
         report.elapsed.as_secs_f64()
     )
@@ -240,7 +237,7 @@ fn xml(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
-        Capability, Tier,
+        Capability,
         workflow::{Failure, Step},
     };
     use std::time::Duration;
@@ -265,7 +262,6 @@ mod tests {
 
     fn report(strict: bool) -> RunReport {
         RunReport {
-            tier: Tier::Pr,
             strict,
             records: vec![
                 record("a", Outcome::Passed),

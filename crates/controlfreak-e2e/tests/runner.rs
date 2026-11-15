@@ -1,5 +1,5 @@
 use controlfreak_e2e::{
-    Capability, Failure, Suite, Tier,
+    Capability, Failure, Suite,
     mcp::McpClient,
     report,
     runner::{self, Environment, Outcome, Plan},
@@ -135,14 +135,12 @@ fn suites() -> Vec<Suite> {
             task("panics", |_| panic!("boom")),
             task("hangs", |cx| cx.call("hang", json!({})).map(drop)),
             task("needs-window", |cx| cx.target("app").map(drop)).scene("single"),
-            task("nightly-only", |_| Ok(())).nightly(),
         ],
     }]
 }
 
-fn plan(tier: Tier, strict: bool, out: &std::path::Path) -> Plan {
+fn plan(strict: bool, out: &std::path::Path) -> Plan {
     Plan {
-        tier,
         strict,
         suites: Vec::new(),
         out_dir: out.to_path_buf(),
@@ -171,17 +169,13 @@ fn every_outcome_is_classified_and_reported() {
     let mut seen = Vec::new();
     let report = runner::run(
         &suites(),
-        &plan(Tier::Pr, false, out.path()),
+        &plan(false, out.path()),
         &mut environment(),
         &mut |record| seen.push(record.task),
     )
     .expect("run");
 
-    assert_eq!(
-        seen.len(),
-        7,
-        "the nightly task is not in a PR run: {seen:?}"
-    );
+    assert_eq!(seen.len(), 7, "every task runs: {seen:?}");
     assert_eq!(outcome(&report, "status-ready"), &Outcome::Passed);
     assert_eq!(
         failure_kind(outcome(&report, "contract-broken")),
@@ -236,29 +230,26 @@ fn every_outcome_is_classified_and_reported() {
 }
 
 #[test]
-fn strict_turns_blocked_into_failure_and_nightly_includes_pr() {
+fn strict_turns_blocked_into_failure() {
     let out = tempfile::tempdir().expect("temp dir");
     let only_blocked = vec![Suite {
         name: "fake",
         about: "",
-        tasks: vec![
-            task("needs-ocr", |_| Ok(())).requires(&[Capability::Ocr]),
-            task("nightly-only", |_| Ok(())).nightly(),
-        ],
+        tasks: vec![task("needs-ocr", |_| Ok(())).requires(&[Capability::Ocr])],
     }];
     let mut ignore = |_: &runner::TaskRecord| {};
     let relaxed = runner::run(
         &only_blocked,
-        &plan(Tier::Nightly, false, out.path()),
+        &plan(false, out.path()),
         &mut environment(),
         &mut ignore,
     )
     .expect("run");
-    assert_eq!(relaxed.records.len(), 2);
+    assert_eq!(relaxed.records.len(), 1);
     assert!(relaxed.succeeded(), "BLOCKED alone passes without --strict");
     let strict = runner::run(
         &only_blocked,
-        &plan(Tier::Nightly, true, out.path()),
+        &plan(true, out.path()),
         &mut environment(),
         &mut ignore,
     )
@@ -269,7 +260,7 @@ fn strict_turns_blocked_into_failure_and_nightly_includes_pr() {
 #[test]
 fn an_unknown_suite_is_refused_before_anything_runs() {
     let out = tempfile::tempdir().expect("temp dir");
-    let mut plan = plan(Tier::Pr, false, out.path());
+    let mut plan = plan(false, out.path());
     plan.suites = vec!["nope".into()];
     let error = runner::run(&suites(), &plan, &mut environment(), &mut |_| {
         panic!("nothing may run")
@@ -285,10 +276,7 @@ fn an_unknown_suite_is_refused_before_anything_runs() {
 fn the_built_in_suites_list_without_a_desktop() {
     let all = controlfreak_e2e::suites::all();
     let out = tempfile::tempdir().expect("temp dir");
-    let pr = runner::select(&all, &plan(Tier::Pr, false, out.path())).expect("select");
-    let nightly = runner::select(&all, &plan(Tier::Nightly, false, out.path())).expect("select");
-    let count =
-        |selected: &[(&Suite, Vec<_>)]| selected.iter().map(|(_, t)| t.len()).sum::<usize>();
-    assert_eq!(count(&pr), 13);
-    assert_eq!(count(&nightly), 14);
+    let selected = runner::select(&all, &plan(false, out.path())).expect("select");
+    let count: usize = selected.iter().map(|(_, tasks)| tasks.len()).sum();
+    assert_eq!(count, 14);
 }

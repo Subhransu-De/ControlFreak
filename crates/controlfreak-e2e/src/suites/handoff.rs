@@ -22,7 +22,6 @@ pub(crate) fn suite() -> Suite {
                 .requires(&[Capability::Ocr]),
             task("ten-round-trips", round_trips)
                 .scene("two-processes")
-                .nightly()
                 .budget_secs(120),
         ],
     }

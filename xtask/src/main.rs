@@ -80,7 +80,7 @@ enum Task {
     },
     /// Build the e2e binaries and run the live suites on a disposable desktop.
     ///
-    /// Arguments go to `controlfreak-e2e run`, for example `--tier pr --strict`.
+    /// Arguments go to `controlfreak-e2e run`, for example `--strict`.
     E2e {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,

@@ -489,7 +489,7 @@ fn lanes(report: &Report<'_>) -> String {
     );
     let _ = writeln!(
         out,
-        "| Live e2e (PR tier) | {e2e_result} | {e2e_delta} | {} | {} |",
+        "| Live e2e | {e2e_result} | {e2e_delta} | {} | {} |",
         job_time(current, E2E_JOB),
         job_delta(current, baseline, E2E_JOB)
     );
@@ -834,7 +834,7 @@ test a::two ... FAILED\n";
         lines.join("\n")
     }
 
-    const RUN_JSON: &str = r#"{"tier":"pr","strict":true,"tools":["begin_control_session","click_mouse","drag_mouse","read_text_in_region"]}"#;
+    const RUN_JSON: &str = r#"{"strict":true,"tools":["begin_control_session","click_mouse","drag_mouse","read_text_in_region"]}"#;
 
     fn jobs(tests: u64, e2e: u64) -> Vec<Job> {
         vec![
@@ -892,7 +892,7 @@ test a::two ... FAILED\n";
             "{body}"
         );
         assert!(
-            body.contains("| Live e2e (PR tier) | ✅ 2 passed | ±0 | 1m 38s | +7s |"),
+            body.contains("| Live e2e | ✅ 2 passed | ±0 | 1m 38s | +7s |"),
             "{body}"
         );
         assert!(
@@ -969,10 +969,7 @@ test a::two ... FAILED\n";
             "{body}"
         );
         assert!(body.contains("| Workspace | ❌ job failure |"), "{body}");
-        assert!(
-            body.contains("| Live e2e (PR tier) | ⏳ running |"),
-            "{body}"
-        );
+        assert!(body.contains("| Live e2e | ⏳ running |"), "{body}");
     }
 
     #[test]

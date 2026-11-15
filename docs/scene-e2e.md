@@ -6,10 +6,10 @@ The suites inject real input and change the foreground window. Run them only on 
 
 ```powershell
 $env:CONTROLFREAK_LIVE_DESKTOP = "1"
-cargo xtask e2e --tier pr --strict
+cargo xtask e2e --strict
 ```
 
-`cargo run -p controlfreak-e2e -- list` prints every task with its tier, scene and required capabilities, and touches nothing.
+`cargo run -p controlfreak-e2e -- list` prints every task with its scene and required capabilities, and touches nothing.
 
 ## The fixture window
 
@@ -78,7 +78,7 @@ This is the "copy something from one application into another" desk. A control s
 | `handoff/sessions-hand-over-cleanly` | Types `A1` into `ledger`, `B2` into `journal` and `C3` into `ledger`, each in its own session. Checks `ledger` received exactly `A1C3` and `journal` exactly `B2`. |
 | `handoff/other-window-refused-in-session` | With a session on `ledger`, tries to type into `journal`. Checks the call is refused, `journal` received no input, and typing into `ledger` still works afterwards. |
 | `handoff/carry-value-read-by-ocr` | Needs OCR. Types `INV 4471 1280` into `ledger`, reads it back from the screen with `read_text_in_region`, ends the session, and types what it read into `journal`. Checks `journal` received the value and `ledger` received nothing after its session ended. |
-| `handoff/ten-round-trips` | Nightly only. Ten handovers in a row, alternating between the windows. Checks every window's text after each round, and that no round takes longer than 3 seconds. |
+| `handoff/ten-round-trips` | Ten handovers in a row, alternating between the windows. Checks every window's text after each round, and that no round takes longer than 3 seconds. |
 
 ## No scene
 

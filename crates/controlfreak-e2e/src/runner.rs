@@ -2,7 +2,7 @@ use crate::{
     host::{Binaries, Window},
     mcp::McpClient,
     scene::{Scene, WindowSpec},
-    workflow::{Capability, Ctx, Failure, FailureKind, Step, Suite, Task, Tier},
+    workflow::{Capability, Ctx, Failure, FailureKind, Step, Suite, Task},
 };
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -34,7 +34,6 @@ impl Environment {
 
 #[derive(Debug, Clone)]
 pub struct Plan {
-    pub tier: Tier,
     pub strict: bool,
     pub suites: Vec<String>,
     pub out_dir: PathBuf,
@@ -58,7 +57,6 @@ pub struct TaskRecord {
 
 #[derive(Debug, Clone)]
 pub struct RunReport {
-    pub(crate) tier: Tier,
     pub(crate) strict: bool,
     pub records: Vec<TaskRecord>,
     pub(crate) elapsed: Duration,
@@ -95,14 +93,7 @@ pub fn select<'s>(
     Ok(suites
         .iter()
         .filter(|suite| plan.suites.is_empty() || plan.suites.iter().any(|s| s == suite.name))
-        .map(|suite| {
-            let tasks = suite
-                .tasks
-                .iter()
-                .filter(|task| plan.tier.includes(task.tier))
-                .collect();
-            (suite, tasks)
-        })
+        .map(|suite| (suite, suite.tasks.iter().collect()))
         .filter(|(_, tasks): &(_, Vec<_>)| !tasks.is_empty())
         .collect())
 }
@@ -128,7 +119,6 @@ pub fn run(
         }
     }
     Ok(RunReport {
-        tier: plan.tier,
         strict: plan.strict,
         records,
         elapsed: started.elapsed(),
