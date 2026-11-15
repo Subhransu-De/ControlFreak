@@ -1,0 +1,10 @@
+description = "Two windows of two different processes, side by side"
+
+[[window]]
+key = "ledger"
+position = [10, 140]
+
+[[window]]
+key = "journal"
+color = "4682B4"
+position = [410, 140]

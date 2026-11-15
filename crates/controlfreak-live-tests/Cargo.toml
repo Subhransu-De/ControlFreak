@@ -1,6 +1,6 @@
 [package]
 name = "controlfreak-live-tests"
-description = "Disposable fixture window and live end-to-end tests for the ControlFreak server (never shipped)"
+description = "Disposable fixture window driven by the controlfreak-e2e suites (never shipped)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 # Test support only. `cargo build -p controlfreak-server -p controlfreak-installer --release`, the
-# installer packaging and `cargo xtask` never build or package this crate.
+# installer packaging and `cargo xtask package` never build or package this crate.
 [[bin]]
 name = "controlfreak-fixture"
 path = "src/fixture.rs"
@@ -23,11 +23,6 @@ windows = { workspace = true, features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
-
-[dev-dependencies]
-base64.workspace = true
-png.workspace = true
-serde_json.workspace = true
 
 [lints]
 workspace = true

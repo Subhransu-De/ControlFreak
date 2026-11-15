@@ -21,6 +21,8 @@ capture tests and `stdio_capture_display_returns_png_image_content` with `--igno
 in an explicitly approved disposable desktop. The default suite uses synthetic data and hidden
 fixture windows for target-policy coverage and never needs a personal application as a fixture.
 
+The live end-to-end suites drive the real server against disposable fixture windows. They run in CI on every pull request. To run them yourself, use a disposable desktop only, set `CONTROLFREAK_LIVE_DESKTOP=1` and run `cargo xtask e2e --tier pr --strict`. [docs/scene-e2e.md](docs/scene-e2e.md) describes each scene and task. After CI finishes, a bot comment on the pull request summarizes the workspace tests and the e2e run.
+
 ## Architecture
 
 - `controlfreak-core` owns domain types and focused backend traits.
@@ -29,6 +31,8 @@ fixture windows for target-policy coverage and never needs a personal applicatio
 - `controlfreak-server` wires the production backend to STDIO transport.
 - `controlfreak-installer` is a separate setup-only configuration utility. It cannot be invoked
   through the MCP protocol and does not perform desktop control.
+- `controlfreak-e2e` holds the live end-to-end suites and renders the pull request test report.
+  `controlfreak-live-tests` holds the disposable fixture window they drive. Neither is shipped.
 - `xtask` is developer-only Rust automation for packaging and release verification. It is never
   installed with ControlFreak or called by the application.
 
