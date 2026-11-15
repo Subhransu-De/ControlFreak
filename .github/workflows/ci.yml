@@ -63,7 +63,22 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Run tests
-        run: cargo test --workspace --locked
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -o pipefail
+          mkdir -p test-results
+          cargo test --workspace --locked 2>&1 | tee test-results/cargo-test.log
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: test-results-tests
+          path: test-results
+          if-no-files-found: ignore
+          retention-days: 90
 
   live-desktop:
     name: Live desktop tests
@@ -82,15 +97,21 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
-      - name: Build the server under test
-        run: cargo build -p controlfreak-server --locked
-
-      # The hosted runner is a disposable interactive desktop. The tests inject real input there
+      # The hosted runner is a disposable interactive desktop. The suites inject real input there
       # and refuse to run anywhere else without this variable.
-      - name: Run live tests against the fixture window
+      - name: Run the live e2e suites
         env:
           CONTROLFREAK_LIVE_DESKTOP: "1"
-        run: cargo test -p controlfreak-live-tests --test live --locked -- --ignored --test-threads=1 --nocapture
+        run: cargo xtask e2e --tier pr --strict --out test-results/e2e
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: test-results-live-desktop
+          path: test-results
+          if-no-files-found: ignore
+          retention-days: 90
 
   windows-build:
     name: Release build

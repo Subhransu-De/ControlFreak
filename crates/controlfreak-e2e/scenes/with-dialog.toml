@@ -1,0 +1,5 @@
+description = "One fixture window that owns a dialog of the same process"
+
+[[window]]
+key = "owner"
+dialog = true

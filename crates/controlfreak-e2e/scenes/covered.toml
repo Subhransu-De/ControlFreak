@@ -1,0 +1,9 @@
+description = "A target window exactly covered by a topmost window of another process"
+
+[[window]]
+key = "target"
+
+[[window]]
+key = "cover"
+color = "FF00FF"
+topmost = true

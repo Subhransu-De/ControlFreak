@@ -1,4 +1,5 @@
 //! Developer-only packaging commands. Never shipped in the installer.
+mod e2e;
 mod lifecycle;
 mod package;
 mod process;
@@ -11,7 +12,7 @@ use std::{path::PathBuf, process::ExitCode};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Parser)]
-#[command(about = "Build and verify ControlFreak Windows distribution artifacts")]
+#[command(about = "Build, verify and test ControlFreak Windows distribution artifacts")]
 struct Cli {
     #[command(subcommand)]
     command: Task,
@@ -77,6 +78,13 @@ enum Task {
         #[arg(long)]
         tag: String,
     },
+    /// Build the e2e binaries and run the live suites on a disposable desktop.
+    ///
+    /// Arguments go to `controlfreak-e2e run`, for example `--tier pr --strict`.
+    E2e {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -124,6 +132,7 @@ fn run(cli: Cli) -> Result<()> {
             metadata.validate_tag(Some(&tag))?;
             package::publish(&package, &tag, &metadata)?;
         }
+        Task::E2e { args } => e2e::run(&metadata.workspace_root, &args)?,
     }
     Ok(())
 }
