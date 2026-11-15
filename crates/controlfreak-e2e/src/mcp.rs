@@ -9,8 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const PROTOCOL_VERSION: &str = "2025-11-25";
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
+pub(crate) const PROTOCOL_VERSION: &str = "2025-11-25";
+pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpError {
@@ -35,29 +35,27 @@ impl std::error::Error for McpError {}
 
 #[derive(Debug, Clone)]
 pub struct ToolResult {
-    pub tool: String,
-    pub is_error: bool,
-    pub structured: Value,
-    pub content: Vec<Value>,
-    pub elapsed: Duration,
+    pub(crate) is_error: bool,
+    pub(crate) structured: Value,
+    pub(crate) content: Vec<Value>,
 }
 
 impl ToolResult {
-    pub fn error_code(&self) -> Option<&str> {
+    pub(crate) fn error_code(&self) -> Option<&str> {
         self.structured["error"]["code"].as_str()
     }
 
-    pub fn error_reason(&self) -> Option<&str> {
+    pub(crate) fn error_reason(&self) -> Option<&str> {
         self.structured["error"]["reason"].as_str()
     }
 
-    pub fn error_message(&self) -> &str {
+    pub(crate) fn error_message(&self) -> &str {
         self.structured["error"]["message"]
             .as_str()
             .unwrap_or_default()
     }
 
-    pub fn image_data(&self) -> Option<&str> {
+    pub(crate) fn image_data(&self) -> Option<&str> {
         self.content
             .iter()
             .find(|block| block["type"] == "image")
@@ -71,9 +69,7 @@ pub struct McpClient {
     child: Option<Child>,
     next_id: u64,
     schemas: HashMap<String, jsonschema::Validator>,
-    notifications: Vec<Value>,
     timeout: Duration,
-    server_name: String,
 }
 
 impl McpClient {
@@ -99,9 +95,7 @@ impl McpClient {
             child,
             next_id: 1,
             schemas: HashMap::new(),
-            notifications: Vec::new(),
             timeout,
-            server_name: String::new(),
         };
         let initialized = client.request(
             "initialize",
@@ -111,35 +105,24 @@ impl McpClient {
                 "clientInfo": { "name": "controlfreak-e2e", "version": env!("CARGO_PKG_VERSION") }
             }),
         )?;
-        initialized["serverInfo"]["name"]
-            .as_str()
-            .ok_or_else(|| {
-                McpError::Protocol(format!("initialize has no serverInfo: {initialized}"))
-            })?
-            .clone_into(&mut client.server_name);
+        if !initialized["serverInfo"]["name"].is_string() {
+            return Err(McpError::Protocol(format!(
+                "initialize has no serverInfo: {initialized}"
+            )));
+        }
         client.notify("notifications/initialized")?;
         client.load_schemas()?;
         Ok(client)
     }
 
-    pub fn server_name(&self) -> &str {
-        &self.server_name
-    }
-
-    pub fn tool_names(&self) -> impl Iterator<Item = &str> {
+    pub(crate) fn tool_names(&self) -> impl Iterator<Item = &str> {
         self.schemas.keys().map(String::as_str)
     }
 
-    pub fn notifications(&self) -> &[Value] {
-        &self.notifications
-    }
-
-    pub fn call(&mut self, tool: &str, arguments: Value) -> Result<ToolResult, McpError> {
-        let started = Instant::now();
+    pub(crate) fn call(&mut self, tool: &str, arguments: Value) -> Result<ToolResult, McpError> {
         let mut params = json!({"name": tool});
         params["arguments"] = arguments;
         let result = self.request("tools/call", params)?;
-        let elapsed = started.elapsed();
         let is_error = result["isError"].as_bool().unwrap_or(false);
         let structured = result
             .get("structuredContent")
@@ -148,11 +131,9 @@ impl McpClient {
         let content = result["content"].as_array().cloned().unwrap_or_default();
         self.check_contract(tool, is_error, &structured)?;
         Ok(ToolResult {
-            tool: tool.to_owned(),
             is_error,
             structured,
             content,
-            elapsed,
         })
     }
 
@@ -240,7 +221,7 @@ impl McpClient {
         self.write(&json!({"jsonrpc": "2.0", "method": method}))
     }
 
-    pub fn request(&mut self, method: &str, params: Value) -> Result<Value, McpError> {
+    pub(crate) fn request(&mut self, method: &str, params: Value) -> Result<Value, McpError> {
         let id = self.next_id;
         self.next_id += 1;
         let mut message = json!({"jsonrpc": "2.0", "id": id, "method": method});
@@ -267,7 +248,6 @@ impl McpClient {
                 )));
             }
             if message.get("method").is_some() {
-                self.notifications.push(message);
                 continue;
             }
             if message["id"] != id {

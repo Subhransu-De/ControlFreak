@@ -49,24 +49,24 @@ pub enum Outcome {
 
 #[derive(Debug, Clone)]
 pub struct TaskRecord {
-    pub suite: &'static str,
+    pub(crate) suite: &'static str,
     pub task: &'static str,
     pub outcome: Outcome,
-    pub elapsed: Duration,
+    pub(crate) elapsed: Duration,
     pub steps: Vec<Step>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RunReport {
-    pub tier: Tier,
-    pub strict: bool,
+    pub(crate) tier: Tier,
+    pub(crate) strict: bool,
     pub records: Vec<TaskRecord>,
-    pub elapsed: Duration,
-    pub tools: Vec<String>,
+    pub(crate) elapsed: Duration,
+    pub(crate) tools: Vec<String>,
 }
 
 impl RunReport {
-    pub fn count(&self, matches: impl Fn(&Outcome) -> bool) -> usize {
+    pub(crate) fn count(&self, matches: impl Fn(&Outcome) -> bool) -> usize {
         self.records.iter().filter(|r| matches(&r.outcome)).count()
     }
 

@@ -1,5 +1,5 @@
 use crate::{
-    events::{self, Event},
+    events::Event,
     host::Window,
     mcp::{McpClient, McpError, ToolResult},
 };
@@ -22,7 +22,7 @@ pub enum Tier {
 }
 
 impl Tier {
-    pub const fn includes(self, task: Self) -> bool {
+    pub(crate) const fn includes(self, task: Self) -> bool {
         match self {
             Self::Nightly => true,
             Self::Pr => matches!(task, Self::Pr),
@@ -75,7 +75,7 @@ pub enum FailureKind {
 }
 
 impl FailureKind {
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Assertion => "assertion",
             Self::Contract => "contract",
@@ -93,7 +93,7 @@ pub struct Failure {
 }
 
 impl Failure {
-    pub fn new(kind: FailureKind, message: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: FailureKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -104,7 +104,7 @@ impl Failure {
         Self::new(FailureKind::Assertion, message)
     }
 
-    pub fn host(message: impl Into<String>) -> Self {
+    pub(crate) fn host(message: impl Into<String>) -> Self {
         Self::new(FailureKind::Host, message)
     }
 }
@@ -143,8 +143,8 @@ pub struct Task {
     pub tier: Tier,
     pub scene: Option<&'static str>,
     pub requires: &'static [Capability],
-    pub budget: Duration,
-    pub body: Body,
+    pub(crate) budget: Duration,
+    pub(crate) body: Body,
 }
 
 pub const fn task(name: &'static str, body: Body) -> Task {
@@ -178,7 +178,7 @@ impl Task {
     }
 
     #[must_use]
-    pub const fn budget_secs(mut self, seconds: u64) -> Self {
+    pub(crate) const fn budget_secs(mut self, seconds: u64) -> Self {
         self.budget = Duration::from_secs(seconds);
         self
     }
@@ -193,9 +193,9 @@ pub struct Suite {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Step {
-    pub at: Duration,
-    pub took: Duration,
-    pub kind: StepKind,
+    pub(crate) at: Duration,
+    pub(crate) took: Duration,
+    pub(crate) kind: StepKind,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -250,19 +250,19 @@ impl<'a> Ctx<'a> {
         });
     }
 
-    pub fn note(&mut self, text: impl Into<String>) {
+    pub(crate) fn note(&mut self, text: impl Into<String>) {
         let now = Instant::now();
         self.record(now, StepKind::Note(text.into()));
     }
 
-    pub fn window(&self, key: &str) -> Result<&'a Window, Failure> {
+    pub(crate) fn window(&self, key: &str) -> Result<&'a Window, Failure> {
         self.windows
             .iter()
             .find(|window| window.key == key)
             .ok_or_else(|| Failure::host(format!("the scene has no window {key:?}")))
     }
 
-    pub fn center(&self, key: &str, region: &str) -> Result<(i32, i32), Failure> {
+    pub(crate) fn center(&self, key: &str, region: &str) -> Result<(i32, i32), Failure> {
         self.window(key)?
             .regions
             .center(region)
@@ -315,7 +315,7 @@ impl<'a> Ctx<'a> {
         Ok(result.structured)
     }
 
-    pub fn refused(&mut self, tool: &str, arguments: Value) -> Result<ToolResult, Failure> {
+    pub(crate) fn refused(&mut self, tool: &str, arguments: Value) -> Result<ToolResult, Failure> {
         let result = self.call(tool, arguments)?;
         ensure!(
             result.is_error,
@@ -325,7 +325,7 @@ impl<'a> Ctx<'a> {
         Ok(result)
     }
 
-    pub fn begin(&mut self, target: &str) -> Result<(), Failure> {
+    pub(crate) fn begin(&mut self, target: &str) -> Result<(), Failure> {
         self.ok(
             "begin_control_session",
             json!({"target_ref": target, "expected_seconds": 60}),
@@ -333,11 +333,11 @@ impl<'a> Ctx<'a> {
         .map(drop)
     }
 
-    pub fn end(&mut self) -> Result<(), Failure> {
+    pub(crate) fn end(&mut self) -> Result<(), Failure> {
         self.ok("end_control_session", json!({})).map(drop)
     }
 
-    pub fn focus(&mut self, target: &str) -> Result<(), Failure> {
+    pub(crate) fn focus(&mut self, target: &str) -> Result<(), Failure> {
         self.ok(
             "focus_window",
             json!({"window_id": target, "observation": {"mode": "none"}}),
@@ -345,7 +345,7 @@ impl<'a> Ctx<'a> {
         .map(drop)
     }
 
-    pub fn click(&mut self, target: &str, point: (i32, i32)) -> Result<ToolResult, Failure> {
+    pub(crate) fn click(&mut self, target: &str, point: (i32, i32)) -> Result<ToolResult, Failure> {
         self.call(
             "click_mouse",
             json!({
@@ -355,7 +355,7 @@ impl<'a> Ctx<'a> {
         )
     }
 
-    pub fn type_text(&mut self, target: &str, text: &str) -> Result<(), Failure> {
+    pub(crate) fn type_text(&mut self, target: &str, text: &str) -> Result<(), Failure> {
         self.ok(
             "type_text",
             json!({"target_ref": target, "text": text, "observation": {"mode": "none"}}),
@@ -363,7 +363,7 @@ impl<'a> Ctx<'a> {
         .map(drop)
     }
 
-    pub fn press(&mut self, target: &str, keys: &[&str]) -> Result<(), Failure> {
+    pub(crate) fn press(&mut self, target: &str, keys: &[&str]) -> Result<(), Failure> {
         self.ok(
             "press_keys",
             json!({"target_ref": target, "keys": keys, "observation": {"mode": "none"}}),
@@ -371,7 +371,7 @@ impl<'a> Ctx<'a> {
         .map(drop)
     }
 
-    pub fn expect(
+    pub(crate) fn expect(
         &mut self,
         key: &str,
         what: &str,
@@ -407,11 +407,7 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    pub fn typed(&self, key: &str) -> Result<String, Failure> {
-        Ok(events::typed(&self.window(key)?.events()))
-    }
-
-    pub fn helper(&mut self, args: &[&str]) -> Result<Output, Failure> {
+    pub(crate) fn helper(&mut self, args: &[&str]) -> Result<Output, Failure> {
         let started = Instant::now();
         let output = (self.helper)(args).map_err(Failure::host);
         self.record(

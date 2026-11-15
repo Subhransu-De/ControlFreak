@@ -15,6 +15,9 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.8
+exceptions = [
+    { crate = "borrow-or-share", allow = ["MIT-0"] },
+]
 
 [licenses.private]
 ignore = true

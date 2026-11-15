@@ -14,7 +14,7 @@ use std::{
 const GREEN: (u8, u8, u8) = (0x2E, 0x8B, 0x57);
 const MAGENTA: (u8, u8, u8) = (0xFF, 0x00, 0xFF);
 
-pub fn suite() -> Suite {
+pub(crate) fn suite() -> Suite {
     Suite {
         name: "smoke",
         about: "One tool behavior per task on one disposable window",

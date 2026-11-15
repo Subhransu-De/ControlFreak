@@ -14,9 +14,9 @@ const BUILTIN: &[(&str, &str)] = &[
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Scene {
-    pub description: String,
+    pub(crate) description: String,
     #[serde(rename = "window")]
-    pub windows: Vec<WindowSpec>,
+    pub(crate) windows: Vec<WindowSpec>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -24,15 +24,15 @@ pub struct Scene {
 pub struct WindowSpec {
     pub key: String,
     #[serde(default = "default_color")]
-    pub color: String,
+    pub(crate) color: String,
     #[serde(default = "default_position")]
-    pub position: [i32; 2],
+    pub(crate) position: [i32; 2],
     #[serde(default)]
-    pub topmost: bool,
+    pub(crate) topmost: bool,
     #[serde(default)]
-    pub dialog: bool,
+    pub(crate) dialog: bool,
     #[serde(default = "default_lifetime")]
-    pub lifetime_secs: u32,
+    pub(crate) lifetime_secs: u32,
 }
 
 fn default_color() -> String {
@@ -48,13 +48,13 @@ const fn default_lifetime() -> u32 {
 }
 
 impl Scene {
-    pub fn parse(text: &str) -> Result<Self, String> {
+    pub(crate) fn parse(text: &str) -> Result<Self, String> {
         let scene: Self = toml::from_str(text).map_err(|error| error.to_string())?;
         scene.validate()?;
         Ok(scene)
     }
 
-    pub fn builtin(name: &str) -> Result<Self, String> {
+    pub(crate) fn builtin(name: &str) -> Result<Self, String> {
         let (_, text) = BUILTIN
             .iter()
             .find(|(known, _)| *known == name)
@@ -62,7 +62,8 @@ impl Scene {
         Self::parse(text).map_err(|error| format!("scene {name}: {error}"))
     }
 
-    pub fn names() -> impl Iterator<Item = &'static str> {
+    #[cfg(test)]
+    fn names() -> impl Iterator<Item = &'static str> {
         BUILTIN.iter().map(|(name, _)| *name)
     }
 

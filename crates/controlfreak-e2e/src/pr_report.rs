@@ -1,9 +1,9 @@
 use serde_json::Value;
 use std::fmt::Write as _;
 
-pub const MARKER: &str = "<!-- controlfreak-test-report -->";
-pub const WORKSPACE_JOB: &str = "Tests";
-pub const E2E_JOB: &str = "Live desktop tests";
+pub(crate) const MARKER: &str = "<!-- controlfreak-test-report -->";
+pub(crate) const WORKSPACE_JOB: &str = "Tests";
+pub(crate) const E2E_JOB: &str = "Live desktop tests";
 const LIMIT: usize = 60_000;
 const MAX_FAILURES: usize = 5;
 const MAX_TEST_NAMES: usize = 20;
@@ -11,19 +11,19 @@ const STEP_TAIL: usize = 8;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CargoTests {
-    pub passed: u64,
-    pub failed: u64,
-    pub ignored: u64,
-    pub failures: Vec<String>,
+    pub(crate) passed: u64,
+    pub(crate) failed: u64,
+    pub(crate) ignored: u64,
+    pub(crate) failures: Vec<String>,
 }
 
 impl CargoTests {
-    pub fn total(&self) -> u64 {
+    pub(crate) fn total(&self) -> u64 {
         self.passed + self.failed
     }
 }
 
-pub fn parse_cargo_test(log: &str) -> Option<CargoTests> {
+pub(crate) fn parse_cargo_test(log: &str) -> Option<CargoTests> {
     let mut tests = CargoTests::default();
     let mut seen = false;
     for raw in log.lines() {
@@ -80,22 +80,22 @@ fn strip_ansi(text: &str) -> String {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct E2eRun {
-    pub strict: bool,
-    pub tools: Vec<String>,
-    pub tasks: Vec<E2eTask>,
-    pub calls: Vec<(String, u64)>,
+    pub(crate) strict: bool,
+    pub(crate) tools: Vec<String>,
+    pub(crate) tasks: Vec<E2eTask>,
+    pub(crate) calls: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct E2eTask {
-    pub suite: String,
-    pub task: String,
-    pub outcome: String,
-    pub took_ms: u64,
-    pub failure_kind: String,
-    pub failure_message: String,
-    pub missing: Vec<String>,
-    pub steps: Vec<String>,
+    pub(crate) suite: String,
+    pub(crate) task: String,
+    pub(crate) outcome: String,
+    pub(crate) took_ms: u64,
+    pub(crate) failure_kind: String,
+    pub(crate) failure_message: String,
+    pub(crate) missing: Vec<String>,
+    pub(crate) steps: Vec<String>,
 }
 
 impl E2eRun {
@@ -110,7 +110,7 @@ impl E2eRun {
     }
 }
 
-pub fn parse_e2e(timeline: &str, run_json: Option<&str>) -> E2eRun {
+pub(crate) fn parse_e2e(timeline: &str, run_json: Option<&str>) -> E2eRun {
     let mut run = E2eRun::default();
     if let Some(summary) = run_json.and_then(|text| serde_json::from_str::<Value>(text).ok()) {
         run.strict = summary["strict"].as_bool().unwrap_or(false);
@@ -218,17 +218,17 @@ fn seconds(ms: u64) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
-    pub name: String,
-    pub conclusion: Option<String>,
-    pub seconds: Option<u64>,
+    pub(crate) name: String,
+    pub(crate) conclusion: Option<String>,
+    pub(crate) seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Results {
-    pub commit: String,
-    pub workspace: Option<CargoTests>,
-    pub e2e: Option<E2eRun>,
-    pub jobs: Vec<Job>,
+    pub(crate) commit: String,
+    pub(crate) workspace: Option<CargoTests>,
+    pub(crate) e2e: Option<E2eRun>,
+    pub(crate) jobs: Vec<Job>,
 }
 
 impl Results {
@@ -237,20 +237,20 @@ impl Results {
     }
 }
 
-pub struct Report<'a> {
-    pub current: &'a Results,
-    pub baseline: Option<&'a Results>,
-    pub run_url: &'a str,
+pub(crate) struct Report<'a> {
+    pub(crate) current: &'a Results,
+    pub(crate) baseline: Option<&'a Results>,
+    pub(crate) run_url: &'a str,
 }
 
-pub fn render_running(commit: &str, run_url: &str) -> String {
+pub(crate) fn render_running(commit: &str, run_url: &str) -> String {
     format!(
         "{MARKER}\n### ⏳ Tests running\n\nThe workspace tests and the live e2e suites are running for `{}`. This comment updates when the run finishes.\n\n<sub>[CI run]({run_url})</sub>\n",
         short(commit)
     )
 }
 
-pub fn render(report: &Report<'_>) -> String {
+pub(crate) fn render(report: &Report<'_>) -> String {
     let current = report.current;
     let e2e = current.e2e.as_ref();
     let mut sections: Vec<(u8, String)> = vec![(0, format!("{MARKER}\n{}\n", title(current)))];
@@ -758,7 +758,7 @@ fn duration(seconds: u64) -> String {
     }
 }
 
-pub fn parse_timestamp(text: &str) -> Option<i64> {
+pub(crate) fn parse_timestamp(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
     if bytes.len() < 20 || bytes[4] != b'-' || bytes[10] != b'T' {
         return None;
@@ -776,7 +776,7 @@ pub fn parse_timestamp(text: &str) -> Option<i64> {
     Some(days * 86_400 + hour * 3600 + minute * 60 + second)
 }
 
-pub fn parse_jobs(json: &str) -> Vec<Job> {
+pub(crate) fn parse_jobs(json: &str) -> Vec<Job> {
     let Ok(value) = serde_json::from_str::<Value>(json) else {
         return Vec::new();
     };

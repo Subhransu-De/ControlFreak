@@ -10,7 +10,7 @@ const INVOICE: &str = "INV 4471 1280";
 const ROUND_TRIPS: usize = 10;
 const ROUND_LIMIT: Duration = Duration::from_secs(3);
 
-pub fn suite() -> Suite {
+pub(crate) fn suite() -> Suite {
     Suite {
         name: "handoff",
         about: "Typing moves between two windows of two processes, one session at a time",

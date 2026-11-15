@@ -4,16 +4,16 @@ use std::collections::HashMap;
 pub struct Regions(HashMap<String, [i32; 4]>);
 
 impl Regions {
-    pub fn get(&self, name: &str) -> Option<[i32; 4]> {
+    pub(crate) fn get(&self, name: &str) -> Option<[i32; 4]> {
         self.0.get(name).copied()
     }
 
-    pub fn center(&self, name: &str) -> Option<(i32, i32)> {
+    pub(crate) fn center(&self, name: &str) -> Option<(i32, i32)> {
         let [left, top, right, bottom] = self.get(name)?;
         Some((left.midpoint(right), top.midpoint(bottom)))
     }
 
-    pub fn contains(&self, name: &str, point: (i32, i32)) -> bool {
+    pub(crate) fn contains(&self, name: &str, point: (i32, i32)) -> bool {
         self.get(name).is_some_and(|[left, top, right, bottom]| {
             point.0 >= left && point.0 < right && point.1 >= top && point.1 < bottom
         })
@@ -53,7 +53,7 @@ pub enum Event {
 }
 
 impl Event {
-    pub fn parse(line: &str) -> Self {
+    pub(crate) fn parse(line: &str) -> Self {
         let parts: Vec<&str> = line.split_whitespace().collect();
         let parsed = match parts.as_slice() {
             ["ready", fields @ ..] => Some(Self::Ready(parse_regions(fields))),
@@ -95,7 +95,7 @@ impl Event {
         parsed.unwrap_or_else(|| Self::Other(line.to_owned()))
     }
 
-    pub fn is_input(&self) -> bool {
+    pub(crate) fn is_input(&self) -> bool {
         matches!(
             self,
             Self::KeyDown { .. } | Self::KeyUp { .. } | Self::Char { .. } | Self::Mouse { .. }
@@ -121,18 +121,18 @@ fn parse_regions(fields: &[&str]) -> Regions {
     Regions(regions)
 }
 
-pub fn parse_log(text: &str) -> Vec<Event> {
+pub(crate) fn parse_log(text: &str) -> Vec<Event> {
     text.lines().map(Event::parse).collect()
 }
 
-pub fn ready(events: &[Event]) -> Option<&Regions> {
+pub(crate) fn ready(events: &[Event]) -> Option<&Regions> {
     events.iter().find_map(|event| match event {
         Event::Ready(regions) => Some(regions),
         _ => None,
     })
 }
 
-pub fn typed(events: &[Event]) -> String {
+pub(crate) fn typed(events: &[Event]) -> String {
     events
         .iter()
         .filter_map(|event| match event {
@@ -144,7 +144,7 @@ pub fn typed(events: &[Event]) -> String {
         .collect()
 }
 
-pub fn left_downs(events: &[Event], role: &str) -> Vec<(i32, i32)> {
+pub(crate) fn left_downs(events: &[Event], role: &str) -> Vec<(i32, i32)> {
     events
         .iter()
         .filter_map(|event| match event {
@@ -159,25 +159,25 @@ pub fn left_downs(events: &[Event], role: &str) -> Vec<(i32, i32)> {
         .collect()
 }
 
-pub fn has_key_down(events: &[Event], vk: u16) -> bool {
+pub(crate) fn has_key_down(events: &[Event], vk: u16) -> bool {
     events
         .iter()
         .any(|event| matches!(event, Event::KeyDown { role, vk: v } if role == "main" && *v == vk))
 }
 
-pub fn button_pressed(events: &[Event], name: &str) -> bool {
+pub(crate) fn button_pressed(events: &[Event], name: &str) -> bool {
     events
         .iter()
         .any(|event| matches!(event, Event::Button { name: n, .. } if n == name))
 }
 
-pub fn activated(events: &[Event]) -> bool {
+pub(crate) fn activated(events: &[Event]) -> bool {
     events
         .iter()
         .any(|event| matches!(event, Event::Activate { role, state: 1 | 2 } if role == "main"))
 }
 
-pub fn near(actual: (i32, i32), wanted: (i32, i32)) -> bool {
+pub(crate) fn near(actual: (i32, i32), wanted: (i32, i32)) -> bool {
     (actual.0 - wanted.0).abs() <= 1 && (actual.1 - wanted.1).abs() <= 1
 }
 

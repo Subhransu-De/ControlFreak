@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const GATE: &str = "CONTROLFREAK_LIVE_DESKTOP";
+pub(crate) const GATE: &str = "CONTROLFREAK_LIVE_DESKTOP";
 const SERVER_EXE: &str = "controlfreak.exe";
 const FIXTURE_EXE: &str = "controlfreak-fixture.exe";
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -27,8 +27,8 @@ pub fn require_live_desktop() -> Result<(), String> {
 
 #[derive(Debug, Clone)]
 pub struct Binaries {
-    pub server: PathBuf,
-    pub fixture: PathBuf,
+    pub(crate) server: PathBuf,
+    pub(crate) fixture: PathBuf,
 }
 
 impl Binaries {
@@ -57,7 +57,7 @@ impl Binaries {
         Ok(binaries)
     }
 
-    pub fn launch_server(&self, stderr_log: &Path) -> Result<McpClient, String> {
+    pub(crate) fn launch_server(&self, stderr_log: &Path) -> Result<McpClient, String> {
         let stderr = fs::File::create(stderr_log)
             .map_err(|error| format!("cannot create {}: {error}", stderr_log.display()))?;
         let mut child = Command::new(&self.server)
@@ -76,7 +76,7 @@ impl Binaries {
             .map_err(|error| error.to_string())
     }
 
-    pub fn open_window(
+    pub(crate) fn open_window(
         &self,
         spec: &WindowSpec,
         unique: &str,
@@ -127,7 +127,7 @@ impl Binaries {
         }
     }
 
-    pub fn fixture_helper(&self, args: &[&str]) -> Result<Output, String> {
+    pub(crate) fn fixture_helper(&self, args: &[&str]) -> Result<Output, String> {
         Command::new(&self.fixture)
             .args(args)
             .output()
@@ -136,19 +136,19 @@ impl Binaries {
 }
 
 pub struct Window {
-    pub key: String,
-    pub title: String,
-    pub log: PathBuf,
+    pub(crate) key: String,
+    pub(crate) title: String,
+    pub(crate) log: PathBuf,
     child: Child,
-    pub regions: events::Regions,
+    pub(crate) regions: events::Regions,
 }
 
 impl Window {
-    pub fn process_id(&self) -> u32 {
+    pub(crate) fn process_id(&self) -> u32 {
         self.child.id()
     }
 
-    pub fn events(&self) -> Vec<events::Event> {
+    pub(crate) fn events(&self) -> Vec<events::Event> {
         events::parse_log(&fs::read_to_string(&self.log).unwrap_or_default())
     }
 }
