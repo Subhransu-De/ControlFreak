@@ -284,7 +284,17 @@ pub fn publish(directory: &Path, tag: &str, metadata: &Metadata) -> Result<()> {
         ),
     )?;
     let mut command = Command::new("gh");
-    command.args(["release", "create", tag, "--verify-tag", "--title", tag]);
+    // GitHub appends its generated list of merged pull requests and their authors, grouped by
+    // .github/release.yml, after the changelog section, so the release also credits contributors.
+    command.args([
+        "release",
+        "create",
+        tag,
+        "--verify-tag",
+        "--title",
+        tag,
+        "--generate-notes",
+    ]);
     if version.contains('-') {
         command.arg("--prerelease");
     }

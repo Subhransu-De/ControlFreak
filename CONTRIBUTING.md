@@ -90,6 +90,14 @@ Run `cargo test -p xtask --locked` for its focused tests. CI uses the same comma
 `cargo xtask publish` is restricted to the GitHub Actions release workflow and verifies that the
 remote tag points to the built commit. Release notes come from the matching changelog section.
 
+## Releasing
+
+Releases start from the **Release** workflow in the Actions tab with **Run workflow** on `main`. Enter a version such as `0.3.0` or `0.3.0-rc.1`, or leave it empty for the next patch version (the release of a prerelease, for example `0.3.0-rc.1` to `0.3.0`). Tick **Dry run** to build and verify on any branch without committing, tagging or publishing.
+
+A release needs a passing CI run on the selected `main` commit. The build job prepares the version and changelog, builds, tests and verifies the package, and writes the version and release notes to the run summary. The publish job then waits on the `release` environment. Open the run, read the summary, and use **Review deployments** to approve or reject it. Approval commits the version and changelog to `main`, tags the commit, and publishes the GitHub release; stable releases are then submitted to winget. Rejecting it changes nothing. If `main` moves while the release waits, the push fails and nothing is published, so start a new release. To retry publication of an existing tag, run the workflow on that tag.
+
+The `release` environment must exist with the maintainer as a required reviewer and deployments limited to `main` and `v*` tags. Without it, GitHub creates an unprotected environment and the release publishes without approval.
+
 Automated package checks make only version/capability and MCP initialize, tools/list and server-status
 requests. They do not capture desktop content or inject input. An elevated runner additionally checks
 default startup refusal before explicit opt-in for these harmless requests. Test a non-elevated clean
