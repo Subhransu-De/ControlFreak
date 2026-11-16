@@ -85,6 +85,7 @@ desktop and run inside a [control session](sessions.md).
 - A refused or timed-out activation (`activation_refused`, `settle_timeout`) leaves the session intact and is retryable, as its `retryable` says. Only a change of the approved window itself ends the session.
 - `timeout_ms` defaults to 1000 and accepts 100 to 5000.
 - It never sends keyboard or mouse input to get focus.
+- Windows lets a process take the foreground only while no user input has arrived since that process started. The server starts before the user types a request, so Windows refuses the server's own request once the user has typed or clicked anywhere. When that happens, `focus_window` asks once more through a short-lived copy of the server (`controlfreak --activation-helper`), started for this request only, which makes the same `SetForegroundWindow` call for the already validated window and exits. It may use only what is left of `timeout_ms`, at most 1.5 seconds, and a stop or cancellation terminates it at once. `input.activation_helper` reports it: `accepted`, `refused` or `failed` (it could not start, did not answer in time, was stopped, or found the window owned by another process). When its answer was lost after it may have made the call, `input.input_outcome` stays `unknown`. The field is absent when the helper was not needed.
 - Errors: `activation_refused`, `settle_timeout`, `target_invalidated`, and the integrity errors.
 
 ## Coordinates
@@ -191,6 +192,7 @@ depends on what an earlier step shows.
 | `input.sent_events` | Count of input events Windows accepted |
 | `input.cleanup` | `not_needed`, `succeeded`, `unknown` |
 | `input.target_remained_foreground` | `true`, `false` or `null` after the action |
+| `input.activation_helper` | `focus_window` only, when Windows refused the server: `accepted`, `refused` or `failed` |
 | `observation_status` | `succeeded`, `failed`, `not_attempted` |
 | `effect_verification` | Always `unverified` |
 | `retry_action` | Always `false` |
@@ -225,7 +227,7 @@ Every error also has `error.retryable`. It says whether repeating the same reque
 
 `higher_integrity_target` and `target_integrity_unavailable` have no `reason` and are not retryable. When the code is about the foreground window, the keyboard focus or the pointer destination, the session is kept, and retrying cannot help until the user changes which window is in front. When it is about the target window itself, the session ends.
 
-A failed foreground activation (`focus_window`) is retryable and keeps the session. Ask the user to click the window first, because Windows can refuse focus changes from a background process.
+A failed foreground activation (`focus_window`) is retryable and keeps the session. The activation helper has then been refused too, so ask the user to click the window first, because Windows can refuse focus changes from a background process.
 
 The reason for `platform_operation_failed` is set by the code that detects the failure, not read from the message text, so rewording a message never changes it.
 

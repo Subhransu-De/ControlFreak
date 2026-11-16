@@ -105,6 +105,10 @@ async fn try_main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if controlfreak_platform::serve_desktop_glow_helper(&arguments)?.is_some() {
         return Ok(());
     }
+    #[cfg(target_os = "windows")]
+    if let Some(code) = controlfreak_platform::serve_activation_helper(&arguments) {
+        std::process::exit(code);
+    }
     let options = parse_options(arguments)?;
     match options.command {
         Command::Serve => run_server(options.allow_elevated).await,
@@ -338,9 +342,11 @@ fn run_ocr_helper() -> Result<(), Box<dyn Error + Send + Sync>> {
 fn platform_backend(
     security_context: SecurityContext,
 ) -> Result<Box<dyn PlatformBackend>, Box<dyn Error + Send + Sync>> {
-    let helper = OcrHelperCommand::new(env::current_exe()?).arg("--ocr-helper");
-    Ok(controlfreak_platform::backend_with_ocr_helper_and_security(
+    let executable = env::current_exe()?;
+    let helper = OcrHelperCommand::new(&executable).arg("--ocr-helper");
+    Ok(controlfreak_platform::backend_with_helpers_and_security(
         helper,
+        executable,
         security_context,
     ))
 }

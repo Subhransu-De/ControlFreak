@@ -30,6 +30,7 @@ pub(crate) fn suite() -> Suite {
                 .requires(&[Capability::Ocr]),
             task("owned-dialog-accepted", owned_dialog).scene("with-dialog"),
             task("foreign-window-refused", foreign_refused).scene("two-processes"),
+            task("focus-after-user-input", focus_after_user_input).scene("two-processes"),
             task("taskbar-target-ref", taskbar_target).requires(&[Capability::TaskbarForeground]),
             task("injected-stop-click-ignored", injected_stop_click)
                 .scene("single")
@@ -313,6 +314,62 @@ fn foreign_refused(cx: &mut Ctx<'_>) -> Result<(), Failure> {
         leaked.is_empty(),
         "the foreign window received input: {leaked:?}"
     );
+    cx.end()
+}
+
+/// Windows lets a process take the foreground only while no input has arrived since it started.
+/// The server starts before the user types the request, so on a real desktop its own
+/// `SetForegroundWindow` is refused from then on. This task recreates that: the harness starts
+/// the server, then a click is injected into `journal`, the "app the user was working in". The
+/// server's own request for `ledger` must now be refused, and the activation helper must still
+/// bring `ledger` to the front.
+fn focus_after_user_input(cx: &mut Ctx<'_>) -> Result<(), Failure> {
+    let ledger = cx.target("ledger")?;
+    let journal = cx.center("journal", "edit")?;
+    let output = cx.helper(&["--inject-click", &format!("{},{}", journal.0, journal.1)])?;
+    ensure!(
+        output.status.success(),
+        "the fixture could not inject the click"
+    );
+    cx.expect("journal", "the injected click", |e| {
+        !events::left_downs(e, "main").is_empty()
+    })?;
+    let foreground = cx.ok("list_windows", json!({}))?;
+    let journal_id = cx.target("journal")?;
+    ensure!(
+        foreground["windows"][0]["id"] == journal_id.as_str()
+            && foreground["windows"][0]["is_foreground"] == true,
+        "the click did not leave journal in front: {foreground}"
+    );
+    let activations_before = events::activations(&cx.window("ledger")?.events());
+    cx.begin(&ledger)?;
+    let focused = cx.ok(
+        "focus_window",
+        json!({"window_id": ledger, "observation": {"mode": "none"}}),
+    )?;
+    ensure!(
+        focused["input"]["activation_helper"] == "accepted",
+        "the foreground lock was not reproduced or not overcome: the server's own request must be refused and the helper's accepted: {focused}"
+    );
+    cx.expect("ledger", "an activation after the click", |e| {
+        events::activations(e) > activations_before
+    })?;
+    let windows = cx.ok("list_windows", json!({}))?;
+    ensure!(
+        windows["windows"][0]["id"] == ledger.as_str()
+            && windows["windows"][0]["is_foreground"] == true,
+        "ledger is not in front: {windows}"
+    );
+    let edit = cx.center("ledger", "edit")?;
+    let clicked = cx.click(&ledger, edit)?;
+    ensure!(
+        !clicked.is_error,
+        "input after the helper's activation was refused: {}",
+        clicked.structured
+    );
+    cx.expect("ledger", "the click after activation", |e| {
+        !events::left_downs(e, "main").is_empty()
+    })?;
     cx.end()
 }
 
