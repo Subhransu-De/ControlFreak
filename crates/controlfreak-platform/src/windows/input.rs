@@ -300,51 +300,73 @@ where
     send_text_checking_held_keys(utf16, control, validate_target, send, |_| false, pace)
 }
 
-/// Pause between two typed keystrokes, after the foreground thread has taken the earlier one, so
-/// an application that takes several queued keystrokes before translating them can translate it
-/// first. Close to the per-key delay of other input tools (`AutoHotkey`'s `SendEvent` waits
-/// 10 ms, xdotool 12 ms).
+/// Pause between two typed keystrokes, after the keyboard-focus window has answered, so an
+/// application that takes several queued keystrokes before translating them is likely to have
+/// translated the earlier one. Close to the per-key delay of other input tools (`AutoHotkey`'s
+/// `SendEvent` waits 10 ms, xdotool 12 ms).
 const KEYSTROKE_GAP: Duration = Duration::from_millis(10);
-/// Longest wait for the foreground window to answer before typing stops.
+/// Longest wait for the keyboard-focus window to answer before typing stops.
 const KEYSTROKE_ANSWER_LIMIT: Duration = Duration::from_secs(5);
 /// One answer wait. Cancellation is checked between them.
 const KEYSTROKE_ANSWER_SLICE_MS: u32 = 100;
 
-/// What the foreground window's thread did with one `WM_NULL`.
+/// What the keyboard-focus window's thread did with one `WM_NULL`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Answer {
-    /// It retrieved messages, so it has taken the keystroke queued before the question.
+    /// It retrieved messages since the question was sent. That shows it is responsive, not that
+    /// it took the earlier keystroke: a thread that retrieves only some messages can answer
+    /// without taking keyboard input.
     Answered,
     /// It did not retrieve messages within one slice.
     Busy,
-    /// It cannot be asked: no foreground window, a window that is gone, or a refused message.
-    /// Pacing falls back to the gap, and the next target validation reports a lost target.
+    /// It cannot be asked: no window, a window that is gone, or a refused message. Pacing falls
+    /// back to the gap, and the next target validation reports a lost target.
     Unavailable,
 }
 
-/// Paces the keystroke about to be sent behind the previous one: waits until the foreground
-/// thread answers (it has taken the previous keystroke), gives it `KEYSTROKE_GAP` to translate,
-/// then waits for another answer (it is retrieving messages again, not busy).
+/// Paces the keystroke about to be sent behind earlier input: waits until the window that
+/// receives keystrokes answers (its thread is retrieving messages), pauses `KEYSTROKE_GAP`, then
+/// waits for another answer (it is retrieving messages again, not stuck handling the keystroke).
 fn wait_for_previous_keystroke(control: &MutationControl) -> Result<(), PlatformError> {
-    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     let _timer = controlfreak_core::timing::start("keystroke_pace");
-    // SAFETY: GetForegroundWindow takes no arguments and returns a handle value only.
-    let window = unsafe { GetForegroundWindow() };
+    let window = keystroke_recipient();
     let ask = || ask_window(window);
     wait_for_answer(control, KEYSTROKE_ANSWER_LIMIT, ask)?;
     thread::sleep(KEYSTROKE_GAP);
     wait_for_answer(control, KEYSTROKE_ANSWER_LIMIT, ask)
 }
 
+/// The window keystrokes go to: the keyboard focus of the foreground thread, which can belong
+/// to another thread or process than the foreground frame, or the foreground window itself.
+fn keystroke_recipient() -> windows::Win32::Foundation::HWND {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo,
+    };
+    let mut gui = GUITHREADINFO {
+        cbSize: u32::try_from(size_of::<GUITHREADINFO>()).unwrap_or(0),
+        ..Default::default()
+    };
+    // SAFETY: `gui` is a correctly sized writable record for the synchronous call; zero queries
+    // the foreground thread.
+    if unsafe { GetGUIThreadInfo(0, &raw mut gui) }.is_ok() && !gui.hwndFocus.is_invalid() {
+        return gui.hwndFocus;
+    }
+    // SAFETY: GetForegroundWindow takes no arguments and returns a handle value only.
+    unsafe { GetForegroundWindow() }
+}
+
 fn ask_window(window: windows::Win32::Foundation::HWND) -> Answer {
     use windows::Win32::{
-        Foundation::{ERROR_TIMEOUT, GetLastError, LPARAM, WPARAM},
+        Foundation::{ERROR_SUCCESS, ERROR_TIMEOUT, GetLastError, LPARAM, SetLastError, WPARAM},
         UI::WindowsAndMessaging::{SMTO_NORMAL, SendMessageTimeoutW, WM_NULL},
     };
     if window.is_invalid() {
         return Answer::Unavailable;
     }
     let mut result = 0_usize;
+    // SAFETY: SetLastError writes only this thread's last-error value. SendMessageTimeoutW does
+    // not set it on every failure, so it is cleared first to tell a timeout from other failures.
+    unsafe { SetLastError(ERROR_SUCCESS) };
     // SAFETY: WM_NULL carries no pointers and the receiver ignores it. `result` is writable for
     // the synchronous call. A window that is destroyed meanwhile fails the call instead.
     let answered = unsafe {
@@ -361,7 +383,7 @@ fn ask_window(window: windows::Win32::Foundation::HWND) -> Answer {
     if answered.0 != 0 {
         return Answer::Answered;
     }
-    // SAFETY: GetLastError reads this thread's last-error value, set by the failed call above.
+    // SAFETY: GetLastError reads only this thread's last-error value, cleared before the call.
     let error = unsafe { GetLastError() };
     if error == ERROR_TIMEOUT {
         Answer::Busy
@@ -387,8 +409,8 @@ fn wait_for_answer(
                     controlfreak_core::FailureCause::TargetNotResponding,
                     "type_text",
                     format!(
-                        "the foreground window stopped processing input for {} s, so typing \
-                         stopped; observe it before typing the rest",
+                        "the window receiving keystrokes stopped processing input for {} s, so \
+                         typing stopped; observe it before typing the rest",
                         limit.as_secs()
                     ),
                 ));
@@ -400,20 +422,22 @@ fn wait_for_answer(
 /// Virtual keys of the four modifiers: Shift, Ctrl, Alt, and the left and right Win keys.
 const HELD_MODIFIER_KEYS: [i32; 5] = [0x10, 0x11, 0x12, 0x5B, 0x5C];
 
-/// Types one keystroke per `SendInput` call, each paced behind the one before.
+/// Types one keystroke per `SendInput` call, each paced behind whatever the application was
+/// handling before it, including input from an earlier call such as a previous `run_actions` step.
 ///
 /// A `WM_KEYDOWN` for a Unicode packet (`VK_PACKET`) does not carry its character. Windows keeps
 /// the character of the packet most recently taken from the thread's queue, and
 /// `TranslateMessage` reads it from there. An application that takes several queued keystrokes
 /// before translating them, as a busy UI framework can, turns all of them into the last
 /// character: a greeting sent as one burst arrived in Notepad as "Hello,!!!!!!!!!!!". So
-/// every unit goes alone and `pace` holds the next one until the application has taken it.
-/// Nothing outside the application can see when it translated a keystroke, so an application
-/// whose own handling of one keystroke takes longer than `KEYSTROKE_GAP` can still mistranslate.
+/// every UTF-16 unit goes alone, and `pace` holds the next one back while the application looks
+/// busy. Nothing outside the application can see when it took or translated a keystroke, so
+/// pacing makes this unlikely rather than impossible; `effect_verification` stays `unverified`.
 ///
-/// The target is validated before every character. The halves of a surrogate pair are sent and
-/// paced separately too, since an application that took both before translating would get two
-/// low surrogates. A cancellation between them stops before the second half.
+/// The target is validated before every unit, because pacing leaves time for the foreground to
+/// change. That includes the second half of a surrogate pair, whose halves are paced separately
+/// so an application that took both before translating could not get two low surrogates. A
+/// refusal or cancellation between the halves stops before the second half.
 ///
 /// Unicode packets carry no virtual key, so only the Enter and Tab segments can repeat a key the
 /// person already holds. Those go through the same held-key refusal as `press_keys`, before
@@ -431,31 +455,19 @@ where
     S: FnMut(&[INPUT]) -> Result<usize, PlatformError>,
     P: FnMut(&MutationControl) -> Result<(), PlatformError>,
 {
-    let mut sent_before = false;
-    let mut after_previous = |control: &MutationControl| {
-        if std::mem::replace(&mut sent_before, true) {
-            pace(control)
-        } else {
-            Ok(())
-        }
-    };
     for segment in text_segments(utf16) {
         match segment {
             TextSegment::Text(units) => {
-                for character in utf16_characters(units) {
-                    for (index, unit) in character.iter().enumerate() {
-                        after_previous(control)?;
-                        if index == 0 {
-                            control.check("type_text")?;
-                            validate_target()?;
-                        }
-                        let inputs = [unicode_input(*unit, false), unicode_input(*unit, true)];
-                        send_releasing("type_text", &inputs, control, &mut send)?;
-                    }
+                for unit in units {
+                    pace(control)?;
+                    control.check("type_text")?;
+                    validate_target()?;
+                    let inputs = [unicode_input(*unit, false), unicode_input(*unit, true)];
+                    send_releasing("type_text", &inputs, control, &mut send)?;
                 }
             }
             TextSegment::Key(key) => {
-                after_previous(control)?;
+                pace(control)?;
                 control.check("type_text")?;
                 let inputs = [keyboard_input(key, false), keyboard_input(key, true)];
                 // A held modifier would turn the key into a shortcut (Alt+Tab, Ctrl+Enter), which
@@ -520,21 +532,6 @@ fn text_segments(utf16: &[u16]) -> Vec<TextSegment<'_>> {
         segments.push(TextSegment::Text(&utf16[start..]));
     }
     segments
-}
-
-/// Splits UTF-16 into characters: a surrogate pair stays together, any other unit stands alone.
-fn utf16_characters(utf16: &[u16]) -> impl Iterator<Item = &[u16]> {
-    let mut rest = utf16;
-    std::iter::from_fn(move || {
-        let first = *rest.first()?;
-        let pair = (0xD800..=0xDBFF).contains(&first)
-            && rest
-                .get(1)
-                .is_some_and(|second| (0xDC00..=0xDFFF).contains(second));
-        let (character, remaining) = rest.split_at(if pair { 2 } else { 1 });
-        rest = remaining;
-        Some(character)
-    })
 }
 
 /// The virtual key for `key` under the foreground window's keyboard layout.
@@ -1610,19 +1607,32 @@ mod progress_tests {
     }
 
     #[test]
-    fn characters_keep_surrogate_pairs_together() {
-        let text = utf16("a\u{1f980}b\u{e9}\u{1f980}");
-        let characters: Vec<&[u16]> = utf16_characters(&text).collect();
-        assert_eq!(characters.concat(), text);
-        assert_eq!(
-            characters.iter().map(|c| c.len()).collect::<Vec<_>>(),
-            [1, 2, 1, 1, 2]
+    fn a_target_lost_while_pacing_a_pair_gets_no_second_half() {
+        let control = MutationControl::default();
+        let mut validations = 0;
+        let mut sent = Vec::new();
+        let result = send_unicode_text_with(
+            &utf16("\u{1f980}"),
+            &control,
+            || {
+                validations += 1;
+                // The foreground changes while the first half is paced.
+                if validations == 2 {
+                    Err(failure())
+                } else {
+                    Ok(())
+                }
+            },
+            |inputs| {
+                // SAFETY: Every INPUT here was built by this module as a keyboard event.
+                sent.push(unsafe { inputs[0].Anonymous.ki.wScan });
+                Ok(inputs.len())
+            },
+            |_| Ok(()),
         );
-        // Unpaired surrogates stand alone instead of swallowing a neighbour.
-        assert_eq!(utf16_characters(&[0xD83E, 0x41]).count(), 2);
-        assert_eq!(utf16_characters(&[0xDD80, 0xD83E]).count(), 2);
-        assert_eq!(utf16_characters(&[0xD83E]).count(), 1);
-        assert_eq!(utf16_characters(&[]).count(), 0);
+        assert!(result.is_err());
+        assert_eq!(sent, [0xD83E]);
+        assert_eq!(control.progress().sent_events, 2);
     }
 
     #[test]
@@ -1702,29 +1712,32 @@ mod progress_tests {
     }
 
     #[test]
-    fn every_keystroke_after_the_first_waits_for_the_one_before() {
+    fn every_keystroke_is_paced_then_validated_then_sent_alone() {
         use Step::{Pace, Send, Validate};
         assert_eq!(
             typing_steps("Hi\u{1f980}\n"),
             [
+                // The first keystroke waits too: the application may still be handling input
+                // from an earlier call, such as a previous run_actions step.
+                Pace,
                 Validate,
                 Send(0x48),
                 Pace,
                 Validate,
                 Send(0x69),
+                // Both halves of a pair are paced and validated like any other unit.
                 Pace,
-                // Both halves of a pair are paced, but the target is validated once per character.
                 Validate,
                 Send(0xD83E),
                 Pace,
+                Validate,
                 Send(0xDD80),
                 Pace,
                 Validate,
                 Send(0x0D),
             ]
         );
-        // A single keystroke has nothing before it to wait for.
-        assert_eq!(typing_steps("x"), [Validate, Send(0x78)]);
+        assert_eq!(typing_steps("x"), [Pace, Validate, Send(0x78)]);
     }
 
     #[test]
@@ -1742,7 +1755,7 @@ mod progress_tests {
             },
             |control| {
                 paces += 1;
-                if paces == 2 {
+                if paces == 3 {
                     wait_for_answer(control, Duration::ZERO, || Answer::Busy)
                 } else {
                     Ok(())
@@ -1757,12 +1770,26 @@ mod progress_tests {
             control.progress().input_outcome,
             InputOutcome::PartiallySent
         );
+
+        // A window that is not answering before anything was typed gets nothing.
+        let control = MutationControl::default();
+        let error = send_unicode_text_with(
+            &utf16("ab"),
+            &control,
+            || Ok(()),
+            |_| panic!("nothing may be sent to a window that does not answer"),
+            |control| wait_for_answer(control, Duration::ZERO, || Answer::Busy),
+        )
+        .expect_err("a window that never answers must stop typing");
+        assert_eq!(error.reason_code(), Some("target_not_responding"));
+        assert_eq!(control.progress().input_outcome, InputOutcome::NotStarted);
     }
 
     #[test]
     fn cancellation_while_pacing_a_pair_sends_no_second_half() {
         let control = MutationControl::default();
         let mut sent = Vec::new();
+        let mut paces = 0;
         let result = send_unicode_text_with(
             &utf16("\u{1f980}"),
             &control,
@@ -1773,13 +1800,82 @@ mod progress_tests {
                 Ok(inputs.len())
             },
             |control| {
-                control.cancel();
+                paces += 1;
+                if paces == 2 {
+                    control.cancel();
+                }
                 Ok(())
             },
         );
         assert!(result.is_err());
         assert_eq!(sent, [0xD83E]);
         assert_eq!(control.progress().sent_events, 2);
+    }
+
+    /// A window handle carried to the test thread. Only its value is used there.
+    struct WindowValue(windows::Win32::Foundation::HWND);
+    // SAFETY: The handle is a plain value; the receiving thread only passes it to
+    // SendMessageTimeoutW, which accepts handles of windows owned by other threads.
+    unsafe impl Send for WindowValue {}
+
+    #[test]
+    fn asking_a_real_window_tells_answered_busy_and_gone_apart() {
+        use std::sync::mpsc;
+        use windows::{
+            Win32::{
+                Foundation::HWND,
+                UI::WindowsAndMessaging::{
+                    CreateWindowExW, DestroyWindow, DispatchMessageW, HWND_MESSAGE, MSG, PM_REMOVE,
+                    PeekMessageW, WINDOW_EX_STYLE, WINDOW_STYLE,
+                },
+            },
+            core::{PCWSTR, w},
+        };
+        let (window_sender, window_receiver) = mpsc::channel();
+        let (step_sender, step_receiver) = mpsc::channel::<()>();
+        let owner = thread::spawn(move || {
+            // SAFETY: Creates a message-only window of the system STATIC class, owned by this
+            // thread; no pointers are retained.
+            let window = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    PCWSTR::null(),
+                    WINDOW_STYLE(0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .expect("message-only window");
+            window_sender.send(WindowValue(window)).unwrap();
+            // Busy: retrieves no messages until the test moves on.
+            step_receiver.recv().unwrap();
+            let mut message = MSG::default();
+            while step_receiver.try_recv().is_err() {
+                // SAFETY: `message` is writable; this thread owns the window.
+                while unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    // SAFETY: `message` was filled by PeekMessageW just above.
+                    unsafe { DispatchMessageW(&raw const message) };
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            // SAFETY: The window is owned by this thread and destroyed once.
+            unsafe { DestroyWindow(window) }.expect("destroy the window");
+        });
+        let window = window_receiver.recv().unwrap().0;
+        assert_eq!(ask_window(window), Answer::Busy);
+        step_sender.send(()).unwrap();
+        assert_eq!(ask_window(window), Answer::Answered);
+        step_sender.send(()).unwrap();
+        owner.join().unwrap();
+        assert_eq!(ask_window(window), Answer::Unavailable);
+        assert_eq!(ask_window(HWND::default()), Answer::Unavailable);
     }
 
     #[test]
@@ -1814,7 +1910,9 @@ mod progress_tests {
 
     /// How Windows hands Unicode packets to an application that takes every queued keystroke
     /// before translating any, as Notepad did while busy. A packet's character is not in its
-    /// message: translation reads the character of the packet taken last.
+    /// message: translation reads the character of the packet taken last. The tests let the
+    /// application take its queue while it answers pacing, which is the case pacing is built
+    /// for; an application that answers without taking keyboard input is not covered.
     #[derive(Default)]
     struct DrainingApp {
         queue: Vec<INPUT>,

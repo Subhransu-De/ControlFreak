@@ -388,11 +388,14 @@ mod win {
             }
             thread::sleep(Duration::from_millis(u64::from(busy_ms)));
             let mut keystrokes = Vec::new();
-            // SAFETY: `message` is writable; the filter takes only this thread's key-down and
-            // key-up messages.
+            // SAFETY: `message` is writable; the filter takes this thread's key-down and key-up
+            // messages, and WM_QUIT, which PeekMessageW returns whatever the filter.
             while unsafe { PeekMessageW(&raw mut message, None, WM_KEYDOWN, WM_KEYUP, PM_REMOVE) }
                 .as_bool()
             {
+                if message.message == WM_QUIT {
+                    return 0;
+                }
                 keystrokes.push(message);
             }
             for keystroke in &keystrokes {

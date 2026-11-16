@@ -765,7 +765,7 @@ fn type_text_tool() -> Tool {
         TYPE_TEXT,
         "Type text",
         Kind::Input { idempotent: false },
-        "Type Unicode text into the approved window without the clipboard. Needs the window in the foreground and revalidates it before every character. Characters go one at a time, each after the application has taken the one before, so long text takes a while and a busy application slows it further. Use press_keys for shortcuts and special keys.",
+        "Type Unicode text into the approved window without the clipboard. Needs the window in the foreground and revalidates it before every character. Characters go one at a time, each after the application answers, so long text takes a while and a busy application slows it further. Use press_keys for shortcuts and special keys.",
         object_schema(properties, &["text"]),
         action_output_schema(false),
     )
