@@ -9,6 +9,17 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Fixed
+
+- A mouse, touch or pen click on the **Stop agent** button now stops the session. The button is a top-level window, and Windows sent its click notification to the desktop instead of to ControlFreak, so only accessibility tools (UI Automation Invoke) and Esc worked. The press is now handled by the button itself, after the same check that drops injected input.
+- The pointer in the session tab's badge sits in the middle of its square. It was about 1 pixel left of center at 100% and 2 pixels at 200%.
+- The **Stop agent** button matches the tab: the same dark surface, type and rounded corners instead of the gray system button, and it lightens under the pointer and darkens while pressed.
+- The tab has the same outline in every state. Its shoulders now flare out under the lamp while an agent works, as they already did for "reading the screen" and "This PC is yours again".
+- The tab's rim, the "Administrator" chip and the rule before the stop key are sharp at every display scale, including 125% and 150%.
+- The Esc keycap in the one-row tab has the same space above and below it.
+- The badge of "ControlFreak is reading the screen" is visible. It was drawn at a contrast of 1.5:1.
+- The tab's shadow fades out at the shoulders instead of ending in a straight edge.
+
 ## [0.2.0] - 2026-11-14
 
 ### Added
