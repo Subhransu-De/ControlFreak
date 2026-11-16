@@ -1,0 +1,5 @@
+description = "One fixture window that is busy when input arrives and takes every queued keystroke before translating any"
+
+[[window]]
+key = "app"
+busy_drain_ms = 30

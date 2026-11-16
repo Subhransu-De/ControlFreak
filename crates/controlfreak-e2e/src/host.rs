@@ -101,6 +101,9 @@ impl Binaries {
         if spec.dialog {
             command.arg("--with-dialog");
         }
+        if spec.busy_drain_ms > 0 {
+            command.args(["--busy-drain-ms", &spec.busy_drain_ms.to_string()]);
+        }
         let child = command
             .spawn()
             .map_err(|error| format!("cannot open fixture {}: {error}", spec.key))?;

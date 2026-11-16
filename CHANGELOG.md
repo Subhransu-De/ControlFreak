@@ -9,6 +9,14 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Fixed
+
+- `type_text` no longer garbles text in busy applications. It used to send up to 50 characters in one burst, and an application that takes several queued keystrokes before translating them (Windows 11 Notepad while busy) received every one of them as the burst's last character: a typed greeting arrived as "Hello,!!!!!!!!!!!" while the tool reported `completed`. Each keystroke now goes alone, after the foreground window has taken the previous one and a 10 ms pause, and the target is checked before every character. Typing is slower as a result, roughly 70 characters a second.
+
+### Added
+
+- `platform_operation_failed` has a new `reason`, `target_not_responding`: the foreground window stopped answering for 5 seconds while text was typed, so typing stopped. `input.sent_events` shows how much was sent.
+
 ## [0.2.0] - 2026-11-14
 
 ### Added

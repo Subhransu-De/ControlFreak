@@ -22,6 +22,7 @@ pub(crate) fn suite() -> Suite {
             task("focus-window", focus_window).scene("single"),
             task("click-pixel-and-button", click_pixel_and_button).scene("single"),
             task("type-unicode-enter-tab", type_unicode).scene("single"),
+            task("type-into-busy-app", type_into_busy_app).scene("busy-app"),
             task("press-punctuation-keys", press_punctuation).scene("single"),
             task("capture-occluded-window", capture_occluded).scene("covered"),
             task("click-text-by-ocr", click_text_by_ocr)
@@ -86,6 +87,22 @@ fn type_unicode(cx: &mut Ctx<'_>) -> Result<(), Failure> {
     let id = control(cx, "app")?;
     cx.type_text(&id, "Hi, \u{e9}\u{65e5}\r\n\tz")?;
     let wanted = "Hi, \u{e9}\u{65e5}\u{23CE}\u{21E5}z";
+    let events = cx.expect("app", "all typed text", |e| {
+        events::typed(e).chars().count() >= wanted.chars().count()
+    })?;
+    let typed = events::typed(&events);
+    ensure!(typed == wanted, "typed {typed:?}, wanted {wanted:?}");
+    cx.end()
+}
+
+/// An application that takes several queued keystrokes before translating them turns a burst of
+/// Unicode packets into copies of the last character ("Hello,!!!!!!!!!!!" in Notepad). Every
+/// character must arrive as typed.
+fn type_into_busy_app(cx: &mut Ctx<'_>) -> Result<(), Failure> {
+    let id = control(cx, "app")?;
+    let text = "Hello, world! \u{e9}\u{65e5} 0123456789\tz";
+    cx.type_text(&id, text)?;
+    let wanted = text.replace('\t', "\u{21E5}");
     let events = cx.expect("app", "all typed text", |e| {
         events::typed(e).chars().count() >= wanted.chars().count()
     })?;

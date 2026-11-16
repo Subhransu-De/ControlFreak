@@ -115,6 +115,9 @@ pub enum FailureCause {
     DesktopWorkStopped,
     WorkerFailed,
     InputBlocked,
+    /// The foreground window stopped answering while text was typed, so typing stopped instead
+    /// of queueing keystrokes the application could mistranslate.
+    TargetNotResponding,
 }
 
 impl FailureCause {
@@ -129,6 +132,7 @@ impl FailureCause {
             Self::DesktopWorkStopped => "desktop_work_stopped",
             Self::WorkerFailed => "worker_failed",
             Self::InputBlocked => "input_blocked",
+            Self::TargetNotResponding => "target_not_responding",
         }
     }
 
@@ -253,6 +257,11 @@ mod tests {
             (
                 PlatformError::failed(FailureCause::InputBlocked, "SendInput", "x"),
                 "input_blocked",
+                false,
+            ),
+            (
+                PlatformError::failed(FailureCause::TargetNotResponding, "type_text", "x"),
+                "target_not_responding",
                 false,
             ),
             (

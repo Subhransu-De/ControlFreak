@@ -271,61 +271,191 @@ where
     F: FnMut() -> Result<(), PlatformError>,
 {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-    send_text_checking_held_keys(utf16, control, validate_target, native_send_inputs, |key| {
-        // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
-        unsafe { GetAsyncKeyState(key) < 0 }
-    })
+    send_text_checking_held_keys(
+        utf16,
+        control,
+        validate_target,
+        native_send_inputs,
+        |key| {
+            // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
+            unsafe { GetAsyncKeyState(key) < 0 }
+        },
+        wait_for_previous_keystroke,
+    )
 }
 
 #[cfg(test)]
-fn send_unicode_text_with<F, S>(
+fn send_unicode_text_with<F, S, P>(
     utf16: &[u16],
     control: &MutationControl,
     validate_target: F,
     send: S,
+    pace: P,
 ) -> Result<(), PlatformError>
 where
     F: FnMut() -> Result<(), PlatformError>,
     S: FnMut(&[INPUT]) -> Result<usize, PlatformError>,
+    P: FnMut(&MutationControl) -> Result<(), PlatformError>,
 {
-    send_text_checking_held_keys(utf16, control, validate_target, send, |_| false)
+    send_text_checking_held_keys(utf16, control, validate_target, send, |_| false, pace)
+}
+
+/// Pause between two typed keystrokes, after the foreground thread has taken the earlier one, so
+/// an application that takes several queued keystrokes before translating them can translate it
+/// first. Close to the per-key delay of other input tools (`AutoHotkey`'s `SendEvent` waits
+/// 10 ms, xdotool 12 ms).
+const KEYSTROKE_GAP: Duration = Duration::from_millis(10);
+/// Longest wait for the foreground window to answer before typing stops.
+const KEYSTROKE_ANSWER_LIMIT: Duration = Duration::from_secs(5);
+/// One answer wait. Cancellation is checked between them.
+const KEYSTROKE_ANSWER_SLICE_MS: u32 = 100;
+
+/// What the foreground window's thread did with one `WM_NULL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// It retrieved messages, so it has taken the keystroke queued before the question.
+    Answered,
+    /// It did not retrieve messages within one slice.
+    Busy,
+    /// It cannot be asked: no foreground window, a window that is gone, or a refused message.
+    /// Pacing falls back to the gap, and the next target validation reports a lost target.
+    Unavailable,
+}
+
+/// Paces the keystroke about to be sent behind the previous one: waits until the foreground
+/// thread answers (it has taken the previous keystroke), gives it `KEYSTROKE_GAP` to translate,
+/// then waits for another answer (it is retrieving messages again, not busy).
+fn wait_for_previous_keystroke(control: &MutationControl) -> Result<(), PlatformError> {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let _timer = controlfreak_core::timing::start("keystroke_pace");
+    // SAFETY: GetForegroundWindow takes no arguments and returns a handle value only.
+    let window = unsafe { GetForegroundWindow() };
+    let ask = || ask_window(window);
+    wait_for_answer(control, KEYSTROKE_ANSWER_LIMIT, ask)?;
+    thread::sleep(KEYSTROKE_GAP);
+    wait_for_answer(control, KEYSTROKE_ANSWER_LIMIT, ask)
+}
+
+fn ask_window(window: windows::Win32::Foundation::HWND) -> Answer {
+    use windows::Win32::{
+        Foundation::{ERROR_TIMEOUT, GetLastError, LPARAM, WPARAM},
+        UI::WindowsAndMessaging::{SMTO_NORMAL, SendMessageTimeoutW, WM_NULL},
+    };
+    if window.is_invalid() {
+        return Answer::Unavailable;
+    }
+    let mut result = 0_usize;
+    // SAFETY: WM_NULL carries no pointers and the receiver ignores it. `result` is writable for
+    // the synchronous call. A window that is destroyed meanwhile fails the call instead.
+    let answered = unsafe {
+        SendMessageTimeoutW(
+            window,
+            WM_NULL,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_NORMAL,
+            KEYSTROKE_ANSWER_SLICE_MS,
+            Some(&raw mut result),
+        )
+    };
+    if answered.0 != 0 {
+        return Answer::Answered;
+    }
+    // SAFETY: GetLastError reads this thread's last-error value, set by the failed call above.
+    let error = unsafe { GetLastError() };
+    if error == ERROR_TIMEOUT {
+        Answer::Busy
+    } else {
+        Answer::Unavailable
+    }
+}
+
+/// Asks until the window answers, cannot be asked, or stays busy past `limit`.
+fn wait_for_answer(
+    control: &MutationControl,
+    limit: Duration,
+    mut ask: impl FnMut() -> Answer,
+) -> Result<(), PlatformError> {
+    let started = Instant::now();
+    loop {
+        control.check("type_text")?;
+        match ask() {
+            Answer::Answered | Answer::Unavailable => return Ok(()),
+            Answer::Busy if started.elapsed() < limit => {}
+            Answer::Busy => {
+                return Err(PlatformError::failed(
+                    controlfreak_core::FailureCause::TargetNotResponding,
+                    "type_text",
+                    format!(
+                        "the foreground window stopped processing input for {} s, so typing \
+                         stopped; observe it before typing the rest",
+                        limit.as_secs()
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 /// Virtual keys of the four modifiers: Shift, Ctrl, Alt, and the left and right Win keys.
 const HELD_MODIFIER_KEYS: [i32; 5] = [0x10, 0x11, 0x12, 0x5B, 0x5C];
 
+/// Types one keystroke per `SendInput` call, each paced behind the one before.
+///
+/// A `WM_KEYDOWN` for a Unicode packet (`VK_PACKET`) does not carry its character. Windows keeps
+/// the character of the packet most recently taken from the thread's queue, and
+/// `TranslateMessage` reads it from there. An application that takes several queued keystrokes
+/// before translating them, as a busy UI framework can, turns all of them into the last
+/// character: a greeting sent as one burst arrived in Notepad as "Hello,!!!!!!!!!!!". So
+/// every unit goes alone and `pace` holds the next one until the application has taken it.
+/// Nothing outside the application can see when it translated a keystroke, so an application
+/// whose own handling of one keystroke takes longer than `KEYSTROKE_GAP` can still mistranslate.
+///
+/// The target is validated before every character. The halves of a surrogate pair are sent and
+/// paced separately too, since an application that took both before translating would get two
+/// low surrogates. A cancellation between them stops before the second half.
+///
 /// Unicode packets carry no virtual key, so only the Enter and Tab segments can repeat a key the
 /// person already holds. Those go through the same held-key refusal as `press_keys`, before
 /// any input of that segment is sent.
-fn send_text_checking_held_keys<F, S>(
+fn send_text_checking_held_keys<F, S, P>(
     utf16: &[u16],
     control: &MutationControl,
     mut validate_target: F,
     mut send: S,
     mut is_down: impl FnMut(i32) -> bool,
+    mut pace: P,
 ) -> Result<(), PlatformError>
 where
     F: FnMut() -> Result<(), PlatformError>,
     S: FnMut(&[INPUT]) -> Result<usize, PlatformError>,
+    P: FnMut(&MutationControl) -> Result<(), PlatformError>,
 {
+    let mut sent_before = false;
+    let mut after_previous = |control: &MutationControl| {
+        if std::mem::replace(&mut sent_before, true) {
+            pace(control)
+        } else {
+            Ok(())
+        }
+    };
     for segment in text_segments(utf16) {
         match segment {
             TextSegment::Text(units) => {
-                for batch in unicode_batches(units) {
-                    control.check("type_text")?;
-                    let mut inputs = Vec::with_capacity(batch.len() * 2);
-                    for unit in batch {
-                        inputs.push(unicode_input(*unit, false));
-                        inputs.push(unicode_input(*unit, true));
-                    }
-                    validate_target()?;
-                    send_releasing("type_text", &inputs, control, &mut send)?;
-                    if batch.len() + 1 >= UNITS_PER_TEXT_BATCH {
-                        thread::sleep(Duration::from_millis(2));
+                for character in utf16_characters(units) {
+                    for (index, unit) in character.iter().enumerate() {
+                        after_previous(control)?;
+                        if index == 0 {
+                            control.check("type_text")?;
+                            validate_target()?;
+                        }
+                        let inputs = [unicode_input(*unit, false), unicode_input(*unit, true)];
+                        send_releasing("type_text", &inputs, control, &mut send)?;
                     }
                 }
             }
             TextSegment::Key(key) => {
+                after_previous(control)?;
                 control.check("type_text")?;
                 let inputs = [keyboard_input(key, false), keyboard_input(key, true)];
                 // A held modifier would turn the key into a shortcut (Alt+Tab, Ctrl+Enter), which
@@ -392,22 +522,18 @@ fn text_segments(utf16: &[u16]) -> Vec<TextSegment<'_>> {
     segments
 }
 
-const UNITS_PER_TEXT_BATCH: usize = 50;
-
-// Batches end before a high surrogate so a refusal between batches cannot leave half a character.
-fn unicode_batches(utf16: &[u16]) -> impl Iterator<Item = &[u16]> {
+/// Splits UTF-16 into characters: a surrogate pair stays together, any other unit stands alone.
+fn utf16_characters(utf16: &[u16]) -> impl Iterator<Item = &[u16]> {
     let mut rest = utf16;
     std::iter::from_fn(move || {
-        if rest.is_empty() {
-            return None;
-        }
-        let mut end = rest.len().min(UNITS_PER_TEXT_BATCH);
-        if end < rest.len() && (0xD800..=0xDBFF).contains(&rest[end - 1]) {
-            end -= 1;
-        }
-        let (batch, remaining) = rest.split_at(end);
+        let first = *rest.first()?;
+        let pair = (0xD800..=0xDBFF).contains(&first)
+            && rest
+                .get(1)
+                .is_some_and(|second| (0xDC00..=0xDFFF).contains(second));
+        let (character, remaining) = rest.split_at(if pair { 2 } else { 1 });
         rest = remaining;
-        Some(batch)
+        Some(character)
     })
 }
 
@@ -1253,7 +1379,8 @@ mod progress_tests {
                 control.cancel();
                 Ok(())
             },
-            |_| panic!("cancelled batch must not dispatch or clean up unowned keys"),
+            |_| panic!("cancelled keystroke must not dispatch or clean up unowned keys"),
+            |_| Ok(()),
         );
         assert!(result.is_err());
         assert_eq!(control.progress().sent_events, 0);
@@ -1425,37 +1552,43 @@ mod progress_tests {
     }
 
     #[test]
-    fn text_batches_preserve_cumulative_progress_and_cleanup() {
-        let text: Vec<u16> = "a\u{1f980}".repeat(40).encode_utf16().collect();
-        for failed_batch in [0, 1, 2] {
-            for accepted in [0, 1, 7] {
+    fn keystroke_failures_preserve_cumulative_progress_and_cleanup() {
+        let text: Vec<u16> = "a\u{1f980}".repeat(4).encode_utf16().collect();
+        for failed_call in [0_usize, 1, 2, 5] {
+            for accepted in [0_usize, 1] {
                 for cleanup_succeeds in [false, true] {
                     let control = MutationControl::default();
-                    let mut batch = 0;
+                    let mut call = 0;
                     let result = send_unicode_text_with(
                         &text,
                         &control,
                         || Ok(()),
                         |inputs| {
-                            let current = batch;
-                            batch += 1;
-                            if current == failed_batch {
+                            let current = call;
+                            call += 1;
+                            if current == failed_call {
                                 Ok(accepted)
-                            } else if current > failed_batch && !cleanup_succeeds {
+                            } else if current > failed_call && !cleanup_succeeds {
                                 Err(failure())
                             } else {
                                 Ok(inputs.len())
                             }
                         },
+                        |_| Ok(()),
                     );
                     assert!(result.is_err());
                     let progress = control.progress();
-                    // The first batch stops one unit early instead of ending on a high surrogate.
-                    let earlier_events = [0, 98, 198][usize::try_from(failed_batch).unwrap()];
-                    assert_eq!(progress.sent_events, earlier_events + accepted as u64);
+                    // Every earlier call sent one unit's down and up.
+                    assert_eq!(
+                        progress.sent_events,
+                        (failed_call * 2 + accepted) as u64,
+                        "call {failed_call}, accepted {accepted}"
+                    );
+                    // A half-sent keystroke gets one compensating up; nothing else is sent after.
+                    assert_eq!(call, failed_call + 1 + accepted);
                     assert_eq!(
                         progress.input_outcome,
-                        if failed_batch == 0 && accepted == 0 {
+                        if failed_call == 0 && accepted == 0 {
                             InputOutcome::NotStarted
                         } else {
                             InputOutcome::PartiallySent
@@ -1477,29 +1610,29 @@ mod progress_tests {
     }
 
     #[test]
-    fn text_batches_never_split_a_surrogate_pair() {
-        for prefix in 0..60 {
-            let text: Vec<u16> = format!("{}\u{1f980}\u{1f980}", "a".repeat(prefix))
-                .encode_utf16()
-                .collect();
-            let batches: Vec<&[u16]> = unicode_batches(&text).collect();
-            assert_eq!(batches.concat(), text);
-            assert!(batches.iter().all(|batch| {
-                !batch.is_empty()
-                    && batch.len() <= UNITS_PER_TEXT_BATCH
-                    && !(0xD800..=0xDBFF).contains(batch.last().unwrap())
-            }));
-        }
+    fn characters_keep_surrogate_pairs_together() {
+        let text = utf16("a\u{1f980}b\u{e9}\u{1f980}");
+        let characters: Vec<&[u16]> = utf16_characters(&text).collect();
+        assert_eq!(characters.concat(), text);
+        assert_eq!(
+            characters.iter().map(|c| c.len()).collect::<Vec<_>>(),
+            [1, 2, 1, 1, 2]
+        );
+        // Unpaired surrogates stand alone instead of swallowing a neighbour.
+        assert_eq!(utf16_characters(&[0xD83E, 0x41]).count(), 2);
+        assert_eq!(utf16_characters(&[0xDD80, 0xD83E]).count(), 2);
+        assert_eq!(utf16_characters(&[0xD83E]).count(), 1);
+        assert_eq!(utf16_characters(&[]).count(), 0);
     }
 
     #[test]
-    fn later_validation_cancellation_and_provider_failure_keep_earlier_batches() {
+    fn later_validation_cancellation_and_provider_failure_keep_earlier_keystrokes() {
         for mode in 0..3 {
             let control = MutationControl::default();
             let mut validations = 0;
-            let mut batches = 0;
+            let mut calls = 0;
             let result = send_unicode_text_with(
-                &[65; 120],
+                &[65; 5],
                 &control,
                 || {
                     validations += 1;
@@ -1510,8 +1643,8 @@ mod progress_tests {
                     }
                 },
                 |inputs| {
-                    batches += 1;
-                    if mode == 2 && batches == 2 {
+                    calls += 1;
+                    if mode == 2 && calls == 2 {
                         return Err(failure());
                     }
                     if mode == 1 {
@@ -1519,9 +1652,10 @@ mod progress_tests {
                     }
                     Ok(inputs.len())
                 },
+                |_| Ok(()),
             );
             assert!(result.is_err());
-            assert_eq!(control.progress().sent_events, 100);
+            assert_eq!(control.progress().sent_events, 2, "mode {mode}");
             assert_eq!(
                 control.progress().input_outcome,
                 if mode == 2 {
@@ -1531,6 +1665,221 @@ mod progress_tests {
                 }
             );
         }
+    }
+
+    /// One step of a typing run, in the order the run took it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Step {
+        Validate,
+        Send(u16),
+        Pace,
+    }
+
+    fn typing_steps(text: &str) -> Vec<Step> {
+        let steps = std::cell::RefCell::new(Vec::new());
+        send_unicode_text_with(
+            &utf16(text),
+            &MutationControl::default(),
+            || {
+                steps.borrow_mut().push(Step::Validate);
+                Ok(())
+            },
+            |inputs| {
+                assert_eq!(inputs.len(), 2, "one keystroke per SendInput call");
+                // SAFETY: Every INPUT here was built by this module as a keyboard event.
+                let key = unsafe { inputs[0].Anonymous.ki };
+                let unit = if key.wVk.0 == 0 { key.wScan } else { key.wVk.0 };
+                steps.borrow_mut().push(Step::Send(unit));
+                Ok(inputs.len())
+            },
+            |_| {
+                steps.borrow_mut().push(Step::Pace);
+                Ok(())
+            },
+        )
+        .unwrap();
+        steps.into_inner()
+    }
+
+    #[test]
+    fn every_keystroke_after_the_first_waits_for_the_one_before() {
+        use Step::{Pace, Send, Validate};
+        assert_eq!(
+            typing_steps("Hi\u{1f980}\n"),
+            [
+                Validate,
+                Send(0x48),
+                Pace,
+                Validate,
+                Send(0x69),
+                Pace,
+                // Both halves of a pair are paced, but the target is validated once per character.
+                Validate,
+                Send(0xD83E),
+                Pace,
+                Send(0xDD80),
+                Pace,
+                Validate,
+                Send(0x0D),
+            ]
+        );
+        // A single keystroke has nothing before it to wait for.
+        assert_eq!(typing_steps("x"), [Validate, Send(0x78)]);
+    }
+
+    #[test]
+    fn a_window_that_stops_answering_stops_typing_and_keeps_earlier_keystrokes() {
+        let control = MutationControl::default();
+        let mut paces = 0;
+        let mut calls = 0;
+        let error = send_unicode_text_with(
+            &utf16("abcd"),
+            &control,
+            || Ok(()),
+            |inputs| {
+                calls += 1;
+                Ok(inputs.len())
+            },
+            |control| {
+                paces += 1;
+                if paces == 2 {
+                    wait_for_answer(control, Duration::ZERO, || Answer::Busy)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("a window that never answers must stop typing");
+        assert_eq!(error.reason_code(), Some("target_not_responding"));
+        assert_eq!(calls, 2);
+        assert_eq!(control.progress().sent_events, 4);
+        assert_eq!(
+            control.progress().input_outcome,
+            InputOutcome::PartiallySent
+        );
+    }
+
+    #[test]
+    fn cancellation_while_pacing_a_pair_sends_no_second_half() {
+        let control = MutationControl::default();
+        let mut sent = Vec::new();
+        let result = send_unicode_text_with(
+            &utf16("\u{1f980}"),
+            &control,
+            || Ok(()),
+            |inputs| {
+                // SAFETY: Every INPUT here was built by this module as a keyboard event.
+                sent.push(unsafe { inputs[0].Anonymous.ki.wScan });
+                Ok(inputs.len())
+            },
+            |control| {
+                control.cancel();
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(sent, [0xD83E]);
+        assert_eq!(control.progress().sent_events, 2);
+    }
+
+    #[test]
+    fn waiting_for_an_answer_is_bounded_and_cancellable() {
+        let control = MutationControl::default();
+        for answers in [
+            vec![Answer::Answered],
+            vec![Answer::Unavailable],
+            vec![Answer::Busy, Answer::Busy, Answer::Answered],
+        ] {
+            let mut remaining = answers.clone().into_iter();
+            let mut asked = 0;
+            wait_for_answer(&control, Duration::from_mins(1), || {
+                asked += 1;
+                remaining.next().unwrap()
+            })
+            .unwrap();
+            assert_eq!(asked, answers.len());
+        }
+        let error = wait_for_answer(&control, Duration::ZERO, || Answer::Busy)
+            .expect_err("a busy window past the limit stops typing");
+        assert_eq!(error.reason_code(), Some("target_not_responding"));
+        assert!(!error.retryable());
+        let cancelled = MutationControl::default();
+        cancelled.cancel();
+        let error = wait_for_answer(&cancelled, Duration::from_mins(1), || {
+            panic!("a cancelled run must not ask the window")
+        })
+        .expect_err("cancellation ends the wait");
+        assert_eq!(error.reason_code(), Some("cancelled"));
+    }
+
+    /// How Windows hands Unicode packets to an application that takes every queued keystroke
+    /// before translating any, as Notepad did while busy. A packet's character is not in its
+    /// message: translation reads the character of the packet taken last.
+    #[derive(Default)]
+    struct DrainingApp {
+        queue: Vec<INPUT>,
+        typed: Vec<u16>,
+    }
+
+    impl DrainingApp {
+        fn receive(&mut self, inputs: &[INPUT]) -> usize {
+            self.queue.extend_from_slice(inputs);
+            inputs.len()
+        }
+
+        fn take_and_translate(&mut self) {
+            let mut last_packet = 0;
+            let mut downs = Vec::new();
+            for input in std::mem::take(&mut self.queue) {
+                // SAFETY: Every INPUT here was built by this module as a keyboard event.
+                let key = unsafe { input.Anonymous.ki };
+                if key.dwFlags.contains(KEYEVENTF_UNICODE) {
+                    last_packet = key.wScan;
+                }
+                if !key.dwFlags.contains(KEYEVENTF_KEYUP) {
+                    downs.push(key);
+                }
+            }
+            for key in downs {
+                self.typed.push(if key.dwFlags.contains(KEYEVENTF_UNICODE) {
+                    last_packet
+                } else {
+                    key.wVk.0
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn an_app_that_takes_queued_keystrokes_before_translating_gets_every_character() {
+        let text = "Hello, world! \u{1f44b}\u{65e5}\tz\n";
+        let app = std::cell::RefCell::new(DrainingApp::default());
+        send_unicode_text_with(
+            &utf16(text),
+            &MutationControl::default(),
+            || Ok(()),
+            |inputs| Ok(app.borrow_mut().receive(inputs)),
+            |_| {
+                app.borrow_mut().take_and_translate();
+                Ok(())
+            },
+        )
+        .unwrap();
+        let mut app = app.into_inner();
+        app.take_and_translate();
+        // Tab and Enter arrive as VK_TAB and VK_RETURN, which translate to '\t' and '\r'.
+        assert_eq!(app.typed, utf16(&text.replace('\n', "\r")));
+
+        // The same application given the whole text as one burst, as type_text used to send it,
+        // reproduces what Notepad showed: every character becomes the last one.
+        let mut burst = DrainingApp::default();
+        let inputs: Vec<INPUT> = utf16("world!")
+            .into_iter()
+            .flat_map(|unit| [unicode_input(unit, false), unicode_input(unit, true)])
+            .collect();
+        burst.receive(&inputs);
+        burst.take_and_translate();
+        assert_eq!(burst.typed, utf16("!!!!!!"));
     }
 
     #[test]
@@ -1568,7 +1917,14 @@ mod progress_tests {
             .repeat(30)
             .encode_utf16()
             .collect();
-        send_unicode_text_with(&text, &control, || Ok(()), |inputs| Ok(inputs.len())).unwrap();
+        send_unicode_text_with(
+            &text,
+            &control,
+            || Ok(()),
+            |inputs| Ok(inputs.len()),
+            |_| Ok(()),
+        )
+        .unwrap();
         control.input_complete();
         assert_eq!(control.progress().sent_events, text.len() as u64 * 2);
         assert_eq!(control.progress().input_outcome, InputOutcome::InputSent);
@@ -1634,18 +1990,21 @@ mod progress_tests {
                 );
                 Ok(inputs.len())
             },
+            |_| Ok(()),
         )
         .unwrap();
-        // Text, Enter, Tab, text: each is validated and sent as its own batch.
-        assert_eq!(validations, 4);
-        assert_eq!(sent.len(), 4);
+        // Every character, Enter and Tab is validated and sent as its own keystroke.
+        assert_eq!(validations, 5);
         assert_eq!(
-            sent[0],
-            [(0, 97, false), (0, 97, true), (0, 98, false), (0, 98, true)]
+            sent,
+            [
+                [(0, 97, false), (0, 97, true)],
+                [(0, 98, false), (0, 98, true)],
+                [(0x0D, 0, false), (0x0D, 0, true)],
+                [(0x09, 0, false), (0x09, 0, true)],
+                [(0, 99, false), (0, 99, true)],
+            ]
         );
-        assert_eq!(sent[1], [(0x0D, 0, false), (0x0D, 0, true)]);
-        assert_eq!(sent[2], [(0x09, 0, false), (0x09, 0, true)]);
-        assert_eq!(sent[3], [(0, 99, false), (0, 99, true)]);
         assert_eq!(control.progress().sent_events, 10);
     }
 
@@ -1668,12 +2027,13 @@ mod progress_tests {
                     Ok(inputs.len())
                 },
                 |key| key == held,
+                |_| Ok(()),
             );
             let error = result.expect_err("a held key must be refused");
             assert_eq!(error.reason_code(), Some("key_held"), "{text:?}");
             // Only the text before the key was sent; no down and no compensating up for the key.
             assert_eq!(control.progress().sent_events, earlier, "{text:?}");
-            assert_eq!(batches, usize::from(earlier > 0), "{text:?}");
+            assert_eq!(batches * 2, earlier, "{text:?}");
         }
     }
 
@@ -1691,11 +2051,12 @@ mod progress_tests {
                     Ok(inputs.len())
                 },
                 |key| key == modifier,
+                |_| Ok(()),
             )
             .expect_err("a held modifier must refuse the key segment");
             assert_eq!(error.reason_code(), Some("key_held"), "{modifier:#x}");
             // The text before the key went out; the key itself did not.
-            assert_eq!((batches, control.progress().sent_events), (1, 4));
+            assert_eq!((batches, control.progress().sent_events), (2, 4));
         }
         let control = MutationControl::default();
         send_text_checking_held_keys(
@@ -1704,6 +2065,7 @@ mod progress_tests {
             || Ok(()),
             |inputs| Ok(inputs.len()),
             |_| true,
+            |_| Ok(()),
         )
         .expect("Unicode text carries no virtual key and is not affected by a held modifier");
     }
@@ -1728,6 +2090,7 @@ mod progress_tests {
                 queries += 1;
                 queries > 1
             },
+            |_| Ok(()),
         );
         assert!(result.is_err());
         // Text and the first Enter went out; the second Enter was refused before sending.
@@ -1745,7 +2108,8 @@ mod progress_tests {
             &control,
             || {
                 validations += 1;
-                if validations == 2 {
+                // The third validation is the one before the Enter.
+                if validations == 3 {
                     Err(failure())
                 } else {
                     Ok(())
@@ -1755,9 +2119,10 @@ mod progress_tests {
                 batches += 1;
                 Ok(inputs.len())
             },
+            |_| Ok(()),
         );
         assert!(result.is_err());
-        assert_eq!(batches, 1);
+        assert_eq!(batches, 2);
         assert_eq!(control.progress().sent_events, 4);
     }
 
