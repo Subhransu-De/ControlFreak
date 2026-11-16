@@ -1,0 +1,14 @@
+# Groups the pull request list that GitHub appends to each release after the
+# changelog section. The changelog stays the description of what changed; this
+# list credits the pull requests and their authors.
+changelog:
+  categories:
+    - title: Pull requests
+      labels:
+        - "*"
+      exclude:
+        authors:
+          - dependabot[bot]
+    - title: Dependency updates
+      labels:
+        - "*"

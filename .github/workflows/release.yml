@@ -1,12 +1,28 @@
 name: Release
+# Start a release from main with Run workflow. Leave the version empty for the
+# next patch version, or the release of a prerelease. The build job moves the
+# Unreleased entries of CHANGELOG.md into a dated section, then builds, tests
+# and verifies the package. Its run summary shows the version and release notes.
+# The publish job then waits for approval on the release environment. Approve it
+# to commit the version and changelog to main, tag it and publish the GitHub
+# release; reject it to stop with nothing changed.
+# Run it on an existing vX.Y.Z tag to retry publication. A dry run only builds
+# and verifies, on any branch.
+run-name: >-
+  ${{ inputs.dry_run && 'Dry run' || 'Release' }}
+  ${{ inputs.version || (github.ref_type == 'tag' && github.ref_name) || 'next version' }}
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release (without v), for example 0.1.0-alpha"
-        required: true
+        description: "Version such as 0.3.0 or 0.3.0-rc.1. Leave empty for the next patch version."
+        required: false
         type: string
+      dry_run:
+        description: "Dry run: build and verify only, on any branch. Nothing is committed, tagged or published."
+        type: boolean
+        default: false
   push:
     tags:
       - "v*"
@@ -16,17 +32,19 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  build:
     name: Build and verify Windows release
     runs-on: windows-latest
     timeout-minutes: 45
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     permissions:
-      contents: write
+      contents: read
+      # Reads the CI runs of this commit.
+      actions: read
       # Build provenance attestations for the published files.
       id-token: write
       attestations: write
@@ -38,6 +56,15 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Require passing CI on this commit
+        if: ${{ !inputs.dry_run && github.ref_type == 'branch' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $runs = gh run list --repo $env:GITHUB_REPOSITORY --workflow ci.yml --commit $env:GITHUB_SHA --event push --status success --json headSha --limit 20
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read the CI runs of this commit.' }
+          if (@($runs | ConvertFrom-Json).Count -eq 0) { throw "CI has not passed on $env:GITHUB_SHA. Wait for it to pass on main, then run the release again." }
+
       - name: Install Rust toolchain
         run: rustup toolchain install 1.97.1 --profile minimal
 
@@ -48,21 +75,29 @@ jobs:
         id: version
         env:
           REQUESTED_VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and $env:GITHUB_REF -eq 'refs/heads/main') {
-            cargo xtask prepare-release --version $env:REQUESTED_VERSION --date (Get-Date -AsUTC -Format 'yyyy-MM-dd')
-            if ($LASTEXITCODE -ne 0) { throw 'Release preparation failed.' }
-            git show-ref --verify --quiet "refs/tags/v$env:REQUESTED_VERSION"
-            if ($LASTEXITCODE -eq 0) { throw 'This version is already tagged. Choose a new version or retry the existing tag.' }
-            if ($LASTEXITCODE -ne 1) { throw 'Could not check existing tags.' }
-          } elseif ($env:GITHUB_REF.StartsWith('refs/tags/')) {
-            if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and $env:GITHUB_REF_NAME -ne "v$env:REQUESTED_VERSION") {
-              throw 'The requested version must match the selected tag.'
+          $requested = "$env:REQUESTED_VERSION".Trim()
+          if ($env:GITHUB_REF.StartsWith('refs/tags/')) {
+            if ($requested -and "v$($requested.TrimStart('v'))" -ne $env:GITHUB_REF_NAME) {
+              throw "Leave the version empty, or enter the version of $env:GITHUB_REF_NAME, to retry that tag."
             }
             cargo xtask version --tag $env:GITHUB_REF_NAME
             if ($LASTEXITCODE -ne 0) { throw 'Release tag does not match the workspace.' }
+            "::notice::Retrying publication of $env:GITHUB_REF_NAME"
+          } elseif ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and ($env:GITHUB_REF -eq 'refs/heads/main' -or $env:DRY_RUN -eq 'true')) {
+            $prepare = @('xtask', 'prepare-release', '--date', (Get-Date -AsUTC -Format 'yyyy-MM-dd'))
+            if ($requested) { $prepare += @('--version', $requested) }
+            cargo @prepare
+            if ($LASTEXITCODE -ne 0) { throw 'Release preparation failed.' }
+            $prepared = cargo xtask version
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot determine release version.' }
+            git show-ref --verify --quiet "refs/tags/v$prepared"
+            if ($LASTEXITCODE -eq 0) { throw "Tag v$prepared already exists. Choose a higher version, or run the workflow on that tag to retry it." }
+            if ($LASTEXITCODE -ne 1) { throw 'Could not check existing tags.' }
+            "::notice::Preparing release v$prepared"
           } else {
-            throw 'Start a new release from main, or select an existing tag to retry publication.'
+            throw 'Start a new release from main, select an existing tag to retry publication, or tick the dry run box to test another branch.'
           }
           $releaseVersion = cargo xtask version
           if ($LASTEXITCODE -ne 0) { throw 'Cannot determine release version.' }
@@ -101,8 +136,9 @@ jobs:
       # The installer, the ZIP and the executables inside it, so an extracted
       # controlfreak.exe can be verified on its own. A release started from main
       # records main's commit as the source: the release commit, which only adds
-      # the version and changelog date, is created after the build.
+      # the version and changelog date, is created after approval.
       - name: Attest build provenance
+        if: ${{ !inputs.dry_run }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
@@ -110,11 +146,126 @@ jobs:
             dist/*.zip
             dist/payload/*.exe
 
-      - name: Commit release version and create tag
-        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+      # The approver reads this summary on the run page before approving.
+      - name: Summarize the release for approval
         env:
-          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
+          $heading = if ($env:DRY_RUN -eq 'true') { "Dry run of $env:RELEASE_TAG" } else { "Release $env:RELEASE_TAG" }
+          $source = if ($env:GITHUB_REF.StartsWith('refs/tags/')) {
+            "Retry of the existing tag $env:GITHUB_REF_NAME."
+          } elseif ($env:DRY_RUN -eq 'true') {
+            "Built from $env:GITHUB_REF_NAME at $env:GITHUB_SHA. Nothing is committed, tagged or published."
+          } else {
+            "Built from $env:GITHUB_REF_NAME at $env:GITHUB_SHA. Approving the release environment commits this version and changelog to main, tags it and publishes the GitHub release."
+          }
+          @(
+            "## $heading"
+            ''
+            $source
+            ''
+            '### Release notes'
+            ''
+            (Get-Content -Raw "$env:RUNNER_TEMP/release-notes.md")
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Upload release package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-package
+          path: |
+            dist/*.exe
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      # The prepared version and changelog, so the release commit contains
+      # exactly what was built and approved.
+      - name: Upload prepared release files
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-source
+          path: |
+            Cargo.toml
+            Cargo.lock
+            CHANGELOG.md
+          if-no-files-found: error
+          retention-days: 30
+
+  # The required reviewer on the release environment approves each release.
+  # Nothing is committed, tagged or published before approval.
+  publish:
+    name: Publish GitHub release
+    needs: build
+    if: ${{ !inputs.dry_run }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    environment:
+      name: release
+      url: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.build.outputs.tag }}
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.build.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      # The commit the package was built from. Pushing the release commit fails
+      # if main has moved since, so the release matches the package.
+      - name: Check out the built commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: false
+
+      - name: Download release package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-package
+          path: dist
+
+      - name: Download prepared release files
+        if: github.ref_type == 'branch'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-source
+          path: ${{ runner.temp }}/release-source
+
+      # Skipped when retrying a tag. A rerun after a successful push continues
+      # from the tag this release created.
+      - name: Commit release version and create tag
+        if: github.ref_type == 'branch'
+        run: |
+          gh auth setup-git
+          if ($LASTEXITCODE -ne 0) { throw 'Could not configure release authentication.' }
+          git ls-remote --exit-code --tags origin "refs/tags/$env:RELEASE_TAG" > $null
+          if ($LASTEXITCODE -eq 0) {
+            # Continue only with the tag this release pushed: its commit sits
+            # directly on the commit the package was built from.
+            git fetch --quiet --depth=2 origin "refs/tags/${env:RELEASE_TAG}:refs/tags/${env:RELEASE_TAG}"
+            if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the existing release tag.' }
+            $parent = git rev-parse "$env:RELEASE_TAG^{commit}^"
+            if ($LASTEXITCODE -ne 0 -or $parent -ne $env:GITHUB_SHA) {
+              throw "Tag $env:RELEASE_TAG was not created from $env:GITHUB_SHA by this release. Start a new release from main."
+            }
+            git checkout --quiet --detach $env:RELEASE_TAG
+            if ($LASTEXITCODE -ne 0) { throw 'Could not check out the existing release tag.' }
+            "::notice::Tag $env:RELEASE_TAG already exists from this release; skipping the release commit."
+            exit 0
+          }
+          if ($LASTEXITCODE -ne 2) { throw 'Could not check existing tags.' }
+          foreach ($file in 'Cargo.toml', 'Cargo.lock', 'CHANGELOG.md') {
+            Copy-Item -LiteralPath (Join-Path "$env:RUNNER_TEMP/release-source" $file) -Destination $file -Force
+          }
           git add -- Cargo.toml Cargo.lock CHANGELOG.md
           git diff --cached --check
           if ($LASTEXITCODE -ne 0) { throw 'Release diff validation failed.' }
@@ -124,32 +275,27 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Release commit failed.' }
           git tag $env:RELEASE_TAG
           if ($LASTEXITCODE -ne 0) { throw 'Tag creation failed.' }
-          gh auth setup-git
-          if ($LASTEXITCODE -ne 0) { throw 'Could not configure release authentication.' }
           # Both refs move together. Concurrent changes to main fail without moving the tag.
           git push --atomic origin HEAD:refs/heads/main "refs/tags/$env:RELEASE_TAG"
-          if ($LASTEXITCODE -ne 0) { throw 'Release push failed. Check whether main advanced or branch rules blocked the push.' }
+          if ($LASTEXITCODE -ne 0) { throw 'Release push failed. main probably changed after the build, or branch rules blocked the push. Start a new release from main.' }
 
       # GITHUB_TOKEN-created tags do not trigger another push workflow. Publish
-      # here after verification, using the exact commit just tagged.
+      # here after approval, from the exact commit just tagged.
       - name: Publish GitHub release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: cargo xtask publish --package dist --tag $env:RELEASE_TAG
 
   # A separate job keeps the winget token out of the job that holds write
   # access to this repository. Prereleases are not submitted.
   winget:
     name: Submit stable release to winget
-    needs: release
-    if: ${{ !contains(needs.release.outputs.tag, '-') }}
+    needs: [build, publish]
+    if: ${{ !contains(needs.build.outputs.tag, '-') }}
     runs-on: windows-latest
     timeout-minutes: 15
     permissions:
       contents: read
     env:
-      RELEASE_TAG: ${{ needs.release.outputs.tag }}
+      RELEASE_TAG: ${{ needs.build.outputs.tag }}
       HAS_WINGET_TOKEN: ${{ secrets.WINGET_TOKEN != '' }}
       KOMAC_VERSION: 2.17.1
       KOMAC_SHA256: A97C002C5FFA15F232AF117EFAC6774E755D27ACC47EBA00F1661033267D7438
