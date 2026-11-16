@@ -9,6 +9,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+## [0.2.1] - 2026-11-16
+
 ### Fixed
 
 - A mouse, touch or pen click on the **Stop agent** button now stops the session. The button is a top-level window, and Windows sent its click notification to the desktop instead of to ControlFreak, so only accessibility tools (UI Automation Invoke) and Esc worked. The press is now handled by the button itself, after the same check that drops injected input.
