@@ -440,6 +440,38 @@ pub(crate) fn text_scale() -> f32 {
     f32::from(u16::try_from(value.clamp(100, 225)).unwrap_or(100)) / 100.0
 }
 
+/// How the Stop button looks: at rest, under the pointer, and while pressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ButtonState {
+    Rest,
+    Hot,
+    Pressed,
+}
+
+impl ButtonState {
+    pub(crate) const ALL: [Self; 3] = [Self::Rest, Self::Hot, Self::Pressed];
+}
+
+/// Fill, rim and label colours of the Stop button. It is a piece of the tab: the tab's surface
+/// and text colours at rest, lighter under the pointer and darker while pressed, with a rim
+/// strong enough (3:1) to mark a control on a dark desktop. High Contrast has two looks, the
+/// window colours and the highlight colours.
+fn button_tones(state: ButtonState, palette: &Palette) -> (Rgb, Rgb, Rgb) {
+    if palette.high_contrast {
+        return match state {
+            ButtonState::Rest => (palette.surface, palette.ink, palette.ink),
+            ButtonState::Hot | ButtonState::Pressed => {
+                (palette.highlight, palette.ink, palette.highlight_text)
+            }
+        };
+    }
+    match state {
+        ButtonState::Rest => (palette.surface, NEUTRAL_RIM, palette.ink),
+        ButtonState::Hot => (palette.divider, palette.ink2, palette.ink),
+        ButtonState::Pressed => (palette.key_lip, NEUTRAL_RIM, palette.ink),
+    }
+}
+
 /// The lamp and the tab fade in over the same time, from the same opacity, on the same smoothstep
 /// curve, so they arrive together.
 pub(crate) const FADE_IN: Duration = Duration::from_millis(150);
@@ -793,9 +825,18 @@ fn tones(view: TabView, palette: &Palette) -> Tones {
             AMBER.mix(palette.surface, 0.40),
         ),
         // Neither owns the PC: no lamp, and the neutral grey says nothing is being controlled.
-        TabKind::HandedBack { .. } | TabKind::Reading => (
+        TabKind::HandedBack { .. } => (
             None,
             NEUTRAL_BADGE,
+            palette.ink,
+            NEUTRAL_RIM.mix(palette.surface, 0.40),
+        ),
+        // Reading draws its badge as an outline in the badge colour. The tile grey of the
+        // handback is 1.5:1 on the surface, too faint for a line, so it takes the quiet text
+        // colour instead.
+        TabKind::Reading => (
+            None,
+            palette.ink2,
             palette.ink,
             NEUTRAL_RIM.mix(palette.surface, 0.40),
         ),
@@ -1070,7 +1111,9 @@ struct Layout {
     /// Whether the lamp rows are painted. During a fade they are left clear, so the tab's copy
     /// of the lamp never doubles the helper's lamp while both are partly transparent.
     with_lamp: bool,
-    /// Tab body, excluding the shoulders and the shadow margin.
+    /// Tab body, excluding the shoulders and the shadow margin. It starts under the lamp and its
+    /// keyline, where the shoulders flare out, so the tab has the same outline with and without
+    /// a lamp.
     body: Rect,
     shoulder: f32,
     radius: f32,
@@ -1152,7 +1195,7 @@ impl Painter {
             self.layout_within(view, palette, dpi, max_width, max_height, text_scale)?;
         layout.with_lamp = with_lamp;
         let mut surface = DibSurface::create(layout.width, layout.height)?;
-        self.draw(&layout, &mut surface)?;
+        self.draw(&mut surface, &|| self.draw_tab_below_lamp(&layout))?;
         // The body is a few pixels inside the bitmap, so rounding up cannot leave it.
         #[allow(clippy::cast_possible_truncation)]
         let body_bottom = layout.body.3.ceil() as i32;
@@ -1162,6 +1205,68 @@ impl Painter {
             body_bottom,
             spoken: layout.spoken,
         })
+    }
+
+    /// Paints the Stop button as `width` by `height` physical pixels: the tab's surface, corner
+    /// radius, rim and type, with `label` centred on it.
+    pub(crate) fn paint_button(
+        &self,
+        label: &str,
+        state: ButtonState,
+        palette: &Palette,
+        dpi: u32,
+        text_scale: f32,
+        (width, height): (i32, i32),
+    ) -> io::Result<DibSurface> {
+        let s = scale(dpi);
+        let size = 14.0 * s * text_scale.clamp(1.0, 2.25);
+        let text = self.text(label, SEMIBOLD, size, None)?;
+        let (fill, rim, ink) = button_tones(state, palette);
+        let rim_width = if palette.high_contrast {
+            (2.0 * s).round().max(2.0)
+        } else {
+            s.round().max(1.0)
+        };
+        let (x, baseline) = label_placement((to_f(width), to_f(height)), text.width, size);
+        let face = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: 0.0,
+                top: 0.0,
+                right: to_f(width),
+                bottom: to_f(height),
+            },
+            radiusX: (8.0 * s).round(),
+            radiusY: (8.0 * s).round(),
+        };
+        // Like the tab's rim, the stroke is the outermost pixels of the face.
+        let edge = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: rim_width / 2.0,
+                top: rim_width / 2.0,
+                right: to_f(width) - rim_width / 2.0,
+                bottom: to_f(height) - rim_width / 2.0,
+            },
+            radiusX: face.radiusX - rim_width / 2.0,
+            radiusY: face.radiusY - rim_width / 2.0,
+        };
+        let mut surface = DibSurface::create(width, height)?;
+        self.draw(&mut surface, &|| {
+            let fill = self.brush(fill)?;
+            let rim = self.brush(rim)?;
+            // SAFETY: The rectangles are locals and the brushes are live.
+            unsafe {
+                let target = self.target.borrow();
+                target.FillRoundedRectangle(&raw const face, &fill);
+                target.DrawRoundedRectangle(
+                    &raw const edge,
+                    &rim,
+                    rim_width,
+                    None::<&ID2D1StrokeStyle>,
+                );
+            }
+            self.draw_at(&text, x, baseline - text.baseline, ink)
+        })?;
+        Ok(surface)
     }
 
     /// Wraps `text` within `wrap` and then evens out its lines, so no heading or paragraph ends
@@ -1370,7 +1475,9 @@ impl Painter {
         } else {
             None
         };
-        let chip_width = chip.as_ref().map_or(0.0, |chip| chip.width + dip(12.0));
+        let chip_width = chip
+            .as_ref()
+            .map_or(0.0, |chip| (chip.width + dip(12.0)).round());
         // One row carries the status in the slot after the title. Working and waiting reserve the
         // wider of their two statuses, so the row never changes width between them.
         let attribution = if compact {
@@ -1507,20 +1614,22 @@ impl Painter {
                 y = top + chip_height + dip(4.0);
                 (text_left, top)
             } else {
+                // Centred on the title's line; it is put on whole pixels with everything else.
                 (
                     text_left + title_width + dip(8.0),
-                    ((title_line - chip_height) / 2.0).round(),
+                    (title_line - chip_height) / 2.0,
                 )
             };
             used = used.max(left - text_left + chip_width);
             let rect = (left, top, left + chip_width, top + chip_height);
+            let text_x = left + (chip_width - text.width) / 2.0;
             let text_y = top + (chip_height - text.natural_line) / 2.0;
             let baseline = text.baseline;
             (
                 rect,
                 Placed {
                     text,
-                    x: left + dip(6.0),
+                    x: text_x,
                     y: text_y,
                     baseline,
                     color: palette.ink,
@@ -1587,10 +1696,10 @@ impl Painter {
             let press_baseline = press.set_line(body_line)?;
             let key_baseline = key_text.set_line(body_line)?;
             to_stop.set_line(body_line)?;
-            let row = |left: f32, baseline: f32, press, key_text, to_stop| {
+            let row = |left: f32, centre: f32, press, key_text, to_stop| {
                 esc_row(
                     (press, key_text, to_stop),
-                    (left, baseline),
+                    (left, centre),
                     (press_baseline, key_baseline),
                     (key_width, key_height),
                     s,
@@ -1603,8 +1712,8 @@ impl Painter {
                 let row_height = key_height.max(body_line);
                 let width = (text_left + column).max(esc_indent + esc_width) + pad_x;
                 divider = Some((esc_indent, rule_top, width - pad_x, rule_top + rule));
-                let baseline = row_top + (row_height - body_line) / 2.0 + press_baseline;
-                esc = Some(row(esc_indent, baseline, press, key_text, to_stop));
+                let centre = row_top + row_height / 2.0;
+                esc = Some(row(esc_indent, centre, press, key_text, to_stop));
                 (width, row_top + row_height + pad_bottom, content_top)
             } else {
                 let block = text_height.max(key_height);
@@ -1618,14 +1727,11 @@ impl Painter {
                     content_top + block - inset,
                 ));
                 let text_offset = content_top + ((block - text_height) / 2.0).round();
-                // One row shares the title's baseline; two lines centre the stop line on the
-                // block between them.
-                let baseline = if compact {
-                    text_offset + title_baseline
-                } else {
-                    content_top + (block - body_line) / 2.0 + press_baseline
-                };
-                esc = Some(row(esc_left, baseline, press, key_text, to_stop));
+                // The stop line is its own cell behind the rule: its keycap is centred on the
+                // block, in one row as in two lines, so the cap has the same space above and
+                // below it as the badge at the other end of the row.
+                let centre = content_top + block / 2.0;
+                esc = Some(row(esc_left, centre, press, key_text, to_stop));
                 (
                     esc_left + esc_width + pad_x,
                     content_top + block + pad_bottom,
@@ -1653,9 +1759,16 @@ impl Painter {
             .into_iter()
             .map(|placed| snap(placed, text_offset))
             .collect();
+        // The chip's edges land on whole pixels, like the badge and the keycap, and its text
+        // moves with it, so neither blurs at fractional scales.
         let chip = chip.map(|((x0, y0, x1, y1), text)| {
-            let dy = text_offset;
-            ((x0 + left, y0 + dy, x1 + left, y1 + dy), snap(text, dy))
+            let (dx, dy) = ((x0 + left).round() - x0, (y0 + text_offset).round() - y0);
+            let placed = Placed {
+                x: (text.x + dx).round(),
+                y: (text.y + dy + text.baseline).round() - text.baseline,
+                ..text
+            };
+            ((x0 + dx, y0 + dy, x1 + dx, y1 + dy), placed)
         });
         let badge = (
             (left + pad_x).round(),
@@ -1671,7 +1784,7 @@ impl Painter {
             height: to_px(body_height + margin),
             lamp,
             with_lamp: true,
-            body: (left, 0.0, left + body_width, body_height),
+            body: (left, lamp_height, left + body_width, body_height),
             shoulder,
             radius,
             rim_width: if palette.high_contrast {
@@ -1684,30 +1797,34 @@ impl Painter {
             badge_size,
             chip,
             texts,
-            divider: divider.map(|(x0, y0, x1, y1)| (x0 + left, y0, x1 + left, y1)),
+            divider: divider.map(|(x0, y0, x1, y1)| {
+                (
+                    (x0 + left).round(),
+                    y0.round(),
+                    (x1 + left).round(),
+                    y1.round(),
+                )
+            }),
             esc: esc.map(|esc| esc.shifted(left)),
         })
     }
 }
 
-/// Lays out "Press [Esc] to stop" with all three texts on `baseline`, rounded to a whole pixel.
+/// Lays out "Press [Esc] to stop" with the keycap centred on `centre` and all three texts on
+/// one baseline, rounded to a whole pixel.
 fn esc_row(
     (press, key_text, to_stop): (Text, Text, Text),
-    (left, baseline): (f32, f32),
+    (left, centre): (f32, f32),
     (press_baseline, key_baseline): (f32, f32),
     (key_width, key_height): (f32, f32),
     s: f32,
     t: f32,
 ) -> EscLayout {
     let gap = 7.0 * s;
-    let baseline = baseline.round();
     // "Press" is empty in the short "[Esc] to stop" form, and then takes no gap either.
     let press_gap = if press.width > 0.0 { gap } else { 0.0 };
     let key_left = (left + press.width + press_gap).round();
-    // Centre the key face on the 14 px capitals beside it; the lip sits below the face.
-    let cap_centre = baseline - CAP_HEIGHT * 14.0 * t / 2.0;
-    let lip = s.round().max(1.0);
-    let key_top = (cap_centre - (key_height - lip) / 2.0).round();
+    let (key_top, baseline) = key_placement(centre, key_height, s, t);
     let key_text_x = key_left + (key_width - key_text.width) / 2.0;
     let key_text_y = baseline - key_baseline;
     let to_stop_x = key_left + key_width + gap;
@@ -1725,6 +1842,27 @@ fn esc_row(
     }
 }
 
+/// Where a one-line label of `text_width` set at `size` goes on a face of `(width, height)`: its
+/// left edge and its baseline, both on whole pixels, with the capitals centred between the top
+/// and the bottom.
+fn label_placement((width, height): (f32, f32), text_width: f32, size: f32) -> (f32, f32) {
+    (
+        ((width - text_width) / 2.0).round(),
+        (height / 2.0 + CAP_HEIGHT * size / 2.0).round(),
+    )
+}
+
+/// Where a keycap of `key_height` centred on `centre` starts, and the baseline of the stop line
+/// beside it, both on whole pixels. The cap is what is centred, because its box is what the eye
+/// measures against the tab's edges; the 14 px capitals then sit in the middle of the key face,
+/// which is the cap without the lip along its bottom edge.
+fn key_placement(centre: f32, key_height: f32, s: f32, t: f32) -> (f32, f32) {
+    let lip = s.round().max(1.0);
+    let key_top = (centre - key_height / 2.0).round();
+    let cap_centre = key_top + (key_height - lip) / 2.0;
+    (key_top, (cap_centre + CAP_HEIGHT * 14.0 * t / 2.0).round())
+}
+
 impl EscLayout {
     fn shifted(self, dx: f32) -> Self {
         let Self {
@@ -1740,6 +1878,31 @@ impl EscLayout {
             to_stop: (to_stop.0, (to_stop.1 + dx).round(), to_stop.2),
         }
     }
+}
+
+/// The pointer arrow of the working, waiting and reading badges, on a 16 x 22 design grid.
+const POINTER: [(f32, f32); 7] = [
+    (1.0, 1.0),
+    (1.0, 18.5),
+    (5.6, 14.3),
+    (8.6, 21.0),
+    (11.6, 19.7),
+    (8.7, 13.2),
+    (14.8, 13.2),
+];
+
+/// The centre of area of a simple polygon: the point a filled glyph balances on, and so where
+/// the eye puts its middle.
+fn polygon_centroid(points: &[(f32, f32)]) -> (f32, f32) {
+    let (mut area, mut x, mut y) = (0.0_f32, 0.0_f32, 0.0_f32);
+    for (index, &(x0, y0)) in points.iter().enumerate() {
+        let (x1, y1) = points[(index + 1) % points.len()];
+        let cross = x0 * y1 - x1 * y0;
+        area += cross;
+        x += (x0 + x1) * cross;
+        y += (y0 + y1) * cross;
+    }
+    (x / (3.0 * area), y / (3.0 * area))
 }
 
 fn load_inter(factory: &IDWriteFactory5) -> io::Result<IDWriteFontCollection> {
@@ -1823,15 +1986,15 @@ fn target_lost(ended: &windows::core::Result<()>) -> bool {
 }
 
 impl Painter {
-    /// Draws `layout` into `surface`. A lost target is rebuilt and the tab drawn again once, so a
-    /// graphics reset does not take the tab, and with it desktop work, down; any other failure,
-    /// or losing the new target too, is returned.
-    fn draw(&self, layout: &Layout, surface: &mut DibSurface) -> io::Result<()> {
-        if self.draw_once(layout, surface)? {
+    /// Draws into `surface` with `paint`. A lost target is rebuilt and the picture drawn again
+    /// once, so a graphics reset does not take the tab, and with it desktop work, down; any other
+    /// failure, or losing the new target too, is returned.
+    fn draw(&self, surface: &mut DibSurface, paint: &dyn Fn() -> io::Result<()>) -> io::Result<()> {
+        if self.draw_once(surface, paint)? {
             return Ok(());
         }
         self.target.replace(create_target(&self.d2d)?);
-        if self.draw_once(layout, surface)? {
+        if self.draw_once(surface, paint)? {
             Ok(())
         } else {
             Err(io::Error::other(
@@ -1841,17 +2004,21 @@ impl Painter {
     }
 
     /// Draws once; `Ok(false)` means Direct2D lost the target and nothing usable was drawn.
-    fn draw_once(&self, layout: &Layout, surface: &mut DibSurface) -> io::Result<bool> {
+    fn draw_once(
+        &self,
+        surface: &mut DibSurface,
+        paint: &dyn Fn() -> io::Result<()>,
+    ) -> io::Result<bool> {
         let rect = RECT {
             left: 0,
             top: 0,
-            right: layout.width,
-            bottom: layout.height,
+            right: i32::try_from(surface.width).unwrap_or(i32::MAX),
+            bottom: i32::try_from(surface.height).unwrap_or(i32::MAX),
         };
         let target = self.target.borrow();
         let clear = D2D1_COLOR_F::default();
         // SAFETY: The surface's memory DC and DIB are live for the whole draw, `rect` matches the
-        // DIB, and every Direct2D object used below is created from this factory and target.
+        // DIB, and every Direct2D object `paint` uses is created from this factory and target.
         unsafe {
             target
                 .BindDC(surface.dc, &raw const rect)
@@ -1860,6 +2027,21 @@ impl Painter {
             target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             target.Clear(Some(&raw const clear));
         }
+        let drawn = paint();
+        // SAFETY: Ends the draw begun above on the same target, even if a step failed.
+        let ended = unsafe { target.EndDraw(None, None) };
+        if target_lost(&ended) {
+            return Ok(false);
+        }
+        drawn?;
+        ended
+            .map(|()| true)
+            .map_err(|error| windows_error("EndDraw", &error))
+    }
+
+    /// Draws the tab, keeping the lamp rows clear when the layout leaves the lamp out.
+    fn draw_tab_below_lamp(&self, layout: &Layout) -> io::Result<()> {
+        let target = self.target.borrow();
         // Without the lamp, everything is clipped below the lamp rows so they stay transparent
         // and the helper's lamp shows through unchanged.
         let clip = layout
@@ -1880,15 +2062,7 @@ impl Painter {
             // SAFETY: Pops the clip pushed above on the same target.
             unsafe { target.PopAxisAlignedClip() };
         }
-        // SAFETY: Ends the draw begun above on the same target, even if a step failed.
-        let ended = unsafe { target.EndDraw(None, None) };
-        if target_lost(&ended) {
-            return Ok(false);
-        }
-        drawn?;
-        ended
-            .map(|()| true)
-            .map_err(|error| windows_error("EndDraw", &error))
+        drawn
     }
 
     fn draw_tab(&self, layout: &Layout) -> io::Result<()> {
@@ -1900,18 +2074,25 @@ impl Painter {
             // no effect pipeline. It follows the open outline: closing the top edge would fold the
             // path back on itself at each shoulder and the miter join would smear a spike along
             // the lamp.
-            let shadow = self.tab_path(layout, s * 2.0, false)?;
+            // Round caps let it fade out at the tip of each shoulder; a flat cap would cut
+            // the shadow off along a straight vertical edge there.
+            let shadow = self.tab_path(layout, s * 2.0, 0.0, false)?;
             let black = self.brush(Rgb(0, 0, 0))?;
+            let round = self.round_stroke()?;
             for (width, alpha) in [(2.0, 0.07), (5.0, 0.05), (9.0, 0.035), (13.0, 0.02)] {
-                // SAFETY: The brush and geometry are live objects created from this target.
+                // SAFETY: The brush, geometry and stroke style are live objects created from
+                // this factory and target.
                 unsafe {
                     black.SetOpacity(alpha);
-                    target.DrawGeometry(&shadow, &black, width * s, None::<&ID2D1StrokeStyle>);
+                    target.DrawGeometry(&shadow, &black, width * s, &round);
                 }
             }
         }
-        let body = self.tab_path(layout, 0.0, true)?;
-        let rim = self.tab_path(layout, 0.0, false)?;
+        let body = self.tab_path(layout, 0.0, 0.0, true)?;
+        // The rim is the outermost pixels of the body: its stroke runs half its width inside the
+        // outline, so a one-pixel rim is one whole pixel in the rim colour and not two half-lit
+        // ones astride the edge.
+        let rim = self.tab_path(layout, 0.0, layout.rim_width / 2.0, false)?;
         let surface = self.brush(palette.surface)?;
         let rim_brush = self.brush(layout.tones.rim)?;
         // SAFETY: Geometry and brushes are live objects created from this factory and target.
@@ -2039,14 +2220,23 @@ impl Painter {
         .map_err(|error| windows_error("CreateSolidColorBrush", &error))
     }
 
-    /// The tab outline: concave shoulders flaring into the lamp, straight sides, rounded lower
-    /// corners. `closed` adds the top edge for filling; the rim strokes the open outline only, so
-    /// the tab joins the lamp without a line across it.
-    fn tab_path(&self, layout: &Layout, dy: f32, closed: bool) -> io::Result<ID2D1PathGeometry> {
-        let (x0, _, x1, bottom) = layout.body;
-        let (f, r) = (layout.shoulder, layout.radius);
-        let bottom = bottom + dy;
-        let top = dy;
+    /// The tab outline: concave shoulders flaring into the keyline under the lamp (or into the
+    /// display's edge when there is no lamp), straight sides, rounded lower corners. `closed`
+    /// adds the top edge for filling; the rim strokes the open outline only, so the tab joins the
+    /// lamp without a line across it. `inset` moves the outline that far into the body.
+    fn tab_path(
+        &self,
+        layout: &Layout,
+        dy: f32,
+        inset: f32,
+        closed: bool,
+    ) -> io::Result<ID2D1PathGeometry> {
+        let (x0, top, x1, bottom) = layout.body;
+        // Moving into the body shrinks the convex lower corners and widens the concave shoulders.
+        let (f, r) = (layout.shoulder + inset, (layout.radius - inset).max(0.0));
+        let (x0, x1) = (x0 + inset, x1 - inset);
+        let bottom = bottom + dy - inset;
+        let top = top + dy - inset;
         let arc = |x: f32, y: f32, radius: f32, clockwise: bool| D2D1_ARC_SEGMENT {
             point: Vector2::new(x, y),
             size: D2D_SIZE_F {
@@ -2214,18 +2404,13 @@ impl Painter {
         let target = self.target.borrow();
         match layout.badge_kind {
             Badge::Pointer { .. } => {
-                // The arrow from a 16 x 22 design grid, drawn 12 DIP tall.
+                // The arrow from a 16 x 22 design grid, drawn 12 DIP tall. Its weight is on the
+                // badge centre, not the middle of its bounding box: the arrow is all on the left
+                // of that box, with only the thin wing and tail reaching right, so centring the
+                // box leaves the arrow looking off to the left.
                 let k = 12.0 * s / 22.0;
-                let points = [
-                    (1.0, 1.0),
-                    (1.0, 18.5),
-                    (5.6, 14.3),
-                    (8.6, 21.0),
-                    (11.6, 19.7),
-                    (8.7, 13.2),
-                    (14.8, 13.2),
-                ];
-                let path = self.polyline(&points, (cx - 7.9 * k, cy - 11.0 * k), k, true, true)?;
+                let (mx, my) = polygon_centroid(&POINTER);
+                let path = self.polyline(&POINTER, (cx - mx * k, cy - my * k), k, true, true)?;
                 // SAFETY: The geometry and brush are live.
                 unsafe { target.FillGeometry(&path, glyph, None::<&ID2D1Brush>) };
             }
@@ -3015,10 +3200,12 @@ mod tests {
         y + lines[0].baseline
     }
 
+    const SCALES: [u32; 5] = [96, 120, 144, 168, 192];
+
     #[test]
-    fn every_text_in_the_one_row_tab_shares_one_whole_pixel_baseline() {
+    fn the_one_row_tab_keeps_its_running_text_and_its_stop_line_each_on_one_whole_pixel_baseline() {
         let painter = Painter::new().unwrap();
-        for dpi in [96, 120, 144, 168] {
+        for dpi in SCALES {
             for admin in [false, true] {
                 let view = TabView {
                     kind: TabKind::Working,
@@ -3029,27 +3216,411 @@ mod tests {
                     .layout(view, &Palette::STANDARD, dpi, 3840, 1.0)
                     .unwrap();
                 let esc = layout.esc.as_ref().unwrap();
-                let mut baselines: Vec<f32> = layout
+                let running: Vec<f32> = layout
                     .texts
                     .iter()
                     .map(|placed| baseline_of(&placed.text, placed.y))
                     .collect();
-                for (text, _, y) in [&esc.press, &esc.key_text, &esc.to_stop] {
-                    baselines.push(baseline_of(text, *y));
+                let stop_line: Vec<f32> = [&esc.press, &esc.key_text, &esc.to_stop]
+                    .into_iter()
+                    .map(|(text, _, y)| baseline_of(text, *y))
+                    .collect();
+                assert_eq!(running.len(), 2, "title and attribution");
+                for line in [&running, &stop_line] {
+                    for baseline in line {
+                        assert!(
+                            (baseline - line[0]).abs() < 0.01,
+                            "{dpi} DPI admin={admin}: {line:?}"
+                        );
+                        assert!(
+                            (baseline - baseline.round()).abs() < 0.01,
+                            "whole pixel at {dpi} DPI: {baseline}"
+                        );
+                    }
                 }
-                assert_eq!(baselines.len(), 5, "title, attribution and the stop line");
-                for baseline in &baselines {
+                // The stop line is centred with its keycap, so its smaller type sits a little
+                // above the title's baseline, never far from it.
+                let lift = running[0] - stop_line[0];
+                assert!(
+                    (0.0..=2.0 * scale(dpi)).contains(&lift),
+                    "{dpi} DPI: stop line {lift} px above the title's baseline"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_badge_the_chip_and_the_keycap_have_equal_space_above_and_below_in_the_one_row_tab() {
+        let painter = Painter::new().unwrap();
+        for dpi in SCALES {
+            for (kind, admin) in [(TabKind::Working, false), (TabKind::Waiting, true)] {
+                let view = TabView {
+                    kind,
+                    admin,
+                    expanded: false,
+                };
+                let layout = painter
+                    .layout(view, &Palette::STANDARD, dpi, 3840, 1.0)
+                    .unwrap();
+                let (_, top, _, bottom) = layout.body;
+                let key = layout.esc.as_ref().unwrap().key;
+                let badge = (layout.badge.1, layout.badge.1 + layout.badge_size);
+                let chip = layout
+                    .chip
+                    .as_ref()
+                    .map(|(rect, _)| ("chip", (rect.1, rect.3)));
+                let parts = [("keycap", (key.1, key.3)), ("badge", badge)];
+                for (name, (y0, y1)) in parts.into_iter().chain(chip) {
+                    let (above, below) = (y0 - top, bottom - y1);
                     assert!(
-                        (baseline - baselines[0]).abs() < 0.01,
-                        "{dpi} DPI admin={admin}: {baselines:?}"
-                    );
-                    assert!(
-                        (baseline - baseline.round()).abs() < 0.01,
-                        "whole pixel at {dpi} DPI: {baseline}"
+                        (above - below).abs() <= 1.0,
+                        "{dpi} DPI {kind:?}: {name} has {above} px above and {below} px below"
                     );
                 }
             }
         }
+        // One row at 100%: 6 + a 22 px keycap + 6, and the label's capitals in the middle of
+        // the face above the lip.
+        assert_eq!(key_placement(22.0, 22.0, 1.0, 1.0), (11.0, 27.0));
+        assert_eq!(key_placement(44.0, 44.0, 2.0, 2.0), (22.0, 53.0));
+    }
+
+    #[test]
+    fn the_chip_and_the_rule_land_on_whole_pixels_at_every_scale() {
+        let painter = Painter::new().unwrap();
+        let whole = |value: f32| (value - value.round()).abs() < 0.001;
+        for dpi in SCALES {
+            for (expanded, width) in [(false, 3840), (true, 3840), (true, 360 * 2)] {
+                let view = TabView {
+                    kind: TabKind::Working,
+                    admin: true,
+                    expanded,
+                };
+                let layout = painter
+                    .layout(view, &Palette::STANDARD, dpi, width, 1.0)
+                    .unwrap();
+                let ((x0, y0, x1, y1), text) = layout.chip.as_ref().unwrap();
+                assert!(
+                    [*x0, *y0, *x1, *y1].into_iter().all(whole),
+                    "{dpi} DPI expanded={expanded}: chip at {:?}",
+                    (x0, y0, x1, y1)
+                );
+                let off_centre = text.x + text.text.width / 2.0 - (x0 + x1) / 2.0;
+                assert!(
+                    off_centre.abs() <= 0.51,
+                    "{dpi} DPI: chip text {off_centre} px off centre"
+                );
+                let (x0, y0, x1, y1) = layout.divider.unwrap();
+                assert!(
+                    [x0, y0, x1, y1].into_iter().all(whole),
+                    "{dpi} DPI expanded={expanded}: rule at {:?}",
+                    (x0, y0, x1, y1)
+                );
+            }
+        }
+    }
+
+    /// The opaque colour of a painted pixel, or `None` where the tab is not fully opaque.
+    fn pixel(tab: &mut PaintedTab, x: f32, y: f32) -> Option<Rgb> {
+        let width = tab.surface.width;
+        let [blue, green, red, alpha] =
+            tab.surface.pixels()[at_px(y) * width + at_px(x)].to_le_bytes();
+        (alpha == 255).then_some(Rgb(red, green, blue))
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn at_px(value: f32) -> usize {
+        // Test coordinates are small non-negative pixel positions inside a painted bitmap.
+        value.floor().max(0.0) as usize
+    }
+
+    /// Where the ink in `region` (left, top, right, bottom) of an opaque part of the bitmap has
+    /// its centre, taking each pixel as a mix of `paper` and `ink`.
+    fn ink_centre(
+        surface: &mut DibSurface,
+        (x0, y0, x1, y1): (usize, usize, usize, usize),
+        paper: Rgb,
+        ink: Rgb,
+    ) -> (f32, f32) {
+        let width = surface.width;
+        let pixels = surface.pixels();
+        let channels = |color: Rgb| [color.0, color.1, color.2].map(f32::from);
+        let (paper, ink) = (channels(paper), channels(ink));
+        let span: f32 = (0..3).map(|c| (ink[c] - paper[c]).powi(2)).sum();
+        let (mut weight, mut sum_x, mut sum_y) = (0.0_f32, 0.0_f32, 0.0_f32);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let [blue, green, red, _] = pixels[y * width + x].to_le_bytes();
+                let here = [red, green, blue].map(f32::from);
+                let cover: f32 = (0..3)
+                    .map(|c| (here[c] - paper[c]) * (ink[c] - paper[c]))
+                    .sum::<f32>()
+                    / span;
+                let cover = cover.clamp(0.0, 1.0);
+                weight += cover;
+                sum_x += cover * (count_px(x) + 0.5);
+                sum_y += cover * (count_px(y) + 0.5);
+            }
+        }
+        (sum_x / weight, sum_y / weight)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn count_px(value: usize) -> f32 {
+        // Pixel indexes inside a tab bitmap are exactly representable.
+        value as f32
+    }
+
+    #[test]
+    fn the_pointer_sits_on_the_centre_of_its_badge_at_every_scale() {
+        // A unit square balances on its middle; the arrow balances left of the middle of its
+        // 13.8 x 20 box, which is why centring that box left it off-centre.
+        let square = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)];
+        assert_eq!(polygon_centroid(&square), (1.0, 1.0));
+        let (x, y) = polygon_centroid(&POINTER);
+        assert!(
+            (x - 5.857).abs() < 0.01 && (y - 11.401).abs() < 0.01,
+            "{x} {y}"
+        );
+
+        let painter = Painter::new().unwrap();
+        for dpi in SCALES {
+            for (kind, text_scale) in [
+                (TabKind::Working, 1.0),
+                (TabKind::Waiting, 1.0),
+                (TabKind::Reading, 1.0),
+                (TabKind::Working, 1.5),
+            ] {
+                let view = TabView {
+                    kind,
+                    admin: false,
+                    expanded: false,
+                };
+                let palette = Palette::STANDARD;
+                let layout = painter
+                    .layout(view, &palette, dpi, 7680, text_scale)
+                    .unwrap();
+                let mut tab = painter
+                    .paint(view, &palette, dpi, 7680, text_scale)
+                    .unwrap();
+                let (x, y) = layout.badge;
+                let size = layout.badge_size;
+                // Inside the badge's outline and rounded corners, where only the arrow is.
+                let inset = (2.6 * size / 18.0).ceil();
+                let region = (
+                    at_px(x + inset),
+                    at_px(y + inset),
+                    at_px(x + size - inset),
+                    at_px(y + size - inset),
+                );
+                let (paper, ink) = if kind == TabKind::Working {
+                    (layout.tones.badge, layout.tones.badge_ink)
+                } else {
+                    (palette.surface, layout.tones.badge)
+                };
+                let (ink_x, ink_y) = ink_centre(&mut tab.surface, region, paper, ink);
+                let (off_x, off_y) = (ink_x - (x + size / 2.0), ink_y - (y + size / 2.0));
+                assert!(
+                    off_x.abs() < 0.2 && off_y.abs() < 0.2,
+                    "{dpi} DPI {kind:?} at {text_scale}x text: the arrow is ({off_x}, {off_y}) \
+                     px off the badge centre"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_rim_is_one_crisp_line_inside_the_body_at_every_scale() {
+        let painter = Painter::new().unwrap();
+        let view = TabView {
+            kind: TabKind::Working,
+            admin: false,
+            expanded: true,
+        };
+        let night = Palette::high_contrast(
+            Rgb(0, 0, 0),
+            Rgb(255, 255, 255),
+            Rgb(0x1a, 0xeb, 0xff),
+            Rgb(0, 0, 0),
+        );
+        for palette in [Palette::STANDARD, night] {
+            for dpi in SCALES {
+                let layout = painter.layout(view, &palette, dpi, 3840, 1.0).unwrap();
+                let mut tab = painter.paint(view, &palette, dpi, 3840, 1.0).unwrap();
+                let (left, top, right, bottom) = layout.body;
+                let rim = layout.rim_width;
+                let middle = f32::midpoint(top, bottom);
+                let what = format!("{dpi} DPI high_contrast={}", palette.high_contrast);
+                // Every rim pixel is the rim colour at full strength, on the left, the right and
+                // along the bottom, and the surface starts right after it.
+                for (x, y) in [
+                    (left, middle),
+                    (left + rim - 1.0, middle),
+                    (right - 1.0, middle),
+                    (f32::midpoint(left, right), bottom - 1.0),
+                ] {
+                    assert_eq!(pixel(&mut tab, x, y), Some(layout.tones.rim), "{what}");
+                }
+                assert_eq!(
+                    pixel(&mut tab, left + rim, middle),
+                    Some(palette.surface),
+                    "{what}"
+                );
+                assert_eq!(
+                    pixel(&mut tab, left - 1.0, middle),
+                    None,
+                    "{what}: nothing opaque outside the body"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_shoulders_flare_under_the_lamp_as_they_do_without_one() {
+        let painter = Painter::new().unwrap();
+        for dpi in SCALES {
+            for kind in [TabKind::Working, TabKind::InputHeld, TabKind::Reading] {
+                let view = TabView {
+                    kind,
+                    admin: false,
+                    expanded: kind == TabKind::InputHeld,
+                };
+                let layout = painter
+                    .layout(view, &Palette::STANDARD, dpi, 3840, 1.0)
+                    .unwrap();
+                let mut tab = painter
+                    .paint(view, &Palette::STANDARD, dpi, 3840, 1.0)
+                    .unwrap();
+                let (left, top, right, _) = layout.body;
+                assert!(
+                    (top - layout.lamp.map_or(0.0, |lamp| to_f(lamp.height()))).abs() < 0.001,
+                    "the body starts under the lamp and its keyline"
+                );
+                let near = (1.5 * layout.s).round();
+                let beyond = layout.shoulder + 2.0;
+                for (inside, outside) in [
+                    (left - near, left - beyond),
+                    (right + near - 1.0, right + beyond - 1.0),
+                ] {
+                    assert!(
+                        pixel(&mut tab, inside, top).is_some(),
+                        "{dpi} DPI {kind:?}: the shoulder is solid in the first row under the \
+                         lamp"
+                    );
+                    assert!(
+                        pixel(&mut tab, outside, top).is_none(),
+                        "{dpi} DPI {kind:?}: and ends at its tip"
+                    );
+                }
+            }
+        }
+    }
+
+    /// WCAG relative luminance contrast of two colours, 1 to 21.
+    fn contrast(a: Rgb, b: Rgb) -> f32 {
+        let luminance = |color: Rgb| {
+            let linear = |channel: u8| {
+                let value = f32::from(channel) / 255.0;
+                if value <= 0.040_45 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(color.0) + 0.7152 * linear(color.1) + 0.0722 * linear(color.2)
+        };
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn every_badge_symbol_stands_out_from_what_it_is_drawn_on() {
+        let palette = Palette::STANDARD;
+        for kind in ALL_KINDS {
+            for admin in [false, true] {
+                let view = TabView {
+                    kind,
+                    admin,
+                    expanded: true,
+                };
+                let tones = tones(view, &palette);
+                // An outlined or bare badge is drawn in the badge colour on the tab; a filled
+                // one carries its symbol in the badge's ink.
+                let (symbol, ground) = match content(view).badge {
+                    Badge::Pointer { filled: false } | Badge::Stop => {
+                        (tones.badge, palette.surface)
+                    }
+                    _ => (tones.badge_ink, tones.badge),
+                };
+                let ratio = contrast(symbol, ground);
+                assert!(ratio >= 3.0, "{kind:?} admin={admin}: {ratio}:1");
+            }
+        }
+    }
+
+    #[test]
+    fn the_stop_button_is_a_rounded_piece_of_the_tab_with_a_centred_label() {
+        assert_eq!(label_placement((104.0, 32.0), 72.0, 14.0), (16.0, 21.0));
+        assert_eq!(label_placement((208.0, 64.0), 143.0, 28.0), (33.0, 42.0));
+
+        let painter = Painter::new().unwrap();
+        let palette = Palette::STANDARD;
+        for dpi in SCALES {
+            let (width, height) = (scale_px(104.0, dpi), scale_px(32.0, dpi));
+            let mut fills = Vec::new();
+            for state in ButtonState::ALL {
+                let mut face = painter
+                    .paint_button("Stop agent", state, &palette, dpi, 1.0, (width, height))
+                    .unwrap();
+                let (fill, rim, ink) = button_tones(state, &palette);
+                let row = |y: i32| usize::try_from(y * width).unwrap();
+                let column = |x: i32| usize::try_from(x).unwrap();
+                let pixels = face.pixels();
+                assert_eq!(pixels[0] >> 24, 0, "{dpi} DPI: the corners are cut round");
+                let opaque = |color: Rgb| {
+                    0xff00_0000
+                        | u32::from(color.0) << 16
+                        | u32::from(color.1) << 8
+                        | u32::from(color.2)
+                };
+                assert_eq!(
+                    pixels[column(width / 2)],
+                    opaque(rim),
+                    "{dpi} DPI {state:?}: the rim is the outermost row at full strength"
+                );
+                let beside_label = row(height / 2) + column(scale_px(8.0, dpi));
+                assert_eq!(pixels[beside_label], opaque(fill), "{dpi} DPI {state:?}");
+                fills.push(pixels[beside_label]);
+                let inset = usize::try_from(scale_px(8.0, dpi)).unwrap();
+                let region = (
+                    inset,
+                    inset / 2,
+                    usize::try_from(width).unwrap() - inset,
+                    usize::try_from(height).unwrap() - inset / 2,
+                );
+                let (ink_x, _) = ink_centre(&mut face, region, fill, ink);
+                assert!(
+                    (ink_x - to_f(width) / 2.0).abs() <= 1.0,
+                    "{dpi} DPI {state:?}: the label's ink is centred at {ink_x} of {width}"
+                );
+                assert!(contrast(ink, fill) >= 4.5 && contrast(rim, palette.surface) >= 3.0);
+            }
+            assert!(
+                fills[0] != fills[1] && fills[0] != fills[2] && fills[1] != fills[2],
+                "rest, hot and pressed are three different faces"
+            );
+        }
+        let contrast_theme =
+            Palette::high_contrast(Rgb(0, 0, 0), Rgb(255, 255, 255), Rgb(1, 2, 3), Rgb(4, 5, 6));
+        assert_eq!(
+            button_tones(ButtonState::Rest, &contrast_theme),
+            (Rgb(0, 0, 0), Rgb(255, 255, 255), Rgb(255, 255, 255))
+        );
+        assert_eq!(
+            button_tones(ButtonState::Hot, &contrast_theme),
+            (Rgb(1, 2, 3), Rgb(255, 255, 255), Rgb(4, 5, 6)),
+            "High Contrast uses only the theme's own colours"
+        );
     }
 
     #[test]
@@ -3244,14 +3815,16 @@ mod tests {
             ("held", TabKind::InputHeld),
             ("back", TabKind::HandedBack { after_stop: false }),
             ("back-stopped", TabKind::HandedBack { after_stop: true }),
+            ("reading", TabKind::Reading),
         ];
         let mut cases = Vec::new();
         // Only views TabModel can produce: stopping and the input-held warning always have two
-        // lines or more, a handback never carries the administrator chip, and only the handback
-        // after a stop has two lines.
+        // lines or more, a handback never carries the administrator chip, only the handback
+        // after a stop has two lines, and reading the screen is one row without a chip.
         let occurs = |view: TabView| match view.kind {
             TabKind::Stopping | TabKind::InputHeld => view.expanded,
             TabKind::HandedBack { after_stop } => !view.admin && view.expanded == after_stop,
+            TabKind::Reading => !view.admin && !view.expanded,
             _ => true,
         };
         for (name, kind) in names {
@@ -3372,13 +3945,36 @@ mod tests {
                 .unwrap();
             tabs.push((name.to_owned(), tab));
         }
-        for (name, mut tab) in tabs {
-            let rgba = tab.surface.rgba_rows();
+        let mut surfaces: Vec<(String, DibSurface)> = tabs
+            .into_iter()
+            .map(|(name, tab)| (name, tab.surface))
+            .collect();
+        // The Stop button that hangs under the working and waiting tabs, in each of its looks.
+        for (palette_name, palette) in [("", Palette::STANDARD), ("hc-night-", night)] {
+            for (state_name, state) in [
+                ("rest", ButtonState::Rest),
+                ("hot", ButtonState::Hot),
+                ("pressed", ButtonState::Pressed),
+            ] {
+                for dpi in [96, 120, 144] {
+                    let size = (scale_px(104.0, dpi), scale_px(32.0, dpi));
+                    let face = painter
+                        .paint_button("Stop agent", state, &palette, dpi, 1.0, size)
+                        .unwrap();
+                    surfaces.push((
+                        format!("{palette_name}stop-button-{state_name}-{dpi}"),
+                        face,
+                    ));
+                }
+            }
+        }
+        for (name, mut surface) in surfaces {
+            let rgba = surface.rgba_rows();
             let file = std::fs::File::create(folder.join(format!("{name}.png"))).unwrap();
             let mut encoder = png::Encoder::new(
                 std::io::BufWriter::new(file),
-                u32::try_from(tab.width).unwrap(),
-                u32::try_from(tab.surface.height).unwrap(),
+                u32::try_from(surface.width).unwrap(),
+                u32::try_from(surface.height).unwrap(),
             );
             encoder.set_color(png::ColorType::Rgba);
             encoder.set_depth(png::BitDepth::Eight);
