@@ -305,15 +305,37 @@ jobs:
         if: env.HAS_WINGET_TOKEN != 'true'
         run: echo "::notice::WINGET_TOKEN is not set, so $env:RELEASE_TAG was not submitted to winget."
 
-      - name: Install pinned Komac
+      # `komac update` can only add a version to a package that winget-pkgs
+      # already lists. Until the first submission is merged there, skip with a
+      # notice instead of failing every release; submission starts by itself
+      # once the package is listed. Any answer other than 200 or 404 fails.
+      - name: Check that winget lists the package
+        id: catalog
         if: env.HAS_WINGET_TOKEN == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $uri = 'https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/s/SubhransuDe/ControlFreak'
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
+          $response = Invoke-WebRequest -Uri $uri -Headers $headers -SkipHttpErrorCheck
+          switch ($response.StatusCode) {
+            200 { "listed=true" >> $env:GITHUB_OUTPUT }
+            404 {
+              "listed=false" >> $env:GITHUB_OUTPUT
+              "::notice::SubhransuDe.ControlFreak is not in microsoft/winget-pkgs yet, so $env:RELEASE_TAG was not submitted. Re-run this job once the first submission is merged."
+            }
+            default { throw "Could not check the winget catalog: HTTP $($response.StatusCode)." }
+          }
+
+      - name: Install pinned Komac
+        if: env.HAS_WINGET_TOKEN == 'true' && steps.catalog.outputs.listed == 'true'
         run: |
           $komac = Join-Path $env:RUNNER_TEMP 'komac.exe'
           Invoke-WebRequest "https://github.com/russellbanks/Komac/releases/download/v$env:KOMAC_VERSION/komac-$env:KOMAC_VERSION-x86_64-pc-windows-msvc.exe" -OutFile $komac
           if ((Get-FileHash $komac -Algorithm SHA256).Hash -ne $env:KOMAC_SHA256) { throw 'Komac checksum mismatch.' }
 
       - name: Open winget-pkgs pull request
-        if: env.HAS_WINGET_TOKEN == 'true'
+        if: env.HAS_WINGET_TOKEN == 'true' && steps.catalog.outputs.listed == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
         run: |
