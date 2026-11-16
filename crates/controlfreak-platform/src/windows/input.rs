@@ -329,6 +329,8 @@ enum Answer {
 /// waits for another answer (it is retrieving messages again, not stuck handling the keystroke).
 fn wait_for_previous_keystroke(control: &MutationControl) -> Result<(), PlatformError> {
     let _timer = controlfreak_core::timing::start("keystroke_pace");
+    // Resolved once: if focus moves between the two waits, the second asks the old window, and
+    // the target validation before the keystroke reports the move.
     let window = keystroke_recipient();
     let ask = || ask_window(window);
     wait_for_answer(control, KEYSTROKE_ANSWER_LIMIT, ask)?;
@@ -459,7 +461,7 @@ where
         match segment {
             TextSegment::Text(units) => {
                 for unit in units {
-                    pace(control)?;
+                    pace_or_refuse(control, &mut pace, &mut validate_target)?;
                     control.check("type_text")?;
                     validate_target()?;
                     let inputs = [unicode_input(*unit, false), unicode_input(*unit, true)];
@@ -467,7 +469,7 @@ where
                 }
             }
             TextSegment::Key(key) => {
-                pace(control)?;
+                pace_or_refuse(control, &mut pace, &mut validate_target)?;
                 control.check("type_text")?;
                 let inputs = [keyboard_input(key, false), keyboard_input(key, true)];
                 // A held modifier would turn the key into a shortcut (Alt+Tab, Ctrl+Enter), which
@@ -487,6 +489,19 @@ where
         }
     }
     Ok(())
+}
+
+/// Paces the next keystroke. If pacing fails, the window that did not answer may belong to an
+/// application that took the foreground meanwhile, so a target refusal is reported instead.
+fn pace_or_refuse(
+    control: &MutationControl,
+    pace: &mut impl FnMut(&MutationControl) -> Result<(), PlatformError>,
+    validate_target: &mut impl FnMut() -> Result<(), PlatformError>,
+) -> Result<(), PlatformError> {
+    pace(control).or_else(|error| {
+        validate_target()?;
+        Err(error)
+    })
 }
 
 /// One run of `type_text` input: characters sent as Unicode packets, or a key that must be
@@ -1786,6 +1801,42 @@ mod progress_tests {
     }
 
     #[test]
+    fn a_window_that_stops_answering_after_the_target_was_lost_reports_the_lost_target() {
+        let control = MutationControl::default();
+        let mut validations = 0;
+        let mut paces = 0;
+        let error = send_unicode_text_with(
+            &utf16("ab"),
+            &control,
+            || {
+                validations += 1;
+                // Another application took the foreground after the first keystroke.
+                if validations >= 2 {
+                    Err(failure())
+                } else {
+                    Ok(())
+                }
+            },
+            |inputs| Ok(inputs.len()),
+            |control| {
+                paces += 1;
+                if paces == 2 {
+                    // Its hung focus window is the one pacing asks.
+                    wait_for_answer(control, Duration::ZERO, || Answer::Busy)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("a lost target must stop typing");
+        assert!(
+            matches!(error, PlatformError::OperationFailed { ref reason, .. } if reason == "injected"),
+            "the refusal, not the unresponsive window, is reported: {error:?}"
+        );
+        assert_eq!(control.progress().sent_events, 2);
+    }
+
+    #[test]
     fn cancellation_while_pacing_a_pair_sends_no_second_half() {
         let control = MutationControl::default();
         let mut sent = Vec::new();
@@ -1854,10 +1905,11 @@ mod progress_tests {
             }
             .expect("message-only window");
             window_sender.send(WindowValue(window)).unwrap();
-            // Busy: retrieves no messages until the test moves on.
-            step_receiver.recv().unwrap();
+            // Busy: retrieves no messages until the test moves on. A test that panicked drops
+            // the sender, which ends both phases so the window is still destroyed.
+            let _ = step_receiver.recv();
             let mut message = MSG::default();
-            while step_receiver.try_recv().is_err() {
+            while matches!(step_receiver.try_recv(), Err(mpsc::TryRecvError::Empty)) {
                 // SAFETY: `message` is writable; this thread owns the window.
                 while unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
                     // SAFETY: `message` was filled by PeekMessageW just above.
@@ -1871,7 +1923,11 @@ mod progress_tests {
         let window = window_receiver.recv().unwrap().0;
         assert_eq!(ask_window(window), Answer::Busy);
         step_sender.send(()).unwrap();
-        assert_eq!(ask_window(window), Answer::Answered);
+        // A loaded machine may start the pumping thread late, so allow up to 50 slices (5 s).
+        let first_reply = (0..50)
+            .map(|_| ask_window(window))
+            .find(|answer| *answer != Answer::Busy);
+        assert_eq!(first_reply, Some(Answer::Answered));
         step_sender.send(()).unwrap();
         owner.join().unwrap();
         assert_eq!(ask_window(window), Answer::Unavailable);

@@ -115,8 +115,8 @@ pub enum FailureCause {
     DesktopWorkStopped,
     WorkerFailed,
     InputBlocked,
-    /// The foreground window stopped answering while text was typed, so typing stopped instead
-    /// of queueing keystrokes the application could mistranslate.
+    /// The window with keyboard focus stopped answering while text was typed, so typing stopped
+    /// instead of queueing keystrokes the application could mistranslate.
     TargetNotResponding,
 }
 
