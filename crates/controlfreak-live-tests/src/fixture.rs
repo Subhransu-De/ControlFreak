@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! controlfreak-fixture --title TEXT --log FILE [--color RRGGBB] [--pos X,Y] [--topmost]
-//!                      [--with-dialog] [--lifetime-secs N]
+//!                      [--with-dialog] [--lifetime-secs N] [--busy-drain-ms N]
 //! controlfreak-fixture --stop-button-rect     # print the screen rectangle of the Stop agent button
 //! controlfreak-fixture --activate-taskbar     # try to bring the shell taskbar to the foreground
 //! controlfreak-fixture --inject-click X,Y     # SendInput a left click at a screen point
@@ -70,13 +70,14 @@ mod win {
                     AdjustWindowRectEx, BN_CLICKED, BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW,
                     DestroyWindow, DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW,
                     GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowTextW, HMENU,
-                    IDC_ARROW, IsWindowVisible, LoadCursorW, MSG, PostQuitMessage, RegisterClassW,
-                    SW_SHOWNORMAL, SetCursorPos, SetForegroundWindow, SetTimer, ShowWindow,
-                    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CHAR,
-                    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP,
-                    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT, WM_PRINTCLIENT, WM_RBUTTONDOWN,
-                    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CAPTION,
-                    WS_CHILD, WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+                    IDC_ARROW, IsWindowVisible, LoadCursorW, MSG, PM_REMOVE, PeekMessageW,
+                    PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SetCursorPos,
+                    SetForegroundWindow, SetTimer, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
+                    WINDOW_STYLE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE,
+                    WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT,
+                    WM_PRINTCLIENT, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+                    WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_TOPMOST,
+                    WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_VISIBLE, WaitMessage,
                 },
             },
         },
@@ -134,6 +135,8 @@ mod win {
         dialog: bool,
         /// Self-destruct bound so a crashed test run cannot leave a window behind.
         lifetime_secs: u32,
+        /// Nonzero: behave like a busy UI framework (see `busy_draining_loop`).
+        busy_drain_ms: u32,
     }
 
     impl Default for Options {
@@ -145,6 +148,7 @@ mod win {
                 topmost: false,
                 dialog: false,
                 lifetime_secs: 300,
+                busy_drain_ms: 0,
             }
         }
     }
@@ -180,6 +184,9 @@ mod win {
                 "--lifetime-secs" => {
                     options.lifetime_secs = args.next().and_then(|v| v.parse().ok()).unwrap_or(300);
                 }
+                "--busy-drain-ms" => {
+                    options.busy_drain_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                }
                 other => {
                     eprintln!("unknown argument {other}");
                     return 2;
@@ -192,6 +199,7 @@ mod win {
         };
         let _ = LOG.set(log);
         match create_windows(&options) {
+            Ok(()) if options.busy_drain_ms > 0 => busy_draining_loop(options.busy_drain_ms),
             Ok(()) => message_loop(),
             Err(error) => {
                 eprintln!("fixture window failed: {error}");
@@ -364,6 +372,51 @@ mod win {
             }
         }
         0
+    }
+
+    /// Behaves like a UI framework that is busy when input arrives, as Notepad was when typed
+    /// text came out as copies of its last character. It waits for a message, stays busy for
+    /// `busy_ms` without retrieving any, then takes every queued keystroke before translating
+    /// one. Windows gives `TranslateMessage` the character of the Unicode packet taken last, so
+    /// keystrokes that reach this loop in one burst all arrive as the burst's last character.
+    fn busy_draining_loop(busy_ms: u32) -> i32 {
+        let mut message = MSG::default();
+        loop {
+            // SAFETY: WaitMessage takes no arguments; it runs on the thread that owns the windows.
+            if unsafe { WaitMessage() }.is_err() {
+                return 1;
+            }
+            thread::sleep(Duration::from_millis(u64::from(busy_ms)));
+            let mut keystrokes = Vec::new();
+            // SAFETY: `message` is writable; the filter takes this thread's key-down and key-up
+            // messages, and WM_QUIT, which PeekMessageW returns whatever the filter.
+            while unsafe { PeekMessageW(&raw mut message, None, WM_KEYDOWN, WM_KEYUP, PM_REMOVE) }
+                .as_bool()
+            {
+                if message.message == WM_QUIT {
+                    return 0;
+                }
+                keystrokes.push(message);
+            }
+            for keystroke in &keystrokes {
+                // SAFETY: Each message was filled by PeekMessageW above.
+                unsafe {
+                    let _ = TranslateMessage(keystroke);
+                    DispatchMessageW(keystroke);
+                }
+            }
+            // SAFETY: As above, for every remaining message, including the characters just posted.
+            while unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                if message.message == WM_QUIT {
+                    return 0;
+                }
+                // SAFETY: `message` was filled by PeekMessageW just above.
+                unsafe {
+                    let _ = TranslateMessage(&raw const message);
+                    DispatchMessageW(&raw const message);
+                }
+            }
+        }
     }
 
     fn lparam_to_screen(hwnd: HWND, lparam: LPARAM) -> (i32, i32) {

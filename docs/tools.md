@@ -157,9 +157,9 @@ OCR text and checkbox glyphs do not prove the state of a control.
 
 An unknown name is refused with the nearest valid name, or the full list.
 
-`type_text` sends text as Unicode characters, except that `\n`, `\r\n`, a lone `\r` and `\t` are
-pressed as Enter and Tab keys, because a control that ignores those characters still reacts to
-the keys. Each Enter or Tab is checked against the target like a text batch, and is refused before it is sent if Enter or Tab itself, or any of Ctrl, Alt, Shift or Win, is held down at that moment, so a held modifier cannot turn it into a shortcut such as Alt+Tab.
+`type_text` sends text as Unicode characters, except that `\n`, `\r\n`, a lone `\r` and `\t` are pressed as Enter and Tab keys, because a control that ignores those characters still reacts to the keys. Each Enter or Tab is checked against the target like a character, and is refused before it is sent if Enter or Tab itself, or any of Ctrl, Alt, Shift or Win, is held down at that moment, so a held modifier cannot turn it into a shortcut such as Alt+Tab.
+
+`type_text` sends one keystroke at a time and checks the target before every keystroke. Before each keystroke it waits until the window with keyboard focus answers a message, pauses 10 ms, and waits for a second answer. A Unicode keystroke does not carry its character in its window message: Windows keeps the character of the keystroke the application took last, so an application that takes several queued keystrokes before translating them, as a busy one can, would turn them all into the last character. Pacing keeps keystrokes from piling up while the application is busy. It cannot prove the application took or translated a keystroke, so an application that answers messages without taking keyboard input, or handles one keystroke for longer than the pause, can still receive wrong characters, and so can any application when a keyboard hook delays keystrokes for longer than the pause; check the result before relying on it. Typing runs at roughly 70 characters a second, slower while the application is busy, and the 4,000-unit maximum can take about a minute. If the window does not answer for 5 seconds, typing stops with `target_not_responding`, and `input.sent_events` shows how much was sent. Each wait is bounded, but a whole run has no overall limit: a window that answers just under 5 seconds every time keeps typing slowly until it is finished, stopped or cancelled.
 
 ## Waiting for changes
 
@@ -205,6 +205,7 @@ Every error also has `error.retryable`. It says whether repeating the same reque
 | `cancelled` | A stop, client cancellation or closing session cancelled the work. | No |
 | `ocr_unavailable` | The OCR helper failed. | No |
 | `input_blocked` | Windows accepted only part of the input, for example for a higher-integrity window. | No |
+| `target_not_responding` | The window with keyboard focus stopped answering while text was typed, so typing stopped. Observe it before typing the rest. | No |
 | `desktop_work_stopped` | Admission is closed. | No |
 | `worker_failed` | A worker failed. Observe before recovery. | No |
 | `os_call_failed` | Any other Windows call failure. | No |

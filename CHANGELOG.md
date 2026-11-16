@@ -19,6 +19,11 @@ versioned section and uses that section for the corresponding GitHub Release not
 - The Esc keycap in the one-row tab has the same space above and below it.
 - The badge of "ControlFreak is reading the screen" is visible. It was drawn at a contrast of 1.5:1.
 - The tab's shadow fades out at the shoulders instead of ending in a straight edge.
+- `type_text` is much less likely to garble text in busy applications. It used to send up to 50 characters in one burst, and an application that takes several queued keystrokes before translating them (Windows 11 Notepad while busy) received every one of them as the burst's last character: a typed greeting arrived as "Hello,!!!!!!!!!!!" while the tool reported `completed`. Each keystroke now goes alone, after the window with keyboard focus has answered a message twice with a 10 ms pause between, and the target is checked before every keystroke. Typing is slower as a result, roughly 70 characters a second.
+
+### Added
+
+- `platform_operation_failed` has a new `reason`, `target_not_responding`: the window with keyboard focus stopped answering for 5 seconds while text was typed, so typing stopped. `input.sent_events` shows how much was sent.
 
 ## [0.2.0] - 2026-11-14
 

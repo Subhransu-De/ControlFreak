@@ -9,6 +9,7 @@ const BUILTIN: &[(&str, &str)] = &[
         "two-processes",
         include_str!("../scenes/two-processes.toml"),
     ),
+    ("busy-app", include_str!("../scenes/busy-app.toml")),
 ];
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -33,6 +34,10 @@ pub struct WindowSpec {
     pub(crate) dialog: bool,
     #[serde(default = "default_lifetime")]
     pub(crate) lifetime_secs: u32,
+    /// Nonzero: the fixture stays busy this long when input arrives, then takes every queued
+    /// keystroke before translating any, like a busy UI framework.
+    #[serde(default)]
+    pub(crate) busy_drain_ms: u32,
 }
 
 fn default_color() -> String {
@@ -99,6 +104,12 @@ impl Scene {
                     window.key
                 ));
             }
+            if window.busy_drain_ms > 1_000 {
+                return Err(format!(
+                    "window {}: busy_drain_ms must be at most 1000",
+                    window.key
+                ));
+            }
         }
         Ok(())
     }
@@ -124,6 +135,7 @@ mod tests {
         assert_eq!(window.position, [10, 140]);
         assert!(!window.topmost && !window.dialog);
         assert_eq!(window.lifetime_secs, 240);
+        assert_eq!(window.busy_drain_ms, 0);
     }
 
     #[test]
@@ -145,6 +157,10 @@ mod tests {
             (
                 "description = \"d\"\n[[window]]\nkey = \"a\"\nlifetime_secs = 0\n",
                 "lifetime",
+            ),
+            (
+                "description = \"d\"\n[[window]]\nkey = \"a\"\nbusy_drain_ms = 5000\n",
+                "busy_drain_ms",
             ),
             (
                 "description = \"d\"\n[[window]]\nkey = \"a\"\nsize = 3\n",
