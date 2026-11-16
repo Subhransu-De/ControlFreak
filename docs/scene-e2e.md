@@ -85,6 +85,7 @@ This is the "copy something from one application into another" desk. A control s
 
 | Task | What happens |
 | --- | --- |
+| `smoke/focus-after-user-input` | Injects a click into `journal` after the server has started, as a user typing in another app does, then focuses `ledger`. Checks that Windows refused the server's own request and the activation helper's was accepted (`input.activation_helper` is `accepted`), that `ledger` logged an activation and is in front, and that a click on it is accepted. |
 | `smoke/foreign-window-refused` | With a session on `ledger`, clicks at the center of `journal`. Checks the refusal is `target_invalidated` with reason `foreign_destination`, is retryable and sent no input. Then checks the session still works on `ledger` and `journal` received nothing. |
 | `handoff/sessions-hand-over-cleanly` | Types `A1` into `ledger`, `B2` into `journal` and `C3` into `ledger`, each in its own session. Checks `ledger` received exactly `A1C3` and `journal` exactly `B2`. |
 | `handoff/other-window-refused-in-session` | With a session on `ledger`, tries to type into `journal`. Checks the call is refused, `journal` received no input, and typing into `ledger` still works afterwards. |

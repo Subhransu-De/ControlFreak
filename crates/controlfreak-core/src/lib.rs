@@ -38,7 +38,7 @@ pub use ocr::{
     OcrRegionRequest, OcrResult, OcrWord, TextCondition, TextMatch, TextMatchMode, TextMatchTier,
     WaitForTextRequest, WaitForTextResult,
 };
-pub use outcome::{CleanupStatus, InputOutcome, MutationProgress};
+pub use outcome::{ActivationHelperOutcome, CleanupStatus, InputOutcome, MutationProgress};
 pub use permission::{PermissionDescriptor, PermissionId, PermissionState};
 pub use platform::{
     BackendIdentity, BackendMetadata, DisplayBackend, DisplayServer, KeyboardBackend, OcrBackend,

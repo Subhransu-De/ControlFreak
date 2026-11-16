@@ -172,9 +172,15 @@ pub(crate) fn button_pressed(events: &[Event], name: &str) -> bool {
 }
 
 pub(crate) fn activated(events: &[Event]) -> bool {
+    activations(events) > 0
+}
+
+/// How often the main window was activated, by click or by `SetForegroundWindow`.
+pub(crate) fn activations(events: &[Event]) -> usize {
     events
         .iter()
-        .any(|event| matches!(event, Event::Activate { role, state: 1 | 2 } if role == "main"))
+        .filter(|event| matches!(event, Event::Activate { role, state: 1 | 2 } if role == "main"))
+        .count()
 }
 
 pub(crate) fn near(actual: (i32, i32), wanted: (i32, i32)) -> bool {

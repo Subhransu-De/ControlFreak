@@ -77,19 +77,7 @@ verified owning image: `explorer.exe` in the Windows directory for the taskbars 
 lacks a desktop identity is still refused, and every other check, including integrity, still
 applies to the window. ControlFreak still has no tool that launches applications.
 
-Focus acquisition uses only documented restoration and foreground APIs with a bounded retry
-budget. It validates on every poll and stops on competing foreground ownership. A mismatch
-invalidates session approval. Release-only cleanup remains permitted after earlier dispatch.
-These checks reduce OS races; out-of-context event notifications and input delivery are not
-atomic with validation. Post-action foreground evidence is a sample, not a continuous guarantee.
-Clicks and scrolls refuse dispatch if the cursor left the validated point after validation, but
-button and wheel events still fire at the live cursor, so a move in the final microseconds is not
-excluded. `click_text` refuses if any other input action completed while its OCR ran; changes made
-by the application or the user meanwhile are not detected. A window handle reused within the same
-process before its destroy event is processed cannot be told apart from the original; this needs
-the same full handle value, thread, class, bounds and foreground, and is accepted as residual risk.
-Batched actions validate every step's arguments before the first step and recheck the target for
-each step exactly as separate calls would.
+Focus acquisition uses only documented restoration and foreground APIs with a bounded retry budget. It validates on every poll and stops on competing foreground ownership. When Windows refuses the server's own `SetForegroundWindow`, because user input arrived after the server started, the server starts its own executable once per `focus_window` as a helper process in a kill-on-close job. The helper receives only the window handle and the owning process ID that the server validated, refuses the call if the handle now belongs to another process, makes the same call, and exits with its answer within a 1.5-second bound. It sends no input, writes nothing to stdout and has no other mode. All target, desktop and integrity checks stay in the server and run again on every poll after the helper's answer. A mismatch invalidates session approval. Release-only cleanup remains permitted after earlier dispatch. These checks reduce OS races; out-of-context event notifications and input delivery are not atomic with validation. Post-action foreground evidence is a sample, not a continuous guarantee. Clicks and scrolls refuse dispatch if the cursor left the validated point after validation, but button and wheel events still fire at the live cursor, so a move in the final microseconds is not excluded. `click_text` refuses if any other input action completed while its OCR ran; changes made by the application or the user meanwhile are not detected. A window handle reused within the same process before its destroy event is processed cannot be told apart from the original; this needs the same full handle value, thread, class, bounds and foreground, and is accepted as residual risk. Batched actions validate every step's arguments before the first step and recheck the target for each step exactly as separate calls would.
 
 `get_server_status` and `--print-capabilities` report `server_elevated`, the Windows integrity level,
 and whether elevated operation was explicitly allowed. Elevated mutation sessions turn the
