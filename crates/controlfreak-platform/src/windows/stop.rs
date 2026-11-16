@@ -9,6 +9,7 @@
 use controlfreak_core::StopController;
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     io,
     sync::{
         Arc, Weak,
@@ -20,34 +21,37 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WAIT_FAILED, WAIT_TIMEOUT, WPARAM},
-        Graphics::Gdi::{CreateFontIndirectW, DeleteObject, HFONT, HGDIOBJ, LOGFONTW},
+        Foundation::{
+            HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_FAILED, WAIT_TIMEOUT, WPARAM,
+        },
         System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
         UI::{
             Accessibility::NotifyWinEvent,
-            HiDpi::SystemParametersInfoForDpi,
             Input::{
                 GetCurrentInputMessageSource, IMO_HARDWARE, INPUT_MESSAGE_ORIGIN_ID,
                 INPUT_MESSAGE_SOURCE,
-                KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE},
+                KeyboardAndMouse::{
+                    GetAsyncKeyState, GetCapture, ReleaseCapture, SetCapture, TME_LEAVE,
+                    TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE,
+                },
             },
             Shell::{
                 DefSubclassProc, IVirtualDesktopManager, RemoveWindowSubclass, SetWindowSubclass,
             },
             WindowsAndMessaging::{
-                BM_CLICK, BN_CLICKED, BS_PUSHBUTTON, CHILDID_SELF, CallNextHookEx, CreateWindowExW,
+                BM_CLICK, BS_OWNERDRAW, CHILDID_SELF, CallNextHookEx, CreateWindowExW,
                 DefWindowProcW, DestroyWindow, DispatchMessageW, EVENT_OBJECT_NAMECHANGE,
-                EVENT_SYSTEM_ALERT, GetForegroundWindow, HHOOK, HTTRANSPARENT, HWND_TOPMOST,
-                KBDLLHOOKSTRUCT, LLKHF_INJECTED, MA_NOACTIVATE, MSG, MWMO_INPUTAVAILABLE,
-                MsgWaitForMultipleObjectsEx, OBJID_WINDOW, PM_REMOVE, PeekMessageW,
-                PostThreadMessageW, QS_ALLINPUT, RegisterClassW, SPI_GETICONTITLELOGFONT, SW_HIDE,
+                EVENT_SYSTEM_ALERT, GetClientRect, GetForegroundWindow, HHOOK, HTTRANSPARENT,
+                HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MA_NOACTIVATE, MSG,
+                MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, OBJID_WINDOW, PM_REMOVE,
+                PeekMessageW, PostThreadMessageW, QS_ALLINPUT, RegisterClassW, SW_HIDE,
                 SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowDisplayAffinity,
                 SetWindowPos, SetWindowTextW, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx,
                 UnregisterClassW, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WINDOW_STYLE, WM_APP,
-                WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_KEYDOWN,
+                WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_KEYDOWN,
                 WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-                WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST, WM_RBUTTONDOWN,
-                WM_RBUTTONUP, WM_SETFONT, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_SYSKEYDOWN,
+                WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCDESTROY, WM_NCHITTEST,
+                WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_SYSKEYDOWN,
                 WM_SYSKEYUP, WM_THEMECHANGED, WNDCLASSW, WS_DISABLED, WS_EX_LAYERED,
                 WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
             },
@@ -58,9 +62,9 @@ use windows::{
 
 use super::desktop::virtual_desktop_manager;
 use super::indicator::{
-    Activity, FADE_IN, FADE_IN_FROM, Monitor, PaintedTab, Painter, Palette, READING, StopStatus,
-    TabInputs, TabKind, TabModel, TabView, animations_enabled, enumerate_monitors, spoken,
-    text_scale,
+    Activity, ButtonState, DibSurface, FADE_IN, FADE_IN_FROM, Monitor, PaintedTab, Painter,
+    Palette, READING, StopStatus, TabInputs, TabKind, TabModel, TabView, animations_enabled,
+    enumerate_monitors, spoken, text_scale,
 };
 use super::win32::{ComApartment, windows_error};
 
@@ -80,9 +84,11 @@ const SETTINGS_INTERVAL: Duration = Duration::from_millis(500);
 /// setting changes as messages, and a session wakes the thread. This is only a safety net.
 const IDLE_SETTINGS_INTERVAL: Duration = Duration::from_secs(2);
 /// The label of the Stop button, which is also its accessible name.
-const STOP_BUTTON_LABEL: PCWSTR = w!("Stop agent");
+const STOP_BUTTON_LABEL: &str = "Stop agent";
 /// Identifies this module's subclass on the Stop button.
 const BUTTON_SUBCLASS_ID: usize = 0x5354_4f50;
+/// Sent to a window when the pointer leaves it, after `TrackMouseEvent` asked for it.
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EscapeState {
@@ -95,6 +101,69 @@ thread_local! {
     static CONTROLLER: RefCell<Option<StopController>> = const { RefCell::new(None) };
     static ESC_STATE: Cell<EscapeState> = const { Cell::new(EscapeState::Released) };
     static SETTINGS_CHANGED: Cell<bool> = const { Cell::new(false) };
+    /// The look of every Stop button on this thread, by window handle. The tab loop paints the
+    /// faces; the button's own messages (the pointer arriving, a press) pick which one shows.
+    static BUTTON_LOOKS: RefCell<HashMap<isize, ButtonLook>> = RefCell::new(HashMap::new());
+}
+
+/// What one Stop button shows and where: its painted faces, in [`ButtonState::ALL`] order, and
+/// whether the pointer is over it or pressing it.
+struct ButtonLook {
+    faces: [DibSurface; 3],
+    origin: POINT,
+    hot: bool,
+    pressed: bool,
+}
+
+impl ButtonLook {
+    const fn state(&self) -> ButtonState {
+        if self.pressed {
+            ButtonState::Pressed
+        } else if self.hot {
+            ButtonState::Hot
+        } else {
+            ButtonState::Rest
+        }
+    }
+}
+
+fn button_key(button: HWND) -> isize {
+    button.0 as isize
+}
+
+/// Puts the face for the button's current state on screen. A button that has not been painted
+/// yet has nothing to show.
+fn present_button(button: HWND) -> io::Result<()> {
+    BUTTON_LOOKS.with(|looks| {
+        let looks = looks.borrow();
+        let Some(look) = looks.get(&button_key(button)) else {
+            return Ok(());
+        };
+        let face = &look.faces[look.state() as usize];
+        face.present(button, look.origin, 255)
+    })
+}
+
+/// Changes a button's look from one of its own messages and shows the new face. Returns whether
+/// anything changed. A window procedure has nowhere to report a failed presentation: the button
+/// keeps its last face and still takes clicks.
+fn change_button(button: HWND, change: impl FnOnce(&mut ButtonLook)) -> bool {
+    let changed = BUTTON_LOOKS.with(|looks| {
+        // Never re-entered in practice; a message that did arrive mid-update is skipped rather
+        // than allowed to panic inside a window procedure.
+        let Ok(mut looks) = looks.try_borrow_mut() else {
+            return false;
+        };
+        looks.get_mut(&button_key(button)).is_some_and(|look| {
+            let before = look.state();
+            change(look);
+            look.state() != before
+        })
+    });
+    if changed {
+        let _ = present_button(button);
+    }
+    changed
 }
 
 /// What the desktop glow controller last had acknowledged, so the session tab can say whether
@@ -642,30 +711,38 @@ fn current_input_is_from_a_person() -> bool {
     )
 }
 
-/// A real, native push button on its own small window, owned by the tab. Being a standard
-/// `BUTTON` it exposes the Invoke pattern to UI Automation, so voice control and switch access
-/// can press it, as can a mouse, finger or pen; an on-screen keyboard sends keys, which the
-/// button drops. It is enabled and not transparent, so hit-testing resolves to
-/// it, and its process is not the target's, which the pointer checks refuse; its subclass also
-/// drops injected input. It never takes focus.
+/// A real, native button on its own small window, owned by the tab. Being a standard `BUTTON`
+/// it exposes the Invoke pattern to UI Automation, so voice control and switch access can press
+/// it, as can a mouse, finger or pen; an on-screen keyboard sends keys, which the button drops.
+/// It is enabled and not transparent, so hit-testing resolves to it, and its process is not the
+/// target's, which the pointer checks refuse; its subclass also drops injected input. It never
+/// takes focus.
+///
+/// The class gives the button its role and name; its picture and its press are handled here.
+/// It is owner-drawn and layered, and shows faces the tab's painter made, so it has the tab's
+/// colours, type and rounded corners instead of the unthemed system button. The press is
+/// tracked by the subclass (see [`pointer_message`]), because a top-level button reports its
+/// click to the desktop window, where nothing of ours hears it.
 struct StopButton {
     hwnd: HWND,
-    font: Option<HFONT>,
-    /// The DPI and text scale the font and size were made for.
-    fitted: Option<(u32, u32)>,
+    /// The DPI, text scale and palette the faces were painted for.
+    fitted: Option<(u32, u32, Palette)>,
     shown: Option<(i32, i32, i32, i32)>,
 }
 
 impl StopButton {
     fn create(instance: HINSTANCE, owner: HWND) -> io::Result<Self> {
-        // SAFETY: The class is a system class, the owner is a live window of this thread, and the
-        // returned HWND is owned by this value until Drop destroys it.
+        // The window text is the button's accessible name.
+        let name: Vec<u16> = STOP_BUTTON_LABEL.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: The class is a system class, the owner is a live window of this thread, `name`
+        // is NUL-terminated and copied by the call, and the returned HWND is owned by this value
+        // until Drop destroys it.
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
                 w!("BUTTON"),
-                STOP_BUTTON_LABEL,
-                WS_POPUP | WINDOW_STYLE(BS_PUSHBUTTON.cast_unsigned()),
+                PCWSTR(name.as_ptr()),
+                WS_POPUP | WINDOW_STYLE(BS_OWNERDRAW.cast_unsigned()),
                 0,
                 0,
                 1,
@@ -697,88 +774,95 @@ impl StopButton {
         }
         Ok(Self {
             hwnd,
-            font: None,
             fitted: None,
             shown: None,
         })
     }
 
-    /// Gives the button the system message font at this display's DPI and the Windows text size.
-    fn fit(&mut self, dpi: u32, text_scale: f32) {
-        let key = (dpi, text_scale.to_bits());
+    /// Paints the button's faces for this display's DPI, the Windows text size and the palette.
+    /// Returns whether they were painted anew.
+    fn fit(
+        &mut self,
+        painter: &Painter,
+        palette: &Palette,
+        dpi: u32,
+        text_scale: f32,
+        metrics: ButtonMetrics,
+    ) -> io::Result<bool> {
+        let key = (dpi, text_scale.to_bits(), *palette);
         if self.fitted == Some(key) {
-            return;
+            return Ok(false);
         }
-        let mut font = LOGFONTW::default();
-        // SAFETY: `font` is writable and its size is passed; the call fills it for this DPI.
-        let found = unsafe {
-            SystemParametersInfoForDpi(
-                SPI_GETICONTITLELOGFONT.0,
-                u32::try_from(size_of::<LOGFONTW>()).unwrap_or(0),
-                Some((&raw mut font).cast()),
-                0,
-                dpi,
-            )
-        };
-        if found.is_err() {
-            return;
-        }
-        // The icon-title font height is negative (character height); scale its magnitude.
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            font.lfHeight =
-                (f64::from(font.lfHeight) * f64::from(text_scale.clamp(1.0, 2.25))).round() as i32;
-        }
-        font.lfWeight = 600;
-        // SAFETY: `font` is fully initialized by the call above.
-        let created = unsafe { CreateFontIndirectW(&raw const font) };
-        if created.is_invalid() {
-            return;
-        }
-        // SAFETY: The button owns its window; the font stays alive until it replaces or drops it,
-        // and the button is told not to repaint twice (WM_SETFONT with a redraw flag).
-        unsafe {
-            windows::Win32::UI::WindowsAndMessaging::SendMessageW(
-                self.hwnd,
-                WM_SETFONT,
-                Some(WPARAM(created.0 as usize)),
-                Some(LPARAM(1)),
-            );
-        }
-        if let Some(previous) = self.font.replace(created) {
-            // SAFETY: The previous font was created here and is no longer selected anywhere.
-            let _ = unsafe { DeleteObject(HGDIOBJ(previous.0)) };
-        }
+        let size = (metrics.width, metrics.height);
+        let paint =
+            |state| painter.paint_button(STOP_BUTTON_LABEL, state, palette, dpi, text_scale, size);
+        let [rest, hot, pressed] = ButtonState::ALL;
+        let faces = [paint(rest)?, paint(hot)?, paint(pressed)?];
+        BUTTON_LOOKS.with(|looks| {
+            let mut looks = looks.borrow_mut();
+            match looks.get_mut(&button_key(self.hwnd)) {
+                Some(look) => look.faces = faces,
+                None => {
+                    looks.insert(
+                        button_key(self.hwnd),
+                        ButtonLook {
+                            faces,
+                            origin: POINT::default(),
+                            hot: false,
+                            pressed: false,
+                        },
+                    );
+                }
+            }
+        });
         self.fitted = Some(key);
+        Ok(true)
     }
 
-    /// Shows the button at `rect` (left, top, width, height) above everything, or hides it.
-    fn place(&mut self, rect: Option<(i32, i32, i32, i32)>) {
-        if self.shown == rect {
+    /// Shows the button at `rect` (left, top, width, height) above everything. `repainted` shows
+    /// freshly painted faces on a button that has not moved.
+    fn place(&mut self, rect: (i32, i32, i32, i32), repainted: bool) -> io::Result<()> {
+        if self.shown == Some(rect) && !repainted {
+            return Ok(());
+        }
+        let (x, y, width, height) = rect;
+        BUTTON_LOOKS.with(|looks| {
+            if let Some(look) = looks.borrow_mut().get_mut(&button_key(self.hwnd)) {
+                look.origin = POINT { x, y };
+            }
+        });
+        // A layered window shows what it was last given, so the face goes first.
+        present_button(self.hwnd)?;
+        // SAFETY: This thread owns the HWND; the call only moves, sizes and shows it above other
+        // topmost windows, without activating it.
+        let _ = unsafe {
+            SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                x,
+                y,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        };
+        self.shown = Some(rect);
+        Ok(())
+    }
+
+    /// Hides the button. It comes back at rest: a pointer that was over it is not told it left.
+    fn hide(&mut self) {
+        if self.shown.take().is_none() {
             return;
         }
-        match rect {
-            Some((x, y, width, height)) => {
-                // SAFETY: This thread owns the HWND; the call only moves, sizes and shows it
-                // above other topmost windows, without activating it.
-                let _ = unsafe {
-                    SetWindowPos(
-                        self.hwnd,
-                        Some(HWND_TOPMOST),
-                        x,
-                        y,
-                        width,
-                        height,
-                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                    )
-                };
+        // SAFETY: Hiding a window owned by this thread retains no pointers.
+        let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+        BUTTON_LOOKS.with(|looks| {
+            if let Some(look) = looks.borrow_mut().get_mut(&button_key(self.hwnd)) {
+                look.hot = false;
+                look.pressed = false;
             }
-            None => {
-                // SAFETY: Hiding a window owned by this thread retains no pointers.
-                let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
-            }
-        }
-        self.shown = rect;
+        });
     }
 
     /// Keeps a shown button above windows that became topmost after it.
@@ -802,14 +886,13 @@ impl StopButton {
 
 impl Drop for StopButton {
     fn drop(&mut self) {
-        // SAFETY: The window and font are owned by this value and released once. Destroying the
-        // owner earlier would already have destroyed the window, which only makes this fail.
+        // The faces go with the button; a thread that is already ending has dropped them.
+        let _ = BUTTON_LOOKS.try_with(|looks| looks.borrow_mut().remove(&button_key(self.hwnd)));
+        // SAFETY: The window is owned by this value and released once. Destroying the owner
+        // earlier would already have destroyed the window, which only makes this fail.
         unsafe {
             let _ = RemoveWindowSubclass(self.hwnd, Some(button_subclass), BUTTON_SUBCLASS_ID);
             let _ = DestroyWindow(self.hwnd);
-            if let Some(font) = self.font.take() {
-                let _ = DeleteObject(HGDIOBJ(font.0));
-            }
         }
     }
 }
@@ -842,6 +925,91 @@ fn is_person_only_message(message: u32) -> bool {
     )
 }
 
+/// Whether the point a mouse message carries in `lparam` (client coordinates) is on `window`.
+fn pointer_is_on(window: HWND, lparam: LPARAM) -> bool {
+    // The low and high words are signed 16-bit coordinates; the casts keep exactly those bits.
+    #[allow(clippy::cast_possible_truncation)]
+    let (x, y) = (
+        i32::from(lparam.0 as i16),
+        i32::from((lparam.0 >> 16) as i16),
+    );
+    let mut client = RECT::default();
+    // SAFETY: `client` is writable for this synchronous call; a failure leaves it empty, so no
+    // point is on the window.
+    let _ = unsafe { GetClientRect(window, &raw mut client) };
+    (client.left..client.right).contains(&x) && (client.top..client.bottom).contains(&y)
+}
+
+/// Handles the pointer on the Stop button: the look under the pointer, the press, and the click
+/// that stops the session. `Some` is the message's result; `None` leaves it to the button class.
+///
+/// The class cannot be left to track the press. As a top-level window it ignores the first click
+/// (it arms only once it holds the focus) and reports a click to its parent, which for a
+/// top-level window is the desktop and not the tab that owns it, so nothing here would hear it.
+/// The press is the usual one: it starts on the button, shows while the pointer is on it, and
+/// counts when the pointer is released there. The caller has already dropped presses and
+/// releases that did not come from input hardware, and nothing here asks for the focus.
+fn pointer_message(window: HWND, message: u32, lparam: LPARAM) -> Option<LRESULT> {
+    // SAFETY: Reads which window of this thread holds the mouse capture; no pointers.
+    let pressing = || unsafe { GetCapture() } == window;
+    match message {
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+            // SAFETY: `window` belongs to this thread; capture keeps the release coming here
+            // even if the pointer has left the button by then.
+            unsafe { SetCapture(window) };
+            change_button(window, |look| look.pressed = true);
+            Some(LRESULT(0))
+        }
+        WM_MOUSEMOVE => {
+            let on_button = pointer_is_on(window, lparam);
+            let pressed = on_button && pressing();
+            let was_hot = BUTTON_LOOKS.with(|looks| {
+                looks
+                    .borrow()
+                    .get(&button_key(window))
+                    .is_some_and(|look| look.hot)
+            });
+            change_button(window, |look| {
+                look.hot = on_button;
+                look.pressed = pressed;
+            });
+            if on_button && !was_hot {
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: u32::try_from(size_of::<TRACKMOUSEEVENT>()).unwrap_or(0),
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: window,
+                    dwHoverTime: 0,
+                };
+                // SAFETY: `track` is a fully initialized local for this synchronous call. If it
+                // fails the button stays lit until it is next hidden, and still works.
+                let _ = unsafe { TrackMouseEvent(&raw mut track) };
+            }
+            None
+        }
+        WM_LBUTTONUP => {
+            if pressing() {
+                let clicked = pointer_is_on(window, lparam);
+                // SAFETY: Releases the capture this thread took on the press.
+                let _ = unsafe { ReleaseCapture() };
+                change_button(window, |look| look.pressed = false);
+                if clicked {
+                    invoke_stop();
+                }
+            }
+            Some(LRESULT(0))
+        }
+        WM_CAPTURECHANGED => {
+            change_button(window, |look| look.pressed = false);
+            None
+        }
+        WM_MOUSELEAVE => {
+            change_button(window, |look| look.hot = false);
+            None
+        }
+        _ => None,
+    }
+}
+
 unsafe extern "system" fn button_subclass(
     window: HWND,
     message: u32,
@@ -861,6 +1029,12 @@ unsafe extern "system" fn button_subclass(
         }
         message if is_person_only_message(message) && !current_input_is_from_a_person() => {
             return LRESULT(0);
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_LBUTTONUP | WM_MOUSEMOVE | WM_CAPTURECHANGED
+        | WM_MOUSELEAVE => {
+            if let Some(result) = pointer_message(window, message, lparam) {
+                return result;
+            }
         }
         WM_NCDESTROY => {
             // SAFETY: The window is being destroyed; this removes the subclass that is running.
@@ -932,13 +1106,18 @@ impl TabWindow {
 
     /// Shows or hides the Stop button under the tab body. It is offered only while `offered`,
     /// the tab is fully shown and the display has room for it.
-    fn place_stop_button(&mut self, offered: bool) {
+    fn place_stop_button(
+        &mut self,
+        offered: bool,
+        painter: &Painter,
+        palette: &Palette,
+    ) -> io::Result<()> {
+        let metrics = button_metrics(self.monitor.dpi, self.text_scale);
         let rect = self
             .tab
             .as_ref()
             .filter(|_| offered && self.visible)
             .and_then(|tab| {
-                let metrics = button_metrics(self.monitor.dpi, self.text_scale);
                 button_origin(
                     self.monitor,
                     self.origin.x,
@@ -948,10 +1127,14 @@ impl TabWindow {
                 )
                 .map(|origin| (origin.x, origin.y, metrics.width, metrics.height))
             });
-        if rect.is_some() {
-            self.button.fit(self.monitor.dpi, self.text_scale);
-        }
-        self.button.place(rect);
+        let Some(rect) = rect else {
+            self.button.hide();
+            return Ok(());
+        };
+        let repainted =
+            self.button
+                .fit(painter, palette, self.monitor.dpi, self.text_scale, metrics)?;
+        self.button.place(rect, repainted)
     }
 
     /// Paints `view` for this display and names the window with its words, so a window rebuilt
@@ -1067,7 +1250,7 @@ impl TabWindow {
     }
 
     fn hide(&mut self) {
-        self.button.place(None);
+        self.button.hide();
         if self.visible {
             // SAFETY: Hiding a window owned by this thread retains no pointers.
             let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
@@ -1483,7 +1666,7 @@ fn tab_loop(
         // on screen, and never with any other message.
         let offered = presenter.stop_button_offered();
         for tab in &mut native.tabs {
-            tab.place_stop_button(offered);
+            tab.place_stop_button(offered, &presenter.painter, &settings.palette)?;
         }
         let timeout = wait_timeout_ms(
             presenter.fading(),
@@ -1616,22 +1799,10 @@ unsafe extern "system" fn window_proc(
         | WM_DPICHANGED => SETTINGS_CHANGED.with(|flag| flag.set(true)),
         WM_NCHITTEST => return LRESULT(isize::try_from(HTTRANSPARENT).unwrap_or(-1)),
         WM_MOUSEACTIVATE => return LRESULT(isize::try_from(MA_NOACTIVATE).unwrap_or(3)),
-        // The Stop button reports a click here. Injected clicks never get this far: the button's
-        // subclass drops them before the button sees them.
-        WM_COMMAND if is_button_click(wparam, lparam) => {
-            invoke_stop();
-            return LRESULT(0);
-        }
         _ => {}
     }
     // SAFETY: Forward unchanged Win32 callback arguments to the default procedure.
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
-}
-
-/// A `WM_COMMAND` from a control (non-null `lparam`) with the `BN_CLICKED` notification.
-fn is_button_click(wparam: WPARAM, lparam: LPARAM) -> bool {
-    let notification = (wparam.0 >> 16) & 0xffff;
-    lparam.0 != 0 && u32::try_from(notification) == Ok(BN_CLICKED)
 }
 
 #[cfg(test)]
@@ -2264,13 +2435,6 @@ mod tests {
     }
 
     #[test]
-    fn a_command_is_a_click_only_from_a_control_with_the_clicked_notification() {
-        assert!(is_button_click(WPARAM(BN_CLICKED as usize), LPARAM(1)));
-        assert!(!is_button_click(WPARAM(BN_CLICKED as usize), LPARAM(0)));
-        assert!(!is_button_click(WPARAM(1 << 16), LPARAM(1)));
-    }
-
-    #[test]
     fn the_stop_button_is_offered_only_with_a_steady_session_tab() {
         let mut presenter = Presenter::new(Painter::new().unwrap());
         let settings = Settings {
@@ -2363,34 +2527,186 @@ mod tests {
         unsafe { GetWindowDisplayAffinity(button, &raw mut affinity) }.unwrap();
         assert_eq!(affinity, WDA_EXCLUDEFROMCAPTURE.0, "never in screenshots");
 
-        // UI Automation's Invoke pattern clicks with BM_CLICK; the owner hears BN_CLICKED.
+        // UI Automation's Invoke pattern clicks with BM_CLICK.
         let controller = StopController::default();
         CONTROLLER.with(|slot| *slot.borrow_mut() = Some(controller.clone()));
         // SAFETY: Same live window; BM_CLICK carries no pointers.
         unsafe { SendMessageW(button, BM_CLICK, Some(WPARAM(0)), Some(LPARAM(0))) };
         assert!(!controller.is_stopped(), "no session, nothing to stop");
         controller.set_session_active(true);
-        // A command that does not come from a control is not a click.
-        // SAFETY: Same live window; the message carries no pointers.
-        unsafe { SendMessageW(tab.hwnd, WM_COMMAND, Some(WPARAM(0)), Some(LPARAM(0))) };
-        assert!(!controller.is_stopped());
         // SAFETY: Same live window; BM_CLICK carries no pointers.
         unsafe { SendMessageW(button, BM_CLICK, Some(WPARAM(0)), Some(LPARAM(0))) };
         assert!(controller.user_stopped(), "invoked, so stopped by the user");
 
+        // A press sent as a message has no hardware origin, so the button drops it: only a
+        // person's mouse, finger or pen gets as far as `pointer_message`.
         let again = StopController::default();
         again.set_session_active(true);
         CONTROLLER.with(|slot| *slot.borrow_mut() = Some(again.clone()));
-        // SAFETY: Same live windows; the control handle is only compared by the callee.
-        unsafe {
-            SendMessageW(
-                tab.hwnd,
-                WM_COMMAND,
-                Some(WPARAM(BN_CLICKED as usize)),
-                Some(LPARAM(button.0 as isize)),
+        for message in [WM_LBUTTONDOWN, WM_LBUTTONUP] {
+            // SAFETY: Same live window; the message carries a point, no pointers.
+            unsafe { SendMessageW(button, message, Some(WPARAM(1)), Some(LPARAM(0))) };
+        }
+        assert!(!again.is_stopped(), "a sent click is not a person's click");
+        CONTROLLER.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    /// The face a Stop button currently shows, or `None` before it has been painted.
+    fn look_of(button: HWND) -> Option<ButtonState> {
+        BUTTON_LOOKS.with(|looks| {
+            looks
+                .borrow()
+                .get(&button_key(button))
+                .map(ButtonLook::state)
+        })
+    }
+
+    /// Paints the first display's Stop button and shows it under a tab-sized space.
+    fn show_stop_button(native: &mut NativeStop) -> (HWND, ButtonMetrics, POINT) {
+        let painter = Painter::new().unwrap();
+        let monitor = enumerate_monitors().unwrap().remove(0);
+        native.sync_monitors(&[monitor]).unwrap();
+        let button = &mut native.tabs[0].button;
+        let metrics = button_metrics(monitor.dpi, 1.0);
+        let fit = |button: &mut StopButton| {
+            button
+                .fit(&painter, &Palette::STANDARD, monitor.dpi, 1.0, metrics)
+                .unwrap()
+        };
+        assert_eq!(look_of(button.hwnd), None, "not painted until offered");
+        assert!(fit(button));
+        assert!(!fit(button), "painted once per DPI, text size and palette");
+        let origin = button_origin(monitor, monitor.left, monitor.width(), 40, metrics).unwrap();
+        button
+            .place((origin.x, origin.y, metrics.width, metrics.height), true)
+            .unwrap();
+        (button.hwnd, metrics, origin)
+    }
+
+    #[test]
+    fn the_stop_button_is_the_system_button_wearing_the_tabs_look() {
+        use windows::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW};
+        let _windows = window_class_lock();
+        super::super::ensure_dpi_awareness().unwrap();
+        let mut native = NativeStop::create().unwrap();
+        let (button, metrics, origin) = show_stop_button(&mut native);
+
+        // Still the system button class; its picture is a layered face of ours.
+        // SAFETY: The window is live and owned by this thread.
+        let (style, ex_style) = unsafe {
+            (
+                u32::try_from(GetWindowLongPtrW(button, GWL_STYLE) & 0xffff_ffff).unwrap(),
+                u32::try_from(GetWindowLongPtrW(button, GWL_EXSTYLE)).unwrap(),
             )
         };
-        assert!(again.user_stopped(), "a click reported by the button");
+        assert_eq!(style & 0xf, BS_OWNERDRAW.cast_unsigned());
+        assert_ne!(ex_style & WS_EX_LAYERED.0, 0);
+        assert_eq!(look_of(button), Some(ButtonState::Rest));
+
+        let mut rect = RECT::default();
+        // SAFETY: `rect` is writable for the synchronous call and the window is live.
+        unsafe { GetWindowRect(button, &raw mut rect) }.unwrap();
+        assert_eq!(
+            (rect.left, rect.top, rect.right, rect.bottom),
+            (
+                origin.x,
+                origin.y,
+                origin.x + metrics.width,
+                origin.y + metrics.height
+            ),
+            "the window is exactly the painted face"
+        );
+
+        assert!(pointer_message(button, WM_MOUSEMOVE, LPARAM(0)).is_none());
+        native.tabs[0].button.hide();
+        assert_eq!(
+            look_of(button),
+            Some(ButtonState::Rest),
+            "a hidden button comes back at rest"
+        );
+        drop(native);
+        assert_eq!(look_of(button), None, "the faces go with the button");
+    }
+
+    #[test]
+    fn a_press_on_the_stop_button_stops_when_it_is_released_on_the_button() {
+        let _windows = window_class_lock();
+        super::super::ensure_dpi_awareness().unwrap();
+        let mut native = NativeStop::create().unwrap();
+        let (button, metrics, _) = show_stop_button(&mut native);
+        let controller = StopController::default();
+        controller.set_session_active(true);
+        CONTROLLER.with(|slot| *slot.borrow_mut() = Some(controller.clone()));
+
+        // What a person's pointer does, from the point where the hardware check has passed.
+        let at = |x: i32, y: i32| {
+            LPARAM((isize::try_from(y).unwrap() << 16) | isize::try_from(x).unwrap())
+        };
+        let (on, off) = (at(4, 4), at(metrics.width + 40, 4));
+        let mouse = |message, point| pointer_message(button, message, point);
+        // SAFETY: Reads this thread's capture; no pointers.
+        let captured = || unsafe { GetCapture() } == button;
+
+        mouse(WM_MOUSEMOVE, on);
+        assert_eq!(
+            look_of(button),
+            Some(ButtonState::Hot),
+            "lit under the pointer"
+        );
+        mouse(WM_MOUSELEAVE, on);
+        assert_eq!(look_of(button), Some(ButtonState::Rest));
+
+        // A press that slides off the button and is released there is not a click.
+        assert!(
+            mouse(WM_LBUTTONDOWN, on).is_some(),
+            "the class never sees it"
+        );
+        assert_eq!(look_of(button), Some(ButtonState::Pressed));
+        assert!(captured(), "the release comes here wherever the pointer is");
+        mouse(WM_MOUSEMOVE, off);
+        assert_eq!(
+            look_of(button),
+            Some(ButtonState::Rest),
+            "not pressed off it"
+        );
+        mouse(WM_MOUSEMOVE, on);
+        assert_eq!(
+            look_of(button),
+            Some(ButtonState::Pressed),
+            "pressed when back"
+        );
+        mouse(WM_MOUSEMOVE, off);
+        mouse(WM_LBUTTONUP, off);
+        assert!(!captured());
+        assert!(!controller.is_stopped(), "released off the button");
+
+        // A release without a press on the button is not a click either.
+        mouse(WM_LBUTTONUP, on);
+        assert!(!controller.is_stopped());
+
+        // Losing the capture ends a press without a click.
+        mouse(WM_MOUSEMOVE, on);
+        mouse(WM_LBUTTONDOWN, on);
+        // SAFETY: Releases the capture the press above took on this thread.
+        let _ = unsafe { ReleaseCapture() };
+        assert_eq!(
+            look_of(button),
+            Some(ButtonState::Hot),
+            "the lost press is let go"
+        );
+        mouse(WM_LBUTTONUP, on);
+        assert!(!controller.is_stopped());
+
+        // Pressed and released on the button: the user's stop, at the first click.
+        mouse(WM_LBUTTONDOWN, on);
+        mouse(WM_LBUTTONUP, on);
+        assert!(controller.user_stopped(), "a click stops the session");
+        assert!(!captured());
+        assert_eq!(
+            look_of(button),
+            Some(ButtonState::Hot),
+            "still under the pointer"
+        );
         CONTROLLER.with(|slot| *slot.borrow_mut() = None);
     }
 

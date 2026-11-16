@@ -11,6 +11,14 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ### Fixed
 
+- A mouse, touch or pen click on the **Stop agent** button now stops the session. The button is a top-level window, and Windows sent its click notification to the desktop instead of to ControlFreak, so only accessibility tools (UI Automation Invoke) and Esc worked. The press is now handled by the button itself, after the same check that drops injected input.
+- The pointer in the session tab's badge sits in the middle of its square. It was about 1 pixel left of center at 100% and 2 pixels at 200%.
+- The **Stop agent** button matches the tab: the same dark surface, type and rounded corners instead of the gray system button, and it lightens under the pointer and darkens while pressed.
+- The tab has the same outline in every state. Its shoulders now flare out under the lamp while an agent works, as they already did for "reading the screen" and "This PC is yours again".
+- The tab's rim, the "Administrator" chip and the rule before the stop key are sharp at every display scale, including 125% and 150%.
+- The Esc keycap in the one-row tab has the same space above and below it.
+- The badge of "ControlFreak is reading the screen" is visible. It was drawn at a contrast of 1.5:1.
+- The tab's shadow fades out at the shoulders instead of ending in a straight edge.
 - `type_text` is much less likely to garble text in busy applications. It used to send up to 50 characters in one burst, and an application that takes several queued keystrokes before translating them (Windows 11 Notepad while busy) received every one of them as the burst's last character: a typed greeting arrived as "Hello,!!!!!!!!!!!" while the tool reported `completed`. Each keystroke now goes alone, after the window with keyboard focus has answered a message twice with a 10 ms pause between, and the target is checked before every keystroke. Typing is slower as a result, roughly 70 characters a second.
 
 ### Added
