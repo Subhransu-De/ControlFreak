@@ -76,17 +76,6 @@ pub fn backend_with_security(security_context: SecurityContext) -> Box<dyn Platf
     Box::new(implementation::Backend::with_security(security_context))
 }
 
-#[cfg(target_os = "windows")]
-pub fn backend_with_ocr_helper_and_security(
-    command: OcrHelperCommand,
-    security_context: SecurityContext,
-) -> Box<dyn PlatformBackend> {
-    Box::new(implementation::Backend::with_ocr_helper_and_security(
-        command,
-        security_context,
-    ))
-}
-
 /// The production backend: OCR runs in `ocr_helper`, and a refused foreground request in
 /// `focus_window` is asked once more through `server_executable --activation-helper`.
 #[cfg(target_os = "windows")]

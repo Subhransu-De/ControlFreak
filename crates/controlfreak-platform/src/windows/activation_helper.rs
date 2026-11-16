@@ -23,7 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) const FLAG: &str = "--activation-helper";
+const FLAG: &str = "--activation-helper";
 
 /// Exit codes of the helper process.
 const ACCEPTED: i32 = 0;
@@ -31,9 +31,33 @@ const REFUSED: i32 = 1;
 const USAGE: i32 = 2;
 const WINDOW_CHANGED: i32 = 3;
 
-/// The helper normally exits within tens of milliseconds. This bound keeps a stuck helper from
-/// holding the input lock; on expiry it is terminated with its job.
+/// The helper normally exits within tens of milliseconds. The wait is the request's remaining
+/// `timeout_ms`, capped here so a stuck helper never holds the input lock longer; on expiry it is
+/// terminated with its job.
 pub(super) const HELPER_TIMEOUT: Duration = Duration::from_millis(1_500);
+
+/// What the server learned from one helper run. Only `Accepted` and `Refused` are answers from
+/// `SetForegroundWindow`; the others say whether the call can have been made at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HelperAnswer {
+    Accepted,
+    Refused,
+    /// The helper never called Windows: it could not start, or the window had changed owner.
+    NotDispatched,
+    /// The helper may have called Windows before its answer was lost: it timed out, crashed,
+    /// could not be observed, or was terminated because the work was cancelled.
+    Indeterminate,
+}
+
+impl HelperAnswer {
+    pub(super) const fn outcome(self) -> ActivationHelperOutcome {
+        match self {
+            Self::Accepted => ActivationHelperOutcome::Accepted,
+            Self::Refused => ActivationHelperOutcome::Refused,
+            Self::NotDispatched | Self::Indeterminate => ActivationHelperOutcome::Failed,
+        }
+    }
+}
 const POLL: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,39 +130,47 @@ pub(crate) const fn usage_exit_code() -> i32 {
     USAGE
 }
 
-/// Starts the helper for `hwnd`, owned by `process_id`, and waits a bounded time for its answer.
+/// Starts the helper for `hwnd`, owned by `process_id`, and waits at most `timeout` for its
+/// answer. `cancelled` is polled while waiting; once it reports true the helper is terminated at
+/// once, so a stop never waits for it, and a helper that has not reached its call never makes it.
 pub(super) fn request_activation(
     program: &Path,
     hwnd: HWND,
     process_id: u32,
     timeout: Duration,
-) -> ActivationHelperOutcome {
+    cancelled: &dyn Fn() -> bool,
+) -> HelperAnswer {
+    if timeout.is_zero() || cancelled() {
+        return HelperAnswer::NotDispatched;
+    }
     let request = Request {
         window: hwnd.0.expose_provenance(),
         process_id,
     };
     let Ok(child) = spawn_managed_child(program, &request.arguments()) else {
-        return ActivationHelperOutcome::Failed;
+        return HelperAnswer::NotDispatched;
     };
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return outcome(status.code()),
-            Ok(None) if Instant::now() < deadline => thread::sleep(POLL),
-            // Timed out or unobservable: the job closes with `child` and takes the helper with it.
+            Ok(Some(status)) => return answer(status.code()),
+            Ok(None) if Instant::now() < deadline && !cancelled() => thread::sleep(POLL),
+            // Timed out, cancelled or unobservable: the job closes with `child` and takes the
+            // helper with it. It may already have made its call.
             Ok(None) | Err(_) => {
                 let _ = child.terminate();
-                return ActivationHelperOutcome::Failed;
+                return HelperAnswer::Indeterminate;
             }
         }
     }
 }
 
-fn outcome(code: Option<i32>) -> ActivationHelperOutcome {
+fn answer(code: Option<i32>) -> HelperAnswer {
     match code {
-        Some(ACCEPTED) => ActivationHelperOutcome::Accepted,
-        Some(REFUSED) => ActivationHelperOutcome::Refused,
-        _ => ActivationHelperOutcome::Failed,
+        Some(ACCEPTED) => HelperAnswer::Accepted,
+        Some(REFUSED) => HelperAnswer::Refused,
+        Some(USAGE | WINDOW_CHANGED) => HelperAnswer::NotDispatched,
+        _ => HelperAnswer::Indeterminate,
     }
 }
 
@@ -187,12 +219,84 @@ mod tests {
     }
 
     #[test]
-    fn exit_codes_map_to_outcomes() {
-        assert_eq!(outcome(Some(ACCEPTED)), ActivationHelperOutcome::Accepted);
-        assert_eq!(outcome(Some(REFUSED)), ActivationHelperOutcome::Refused);
-        for other in [Some(USAGE), Some(WINDOW_CHANGED), Some(101), None] {
-            assert_eq!(outcome(other), ActivationHelperOutcome::Failed);
+    fn exit_codes_say_whether_windows_was_asked() {
+        assert_eq!(answer(Some(ACCEPTED)), HelperAnswer::Accepted);
+        assert_eq!(answer(Some(REFUSED)), HelperAnswer::Refused);
+        for before_the_call in [Some(USAGE), Some(WINDOW_CHANGED)] {
+            assert_eq!(answer(before_the_call), HelperAnswer::NotDispatched);
         }
+        // A crashed or killed helper may have made its call first.
+        for lost in [Some(101), Some(-1), None] {
+            assert_eq!(answer(lost), HelperAnswer::Indeterminate);
+        }
+    }
+
+    #[test]
+    fn only_answers_from_windows_are_reported_as_such() {
+        assert_eq!(
+            HelperAnswer::Accepted.outcome(),
+            ActivationHelperOutcome::Accepted
+        );
+        assert_eq!(
+            HelperAnswer::Refused.outcome(),
+            ActivationHelperOutcome::Refused
+        );
+        for failed in [HelperAnswer::NotDispatched, HelperAnswer::Indeterminate] {
+            assert_eq!(failed.outcome(), ActivationHelperOutcome::Failed);
+        }
+    }
+
+    fn any_window() -> HWND {
+        HWND(std::ptr::with_exposed_provenance_mut::<c_void>(0x10))
+    }
+
+    #[test]
+    fn no_helper_starts_without_budget_or_after_cancellation() {
+        let missing = Path::new(r"C:\definitely\missing\controlfreak.exe");
+        assert_eq!(
+            request_activation(missing, any_window(), 1, Duration::ZERO, &|| false),
+            HelperAnswer::NotDispatched
+        );
+        assert_eq!(
+            request_activation(missing, any_window(), 1, Duration::from_secs(1), &|| true),
+            HelperAnswer::NotDispatched
+        );
+    }
+
+    /// A helper that never answers: `cmd.exe` ignores the helper arguments and waits on its stdin
+    /// pipe, which the server holds open.
+    fn silent_helper() -> std::path::PathBuf {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        Path::new(&root).join("System32").join("cmd.exe")
+    }
+
+    #[test]
+    fn a_stop_terminates_a_waiting_helper_promptly() {
+        let started = Instant::now();
+        let stop_at = started + Duration::from_millis(150);
+        let answer = request_activation(
+            &silent_helper(),
+            any_window(),
+            1,
+            Duration::from_secs(30),
+            &|| Instant::now() >= stop_at,
+        );
+        assert_eq!(answer, HelperAnswer::Indeterminate);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_helper_that_does_not_answer_in_time_is_indeterminate() {
+        let started = Instant::now();
+        let answer = request_activation(
+            &silent_helper(),
+            any_window(),
+            1,
+            Duration::from_millis(200),
+            &|| false,
+        );
+        assert_eq!(answer, HelperAnswer::Indeterminate);
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]
@@ -208,13 +312,14 @@ mod tests {
     #[test]
     fn a_helper_that_cannot_start_fails_without_waiting() {
         let started = Instant::now();
-        let outcome = request_activation(
+        let answer = request_activation(
             Path::new(r"C:\definitely\missing\controlfreak.exe"),
-            HWND(std::ptr::with_exposed_provenance_mut::<c_void>(0x10)),
+            any_window(),
             1,
             Duration::from_secs(5),
+            &|| false,
         );
-        assert_eq!(outcome, ActivationHelperOutcome::Failed);
+        assert_eq!(answer, HelperAnswer::NotDispatched);
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

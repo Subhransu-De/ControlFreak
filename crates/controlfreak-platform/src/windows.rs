@@ -214,6 +214,8 @@ struct NativeActivation<'a> {
     helper: Option<&'a std::path::Path>,
     /// The helper is asked at most once per `focus_window`: its answer does not change on retry.
     helper_tried: bool,
+    /// The request's `timeout_ms`; the helper may use only what is left of it.
+    budget_ms: u32,
 }
 
 impl NativeActivation<'_> {
@@ -228,23 +230,37 @@ impl NativeActivation<'_> {
         if activation::Activation::validate(self)? {
             return Ok(true);
         }
-        let previous = self.control.dispatch_started();
-        let outcome = controlfreak_core::timing::time("activation_helper", || {
+        let remaining = Duration::from_millis(
+            u64::from(self.budget_ms).saturating_sub(activation::Activation::elapsed_ms(self)),
+        )
+        .min(activation_helper::HELPER_TIMEOUT);
+        let control = self.control;
+        let previous = control.dispatch_started();
+        let answer = controlfreak_core::timing::time("activation_helper", || {
             activation_helper::request_activation(
                 program,
                 self.hwnd,
                 self.process_id,
-                activation_helper::HELPER_TIMEOUT,
+                remaining,
+                &|| control.is_cancelled(),
             )
         });
-        self.control.activation_helper(outcome);
-        if outcome == controlfreak_core::ActivationHelperOutcome::Accepted {
-            self.control.dispatch_accepted(0);
-            target::arm_if_foreground(self.approved_id)?;
-            return Ok(true);
+        control.activation_helper(answer.outcome());
+        match answer {
+            activation_helper::HelperAnswer::Accepted => {
+                control.dispatch_accepted(0);
+                target::arm_if_foreground(self.approved_id)?;
+                Ok(true)
+            }
+            activation_helper::HelperAnswer::Refused
+            | activation_helper::HelperAnswer::NotDispatched => {
+                control.dispatch_rejected(previous);
+                Ok(false)
+            }
+            // The helper may have changed the foreground before its answer was lost, so delivery
+            // stays unknown; the next poll observes the foreground as usual.
+            activation_helper::HelperAnswer::Indeterminate => Ok(false),
         }
-        self.control.dispatch_rejected(previous);
-        Ok(false)
     }
 }
 
@@ -1040,6 +1056,7 @@ impl WindowBackend for Backend {
             process_id,
             helper: self.activation_helper.as_deref(),
             helper_tried: false,
+            budget_ms: request.timeout_ms,
         };
         let activation = controlfreak_core::timing::time("activate", || {
             activation::focus(&mut driver, request.timeout_ms)
