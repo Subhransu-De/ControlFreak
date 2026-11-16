@@ -491,15 +491,18 @@ where
     Ok(())
 }
 
-/// Paces the next keystroke. If pacing fails, the window that did not answer may belong to an
-/// application that took the foreground meanwhile, so a target refusal is reported instead.
+/// Paces the next keystroke. If the window did not answer, it may belong to an application that
+/// took the foreground meanwhile, so a target refusal is reported instead. A cancellation is
+/// reported as it is.
 fn pace_or_refuse(
     control: &MutationControl,
     pace: &mut impl FnMut(&MutationControl) -> Result<(), PlatformError>,
     validate_target: &mut impl FnMut() -> Result<(), PlatformError>,
 ) -> Result<(), PlatformError> {
     pace(control).or_else(|error| {
-        validate_target()?;
+        if error.reason_code() == Some("target_not_responding") {
+            validate_target()?;
+        }
         Err(error)
     })
 }
@@ -1834,6 +1837,24 @@ mod progress_tests {
             "the refusal, not the unresponsive window, is reported: {error:?}"
         );
         assert_eq!(control.progress().sent_events, 2);
+
+        // A cancellation while pacing stays a cancellation even when the target is gone too.
+        let control = MutationControl::default();
+        let mut paces = 0;
+        let error = send_unicode_text_with(
+            &utf16("ab"),
+            &control,
+            || Err(failure()),
+            |inputs| Ok(inputs.len()),
+            |control| {
+                paces += 1;
+                control.cancel();
+                wait_for_answer(control, Duration::ZERO, || Answer::Busy)
+            },
+        )
+        .expect_err("a cancelled run must stop");
+        assert_eq!(error.reason_code(), Some("cancelled"));
+        assert_eq!(paces, 1);
     }
 
     #[test]
