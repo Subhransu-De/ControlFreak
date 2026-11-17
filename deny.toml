@@ -3,7 +3,11 @@ targets = ["x86_64-pc-windows-msvc"]
 all-features = true
 
 [advisories]
-ignore = []
+ignore = [
+    # chrono is unmaintained, not vulnerable. rmcp, the MCP SDK, requires it in every release up
+    # to 3.10.0, and ControlFreak does not use it directly. Remove once rmcp drops it.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained transitive dependency of rmcp with no replacement yet" },
+]
 
 [licenses]
 allow = [

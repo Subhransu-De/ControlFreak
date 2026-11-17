@@ -27,8 +27,8 @@ pub use display::{
     ActionObservation, CaptureDisplayRequest, CaptureRegionRequest, DisplayBounds, DisplayInfo,
     DisplayScreenshot, MouseButton, MouseClickRequest, MouseDragRequest, MouseMoveRequest,
     MousePosition, MouseScrollRequest, ObservationMode, ObservationOptions, ObservationRegion,
-    PointerActionResult, VisualBaseline, VisualBaselineRequest, VisualChangeResult,
-    WaitForChangeSinceRequest, WaitForVisualChangeRequest,
+    PointerActionResult, SettleOutcome, SettleReport, VisualBaseline, VisualBaselineRequest,
+    VisualChangeResult, WaitForChangeSinceRequest, WaitForVisualChangeRequest,
 };
 pub use error::{FailureCause, PlatformError, RefusalCause};
 pub use keyboard::{Key, KeyChordRequest, KeyboardActionResult, TextInputRequest};

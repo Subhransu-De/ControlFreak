@@ -72,6 +72,7 @@ mod indicator;
 mod input;
 mod privilege;
 mod process;
+mod settle;
 mod shell;
 mod stop;
 mod win32;
@@ -141,7 +142,8 @@ use windows::{
 };
 
 use controlfreak_core::limits::{
-    MAX_CAPTURE_WIDTH, MAX_MOVE_DURATION_MS, MAX_SCROLL_DELTA, MAX_TEXT_UTF16_UNITS, MAX_WAIT_MS,
+    MAX_CAPTURE_WIDTH, MAX_MOVE_DURATION_MS, MAX_SCROLL_DELTA, MAX_SETTLE_MS, MAX_TEXT_UTF16_UNITS,
+    MAX_WAIT_MS,
 };
 
 const MAX_CAPTURE_BYTES: usize = 512 * 1024 * 1024;
@@ -1198,7 +1200,17 @@ fn validate_duration(duration_ms: u32) -> Result<(), PlatformError> {
 }
 
 fn validate_observation(options: &ObservationOptions) -> Result<(), PlatformError> {
-    validate_max_width(options.max_width)
+    validate_max_width(options.max_width)?;
+    if options
+        .settle_ms
+        .is_some_and(|settle_ms| settle_ms > MAX_SETTLE_MS)
+    {
+        return Err(PlatformError::InvalidArgument {
+            argument: "observation.settle_ms".to_owned(),
+            reason: format!("must be between 0 and {MAX_SETTLE_MS}"),
+        });
+    }
+    Ok(())
 }
 
 fn last_win32_error(operation: &str) -> PlatformError {
@@ -1257,6 +1269,18 @@ mod tests {
             })
             .collect();
         (answers, recognitions)
+    }
+
+    #[test]
+    fn settle_ms_is_bounded() {
+        let options = |settle_ms| ObservationOptions {
+            settle_ms: Some(settle_ms),
+            ..ObservationOptions::default()
+        };
+        assert!(super::validate_observation(&options(0)).is_ok());
+        assert!(super::validate_observation(&options(super::MAX_SETTLE_MS)).is_ok());
+        let error = super::validate_observation(&options(super::MAX_SETTLE_MS + 1)).unwrap_err();
+        assert!(error.to_string().contains("settle_ms"), "{error}");
     }
 
     #[test]

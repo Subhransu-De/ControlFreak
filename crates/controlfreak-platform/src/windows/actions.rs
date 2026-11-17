@@ -1,5 +1,6 @@
-use super::capture::{SettleOutcome, SettleWatch};
+use super::capture::SettleWatch;
 use super::input::BUTTON_DWELL;
+use super::settle::SettlePolicy;
 use super::{
     Backend, Duration, HWND, KeyChordRequest, KeyboardActionResult, KeyboardBackend,
     MAX_SCROLL_DELTA, MAX_TEXT_UTF16_UNITS, MouseClickRequest, MouseDragRequest, MouseMoveRequest,
@@ -9,9 +10,10 @@ use super::{
     ensure_dpi_awareness, ensure_interactive_input_desktop, find_display_at_point,
     foreground_window_handle, move_cursor, observe_display, observe_foreground, post_action_error,
     privilege, send_click, send_drag_press, send_drag_release, send_key_chord, send_scroll,
-    send_unicode_text, thread, validate_click_request, validate_duration, validate_key_chord,
+    send_unicode_text, validate_click_request, validate_duration, validate_key_chord,
     validate_modifiers, validate_observation, window_info,
 };
+use controlfreak_core::{SettleOutcome, SettleReport};
 
 impl PointerBackend for Backend {
     fn move_mouse_controlled(
@@ -30,7 +32,7 @@ impl PointerBackend for Backend {
                 input_generation: None,
             },
             control,
-            |_, _| Ok(()),
+            None::<fn(&MutationControl, POINT) -> Result<SettleReport, PlatformError>>,
         )
     }
 
@@ -79,6 +81,7 @@ impl PointerBackend for Backend {
             },
         )?;
         control.check("drag_mouse")?;
+        let watch = settle_watch(control, &request.observation);
         send_drag_press(request.button, &request.modifiers, control, || {
             super::target::validate(control, "drag_mouse", Some(current_cursor_position()?))
         })?;
@@ -110,10 +113,20 @@ impl PointerBackend for Backend {
         );
         movement?;
         release?;
-        settle(None, POST_INPUT_SETTLE_MS);
-        control.input_complete();
+        let settled = settle(
+            "drag_mouse",
+            watch,
+            &request.observation,
+            POST_INPUT_SETTLE_MS,
+            control,
+        )?;
         super::target::evidence(control);
-        Self::pointer_action_result("drag_mouse", foreground_before, &request.observation)
+        Self::pointer_action_result(
+            "drag_mouse",
+            foreground_before,
+            &request.observation,
+            settled,
+        )
     }
 
     fn scroll_mouse_controlled(
@@ -149,17 +162,21 @@ impl PointerBackend for Backend {
                 input_generation: None,
             },
             control,
-            |control, target| {
+            Some(|control: &MutationControl, target| {
                 control.check("scroll_mouse")?;
+                let watch = settle_watch(control, &request.observation);
                 send_scroll(request.delta_x, request.delta_y, control, || {
                     super::target::validate(control, "scroll_mouse", Some(target))?;
                     ensure_cursor_at("scroll_mouse", target, current_cursor_position()?)
                 })?;
-                // A window-settle check needs the same stillness window as keyboard
-                // actions, which would save almost nothing within this short cap.
-                settle(None, POST_INPUT_SETTLE_MS);
-                Ok(())
-            },
+                settle(
+                    "scroll_mouse",
+                    watch,
+                    &request.observation,
+                    POST_INPUT_SETTLE_MS,
+                    control,
+                )
+            }),
         )
     }
 }
@@ -175,17 +192,22 @@ impl KeyboardBackend for Backend {
         validate_observation(&request.observation)?;
         let _guard = self.lock_input(control)?;
         super::target::validate(control, "press_keys", None)?;
-        let watch = settle_watch(control);
+        let watch = settle_watch(control, &request.observation);
         send_key_chord("press_keys", &request.keys, control, || {
             super::target::validate(control, "press_keys", None)
         })?;
-        settle(watch, POST_FOCUS_SETTLE_MS);
-        control.input_complete();
+        let settled = settle(
+            "press_keys",
+            watch,
+            &request.observation,
+            POST_FOCUS_SETTLE_MS,
+            control,
+        )?;
         super::target::evidence(control);
-        Ok(KeyboardActionResult {
-            observation: observe_foreground(&request.observation)
-                .map_err(|error| post_action_error("press_keys", error.to_string()))?,
-        })
+        let mut observation = observe_foreground(&request.observation)
+            .map_err(|error| post_action_error("press_keys", error.to_string()))?;
+        observation.settle = Some(settled);
+        Ok(KeyboardActionResult { observation })
     }
 
     fn type_text_controlled(
@@ -211,17 +233,22 @@ impl KeyboardBackend for Backend {
 
         let _guard = self.lock_input(control)?;
         super::target::validate(control, "type_text", None)?;
-        let watch = settle_watch(control);
+        let watch = settle_watch(control, &request.observation);
         send_unicode_text(&utf16, control, || {
             super::target::validate(control, "type_text", None)
         })?;
-        settle(watch, POST_FOCUS_SETTLE_MS);
-        control.input_complete();
+        let settled = settle(
+            "type_text",
+            watch,
+            &request.observation,
+            POST_FOCUS_SETTLE_MS,
+            control,
+        )?;
         super::target::evidence(control);
-        Ok(KeyboardActionResult {
-            observation: observe_foreground(&request.observation)
-                .map_err(|error| post_action_error("type_text", error.to_string()))?,
-        })
+        let mut observation = observe_foreground(&request.observation)
+            .map_err(|error| post_action_error("type_text", error.to_string()))?;
+        observation.settle = Some(settled);
+        Ok(KeyboardActionResult { observation })
     }
 }
 
@@ -259,8 +286,9 @@ impl Backend {
                 input_generation,
             },
             control,
-            |control, target| {
+            Some(|control: &MutationControl, target| {
                 control.check("click_mouse")?;
+                let watch = settle_watch(control, &request.observation);
                 send_click(
                     request.button,
                     request.click_count,
@@ -271,11 +299,14 @@ impl Backend {
                         ensure_cursor_at("click_mouse", target, current_cursor_position()?)
                     },
                 )?;
-                // A window-settle check needs the same stillness window as keyboard
-                // actions, which would save almost nothing within this short cap.
-                settle(None, POST_INPUT_SETTLE_MS);
-                Ok(())
-            },
+                settle(
+                    "click_mouse",
+                    watch,
+                    &request.observation,
+                    POST_INPUT_SETTLE_MS,
+                    control,
+                )
+            }),
         )
     }
 
@@ -315,10 +346,10 @@ impl Backend {
         operation: &str,
         spec: PointerActionSpec<'_>,
         control: &MutationControl,
-        action: F,
+        action: Option<F>,
     ) -> Result<PointerActionResult, PlatformError>
     where
-        F: FnOnce(&MutationControl, POINT) -> Result<(), PlatformError>,
+        F: FnOnce(&MutationControl, POINT) -> Result<SettleReport, PlatformError>,
     {
         ensure_dpi_awareness()?;
         validate_duration(spec.duration_ms)?;
@@ -339,6 +370,13 @@ impl Backend {
         let foreground_before = foreground_window_handle();
 
         let start = current_cursor_position()?;
+        // Hover effects are a move's response. A click or scroll is watched from its own
+        // dispatch, so the hover effects of its approach are not taken for its response.
+        let move_watch = if action.is_none() {
+            settle_watch(control, spec.observation)
+        } else {
+            None
+        };
 
         move_cursor(
             operation,
@@ -356,23 +394,27 @@ impl Backend {
         )?;
         // A move-only action is already dispatched. Its next cursor read is observation,
         // whereas clicks and scrolls still need this read to validate their input target.
-        if operation == "move_mouse" {
-            control.input_complete();
-            super::target::evidence(control);
-            return Self::pointer_action_result(operation, foreground_before, spec.observation);
-        }
-        let actual_target = current_cursor_position()?;
-        action(control, actual_target)?;
-
-        control.input_complete();
+        let settled = if let Some(action) = action {
+            let actual_target = current_cursor_position()?;
+            action(control, actual_target)?
+        } else {
+            settle(
+                operation,
+                move_watch,
+                spec.observation,
+                POST_INPUT_SETTLE_MS,
+                control,
+            )?
+        };
         super::target::evidence(control);
-        Self::pointer_action_result(operation, foreground_before, spec.observation)
+        Self::pointer_action_result(operation, foreground_before, spec.observation, settled)
     }
 
     fn pointer_action_result(
         operation: &str,
         foreground_before: HWND,
         options: &ObservationOptions,
+        settled: SettleReport,
     ) -> Result<PointerActionResult, PlatformError> {
         let actual = current_cursor_position()
             .map_err(|error| post_action_error(operation, error.to_string()))?;
@@ -402,8 +444,9 @@ impl Backend {
             } else {
                 actual_display.id.clone()
             };
-        let observation = observe_display(&observation_display_id, options)
+        let mut observation = observe_display(&observation_display_id, options)
             .map_err(|error| post_action_error(operation, error.to_string()))?;
+        observation.settle = Some(settled);
 
         Ok(PointerActionResult {
             position,
@@ -427,26 +470,48 @@ const fn effective_drag_duration_ms(requested: u32) -> u32 {
     }
 }
 
-/// Gives the target application time to process input before evidence is captured. With a
-/// watch, returns once the approved window has responded and stopped changing; otherwise, or if
-/// it never visibly responds, waits the full cap as before.
-fn settle(watch: Option<SettleWatch>, cap_milliseconds: u64) {
-    let cap = Duration::from_millis(cap_milliseconds);
+/// Waits for the target application to process sent input before evidence is read, and reports
+/// how the wait ended. The input is recorded as sent first, and a stop during the wait is
+/// reported as missing evidence, so the action is completed but unverified and a batch counts
+/// the step as delivered. With a watch the wait ends once the approved window has
+/// responded and stopped changing, or at the limits of `options`; without one it is the short
+/// fixed `fixed_ms` pause.
+fn settle(
+    operation: &str,
+    watch: Option<SettleWatch>,
+    options: &ObservationOptions,
+    fixed_ms: u64,
+    control: &MutationControl,
+) -> Result<SettleReport, PlatformError> {
+    control.input_complete();
     let started = std::time::Instant::now();
-    let outcome = watch.map(|watch| watch.wait(cap));
-    if outcome.is_none() {
-        thread::sleep(cap);
+    let policy = SettlePolicy::for_observation(options);
+    let outcome = if let (Some(watch), Some(policy)) = (watch, policy) {
+        watch.wait(operation, policy, control)
+    } else {
+        control
+            .wait(operation, Duration::from_millis(fixed_ms))
+            .map(|()| SettleOutcome::NotWatched)
     }
+    .map_err(|error| post_action_error(operation, error.to_string()))?;
+    let elapsed = started.elapsed();
     let stage = match outcome {
-        Some(SettleOutcome::Settled) => "settle_responded",
-        Some(SettleOutcome::Capped) => "settle_capped",
-        None => "settle_fixed",
+        SettleOutcome::Settled => "settle_responded",
+        SettleOutcome::Unchanged => "settle_unchanged",
+        SettleOutcome::StillChanging => "settle_capped",
+        SettleOutcome::NotWatched => "settle_fixed",
     };
-    controlfreak_core::timing::record(stage, started.elapsed());
-    controlfreak_core::timing::record("settle", started.elapsed());
+    controlfreak_core::timing::record(stage, elapsed);
+    controlfreak_core::timing::record("settle", elapsed);
+    Ok(SettleReport {
+        outcome,
+        elapsed_ms: u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX),
+    })
 }
 
-fn settle_watch(control: &MutationControl) -> Option<SettleWatch> {
+/// Reads the approved window before input, unless `settle_ms` is 0 and nothing will be watched.
+fn settle_watch(control: &MutationControl, options: &ObservationOptions) -> Option<SettleWatch> {
+    SettlePolicy::for_observation(options)?;
     SettleWatch::begin(super::target::approved_window_bounds(control))
 }
 
@@ -503,6 +568,28 @@ mod tests {
         assert!(ensure_input_generation("click_text", Some(before), after).is_err());
         assert!(ensure_input_generation("click_text", Some(after), after).is_ok());
         assert!(ensure_input_generation("click_mouse", None, after).is_ok());
+    }
+
+    #[test]
+    fn a_stop_during_the_settle_wait_reports_sent_input_without_evidence() {
+        let control = MutationControl::default();
+        control.cancel();
+        let error = settle(
+            "click_mouse",
+            None,
+            &ObservationOptions::default(),
+            POST_INPUT_SETTLE_MS,
+            &control,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, PlatformError::PostActionObservationFailed { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            control.progress().input_outcome,
+            controlfreak_core::InputOutcome::InputSent
+        );
     }
 
     #[test]

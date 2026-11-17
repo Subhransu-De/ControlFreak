@@ -87,6 +87,7 @@ impl Fixture {
             observation: ActionObservation {
                 foreground_window: None,
                 screenshot: None,
+                settle: None,
             },
         }
     }
