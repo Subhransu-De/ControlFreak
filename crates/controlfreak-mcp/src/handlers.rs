@@ -674,10 +674,14 @@ pub(super) async fn call_switch_virtual_desktop(
     operation_lease: Option<OperationLease>,
 ) -> Result<CallToolResponse, ErrorData> {
     let input = parse_arguments::<SwitchVirtualDesktopInput>(arguments)?;
+    let observation = match input.observation.without_settle() {
+        Ok(observation) => observation,
+        Err(error) => return Ok(not_started(&error)),
+    };
     let request = VirtualDesktopSwitchRequest {
         direction: input.direction,
         steps: input.steps,
-        observation: input.observation.into(),
+        observation,
     };
     let (result, progress) = run_encoded_mutation(
         operation_lease,
@@ -707,10 +711,14 @@ pub(super) async fn call_focus_window(
         Ok(window_id) => window_id,
         Err(error) => return Ok(not_started(&error)),
     };
+    let observation = match input.observation.without_settle() {
+        Ok(observation) => observation,
+        Err(error) => return Ok(not_started(&error)),
+    };
     let request = FocusWindowRequest {
         timeout_ms: input.timeout_ms,
         window_id,
-        observation: input.observation.into(),
+        observation,
     };
     // Inside a session the approved window stays bound, and the backend decides whether the
     // requested window may be focused: the approved window itself or a dialog of its process.
@@ -1060,7 +1068,7 @@ fn run_steps(
         match outcome {
             Ok(step_observation) => {
                 report(
-                    json!({ "index": index, "action": step.kind(), "status": "completed", "sent_events": sent_events }),
+                    json!({ "index": index, "action": step.kind(), "status": "completed", "sent_events": sent_events, "settle": step_observation.settle }),
                 );
                 observation = Some(step_observation);
             }

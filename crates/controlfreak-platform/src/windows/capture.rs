@@ -1,12 +1,13 @@
 #![allow(unsafe_code)]
 
-use controlfreak_core::timing;
+use controlfreak_core::{MutationControl, SettleOutcome, timing};
 use windows::Win32::{
     Foundation::{HWND, RECT},
     Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow},
     UI::WindowsAndMessaging::{GetWindowRect, IsHungAppWindow},
 };
 
+use super::settle::{SettlePolicy, Settler};
 use super::{
     ActionObservation, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, BitmapPixelFormat, CAPTUREBLT,
     CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS, DataWriter, DeleteDC, DeleteObject,
@@ -217,6 +218,7 @@ pub(super) fn observe_display(
         return Ok(ActionObservation {
             foreground_window: None,
             screenshot: None,
+            settle: None,
         });
     }
     let _timer = timing::start("observe");
@@ -230,6 +232,7 @@ pub(super) fn observe_display(
     Ok(ActionObservation {
         foreground_window,
         screenshot,
+        settle: None,
     })
 }
 
@@ -241,6 +244,7 @@ pub(super) fn observe_foreground(
         return Ok(ActionObservation {
             foreground_window: None,
             screenshot: None,
+            settle: None,
         });
     }
     let _timer = timing::start("observe");
@@ -264,6 +268,7 @@ pub(super) fn observe_foreground(
     Ok(ActionObservation {
         foreground_window,
         screenshot,
+        settle: None,
     })
 }
 
@@ -810,29 +815,14 @@ const SETTLE_MIN_CHANGED_PIXELS: usize = 48;
 /// Largest window area watched for settling; bigger windows fall back to the fixed wait because
 /// each read of them costs about as much as the wait itself.
 const SETTLE_MAX_PIXELS: u64 = 2_560 * 1_600;
-const SETTLE_POLL: Duration = Duration::from_millis(4);
-/// How long the window must stay identical to count as settled. Applications often repaint in
-/// phases, for example a busy state and then the result; a short window returns between phases
-/// and the evidence shows the intermediate state. Live tests saw a second phase 65 ms after the
-/// first, so the window covers gaps up to 60 ms while still returning well under the 150 ms cap.
-const SETTLE_STABLE: Duration = Duration::from_millis(60);
 
-/// Watches the approved window across an input action, so the action returns as soon as the
-/// window has visibly responded and stopped changing, instead of always sleeping the full cap.
+/// Watches the approved window across an input action, so the action's evidence is read once the
+/// window has visibly responded and stopped changing, instead of after a fixed pause.
 pub(super) struct SettleWatch {
     /// Reads the window with reused GDI objects and one pixel buffer.
     grabber: FrameGrabber,
     /// The window before input, as BGRA.
     before: Vec<u8>,
-}
-
-/// How a settle wait ended; recorded as a timing stage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SettleOutcome {
-    /// The window changed and then held still for one read.
-    Settled,
-    /// The cap elapsed first; the result is the same as the previous fixed wait.
-    Capped,
 }
 
 impl SettleWatch {
@@ -852,44 +842,40 @@ impl SettleWatch {
         Some(Self { grabber, before })
     }
 
-    /// Waits until the window changed and then stayed identical for at least `SETTLE_STABLE`,
-    /// or until `cap`. Frames are compared as the BGRA the screen read produces, with no
-    /// conversion or allocation per read.
-    pub(super) fn wait(mut self, cap: Duration) -> SettleOutcome {
+    /// Waits until the window changed and then stayed identical, or until the policy's limits,
+    /// pausing through `control` so a stop ends the wait promptly. Frames are compared as the
+    /// BGRA the screen read produces, with no conversion or allocation per read. A failed read
+    /// ends watching: the wait runs on to the response limit and reports the window unwatched.
+    pub(super) fn wait(
+        mut self,
+        operation: &str,
+        policy: SettlePolicy,
+        control: &MutationControl,
+    ) -> Result<SettleOutcome, PlatformError> {
         let started = Instant::now();
-        // The latest frame that differed from its predecessor, and when it was read. Swapping
-        // it with the grabber's buffer keeps both buffers at full size without copying.
+        let mut settler = Settler::new(policy);
+        // The latest frame that differed from its predecessor. Swapping it with the grabber's
+        // buffer keeps both buffers at full size without copying.
         let mut held = vec![0_u8; self.before.len()];
-        let mut changed_at: Option<Instant> = None;
         loop {
-            let remaining = cap.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                return SettleOutcome::Capped;
-            }
-            std::thread::sleep(SETTLE_POLL.min(remaining));
-            let read_at = Instant::now();
+            control.wait(operation, policy.poll_interval(started.elapsed()))?;
+            let elapsed = started.elapsed();
             if timing::time("settle_capture", || self.grabber.grab()).is_err() {
-                std::thread::sleep(cap.saturating_sub(started.elapsed()));
-                return SettleOutcome::Capped;
+                control.wait(operation, policy.response.saturating_sub(elapsed))?;
+                return Ok(SettleOutcome::NotWatched);
             }
             let frame = &self.grabber.buffer;
-            match changed_at {
-                Some(since) if changed_pixels(&held, frame, 1) == 0 => {
-                    if read_at.saturating_duration_since(since) >= SETTLE_STABLE {
-                        return SettleOutcome::Settled;
-                    }
-                }
-                Some(_) => {
-                    std::mem::swap(&mut held, &mut self.grabber.buffer);
-                    changed_at = Some(read_at);
-                }
-                None if changed_pixels(&self.before, frame, SETTLE_MIN_CHANGED_PIXELS)
-                    >= SETTLE_MIN_CHANGED_PIXELS =>
-                {
-                    std::mem::swap(&mut held, &mut self.grabber.buffer);
-                    changed_at = Some(read_at);
-                }
-                None => {}
+            let changed = if settler.responded() {
+                changed_pixels(&held, frame, 1) > 0
+            } else {
+                changed_pixels(&self.before, frame, SETTLE_MIN_CHANGED_PIXELS)
+                    >= SETTLE_MIN_CHANGED_PIXELS
+            };
+            if changed {
+                std::mem::swap(&mut held, &mut self.grabber.buffer);
+            }
+            if let Some(outcome) = settler.read(elapsed, changed) {
+                return Ok(outcome);
             }
         }
     }
@@ -1731,6 +1717,35 @@ mod settle_tests {
         let glyph = vec![0_u8; 4 * 100];
         assert_eq!(changed_pixels(&base, &glyph, 7), 7);
         assert_eq!(changed_pixels(&base, &base[..4], 5), 5);
+    }
+
+    /// The comparison cost of one settle read on synthetic frames. Identical frames are the worst
+    /// case, because the scan never stops early. Run with
+    /// `cargo test -p controlfreak-platform --release --lib settle_compare -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "synthetic latency benchmark; run explicitly"]
+    fn settle_compare_latency() {
+        for (width, height) in [(1_920_usize, 1_080_usize), (2_560, 1_600)] {
+            let frame = vec![0x5a_u8; width * height * 4];
+            let copy = frame.clone();
+            let mut samples: Vec<f64> = (0..15)
+                .map(|_| {
+                    let started = Instant::now();
+                    std::hint::black_box(changed_pixels(
+                        std::hint::black_box(&frame),
+                        std::hint::black_box(&copy),
+                        SETTLE_MIN_CHANGED_PIXELS,
+                    ));
+                    started.elapsed().as_secs_f64() * 1_000.0
+                })
+                .collect();
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "{width}x{height}: median={:.2}ms min={:.2}ms",
+                samples[samples.len() / 2],
+                samples[0]
+            );
+        }
     }
 
     #[test]

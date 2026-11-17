@@ -350,6 +350,7 @@ pub(super) struct ObservationInput {
     #[serde(default = "default_true")]
     include_cursor: bool,
     pub(super) region: Option<ObservationRegionInput>,
+    settle_ms: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -369,7 +370,22 @@ impl Default for ObservationInput {
             max_width: None,
             include_cursor: true,
             region: None,
+            settle_ms: None,
         }
+    }
+}
+
+impl ObservationInput {
+    /// The options of a tool that sends no input of its own to wait on, which refuses
+    /// `settle_ms` instead of ignoring it.
+    pub(super) fn without_settle(self) -> Result<ObservationOptions, PlatformError> {
+        if self.settle_ms.is_some() {
+            return Err(PlatformError::InvalidArgument {
+                argument: "observation.settle_ms".to_owned(),
+                reason: "applies only to input actions".to_owned(),
+            });
+        }
+        Ok(self.into())
     }
 }
 
@@ -386,6 +402,7 @@ impl From<ObservationInput> for ObservationOptions {
                 width: region.width,
                 height: region.height,
             }),
+            settle_ms: input.settle_ms,
         }
     }
 }

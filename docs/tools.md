@@ -16,7 +16,7 @@ desktop and run inside a [control session](sessions.md).
 | `list_displays` | Observe | Active displays with IDs, primary flag and bounds in physical pixels. |
 | `capture_display` | Observe | Screenshot of a display. |
 | `capture_region` | Observe | Screenshot of a rectangle, 1280 px wide unless `max_width` or `native` is set. |
-| `capture_window` | Observe | Screenshot of a window's visible frame, without focusing it. The window renders itself (`capture_method` `windows_print_window`), so windows covering it do not appear. The render is bounded: a window that Windows flags as hung is not asked, and one that does not answer within 2 seconds is given up on. The screen rectangle is then copied (`windows_gdi`), which shows whatever covers the window, so `capture_method` says which one you got. Only one render runs at a time: a second `capture_window` call made meanwhile waits for it while it is still rendering, within the same 2 seconds, and copies the screen if that time runs out; if that render was already given up on, the screen is copied at once. Every screenshot result reports `capture_method` as one of `windows_print_window` or `windows_gdi`; display and region captures always report `windows_gdi`. |
+| `capture_window` | Observe | Screenshot of a window's visible frame, without focusing it. The window renders itself (`capture_method` `windows_print_window`), so windows covering it do not appear. The render is bounded: a window that Windows flags as hung is not asked, and one that does not answer within 2 seconds is given up on. The screen rectangle is then copied (`windows_gdi`), which shows whatever covers the window, so `capture_method` says which one you got. Menus, popups and dropdowns are separate windows and never appear in it; use an action's screenshot or `capture_display` to see them. Only one render runs at a time: a second `capture_window` call made meanwhile waits for it while it is still rendering, within the same 2 seconds, and copies the screen if that time runs out; if that render was already given up on, the screen is copied at once. Every screenshot result reports `capture_method` as one of `windows_print_window` or `windows_gdi`; display and region captures always report `windows_gdi`. |
 | `list_windows` | Observe | Visible titled windows, including owned dialogs (with an `owner` field), foreground first. At most 200. |
 | `wait_for_window` | Observe | Wait for a window that matches title, class or process. |
 | `list_virtual_desktops` | Observe | Windows grouped by virtual desktop, with the current one marked. |
@@ -99,6 +99,16 @@ desktop and run inside a [control session](sessions.md).
 - An image of one window (`capture_window`) maps points only while that window is unchanged. If it moved, resized or closed, its reference changed, and the point is refused with `invalid_argument`. Capture the window again.
 - Screenshots are downscaled by area averaging (`resize_method: area_average`).
 
+## Waiting for the window to settle
+
+Every input action (`move_mouse`, `click_mouse`, `click_text`, `scroll_mouse`, `drag_mouse`, `press_keys`, `type_text` and each `run_actions` step) watches the approved window after it sends input and reads its evidence once the window has visibly responded and then stayed unchanged for 150 ms. This keeps an action from returning the screen as it was before the application reacted, for example a menu that is still opening or a page that is still loading.
+
+- A window that does not visibly change within 500 ms (150 ms for an action without a screenshot) is taken as not responding, and the action returns.
+- `observation.settle_ms` bounds the whole wait: 2000 ms by default, 500 ms for an action without a screenshot (`mode` `none` or `metadata`, and every `run_actions` step before the last), at most 10000. `0` keeps a short fixed wait (75 ms after pointer input, 150 ms after keys) and watches nothing.
+- `observation.settle` reports how the wait ended, with `elapsed_ms`: `settled` (the evidence shows the response), `unchanged` (no visible response, so the evidence may predate it), `still_changing` (the limit was reached, for example on a page with animation or video) or `not_watched` (`settle_ms` was 0, or the window is unknown or larger than 2560×1600 physical pixels, so the fixed wait was used). In `run_actions`, each step reports its own `settle`.
+- A stop during the wait ends it at once. The input was already sent, so the action reports `completed_unverified`.
+- Only the approved window's rectangle is watched. A menu or dialog that opens outside it reads as `unchanged`. `focus_window` and `switch_virtual_desktop` have their own waits and refuse `settle_ms`.
+
 ## Text (OCR)
 
 OCR uses the Windows OCR engine on the computer. It needs a Windows OCR language pack. It gives
@@ -177,7 +187,7 @@ An unknown name is refused with the nearest valid name, or the full list.
 - Each step gets the same target checks as the single tool.
 - The batch stops at the first failure. `action.steps` reports each step as `completed`,
   `failed` or `skipped`.
-- Only the last step returns a screenshot.
+- Only the last step returns a screenshot. Each earlier step waits up to 500 ms for the window to settle (see [Waiting for the window to settle](#waiting-for-the-window-to-settle)). Add a `wait` step before a step that depends on a slower load.
 - A `wait` step (`wait_ms` from 1 to 5000, at most 15000 in total) pauses between steps. It sends no input and cannot be the last step.
 
 Use it for a known sequence, such as filling a form. Observe between calls when a later step

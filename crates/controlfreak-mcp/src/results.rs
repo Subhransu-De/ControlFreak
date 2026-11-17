@@ -301,6 +301,9 @@ fn action_result(
             "screenshot": observation.screenshot.as_ref().map(screenshot_metadata),
         },
     });
+    if let Some(settle) = observation.settle {
+        metadata["observation"]["settle"] = json!(settle);
+    }
     if let Some(position) = position {
         metadata["position"] = position;
     }

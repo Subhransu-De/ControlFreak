@@ -9,6 +9,17 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Changed
+
+- Every input action waits for the approved window to respond and settle before it takes its screenshot. Clicks, scrolls, drags and moves used to wait a fixed 75 ms and keys at most 150 ms, so a menu that was still opening or a page that was still loading came back as the screen before the action, and agents captured the screen again to see the result. An action now returns once the window has changed and then stayed unchanged for 150 ms, after 500 ms if it never visibly changes, and after 2 seconds at most. Actions without a screenshot, including every `run_actions` step before the last, wait at most 500 ms. Fast windows still return in a few hundred milliseconds; animated pages take the full limit.
+- The server instructions are about half as long (874 characters instead of 1,470). Some clients copy them into every tool description, so their tool list is smaller. Guidance that one tool needs stays in that tool's description.
+- The `capture_window` description says that menus and popups are separate windows and do not appear in its screenshot.
+
+### Added
+
+- `observation.settle_ms` (0 to 10000) on input actions sets the longest wait for the window to settle. `0` keeps the previous short fixed wait.
+- `observation.settle` in every input action result, and `settle` in each `run_actions` step, report how the wait ended: `settled`, `unchanged`, `still_changing` or `not_watched`, with `elapsed_ms`. An agent can tell a screenshot that shows the response from one that may be stale without capturing again.
+
 ## [0.2.1] - 2026-11-16
 
 ### Fixed
