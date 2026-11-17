@@ -9,6 +9,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+## [0.2.2] - 2026-11-17
+
 ### Changed
 
 - Every input action waits for the approved window to respond and settle before it takes its screenshot. Clicks, scrolls, drags and moves used to wait a fixed 75 ms and keys at most 150 ms, so a menu that was still opening or a page that was still loading came back as the screen before the action, and agents captured the screen again to see the result. An action now returns once the window has changed and then stayed unchanged for 150 ms, after 500 ms if it never visibly changes, and after 2 seconds at most. Actions without a screenshot, including every `run_actions` step before the last, wait at most 500 ms. Fast windows still return in a few hundred milliseconds; animated pages take the full limit.
