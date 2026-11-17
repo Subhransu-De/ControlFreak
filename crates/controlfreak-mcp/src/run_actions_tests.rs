@@ -327,6 +327,23 @@ async fn invalid_later_steps_are_refused_before_any_input() {
 }
 
 #[tokio::test]
+async fn final_observation_limits_are_refused_before_any_input() {
+    for observation in [
+        json!({"settle_ms": 10_001}),
+        json!({"max_width": 0}),
+        json!({"max_width": 7_681}),
+    ] {
+        let (content, calls) = run(
+            None,
+            json!({"target_ref": "target-00000000-0000-0000-0000-000000000003", "steps": steps(), "observation": observation}),
+        )
+        .await;
+        assert_eq!(content["status"], "not_started", "{observation}: {content}");
+        assert!(calls.is_empty(), "{observation}: {calls:?}");
+    }
+}
+
+#[tokio::test]
 async fn observation_failures_report_steps_and_true_delivery() {
     let statuses = |steps: &Value| -> Vec<String> {
         steps

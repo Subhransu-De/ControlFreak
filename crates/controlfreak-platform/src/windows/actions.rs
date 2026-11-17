@@ -471,8 +471,9 @@ const fn effective_drag_duration_ms(requested: u32) -> u32 {
 }
 
 /// Waits for the target application to process sent input before evidence is read, and reports
-/// how the wait ended. The input is recorded as sent first, so a stop during the wait leaves the
-/// action completed but unverified. With a watch the wait ends once the approved window has
+/// how the wait ended. The input is recorded as sent first, and a stop during the wait is
+/// reported as missing evidence, so the action is completed but unverified and a batch counts
+/// the step as delivered. With a watch the wait ends once the approved window has
 /// responded and stopped changing, or at the limits of `options`; without one it is the short
 /// fixed `fixed_ms` pause.
 fn settle(
@@ -486,11 +487,13 @@ fn settle(
     let started = std::time::Instant::now();
     let policy = SettlePolicy::for_observation(options);
     let outcome = if let (Some(watch), Some(policy)) = (watch, policy) {
-        watch.wait(operation, policy, control)?
+        watch.wait(operation, policy, control)
     } else {
-        control.wait(operation, Duration::from_millis(fixed_ms))?;
-        SettleOutcome::NotWatched
-    };
+        control
+            .wait(operation, Duration::from_millis(fixed_ms))
+            .map(|()| SettleOutcome::NotWatched)
+    }
+    .map_err(|error| post_action_error(operation, error.to_string()))?;
     let elapsed = started.elapsed();
     let stage = match outcome {
         SettleOutcome::Settled => "settle_responded",
@@ -565,6 +568,28 @@ mod tests {
         assert!(ensure_input_generation("click_text", Some(before), after).is_err());
         assert!(ensure_input_generation("click_text", Some(after), after).is_ok());
         assert!(ensure_input_generation("click_mouse", None, after).is_ok());
+    }
+
+    #[test]
+    fn a_stop_during_the_settle_wait_reports_sent_input_without_evidence() {
+        let control = MutationControl::default();
+        control.cancel();
+        let error = settle(
+            "click_mouse",
+            None,
+            &ObservationOptions::default(),
+            POST_INPUT_SETTLE_MS,
+            &control,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, PlatformError::PostActionObservationFailed { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            control.progress().input_outcome,
+            controlfreak_core::InputOutcome::InputSent
+        );
     }
 
     #[test]
