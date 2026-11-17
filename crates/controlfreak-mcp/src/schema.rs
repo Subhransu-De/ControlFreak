@@ -1092,7 +1092,7 @@ fn input_progress_schema() -> Value {
 
 /// How the wait between input and evidence ended: `settled` evidence shows the response;
 /// `unchanged`, `still_changing` and `not_watched` evidence may predate or interrupt it.
-pub(super) fn settle_schema() -> Value {
+fn settle_schema() -> Value {
     json!({
         "type": "object",
         "properties": {

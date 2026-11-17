@@ -31,9 +31,9 @@ const SLOW_POLL: Duration = Duration::from_millis(33);
 pub(super) struct SettlePolicy {
     /// No visible change by then means the window did not respond.
     pub(super) response: Duration,
-    pub(super) stable: Duration,
+    stable: Duration,
     /// The wait never runs longer than this.
-    pub(super) budget: Duration,
+    budget: Duration,
 }
 
 impl SettlePolicy {
