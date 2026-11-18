@@ -104,6 +104,9 @@ impl Binaries {
         if spec.busy_drain_ms > 0 {
             command.args(["--busy-drain-ms", &spec.busy_drain_ms.to_string()]);
         }
+        if spec.clip_cursor {
+            command.arg("--clip-cursor");
+        }
         let child = command
             .spawn()
             .map_err(|error| format!("cannot open fixture {}: {error}", spec.key))?;
@@ -113,6 +116,7 @@ impl Binaries {
             log,
             child,
             regions: events::Regions::default(),
+            release_clip_with: spec.clip_cursor.then(|| self.fixture.clone()),
         };
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
@@ -144,6 +148,9 @@ pub struct Window {
     pub(crate) log: PathBuf,
     child: Child,
     pub(crate) regions: events::Regions,
+    /// The fixture executable, for a window that confines the pointer: killing it may leave
+    /// the pointer clipped, so the pointer is freed after the kill, whatever the task did.
+    release_clip_with: Option<PathBuf>,
 }
 
 impl Window {
@@ -160,5 +167,14 @@ impl Drop for Window {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(fixture) = &self.release_clip_with {
+            let released = Command::new(fixture)
+                .arg("--release-clip")
+                .status()
+                .is_ok_and(|status| status.success());
+            if !released {
+                eprintln!("could not free the pointer clip of fixture {}", self.key);
+            }
+        }
     }
 }

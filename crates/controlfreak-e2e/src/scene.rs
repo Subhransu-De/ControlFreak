@@ -10,6 +10,7 @@ const BUILTIN: &[(&str, &str)] = &[
         include_str!("../scenes/two-processes.toml"),
     ),
     ("busy-app", include_str!("../scenes/busy-app.toml")),
+    ("clipped", include_str!("../scenes/clipped.toml")),
 ];
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -38,6 +39,9 @@ pub struct WindowSpec {
     /// keystroke before translating any, like a busy UI framework.
     #[serde(default)]
     pub(crate) busy_drain_ms: u32,
+    /// The fixture confines the pointer to the left half of its client area while it is active.
+    #[serde(default)]
+    pub(crate) clip_cursor: bool,
 }
 
 fn default_color() -> String {
@@ -136,6 +140,7 @@ mod tests {
         assert!(!window.topmost && !window.dialog);
         assert_eq!(window.lifetime_secs, 240);
         assert_eq!(window.busy_drain_ms, 0);
+        assert!(!window.clip_cursor);
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub(crate) fn suite() -> Suite {
         tasks: vec![
             task("focus-window", focus_window).scene("single"),
             task("click-pixel-and-button", click_pixel_and_button).scene("single"),
+            task("click-outside-pointer-clip", click_outside_pointer_clip).scene("clipped"),
             task("type-unicode-enter-tab", type_unicode).scene("single"),
             task("type-into-busy-app", type_into_busy_app).scene("busy-app"),
             task("press-punctuation-keys", press_punctuation).scene("single"),
@@ -82,6 +83,81 @@ fn click_pixel_and_button(cx: &mut Ctx<'_>) -> Result<(), Failure> {
         events::button_pressed(e, "ping")
     })?;
     cx.end()
+}
+
+/// A program that confines the pointer with `ClipCursor` makes `SetCursorPos` succeed but leave
+/// the pointer on the clip's edge. A click asked for outside the clip must be refused instead of
+/// landing on whatever is at the edge, and a click inside it must still land. The harness frees
+/// the pointer when it closes the fixture, whatever happens here.
+fn click_outside_pointer_clip(cx: &mut Ctx<'_>) -> Result<(), Failure> {
+    let id = control(cx, "app")?;
+    cx.expect("app", "the pointer clip", |e| {
+        e.iter()
+            .any(|event| matches!(event, Event::Other(line) if line == "main clip on"))
+    })?;
+    let regions = cx.window("app")?.regions.clone();
+    let clip = regions
+        .get("clip")
+        .ok_or_else(|| Failure::host("the fixture reported no clip region"))?;
+
+    let button = cx.center("app", "button")?;
+    ensure!(button.0 < clip[2], "the button is outside the clip");
+    ensure_clip_in_force(cx, clip)?;
+    let inside = cx.click(&id, button)?;
+    ensure!(
+        !inside.is_error,
+        "a click inside the clip was refused: {}",
+        inside.structured
+    );
+    cx.expect("app", "the button press", |e| {
+        events::button_pressed(e, "ping")
+    })?;
+
+    let [_, edit_top, edit_right, edit_bottom] = regions
+        .get("edit")
+        .ok_or_else(|| Failure::host("the fixture reported no edit region"))?;
+    let outside = (edit_right - 20, edit_top.midpoint(edit_bottom));
+    ensure!(outside.0 >= clip[2], "the edit point is inside the clip");
+    ensure_clip_in_force(cx, clip)?;
+    let downs_before = events::left_downs(&cx.window("app")?.events(), "main").len();
+    // Only the pointer moved, so the result is `partially_sent` with the error beside it, not
+    // an MCP error: a result whose input began never sets `isError`.
+    let refused = cx.call(
+        "click_mouse",
+        json!({"target_ref": id, "x": outside.0, "y": outside.1, "observation": {"mode": "none"}}),
+    )?;
+    ensure!(
+        refused.structured["status"] == "partially_sent"
+            && refused.error_code() == Some("platform_operation_failed")
+            && refused.error_reason() == Some("pointer_not_placed")
+            && refused.structured["error"]["retryable"] == false
+            && refused.structured["input"]["sent_events"] == 0,
+        "wrong refusal: {}",
+        refused.structured
+    );
+    thread::sleep(Duration::from_millis(300));
+    let downs_after = events::left_downs(&cx.window("app")?.events(), "main").len();
+    ensure!(
+        downs_after == downs_before,
+        "the refused click reached the fixture at the clip edge"
+    );
+    cx.end()
+}
+
+/// Reads the pointer's clip back from Windows. A clip lost since the fixture set it would let
+/// the clicks pass or fail for the wrong reason, so that is a harness failure, not a finding.
+fn ensure_clip_in_force(cx: &mut Ctx<'_>, clip: [i32; 4]) -> Result<(), Failure> {
+    let output = cx.helper(&["--clip-rect"])?;
+    let current: Vec<i32> = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    if current != clip {
+        return Err(Failure::host(format!(
+            "the pointer clip {clip:?} is not in force: Windows reports {current:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn type_unicode(cx: &mut Ctx<'_>) -> Result<(), Failure> {
