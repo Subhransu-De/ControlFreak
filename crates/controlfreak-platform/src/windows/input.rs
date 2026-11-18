@@ -9,14 +9,27 @@ use super::{
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN,
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, MOVE_FRAME_MS, MouseButton,
     MouseClickRequest, MutationControl, POINT, PlatformError, SendInput, SetCursorPos, VIRTUAL_KEY,
-    size_of, thread, win32_error,
+    current_cursor_position, size_of, thread, win32_error,
 };
+
+/// Whether `move_cursor` checks that Windows put the pointer where it was sent.
+#[derive(Clone, Copy)]
+pub(super) enum Placement {
+    /// A plain move. The result reports wherever the pointer ended up.
+    Unchecked,
+    /// The approach of a click, scroll or drag. `SetCursorPos` succeeds even when Windows keeps
+    /// the pointer inside another program's `ClipCursor` rectangle, and button and wheel events
+    /// fire wherever the pointer is, so a pointer that Windows left elsewhere stops the action
+    /// with `pointer_not_placed` before it can press anything there.
+    Verified,
+}
 
 pub(super) fn move_cursor<F>(
     operation: &str,
     start: POINT,
     target: POINT,
     duration_ms: u32,
+    placement: Placement,
     control: &MutationControl,
     validate_target: F,
 ) -> Result<(), PlatformError>
@@ -32,13 +45,48 @@ where
         control,
         validate_target,
         |point| {
-            // SAFETY: SetCursorPos takes signed screen coordinates and retains no references.
-            unsafe { SetCursorPos(point.x, point.y) }
-                .map_err(|error| win32_error("SetCursorPos", &error))
+            place_pointer(
+                point,
+                placement,
+                |point| {
+                    // SAFETY: SetCursorPos takes signed screen coordinates and retains no
+                    // references.
+                    unsafe { SetCursorPos(point.x, point.y) }
+                        .map_err(|error| win32_error("SetCursorPos", &error))
+                },
+                current_cursor_position,
+            )
         },
     )
 }
 
+/// Sets the pointer and, when placement is checked, returns where Windows left it after the
+/// first and the last try. A mismatch gets one more try: a clip puts the pointer on the same
+/// edge again, a hand that moved the mouse between setting and reading lets the second try
+/// land, and a pointer that is still moving is somewhere else each time.
+fn place_pointer(
+    point: POINT,
+    placement: Placement,
+    mut set: impl FnMut(POINT) -> Result<(), PlatformError>,
+    mut read: impl FnMut() -> Result<POINT, PlatformError>,
+) -> Result<Option<[POINT; 2]>, PlatformError> {
+    set(point)?;
+    if matches!(placement, Placement::Unchecked) {
+        return Ok(None);
+    }
+    let first = read()?;
+    if first == point {
+        return Ok(Some([first, first]));
+    }
+    set(point)?;
+    Ok(Some([first, read()?]))
+}
+
+/// Moves the pointer from `start` to `target`, validating each point before `set_position`.
+/// `set_position` returns where Windows left the pointer when placement is checked, and `None`
+/// when it is not. Once `set_position` returns, the move is recorded as accepted before the
+/// placement check, so a refusal there still reports that the pointer moved; if `set_position`
+/// fails, including when the pointer cannot be read back, delivery stays unknown.
 fn move_cursor_with(
     operation: &str,
     start: POINT,
@@ -46,16 +94,21 @@ fn move_cursor_with(
     duration_ms: u32,
     control: &MutationControl,
     mut validate_target: impl FnMut(POINT) -> Result<(), PlatformError>,
-    mut set_position: impl FnMut(POINT) -> Result<(), PlatformError>,
+    mut set_position: impl FnMut(POINT) -> Result<Option<[POINT; 2]>, PlatformError>,
 ) -> Result<(), PlatformError> {
-    control.check(operation)?;
-    if duration_ms == 0 {
-        validate_target(target)?;
+    let mut move_to = |point: POINT| {
+        validate_target(point)?;
         control.check(operation)?;
         control.dispatch_started();
-        set_position(target)?;
+        let left_at = set_position(point)?;
         control.dispatch_accepted(0);
-        return Ok(());
+        left_at.map_or(Ok(()), |readings| {
+            ensure_pointer_placed(operation, point, readings)
+        })
+    };
+    control.check(operation)?;
+    if duration_ms == 0 {
+        return move_to(target);
     }
 
     let steps = u64::from(duration_ms).div_ceil(MOVE_FRAME_MS).max(1);
@@ -66,15 +119,44 @@ fn move_cursor_with(
         if let Some(remaining) = target_elapsed.checked_sub(started.elapsed()) {
             control.wait(operation, remaining)?;
         }
-        let x = interpolate(start.x, target.x, step, steps);
-        let y = interpolate(start.y, target.y, step, steps);
-        validate_target(POINT { x, y })?;
-        control.check(operation)?;
-        control.dispatch_started();
-        set_position(POINT { x, y })?;
-        control.dispatch_accepted(0);
+        move_to(POINT {
+            x: interpolate(start.x, target.x, step, steps),
+            y: interpolate(start.y, target.y, step, steps),
+        })?;
     }
     Ok(())
+}
+
+/// Refuses to continue when Windows left the pointer somewhere other than `requested`.
+/// `SetCursorPos` reports success when it keeps the pointer inside a `ClipCursor` rectangle,
+/// so only reading the pointer back shows where it went. `readings` are the first and last
+/// read-backs of `place_pointer`: the same wrong point twice is a clip, two different wrong
+/// points are a pointer that someone is moving.
+fn ensure_pointer_placed(
+    operation: &str,
+    requested: POINT,
+    [first, last]: [POINT; 2],
+) -> Result<(), PlatformError> {
+    if last == requested {
+        return Ok(());
+    }
+    if first != last {
+        return Err(PlatformError::failed(
+            controlfreak_core::FailureCause::PointerMoved,
+            operation,
+            "the pointer kept moving away from the requested point; observe again before retrying",
+        ));
+    }
+    Err(PlatformError::failed(
+        controlfreak_core::FailureCause::PointerNotPlaced,
+        operation,
+        format!(
+            "Windows left the pointer at ({}, {}) instead of the requested ({}, {}) in \
+             virtual-desktop pixels, usually because another program confines the pointer; \
+             observe before deciding how to continue",
+            last.x, last.y, requested.x, requested.y
+        ),
+    ))
 }
 
 fn mouse_input(flags: MOUSE_EVENT_FLAGS, data: i32) -> INPUT {
@@ -1373,7 +1455,7 @@ mod progress_tests {
                     |_| ensure_pointer_idle_with("approach", |key| key == button),
                     |_| {
                         dispatched = true;
-                        Ok(())
+                        Ok(None)
                     },
                 );
                 assert!(result.is_err());
@@ -1382,6 +1464,180 @@ mod progress_tests {
             }
         }
         assert!(ensure_pointer_idle_with("approach", |_| false).is_ok());
+    }
+
+    /// A pointer that another program confined to `x < clip_right`, as `ClipCursor` does:
+    /// `SetCursorPos` succeeds and Windows moves the pointer to the clip edge instead.
+    struct ClippedPointer {
+        clip_right: i32,
+        live: std::cell::Cell<POINT>,
+        moves: std::cell::Cell<u32>,
+    }
+
+    impl ClippedPointer {
+        fn new(clip_right: i32) -> Self {
+            Self {
+                clip_right,
+                live: std::cell::Cell::new(POINT::default()),
+                moves: std::cell::Cell::new(0),
+            }
+        }
+
+        fn approach(
+            &self,
+            target: POINT,
+            duration_ms: u32,
+            control: &MutationControl,
+        ) -> Result<(), PlatformError> {
+            move_cursor_with(
+                "click_mouse",
+                POINT::default(),
+                target,
+                duration_ms,
+                control,
+                |_| Ok(()),
+                |point| {
+                    place_pointer(
+                        point,
+                        Placement::Verified,
+                        |point| {
+                            self.moves.set(self.moves.get() + 1);
+                            self.live.set(POINT {
+                                x: point.x.min(self.clip_right - 1),
+                                y: point.y,
+                            });
+                            Ok(())
+                        },
+                        || Ok(self.live.get()),
+                    )
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn a_clipped_pointer_stops_the_approach_where_windows_left_it() {
+        let target = POINT { x: 580, y: 222 };
+        for duration in [0, 48] {
+            let pointer = ClippedPointer::new(440);
+            let control = MutationControl::default();
+            let error = pointer.approach(target, duration, &control).unwrap_err();
+            assert_eq!(error.reason_code(), Some("pointer_not_placed"));
+            assert!(!error.retryable(), "the same request is clamped again");
+            assert!(error.to_string().contains("(439, 222)"), "{error}");
+            // The pointer did move, so the progress says so, but no button or wheel event went.
+            assert_eq!(control.progress().sent_events, 0);
+            assert_eq!(
+                control.progress().input_outcome,
+                InputOutcome::PartiallySent
+            );
+        }
+
+        // A stepped approach stops at the first point Windows clamped: (600, 200) of
+        // (300, 100), (600, 200), (900, 300). That point is tried twice, so three moves.
+        let pointer = ClippedPointer::new(440);
+        let control = MutationControl::default();
+        assert!(
+            pointer
+                .approach(POINT { x: 900, y: 300 }, 48, &control)
+                .is_err()
+        );
+        assert_eq!(pointer.moves.get(), 3);
+        let progress = control.progress();
+        assert_eq!(progress.input_outcome, InputOutcome::PartiallySent);
+        assert_eq!(progress.sent_events, 0);
+        assert_eq!(progress.cleanup, CleanupStatus::NotNeeded);
+    }
+
+    #[test]
+    fn a_clip_is_tried_once_more_and_a_hand_movement_is_not_taken_for_one() {
+        let target = POINT { x: 580, y: 222 };
+        let clamped = POINT { x: 439, y: 222 };
+        // A clip puts the pointer on its edge every time.
+        let mut sets = 0;
+        let left_at = place_pointer(
+            target,
+            Placement::Verified,
+            |_| {
+                sets += 1;
+                Ok(())
+            },
+            || Ok(clamped),
+        );
+        assert_eq!(left_at.unwrap(), Some([clamped, clamped]));
+        assert_eq!(sets, 2);
+
+        // The user's hand moved the mouse between the first set and read; the retry lands.
+        let nudged = POINT { x: 583, y: 220 };
+        let mut reads = [Ok(nudged), Ok(target)].into_iter();
+        let left_at = place_pointer(
+            target,
+            Placement::Verified,
+            |_| Ok(()),
+            || reads.next().unwrap(),
+        );
+        assert_eq!(left_at.unwrap(), Some([nudged, target]));
+    }
+
+    #[test]
+    fn a_pointer_that_cannot_be_read_back_leaves_delivery_unknown() {
+        let control = MutationControl::default();
+        let error = move_cursor_with(
+            "click_mouse",
+            POINT::default(),
+            POINT { x: 10, y: 10 },
+            0,
+            &control,
+            |_| Ok(()),
+            |point| place_pointer(point, Placement::Verified, |_| Ok(()), || Err(failure())),
+        )
+        .unwrap_err();
+        assert_eq!(error.reason_code(), Some("os_call_failed"));
+        assert_eq!(control.progress().input_outcome, InputOutcome::Unknown);
+    }
+
+    #[test]
+    fn a_plain_move_neither_reads_back_nor_refuses_a_clamped_pointer() {
+        let left_at = place_pointer(
+            POINT { x: 580, y: 222 },
+            Placement::Unchecked,
+            |_| Ok(()),
+            || panic!("a plain move must not read the pointer back"),
+        );
+        assert_eq!(left_at.unwrap(), None);
+    }
+
+    #[test]
+    fn an_unclipped_approach_reaches_the_requested_point() {
+        for duration in [0, 48] {
+            let pointer = ClippedPointer::new(i32::MAX);
+            let control = MutationControl::default();
+            let target = POINT {
+                x: -1_920,
+                y: 1_079,
+            };
+            pointer.approach(target, duration, &control).unwrap();
+            assert_eq!(pointer.live.get(), target);
+        }
+    }
+
+    #[test]
+    fn placement_compares_the_exact_requested_point() {
+        let requested = POINT { x: -100, y: 20 };
+        let nudged = POINT { x: -99, y: 20 };
+        assert!(ensure_pointer_placed("drag_mouse", requested, [requested, requested]).is_ok());
+        assert!(ensure_pointer_placed("drag_mouse", requested, [nudged, requested]).is_ok());
+        for actual in [nudged, POINT { x: -100, y: 19 }] {
+            let error =
+                ensure_pointer_placed("drag_mouse", requested, [actual, actual]).unwrap_err();
+            assert_eq!(error.reason_code(), Some("pointer_not_placed"));
+        }
+        // Somewhere else on each try: the pointer is being moved, not held by a clip.
+        let error =
+            ensure_pointer_placed("drag_mouse", requested, [nudged, POINT { x: -98, y: 21 }])
+                .unwrap_err();
+        assert_eq!(error.reason_code(), Some("pointer_moved"));
+        assert!(error.retryable());
     }
 
     #[test]
