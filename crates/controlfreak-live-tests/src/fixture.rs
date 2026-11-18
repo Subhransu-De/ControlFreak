@@ -9,18 +9,24 @@
 //!
 //! ```text
 //! controlfreak-fixture --title TEXT --log FILE [--color RRGGBB] [--pos X,Y] [--topmost]
-//!                      [--with-dialog] [--lifetime-secs N] [--busy-drain-ms N]
+//!                      [--with-dialog] [--lifetime-secs N] [--busy-drain-ms N] [--clip-cursor]
 //! controlfreak-fixture --stop-button-rect     # print the screen rectangle of the Stop agent button
 //! controlfreak-fixture --activate-taskbar     # try to bring the shell taskbar to the foreground
 //! controlfreak-fixture --inject-click X,Y     # SendInput a left click at a screen point
+//! controlfreak-fixture --release-clip         # free the pointer from any ClipCursor rectangle
+//! controlfreak-fixture --clip-rect            # print the rectangle the pointer is confined to
 //! ```
+//!
+//! With `--clip-cursor` the window confines the pointer to the left part of its client area with
+//! `ClipCursor` whenever it is activated, as games and remote viewers do, and frees it when it is
+//! deactivated.
 //!
 //! Log lines, screen coordinates in physical pixels:
 //!
 //! ```text
-//! ready client=L,T,R,B label=L,T,R,B edit=L,T,R,B button=L,T,R,B [dialog=L,T,R,B]
+//! ready client=L,T,R,B label=L,T,R,B edit=L,T,R,B button=L,T,R,B [dialog=L,T,R,B] [clip=L,T,R,B]
 //! main keydown 0x0D | main keyup 0x0D | main char U+0041 | main activate 1
-//! main mouse left_down X Y | dialog mouse left_down X Y | main button ping
+//! main mouse left_down X Y | dialog mouse left_down X Y | main button ping | main clip on
 //! ```
 
 #[cfg(not(windows))]
@@ -44,7 +50,7 @@ mod win {
         path::PathBuf,
         sync::{
             Mutex, OnceLock,
-            atomic::{AtomicU32, Ordering},
+            atomic::{AtomicBool, AtomicU32, Ordering},
         },
         thread,
         time::Duration,
@@ -67,11 +73,11 @@ mod win {
                     MOUSEINPUT, SendInput, SetFocus,
                 },
                 WindowsAndMessaging::{
-                    AdjustWindowRectEx, BN_CLICKED, BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW,
-                    DestroyWindow, DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW,
-                    GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowTextW, HMENU,
-                    IDC_ARROW, IsWindowVisible, LoadCursorW, MSG, PM_REMOVE, PeekMessageW,
-                    PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SetCursorPos,
+                    AdjustWindowRectEx, BN_CLICKED, BS_PUSHBUTTON, ClipCursor, CreateWindowExW,
+                    DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, FindWindowW,
+                    GetClassNameW, GetClipCursor, GetForegroundWindow, GetMessageW, GetWindowRect,
+                    GetWindowTextW, HMENU, IDC_ARROW, IsWindowVisible, LoadCursorW, MSG, PM_REMOVE,
+                    PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SetCursorPos,
                     SetForegroundWindow, SetTimer, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
                     WINDOW_STYLE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE,
                     WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT,
@@ -118,6 +124,15 @@ mod win {
         right: DIALOG_WIDTH,
         bottom: DIALOG_HEIGHT,
     };
+    /// Where `--clip-cursor` confines the pointer: the left half of the client area. It holds
+    /// the button and the left part of the edit surface, so a test can click inside it and ask
+    /// for a point on the edit surface outside it.
+    const CLIP_AREA: RECT = RECT {
+        left: 0,
+        top: 0,
+        right: 180,
+        bottom: CLIENT_HEIGHT,
+    };
     const BUTTON_ID: usize = 100;
     const LIFETIME_TIMER: usize = 1;
     const LABEL_TEXT: &str = "Banana";
@@ -126,6 +141,8 @@ mod win {
     static TYPED: Mutex<String> = Mutex::new(String::new());
     /// COLORREF (0x00BBGGRR) of the window background.
     static BACKGROUND: AtomicU32 = AtomicU32::new(0x00D0_D0D0);
+    /// Set by `--clip-cursor` before any window exists.
+    static CLIP_CURSOR: AtomicBool = AtomicBool::new(false);
 
     struct Options {
         title: String,
@@ -164,6 +181,8 @@ mod win {
                 "--stop-button-rect" => return print_stop_button_rect(),
                 "--activate-taskbar" => return activate_taskbar(),
                 "--inject-click" => return inject_click(&args.next().unwrap_or_default()),
+                "--release-clip" => return release_clip(),
+                "--clip-rect" => return print_clip_rect(),
                 "--title" => options.title = args.next().unwrap_or_default(),
                 "--log" => options.log = args.next().map(PathBuf::from),
                 "--color" => {
@@ -187,6 +206,7 @@ mod win {
                 "--busy-drain-ms" => {
                     options.busy_drain_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
                 }
+                "--clip-cursor" => CLIP_CURSOR.store(true, Ordering::Relaxed),
                 other => {
                     eprintln!("unknown argument {other}");
                     return 2;
@@ -357,6 +377,10 @@ mod win {
             ready.push(' ');
             ready.push_str(&format_rect("dialog", screen_rect(dialog, DIALOG_AREA)));
         }
+        if CLIP_CURSOR.load(Ordering::Relaxed) {
+            ready.push(' ');
+            ready.push_str(&format_rect("clip", screen_rect(hwnd, CLIP_AREA)));
+        }
         log(&ready);
         Ok(())
     }
@@ -476,10 +500,50 @@ mod win {
                 // SAFETY: `hwnd` is live and owned by this thread.
                 let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
             }
-            WM_ACTIVATE => log(&format!("{role} activate {}", wparam.0 & 0xFFFF)),
+            WM_ACTIVATE => {
+                let state = wparam.0 & 0xFFFF;
+                log(&format!("{role} activate {state}"));
+                if role == "main" && CLIP_CURSOR.load(Ordering::Relaxed) {
+                    clip_pointer(hwnd, state != 0);
+                }
+            }
             _ => return None,
         }
         Some(LRESULT(0))
+    }
+
+    /// Confines the pointer to `CLIP_AREA` while the main window is active, and frees it when
+    /// the window is deactivated. Logs `main clip on` once `ClipCursor` accepted the rectangle.
+    fn clip_pointer(hwnd: HWND, active: bool) {
+        if active {
+            let clip = screen_rect(hwnd, CLIP_AREA);
+            // SAFETY: `clip` is a valid RECT for the synchronous call, which keeps no reference.
+            if unsafe { ClipCursor(Some(&raw const clip)) }.is_ok() {
+                log("main clip on");
+            }
+        } else {
+            // SAFETY: A null rectangle frees the pointer; no memory is passed.
+            let _ = unsafe { ClipCursor(None) };
+        }
+    }
+
+    /// Frees the pointer from any `ClipCursor` rectangle. The harness kills fixtures, so a
+    /// clipping fixture never sees its own deactivation and its clip may outlive it; the harness
+    /// runs this after it kills one.
+    fn release_clip() -> i32 {
+        // SAFETY: A null rectangle frees the pointer; no memory is passed.
+        i32::from(unsafe { ClipCursor(None) }.is_err())
+    }
+
+    /// Prints `left top right bottom` of the rectangle the pointer is confined to now.
+    fn print_clip_rect() -> i32 {
+        let mut clip = RECT::default();
+        // SAFETY: `clip` is writable for the synchronous call, which keeps no reference.
+        if unsafe { GetClipCursor(&raw mut clip) }.is_err() {
+            return 1;
+        }
+        println!("{} {} {} {}", clip.left, clip.top, clip.right, clip.bottom);
+        0
     }
 
     fn destroy(hwnd: HWND) -> LRESULT {

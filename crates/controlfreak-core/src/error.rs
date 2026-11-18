@@ -109,6 +109,10 @@ impl RefusalCause {
 pub enum FailureCause {
     Cancelled,
     PointerMoved,
+    /// Windows left the pointer somewhere other than the requested point, usually because
+    /// another program confines it with `ClipCursor`. Repeating the same request fails the same
+    /// way, so it is not retryable.
+    PointerNotPlaced,
     KeyHeld,
     InputInterleaved,
     OcrUnavailable,
@@ -126,6 +130,7 @@ impl FailureCause {
         match self {
             Self::Cancelled => "cancelled",
             Self::PointerMoved => "pointer_moved",
+            Self::PointerNotPlaced => "pointer_not_placed",
             Self::KeyHeld => "key_held",
             Self::InputInterleaved => "input_interleaved",
             Self::OcrUnavailable => "ocr_unavailable",
@@ -214,6 +219,13 @@ mod tests {
             operation: operation.to_owned(),
             reason: reason.to_owned(),
         }
+    }
+
+    #[test]
+    fn a_pointer_windows_did_not_place_is_its_own_non_retryable_reason() {
+        let error = PlatformError::failed(FailureCause::PointerNotPlaced, "click_mouse", "x");
+        assert_eq!(error.reason_code(), Some("pointer_not_placed"));
+        assert!(!error.retryable(), "the same request is clamped again");
     }
 
     #[test]

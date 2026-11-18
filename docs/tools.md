@@ -211,7 +211,8 @@ Every error also has `error.retryable`. It says whether repeating the same reque
 
 | `reason` | Meaning | `retryable` |
 | --- | --- | --- |
-| `pointer_moved` | The pointer moved after validation. Observe again. | Yes |
+| `pointer_moved` | The pointer moved away from the requested point before a button or wheel event, for example because the user moved the mouse. For `drag_mouse` this can be found at the end point, after the drag happened: the button was released where the pointer was, so observe before repeating. | Yes |
+| `pointer_not_placed` | Windows did not put the pointer on the requested point, usually because another program confines it (`ClipCursor`). Nothing was pressed there; a drag already in progress is released where the pointer stopped. Observe before continuing. | No |
 | `key_held` | A requested key or button is already held. Release it. | Yes |
 | `input_interleaved` | Another input ran during text recognition. Find the text again. | Yes |
 | `cancelled` | A stop, client cancellation or closing session cancelled the work. | No |
