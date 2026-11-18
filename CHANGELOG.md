@@ -9,6 +9,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+## [0.2.3] - 2026-11-18
+
 ### Fixed
 
 - Clicks, scrolls and drags no longer land on a different control of the approved window when another program confines the pointer (`ClipCursor`) or the user moves it during the action. The pointer is now checked against the requested point and the action refused before anything is pressed. A drag that ends off its end point still releases the button and reports `pointer_moved`, so observe before repeating it.
