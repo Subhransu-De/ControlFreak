@@ -28,6 +28,8 @@ The fixture writes every key, character, click and activation it receives to its
 | `window.topmost` | `false` | Keeps the window above all non-topmost windows. |
 | `window.dialog` | `false` | Opens an owned dialog of the same process. |
 | `window.lifetime_secs` | `240` | Seconds until the fixture closes itself, from 10 to 600. |
+| `window.busy_drain_ms` | `0` | When above 0, at most 1000: the fixture stays busy this many milliseconds whenever a message arrives, then takes every queued keystroke before translating any, like a busy UI framework. |
+| `window.clip_cursor` | `false` | While the window is active, the fixture confines the pointer to the left half of its client area with `ClipCursor`, as games and remote viewers do, and reports that rectangle as `clip` in its ready line. |
 
 Scenes are compiled into the harness, so a run does not depend on the working directory. Unknown fields, duplicate keys and invalid colors are refused when the scene loads.
 
@@ -45,6 +47,26 @@ This is the plain "one application" desk. Every task here starts a control sessi
 | `smoke/press-punctuation-keys` | Presses nine punctuation keys by name, then Enter and Tab. Checks each arrived as the right virtual key and typed the US-layout character. |
 | `smoke/click-text-by-ocr` | Needs OCR. Clicks the word `Banana` by OCR and checks the click landed inside the label. |
 | `smoke/injected-stop-click-ignored` | Finds the session's Stop button. Checks the server refuses a click on it with `own_indicator`. Then sends a real injected click straight to the button through the fixture and checks control did not stop. |
+
+## busy-app
+
+One green window, `app`, with `busy_drain_ms = 30`.
+
+This is the "application that is busy when input arrives" desk. Windows hands a Unicode keystroke's character to the application from the keystroke it took last, so an application that takes several queued keystrokes before translating them receives them all as one character. Windows 11 Notepad did this while busy, and `type_text` used to send text in bursts of 50 characters.
+
+| Task | What happens |
+| --- | --- |
+| `smoke/type-into-busy-app` | Types `Hello, world! é日 0123456789`, Tab and `z`. Checks the window received exactly those characters. Before keystrokes were paced, it received most of them as copies of one character. |
+
+## clipped
+
+One green window, `app`, with `clip_cursor = true`.
+
+This is the "application that confines the pointer" desk. Windows keeps the pointer inside a `ClipCursor` rectangle and still reports success to `SetCursorPos`, so a click aimed outside the rectangle would land on whatever is at its edge.
+
+| Task | What happens |
+| --- | --- |
+| `smoke/click-outside-pointer-clip` | Checks through the fixture that Windows has the clip in force before each click. Clicks the button, inside the clip, and waits for its press. Then clicks the right part of the edit surface, outside it. Checks the result is `partially_sent` (only the pointer moved) with error `platform_operation_failed` and reason `pointer_not_placed`, is not retryable and sent no events, and that the fixture logged no click. The harness frees the pointer after it closes the fixture, whatever the outcome, because killing the fixture may not. |
 
 ## with-dialog
 
@@ -74,6 +96,7 @@ This is the "copy something from one application into another" desk. A control s
 
 | Task | What happens |
 | --- | --- |
+| `smoke/focus-after-user-input` | Injects a click into `journal` after the server has started, as a user typing in another app does, then focuses `ledger`. Checks that Windows refused the server's own request and the activation helper's was accepted (`input.activation_helper` is `accepted`), that `ledger` logged an activation and is in front, and that a click on it is accepted. |
 | `smoke/foreign-window-refused` | With a session on `ledger`, clicks at the center of `journal`. Checks the refusal is `target_invalidated` with reason `foreign_destination`, is retryable and sent no input. Then checks the session still works on `ledger` and `journal` received nothing. |
 | `handoff/sessions-hand-over-cleanly` | Types `A1` into `ledger`, `B2` into `journal` and `C3` into `ledger`, each in its own session. Checks `ledger` received exactly `A1C3` and `journal` exactly `B2`. |
 | `handoff/other-window-refused-in-session` | With a session on `ledger`, tries to type into `journal`. Checks the call is refused, `journal` received no input, and typing into `ledger` still works afterwards. |

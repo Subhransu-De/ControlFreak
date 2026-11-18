@@ -42,6 +42,10 @@ fn observation() -> ActionObservation {
     ActionObservation {
         foreground_window: None,
         screenshot: None,
+        settle: Some(controlfreak_core::SettleReport {
+            outcome: controlfreak_core::SettleOutcome::Settled,
+            elapsed_ms: 180,
+        }),
     }
 }
 
@@ -110,7 +114,12 @@ impl PointerBackend for Scripted {
         request: &MouseScrollRequest,
         control: &MutationControl,
     ) -> Result<PointerActionResult, PlatformError> {
-        self.step(format!("scroll {}", request.delta_y), control)
+        // The last step of the shared batch; it records the settle limit it was given.
+        let settle = request
+            .observation
+            .settle_ms
+            .map_or_else(String::new, |settle_ms| format!(" settle={settle_ms}"));
+        self.step(format!("scroll {}{settle}", request.delta_y), control)
             .map(|()| pointer())
     }
 }
@@ -252,6 +261,30 @@ async fn steps_run_in_order_with_one_final_observation() {
 }
 
 #[tokio::test]
+async fn each_step_reports_its_settle_and_only_the_last_gets_settle_ms() {
+    let (content, calls) = run(
+        None,
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000003", "steps": steps(), "observation": {"mode": "metadata", "settle_ms": 1_500}}),
+    )
+    .await;
+    assert_eq!(content["status"], "completed", "{content}");
+    // Earlier steps take no screenshot and keep the short default limit.
+    assert_eq!(
+        calls,
+        [
+            "click fixture 10 20",
+            "type Ada None",
+            "keys [Tab] None",
+            "scroll -120 settle=1500"
+        ]
+    );
+    for step in content["action"]["steps"].as_array().unwrap() {
+        assert_eq!(step["settle"]["outcome"], "settled", "{step}");
+    }
+    assert_eq!(content["observation"]["settle"]["elapsed_ms"], 180);
+}
+
+#[tokio::test]
 async fn a_failed_step_stops_the_batch_and_reports_partial_delivery() {
     let (content, calls) = run(
         Some(2),
@@ -290,6 +323,23 @@ async fn invalid_later_steps_are_refused_before_any_input() {
         .await;
         assert_eq!(content["status"], "not_started", "{bad}: {content}");
         assert!(calls.is_empty(), "{bad}: {calls:?}");
+    }
+}
+
+#[tokio::test]
+async fn final_observation_limits_are_refused_before_any_input() {
+    for observation in [
+        json!({"settle_ms": 10_001}),
+        json!({"max_width": 0}),
+        json!({"max_width": 7_681}),
+    ] {
+        let (content, calls) = run(
+            None,
+            json!({"target_ref": "target-00000000-0000-0000-0000-000000000003", "steps": steps(), "observation": observation}),
+        )
+        .await;
+        assert_eq!(content["status"], "not_started", "{observation}: {content}");
+        assert!(calls.is_empty(), "{observation}: {calls:?}");
     }
 }
 

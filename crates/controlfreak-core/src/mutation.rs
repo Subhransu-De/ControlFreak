@@ -96,6 +96,10 @@ impl MutationControl {
         });
     }
 
+    pub fn activation_helper(&self, outcome: crate::ActivationHelperOutcome) {
+        self.update_progress(|progress| progress.activation_helper = outcome);
+    }
+
     pub fn invalidate_target(&self) {
         self.target_invalidated.store(true, Ordering::Release);
     }

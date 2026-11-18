@@ -21,7 +21,9 @@ pub(crate) fn suite() -> Suite {
         tasks: vec![
             task("focus-window", focus_window).scene("single"),
             task("click-pixel-and-button", click_pixel_and_button).scene("single"),
+            task("click-outside-pointer-clip", click_outside_pointer_clip).scene("clipped"),
             task("type-unicode-enter-tab", type_unicode).scene("single"),
+            task("type-into-busy-app", type_into_busy_app).scene("busy-app"),
             task("press-punctuation-keys", press_punctuation).scene("single"),
             task("capture-occluded-window", capture_occluded).scene("covered"),
             task("click-text-by-ocr", click_text_by_ocr)
@@ -29,6 +31,7 @@ pub(crate) fn suite() -> Suite {
                 .requires(&[Capability::Ocr]),
             task("owned-dialog-accepted", owned_dialog).scene("with-dialog"),
             task("foreign-window-refused", foreign_refused).scene("two-processes"),
+            task("focus-after-user-input", focus_after_user_input).scene("two-processes"),
             task("taskbar-target-ref", taskbar_target).requires(&[Capability::TaskbarForeground]),
             task("injected-stop-click-ignored", injected_stop_click)
                 .scene("single")
@@ -82,10 +85,101 @@ fn click_pixel_and_button(cx: &mut Ctx<'_>) -> Result<(), Failure> {
     cx.end()
 }
 
+/// A program that confines the pointer with `ClipCursor` makes `SetCursorPos` succeed but leave
+/// the pointer on the clip's edge. A click asked for outside the clip must be refused instead of
+/// landing on whatever is at the edge, and a click inside it must still land. The harness frees
+/// the pointer when it closes the fixture, whatever happens here.
+fn click_outside_pointer_clip(cx: &mut Ctx<'_>) -> Result<(), Failure> {
+    let id = control(cx, "app")?;
+    cx.expect("app", "the pointer clip", |e| {
+        e.iter()
+            .any(|event| matches!(event, Event::Other(line) if line == "main clip on"))
+    })?;
+    let regions = cx.window("app")?.regions.clone();
+    let clip = regions
+        .get("clip")
+        .ok_or_else(|| Failure::host("the fixture reported no clip region"))?;
+
+    let button = cx.center("app", "button")?;
+    ensure!(button.0 < clip[2], "the button is outside the clip");
+    ensure_clip_in_force(cx, clip)?;
+    let inside = cx.click(&id, button)?;
+    ensure!(
+        !inside.is_error,
+        "a click inside the clip was refused: {}",
+        inside.structured
+    );
+    cx.expect("app", "the button press", |e| {
+        events::button_pressed(e, "ping")
+    })?;
+
+    let [_, edit_top, edit_right, edit_bottom] = regions
+        .get("edit")
+        .ok_or_else(|| Failure::host("the fixture reported no edit region"))?;
+    let outside = (edit_right - 20, edit_top.midpoint(edit_bottom));
+    ensure!(outside.0 >= clip[2], "the edit point is inside the clip");
+    ensure_clip_in_force(cx, clip)?;
+    let downs_before = events::left_downs(&cx.window("app")?.events(), "main").len();
+    // Only the pointer moved, so the result is `partially_sent` with the error beside it, not
+    // an MCP error: a result whose input began never sets `isError`.
+    let refused = cx.call(
+        "click_mouse",
+        json!({"target_ref": id, "x": outside.0, "y": outside.1, "observation": {"mode": "none"}}),
+    )?;
+    ensure!(
+        refused.structured["status"] == "partially_sent"
+            && refused.error_code() == Some("platform_operation_failed")
+            && refused.error_reason() == Some("pointer_not_placed")
+            && refused.structured["error"]["retryable"] == false
+            && refused.structured["input"]["sent_events"] == 0,
+        "wrong refusal: {}",
+        refused.structured
+    );
+    thread::sleep(Duration::from_millis(300));
+    let downs_after = events::left_downs(&cx.window("app")?.events(), "main").len();
+    ensure!(
+        downs_after == downs_before,
+        "the refused click reached the fixture at the clip edge"
+    );
+    cx.end()
+}
+
+/// Reads the pointer's clip back from Windows. A clip lost since the fixture set it would let
+/// the clicks pass or fail for the wrong reason, so that is a harness failure, not a finding.
+fn ensure_clip_in_force(cx: &mut Ctx<'_>, clip: [i32; 4]) -> Result<(), Failure> {
+    let output = cx.helper(&["--clip-rect"])?;
+    let current: Vec<i32> = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    if current != clip {
+        return Err(Failure::host(format!(
+            "the pointer clip {clip:?} is not in force: Windows reports {current:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn type_unicode(cx: &mut Ctx<'_>) -> Result<(), Failure> {
     let id = control(cx, "app")?;
     cx.type_text(&id, "Hi, \u{e9}\u{65e5}\r\n\tz")?;
     let wanted = "Hi, \u{e9}\u{65e5}\u{23CE}\u{21E5}z";
+    let events = cx.expect("app", "all typed text", |e| {
+        events::typed(e).chars().count() >= wanted.chars().count()
+    })?;
+    let typed = events::typed(&events);
+    ensure!(typed == wanted, "typed {typed:?}, wanted {wanted:?}");
+    cx.end()
+}
+
+/// An application that takes several queued keystrokes before translating them turns a burst of
+/// Unicode packets into copies of the last character ("Hello,!!!!!!!!!!!" in Notepad). Every
+/// character must arrive as typed.
+fn type_into_busy_app(cx: &mut Ctx<'_>) -> Result<(), Failure> {
+    let id = control(cx, "app")?;
+    let text = "Hello, world! \u{e9}\u{65e5} 0123456789\tz";
+    cx.type_text(&id, text)?;
+    let wanted = text.replace('\t', "\u{21E5}");
     let events = cx.expect("app", "all typed text", |e| {
         events::typed(e).chars().count() >= wanted.chars().count()
     })?;
@@ -296,6 +390,62 @@ fn foreign_refused(cx: &mut Ctx<'_>) -> Result<(), Failure> {
         leaked.is_empty(),
         "the foreign window received input: {leaked:?}"
     );
+    cx.end()
+}
+
+/// Windows lets a process take the foreground only while no input has arrived since it started.
+/// The server starts before the user types the request, so on a real desktop its own
+/// `SetForegroundWindow` is refused from then on. This task recreates that: the harness starts
+/// the server, then a click is injected into `journal`, the "app the user was working in". The
+/// server's own request for `ledger` must now be refused, and the activation helper must still
+/// bring `ledger` to the front.
+fn focus_after_user_input(cx: &mut Ctx<'_>) -> Result<(), Failure> {
+    let ledger = cx.target("ledger")?;
+    let journal = cx.center("journal", "edit")?;
+    let output = cx.helper(&["--inject-click", &format!("{},{}", journal.0, journal.1)])?;
+    ensure!(
+        output.status.success(),
+        "the fixture could not inject the click"
+    );
+    cx.expect("journal", "the injected click", |e| {
+        !events::left_downs(e, "main").is_empty()
+    })?;
+    let foreground = cx.ok("list_windows", json!({}))?;
+    let journal_id = cx.target("journal")?;
+    ensure!(
+        foreground["windows"][0]["id"] == journal_id.as_str()
+            && foreground["windows"][0]["is_foreground"] == true,
+        "the click did not leave journal in front: {foreground}"
+    );
+    let activations_before = events::activations(&cx.window("ledger")?.events());
+    cx.begin(&ledger)?;
+    let focused = cx.ok(
+        "focus_window",
+        json!({"window_id": ledger, "observation": {"mode": "none"}}),
+    )?;
+    ensure!(
+        focused["input"]["activation_helper"] == "accepted",
+        "the foreground lock was not reproduced or not overcome: the server's own request must be refused and the helper's accepted: {focused}"
+    );
+    cx.expect("ledger", "an activation after the click", |e| {
+        events::activations(e) > activations_before
+    })?;
+    let windows = cx.ok("list_windows", json!({}))?;
+    ensure!(
+        windows["windows"][0]["id"] == ledger.as_str()
+            && windows["windows"][0]["is_foreground"] == true,
+        "ledger is not in front: {windows}"
+    );
+    let edit = cx.center("ledger", "edit")?;
+    let clicked = cx.click(&ledger, edit)?;
+    ensure!(
+        !clicked.is_error,
+        "input after the helper's activation was refused: {}",
+        clicked.structured
+    );
+    cx.expect("ledger", "the click after activation", |e| {
+        !events::left_downs(e, "main").is_empty()
+    })?;
     cx.end()
 }
 

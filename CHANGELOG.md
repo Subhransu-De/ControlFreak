@@ -9,6 +9,46 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Fixed
+
+- Clicks, scrolls and drags no longer land on a different control of the approved window when another program confines the pointer (`ClipCursor`) or the user moves it during the action. The pointer is now checked against the requested point and the action refused before anything is pressed. A drag that ends off its end point still releases the button and reports `pointer_moved`, so observe before repeating it.
+
+### Added
+
+- `error.reason` `pointer_not_placed` (not retryable): Windows did not put the pointer on the requested point, usually because another program confines it. `pointer_moved` now means the pointer moved away from the requested point.
+
+## [0.2.2] - 2026-11-17
+
+### Changed
+
+- Every input action waits for the approved window to respond and settle before it takes its screenshot. Clicks, scrolls, drags and moves used to wait a fixed 75 ms and keys at most 150 ms, so a menu that was still opening or a page that was still loading came back as the screen before the action, and agents captured the screen again to see the result. An action now returns once the window has changed and then stayed unchanged for 150 ms, after 500 ms if it never visibly changes, and after 2 seconds at most. Actions without a screenshot, including every `run_actions` step before the last, wait at most 500 ms. Fast windows still return in a few hundred milliseconds; animated pages take the full limit.
+- The server instructions are about half as long (874 characters instead of 1,470). Some clients copy them into every tool description, so their tool list is smaller. Guidance that one tool needs stays in that tool's description.
+- The `capture_window` description says that menus and popups are separate windows and do not appear in its screenshot.
+
+### Added
+
+- `observation.settle_ms` (0 to 10000) on input actions sets the longest wait for the window to settle. `0` keeps the previous short fixed wait.
+- `observation.settle` in every input action result, and `settle` in each `run_actions` step, report how the wait ended: `settled`, `unchanged`, `still_changing` or `not_watched`, with `elapsed_ms`. An agent can tell a screenshot that shows the response from one that may be stale without capturing again.
+
+## [0.2.1] - 2026-11-16
+
+### Fixed
+
+- A mouse, touch or pen click on the **Stop agent** button now stops the session. The button is a top-level window, and Windows sent its click notification to the desktop instead of to ControlFreak, so only accessibility tools (UI Automation Invoke) and Esc worked. The press is now handled by the button itself, after the same check that drops injected input.
+- The pointer in the session tab's badge sits in the middle of its square. It was about 1 pixel left of center at 100% and 2 pixels at 200%.
+- The **Stop agent** button matches the tab: the same dark surface, type and rounded corners instead of the gray system button, and it lightens under the pointer and darkens while pressed.
+- The tab has the same outline in every state. Its shoulders now flare out under the lamp while an agent works, as they already did for "reading the screen" and "This PC is yours again".
+- The tab's rim, the "Administrator" chip and the rule before the stop key are sharp at every display scale, including 125% and 150%.
+- The Esc keycap in the one-row tab has the same space above and below it.
+- The badge of "ControlFreak is reading the screen" is visible. It was drawn at a contrast of 1.5:1.
+- The tab's shadow fades out at the shoulders instead of ending in a straight edge.
+- `focus_window` can bring a background window to the front after the user has typed or clicked in another window, for example in the agent's chat. Windows lets a process take the foreground only while no user input has arrived since it started, and the server always starts before the user types the request, so the call failed with `activation_refused` until the user clicked the window themselves, and retrying could not help. When Windows refuses the server, it now asks once more through a short-lived helper copy of itself, which Windows allows. The helper sends no input, stays within the request's `timeout_ms` and ends at once on a stop. `input.activation_helper` reports when it was used.
+- `type_text` is much less likely to garble text in busy applications. It used to send up to 50 characters in one burst, and an application that takes several queued keystrokes before translating them (Windows 11 Notepad while busy) received every one of them as the burst's last character: a typed greeting arrived as "Hello,!!!!!!!!!!!" while the tool reported `completed`. Each keystroke now goes alone, after the window with keyboard focus has answered a message twice with a 10 ms pause between, and the target is checked before every keystroke. Typing is slower as a result, roughly 70 characters a second.
+
+### Added
+
+- `platform_operation_failed` has a new `reason`, `target_not_responding`: the window with keyboard focus stopped answering for 5 seconds while text was typed, so typing stopped. `input.sent_events` shows how much was sent.
+
 ## [0.2.0] - 2026-11-14
 
 ### Added

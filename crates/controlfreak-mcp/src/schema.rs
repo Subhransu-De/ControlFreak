@@ -8,8 +8,9 @@ use super::{
     requests::MAX_RUN_ACTION_STEPS,
 };
 use controlfreak_core::limits::{
-    DEFAULT_CAPTURE_WIDTH, MAX_CAPTURE_WIDTH, MAX_MOVE_DURATION_MS, MAX_RUN_ACTIONS_WAIT_MS,
-    MAX_SCROLL_DELTA, MAX_TEXT_UTF16_UNITS, MAX_WAIT_MS, MIN_WAIT_MS,
+    DEFAULT_CAPTURE_WIDTH, DEFAULT_QUIET_SETTLE_MS, DEFAULT_SETTLE_MS, MAX_CAPTURE_WIDTH,
+    MAX_MOVE_DURATION_MS, MAX_RUN_ACTIONS_WAIT_MS, MAX_SCROLL_DELTA, MAX_SETTLE_MS,
+    MAX_TEXT_UTF16_UNITS, MAX_WAIT_MS, MIN_WAIT_MS,
 };
 
 /// How a tool touches the desktop. It decides the annotations, which every client reads.
@@ -383,7 +384,7 @@ fn click_text_tool() -> Tool {
     properties.insert("click_count".to_owned(), click_count_property());
     properties.insert("modifiers".to_owned(), modifier_schema());
     properties.insert("duration_ms".to_owned(), duration_property());
-    add_observation(&mut properties);
+    add_action_observation(&mut properties);
     tool(
         CLICK_TEXT,
         "Click text (OCR)",
@@ -502,7 +503,7 @@ fn capture_window_tool() -> Tool {
         CAPTURE_WINDOW,
         "Capture window",
         Kind::Observe { idempotent: false },
-        "Capture one window as PNG without focusing it. window_id (or its alias target_ref) comes from list_windows, and must be fresh. Restore minimized windows first. Width defaults to 1280 (max_width changes it, native=true keeps full resolution).",
+        "Capture one window as PNG without focusing it. window_id (or its alias target_ref) comes from list_windows, and must be fresh. Restore minimized windows first. Width defaults to 1280 (max_width changes it, native=true keeps full resolution). Menus and popups are separate windows and do not appear: use an action's screenshot or capture_display.",
         object_schema(properties, &[]),
         output_schema(vec![window_screenshot_schema()], false),
     )
@@ -605,7 +606,7 @@ fn drag_mouse_tool() -> Tool {
     properties.insert("button".to_owned(), button_property(true));
     properties.insert("modifiers".to_owned(), modifier_schema());
     properties.insert("duration_ms".to_owned(), duration_property());
-    add_observation(&mut properties);
+    add_action_observation(&mut properties);
     tool(
         DRAG_MOUSE,
         "Drag mouse",
@@ -681,7 +682,7 @@ fn press_keys_tool() -> Tool {
             "items": { "type": "string", "minLength": 1 }
         }),
     );
-    add_observation(&mut properties);
+    add_action_observation(&mut properties);
     tool(
         PRESS_KEYS,
         "Press keys",
@@ -739,12 +740,12 @@ fn run_actions_tool() -> Tool {
             }
         }),
     );
-    add_observation(&mut properties);
+    add_action_observation(&mut properties);
     tool(
         RUN_ACTIONS,
         "Run action batch",
         Kind::Input { idempotent: false },
-        "Run up to 16 click, scroll, type_text, press_keys and wait steps in order on the approved window, with one final screenshot. Needs the window in the foreground. Every step is checked before the first runs. The batch stops at the first failure and reports each step as completed, failed or skipped. A wait step pauses up to 5 s and cannot be the last step. Use it for a known sequence such as filling a form, and observe between steps when the next one depends on the result.",
+        "Run up to 16 click, scroll, type_text, press_keys and wait steps in order on the approved window, with one final screenshot. Needs the window in the foreground. Every step is checked before the first runs. The batch stops at the first failure and reports each step as completed, failed or skipped. Each step waits up to 0.5 s for the window to settle and reports how that ended; a wait step pauses up to 5 s for slower loads and cannot be the last step. Use it for a known sequence such as filling a form, and observe between steps when the next one depends on the result.",
         object_schema(properties, &["steps"]),
         action_output_schema(false),
     )
@@ -760,12 +761,12 @@ fn type_text_tool() -> Tool {
             "maxLength": MAX_TEXT_UTF16_UNITS,
         }),
     );
-    add_observation(&mut properties);
+    add_action_observation(&mut properties);
     tool(
         TYPE_TEXT,
         "Type text",
         Kind::Input { idempotent: false },
-        "Type Unicode text into the approved window without the clipboard. Needs the window in the foreground and revalidates it for each batch of characters. Use press_keys for shortcuts and special keys.",
+        "Type Unicode text into the approved window without the clipboard. Needs the window in the foreground and revalidates it before every character. Characters go one at a time, each after the application answers, so long text takes a while and a busy application slows it further. Use press_keys for shortcuts and special keys.",
         object_schema(properties, &["text"]),
         action_output_schema(false),
     )
@@ -853,6 +854,17 @@ fn add_observation(properties: &mut JsonObject) {
     );
 }
 
+/// The observation of an input action, which also bounds the wait for the window to settle.
+fn add_action_observation(properties: &mut JsonObject) {
+    add_observation(properties);
+    properties["observation"]["properties"]["settle_ms"] = json!({
+        "type": "integer",
+        "minimum": 0,
+        "maximum": MAX_SETTLE_MS,
+        "description": format!("Max ms to wait for the window to stop changing: default {DEFAULT_SETTLE_MS}, {DEFAULT_QUIET_SETTLE_MS} with no image, 0 skips."),
+    });
+}
+
 fn region_properties() -> JsonObject {
     let mut properties = JsonObject::new();
     properties.insert("display_id".to_owned(), display_id_property());
@@ -916,7 +928,7 @@ fn pointer_properties() -> JsonObject {
         );
     }
     properties.insert("duration_ms".to_owned(), duration_property());
-    add_observation(&mut properties);
+    add_action_observation(&mut properties);
     properties
 }
 
@@ -1070,10 +1082,23 @@ fn input_progress_schema() -> Value {
             "target_remained_foreground": { "type": ["boolean", "null"] },
             "activation_attempts": { "type": "integer", "minimum": 0 },
             "activation_elapsed_ms": { "type": "integer", "minimum": 0 },
+            "activation_helper": {"enum": ["accepted", "refused", "failed"]},
             "cleanup": {"enum": ["not_needed", "succeeded", "unknown"]}
         },
         "required": ["input_outcome", "sent_events", "cleanup"],
         "additionalProperties": false
+    })
+}
+
+/// How the wait between input and evidence ended: `settled` evidence shows the response;
+/// `unchanged`, `still_changing` and `not_watched` evidence may predate or interrupt it.
+fn settle_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "outcome": { "enum": ["settled", "unchanged", "still_changing", "not_watched"] },
+            "elapsed_ms": { "type": "integer" }
+        }
     })
 }
 
@@ -1086,7 +1111,8 @@ fn action_output_schema(include_position: bool) -> Arc<JsonObject> {
                 "type": "object",
                 "properties": {
                     "foreground_window": { "oneOf": [def_ref("window"), { "type": "null" }] },
-                    "screenshot": { "oneOf": [def_ref("screenshot"), { "type": "null" }] }
+                    "screenshot": { "oneOf": [def_ref("screenshot"), { "type": "null" }] },
+                    "settle": settle_schema()
                 },
                 "required": ["foreground_window", "screenshot"],
                 "additionalProperties": false

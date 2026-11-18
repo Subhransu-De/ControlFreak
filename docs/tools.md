@@ -16,7 +16,7 @@ desktop and run inside a [control session](sessions.md).
 | `list_displays` | Observe | Active displays with IDs, primary flag and bounds in physical pixels. |
 | `capture_display` | Observe | Screenshot of a display. |
 | `capture_region` | Observe | Screenshot of a rectangle, 1280 px wide unless `max_width` or `native` is set. |
-| `capture_window` | Observe | Screenshot of a window's visible frame, without focusing it. The window renders itself (`capture_method` `windows_print_window`), so windows covering it do not appear. The render is bounded: a window that Windows flags as hung is not asked, and one that does not answer within 2 seconds is given up on. The screen rectangle is then copied (`windows_gdi`), which shows whatever covers the window, so `capture_method` says which one you got. Only one render runs at a time: a second `capture_window` call made meanwhile waits for it while it is still rendering, within the same 2 seconds, and copies the screen if that time runs out; if that render was already given up on, the screen is copied at once. Every screenshot result reports `capture_method` as one of `windows_print_window` or `windows_gdi`; display and region captures always report `windows_gdi`. |
+| `capture_window` | Observe | Screenshot of a window's visible frame, without focusing it. The window renders itself (`capture_method` `windows_print_window`), so windows covering it do not appear. The render is bounded: a window that Windows flags as hung is not asked, and one that does not answer within 2 seconds is given up on. The screen rectangle is then copied (`windows_gdi`), which shows whatever covers the window, so `capture_method` says which one you got. Menus, popups and dropdowns are separate windows and never appear in it; use an action's screenshot or `capture_display` to see them. Only one render runs at a time: a second `capture_window` call made meanwhile waits for it while it is still rendering, within the same 2 seconds, and copies the screen if that time runs out; if that render was already given up on, the screen is copied at once. Every screenshot result reports `capture_method` as one of `windows_print_window` or `windows_gdi`; display and region captures always report `windows_gdi`. |
 | `list_windows` | Observe | Visible titled windows, including owned dialogs (with an `owner` field), foreground first. At most 200. |
 | `wait_for_window` | Observe | Wait for a window that matches title, class or process. |
 | `list_virtual_desktops` | Observe | Windows grouped by virtual desktop, with the current one marked. |
@@ -85,6 +85,7 @@ desktop and run inside a [control session](sessions.md).
 - A refused or timed-out activation (`activation_refused`, `settle_timeout`) leaves the session intact and is retryable, as its `retryable` says. Only a change of the approved window itself ends the session.
 - `timeout_ms` defaults to 1000 and accepts 100 to 5000.
 - It never sends keyboard or mouse input to get focus.
+- Windows lets a process take the foreground only while no user input has arrived since that process started. The server starts before the user types a request, so Windows refuses the server's own request once the user has typed or clicked anywhere. When that happens, `focus_window` asks once more through a short-lived copy of the server (`controlfreak --activation-helper`), started for this request only, which makes the same `SetForegroundWindow` call for the already validated window and exits. It may use only what is left of `timeout_ms`, at most 1.5 seconds, and a stop or cancellation terminates it at once. `input.activation_helper` reports it: `accepted`, `refused` or `failed` (it could not start, did not answer in time, was stopped, or found the window owned by another process). When its answer was lost after it may have made the call, `input.input_outcome` stays `unknown`. The field is absent when the helper was not needed.
 - Errors: `activation_refused`, `settle_timeout`, `target_invalidated`, and the integrity errors.
 
 ## Coordinates
@@ -97,6 +98,16 @@ desktop and run inside a [control session](sessions.md).
 - Observation IDs keep geometry only, expire after 5 minutes, and at most 64 are kept.
 - An image of one window (`capture_window`) maps points only while that window is unchanged. If it moved, resized or closed, its reference changed, and the point is refused with `invalid_argument`. Capture the window again.
 - Screenshots are downscaled by area averaging (`resize_method: area_average`).
+
+## Waiting for the window to settle
+
+Every input action (`move_mouse`, `click_mouse`, `click_text`, `scroll_mouse`, `drag_mouse`, `press_keys`, `type_text` and each `run_actions` step) watches the approved window after it sends input and reads its evidence once the window has visibly responded and then stayed unchanged for 150 ms. This keeps an action from returning the screen as it was before the application reacted, for example a menu that is still opening or a page that is still loading.
+
+- A window that does not visibly change within 500 ms (150 ms for an action without a screenshot) is taken as not responding, and the action returns.
+- `observation.settle_ms` bounds the whole wait: 2000 ms by default, 500 ms for an action without a screenshot (`mode` `none` or `metadata`, and every `run_actions` step before the last), at most 10000. `0` keeps a short fixed wait (75 ms after pointer input, 150 ms after keys) and watches nothing.
+- `observation.settle` reports how the wait ended, with `elapsed_ms`: `settled` (the evidence shows the response), `unchanged` (no visible response, so the evidence may predate it), `still_changing` (the limit was reached, for example on a page with animation or video) or `not_watched` (`settle_ms` was 0, or the window is unknown or larger than 2560×1600 physical pixels, so the fixed wait was used). In `run_actions`, each step reports its own `settle`.
+- A stop during the wait ends it at once. The input was already sent, so the action reports `completed_unverified`.
+- Only the approved window's rectangle is watched. A menu or dialog that opens outside it reads as `unchanged`. `focus_window` and `switch_virtual_desktop` have their own waits and refuse `settle_ms`.
 
 ## Text (OCR)
 
@@ -157,9 +168,9 @@ OCR text and checkbox glyphs do not prove the state of a control.
 
 An unknown name is refused with the nearest valid name, or the full list.
 
-`type_text` sends text as Unicode characters, except that `\n`, `\r\n`, a lone `\r` and `\t` are
-pressed as Enter and Tab keys, because a control that ignores those characters still reacts to
-the keys. Each Enter or Tab is checked against the target like a text batch, and is refused before it is sent if Enter or Tab itself, or any of Ctrl, Alt, Shift or Win, is held down at that moment, so a held modifier cannot turn it into a shortcut such as Alt+Tab.
+`type_text` sends text as Unicode characters, except that `\n`, `\r\n`, a lone `\r` and `\t` are pressed as Enter and Tab keys, because a control that ignores those characters still reacts to the keys. Each Enter or Tab is checked against the target like a character, and is refused before it is sent if Enter or Tab itself, or any of Ctrl, Alt, Shift or Win, is held down at that moment, so a held modifier cannot turn it into a shortcut such as Alt+Tab.
+
+`type_text` sends one keystroke at a time and checks the target before every keystroke. Before each keystroke it waits until the window with keyboard focus answers a message, pauses 10 ms, and waits for a second answer. A Unicode keystroke does not carry its character in its window message: Windows keeps the character of the keystroke the application took last, so an application that takes several queued keystrokes before translating them, as a busy one can, would turn them all into the last character. Pacing keeps keystrokes from piling up while the application is busy. It cannot prove the application took or translated a keystroke, so an application that answers messages without taking keyboard input, or handles one keystroke for longer than the pause, can still receive wrong characters, and so can any application when a keyboard hook delays keystrokes for longer than the pause; check the result before relying on it. Typing runs at roughly 70 characters a second, slower while the application is busy, and the 4,000-unit maximum can take about a minute. If the window does not answer for 5 seconds, typing stops with `target_not_responding`, and `input.sent_events` shows how much was sent. Each wait is bounded, but a whole run has no overall limit: a window that answers just under 5 seconds every time keeps typing slowly until it is finished, stopped or cancelled.
 
 ## Waiting for changes
 
@@ -176,7 +187,7 @@ the keys. Each Enter or Tab is checked against the target like a text batch, and
 - Each step gets the same target checks as the single tool.
 - The batch stops at the first failure. `action.steps` reports each step as `completed`,
   `failed` or `skipped`.
-- Only the last step returns a screenshot.
+- Only the last step returns a screenshot. Each earlier step waits up to 500 ms for the window to settle (see [Waiting for the window to settle](#waiting-for-the-window-to-settle)). Add a `wait` step before a step that depends on a slower load.
 - A `wait` step (`wait_ms` from 1 to 5000, at most 15000 in total) pauses between steps. It sends no input and cannot be the last step.
 
 Use it for a known sequence, such as filling a form. Observe between calls when a later step
@@ -191,6 +202,7 @@ depends on what an earlier step shows.
 | `input.sent_events` | Count of input events Windows accepted |
 | `input.cleanup` | `not_needed`, `succeeded`, `unknown` |
 | `input.target_remained_foreground` | `true`, `false` or `null` after the action |
+| `input.activation_helper` | `focus_window` only, when Windows refused the server: `accepted`, `refused` or `failed` |
 | `observation_status` | `succeeded`, `failed`, `not_attempted` |
 | `effect_verification` | Always `unverified` |
 | `retry_action` | Always `false` |
@@ -199,12 +211,14 @@ Every error also has `error.retryable`. It says whether repeating the same reque
 
 | `reason` | Meaning | `retryable` |
 | --- | --- | --- |
-| `pointer_moved` | The pointer moved after validation. Observe again. | Yes |
+| `pointer_moved` | The pointer moved away from the requested point before a button or wheel event, for example because the user moved the mouse. For `drag_mouse` this can be found at the end point, after the drag happened: the button was released where the pointer was, so observe before repeating. | Yes |
+| `pointer_not_placed` | Windows did not put the pointer on the requested point, usually because another program confines it (`ClipCursor`). Nothing was pressed there; a drag already in progress is released where the pointer stopped. Observe before continuing. | No |
 | `key_held` | A requested key or button is already held. Release it. | Yes |
 | `input_interleaved` | Another input ran during text recognition. Find the text again. | Yes |
 | `cancelled` | A stop, client cancellation or closing session cancelled the work. | No |
 | `ocr_unavailable` | The OCR helper failed. | No |
 | `input_blocked` | Windows accepted only part of the input, for example for a higher-integrity window. | No |
+| `target_not_responding` | The window with keyboard focus stopped answering while text was typed, so typing stopped. Observe it before typing the rest. | No |
 | `desktop_work_stopped` | Admission is closed. | No |
 | `worker_failed` | A worker failed. Observe before recovery. | No |
 | `os_call_failed` | Any other Windows call failure. | No |
@@ -224,7 +238,7 @@ Every error also has `error.retryable`. It says whether repeating the same reque
 
 `higher_integrity_target` and `target_integrity_unavailable` have no `reason` and are not retryable. When the code is about the foreground window, the keyboard focus or the pointer destination, the session is kept, and retrying cannot help until the user changes which window is in front. When it is about the target window itself, the session ends.
 
-A failed foreground activation (`focus_window`) is retryable and keeps the session. Ask the user to click the window first, because Windows can refuse focus changes from a background process.
+A failed foreground activation (`focus_window`) is retryable and keeps the session. The activation helper has then been refused too, so ask the user to click the window first, because Windows can refuse focus changes from a background process.
 
 The reason for `platform_operation_failed` is set by the code that detects the failure, not read from the message text, so rewording a message never changes it.
 

@@ -3,12 +3,13 @@ use crate::{Result, package::Metadata, process};
 use std::{fs, process::Command, time::Duration};
 use toml_edit::{DocumentMut, value};
 
-pub fn prepare(metadata: &Metadata, version: &str, date: &str) -> Result<()> {
+/// Prepares the release, choosing the next version when none is requested.
+pub fn prepare(metadata: &Metadata, requested: Option<&str>, date: &str) -> Result<()> {
     let manifest_path = metadata.workspace_root.join("Cargo.toml");
     let manifest = fs::read_to_string(&manifest_path)?;
     let changelog_path = metadata.workspace_root.join("CHANGELOG.md");
     let changelog = fs::read_to_string(&changelog_path)?;
-    let (manifest, changelog) = prepare_text(&manifest, &changelog, version, date)?;
+    let (manifest, changelog) = prepare_text(&manifest, &changelog, requested, date)?;
     // xtask's build need not fetch packages used only by other workspace crates.
     // Populate the complete locked graph before an offline workspace resolution.
     process::checked(
@@ -30,20 +31,37 @@ pub fn prepare(metadata: &Metadata, version: &str, date: &str) -> Result<()> {
     Ok(())
 }
 
+/// The requested version, with an optional leading `v`, or the next one after `current` when the
+/// request is empty: the release of a prerelease (`0.3.0-rc.1` to `0.3.0`), otherwise the next patch.
+fn resolve_version(current: &str, requested: Option<&str>) -> Result<String> {
+    let requested = requested.unwrap_or_default().trim();
+    if !requested.is_empty() {
+        return Ok(requested.strip_prefix('v').unwrap_or(requested).to_owned());
+    }
+    let current = semver::Version::parse(current)?;
+    let patch = if current.pre.is_empty() {
+        current.patch + 1
+    } else {
+        current.patch
+    };
+    Ok(semver::Version::new(current.major, current.minor, patch).to_string())
+}
+
 fn prepare_text(
     manifest: &str,
     changelog: &str,
-    version: &str,
+    requested: Option<&str>,
     date: &str,
 ) -> Result<(String, String)> {
-    let next = semver::Version::parse(version)?;
-    if next.to_string() != version || !next.build.is_empty() {
-        return Err("Use a canonical version without v or build metadata".into());
-    }
     let mut manifest: DocumentMut = manifest.parse()?;
     let current = manifest["workspace"]["package"]["version"]
         .as_str()
         .ok_or("Workspace version is missing")?;
+    let version = &resolve_version(current, requested)?;
+    let next = semver::Version::parse(version)?;
+    if next.to_string() != *version || !next.build.is_empty() {
+        return Err("Use a canonical version without build metadata".into());
+    }
     if next < semver::Version::parse(current)? {
         return Err("Release version cannot go backwards".into());
     }
@@ -251,7 +269,8 @@ mod tests {
     fn preparation_updates_local_versions_and_preserves_history() {
         let manifest = "[workspace.package]\nversion = \"1.2.2\"\n[workspace.dependencies]\nlocal = { version = \"=1.2.2\", path = \"crates/local\" }\nexternal = \"3.0\"\n";
         let source = "# Changelog\n\n## Unreleased\n\n### Fixed\n- Synthetic fix\n\n## [1.2.2] - 2026-01-01\n- Earlier change\n";
-        let (manifest, changelog) = prepare_text(manifest, source, "1.2.3", "2026-01-02").unwrap();
+        let (manifest, changelog) =
+            prepare_text(manifest, source, Some("1.2.3"), "2026-01-02").unwrap();
         assert!(manifest.contains("version = \"1.2.3\""));
         assert!(manifest.contains("version = \"=1.2.3\""));
         assert!(manifest.contains("external = \"3.0\""));
@@ -260,9 +279,9 @@ mod tests {
             "### Fixed\n- Synthetic fix\n"
         );
         assert_eq!(notes(&changelog, "1.2.2").unwrap(), "- Earlier change\n");
-        assert!(prepare_text(&manifest, &changelog, "1.2.3", "2026-01-02").is_err());
-        assert!(prepare_text(&manifest, &changelog, "1.0.0", "2026-01-02").is_err());
-        assert!(prepare_text(&manifest, &changelog, "2.0.0", "2026-01-02").is_err());
+        assert!(prepare_text(&manifest, &changelog, Some("1.2.3"), "2026-01-02").is_err());
+        assert!(prepare_text(&manifest, &changelog, Some("1.0.0"), "2026-01-02").is_err());
+        assert!(prepare_text(&manifest, &changelog, Some("2.0.0"), "2026-01-02").is_err());
     }
 
     #[test]
@@ -271,13 +290,31 @@ mod tests {
         let (_, changelog) = prepare_text(
             manifest,
             "# Changelog\n\n## Unreleased\n\n- Synthetic initial feature\n",
-            "0.1.0-alpha",
+            Some("0.1.0-alpha"),
             "2026-01-02",
         )
         .unwrap();
         assert!(changelog.ends_with("feature\n"));
         assert!(!changelog.ends_with("\n\n"));
         assert!(notes(&changelog, "0.1.0-alpha").is_ok());
+    }
+
+    #[test]
+    fn empty_request_picks_the_next_version() {
+        assert_eq!(resolve_version("0.2.0", None).unwrap(), "0.2.1");
+        assert_eq!(resolve_version("0.2.0", Some("  ")).unwrap(), "0.2.1");
+        assert_eq!(resolve_version("0.3.0-rc.1", Some("")).unwrap(), "0.3.0");
+        assert_eq!(resolve_version("0.2.0", Some(" v0.3.0 ")).unwrap(), "0.3.0");
+        let current = "[workspace.package]\nversion = \"0.2.0\"\n[workspace.dependencies]\n";
+        let source =
+            "## Unreleased\n\n- Synthetic fix\n\n## [0.2.0] - 2026-01-01\n- Earlier change\n";
+        let (manifest, changelog) = prepare_text(current, source, None, "2026-01-02").unwrap();
+        assert!(manifest.contains("version = \"0.2.1\""));
+        assert_eq!(notes(&changelog, "0.2.1").unwrap(), "- Synthetic fix\n");
+        let (manifest, _) = prepare_text(current, source, Some("v0.3.0"), "2026-01-02").unwrap();
+        assert!(manifest.contains("version = \"0.3.0\""));
+        assert!(prepare_text(current, source, Some("v0.2.0+build"), "2026-01-02").is_err());
+        assert!(prepare_text(current, source, Some("vv0.3.0"), "2026-01-02").is_err());
     }
 
     #[test]

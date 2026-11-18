@@ -27,8 +27,10 @@ enum Task {
     },
     /// Prepare a release version and move Unreleased changes into a dated section.
     PrepareRelease {
+        /// The version, with or without a leading v. Empty or omitted picks the next patch
+        /// version, or the release of a prerelease.
         #[arg(long)]
-        version: String,
+        version: Option<String>,
         #[arg(long)]
         date: String,
     },
@@ -104,7 +106,9 @@ fn run(cli: Cli) -> Result<()> {
             metadata.validate_tag(tag.as_deref())?;
             println!("{}", metadata.version()?);
         }
-        Task::PrepareRelease { version, date } => release::prepare(&metadata, &version, &date)?,
+        Task::PrepareRelease { version, date } => {
+            release::prepare(&metadata, version.as_deref(), &date)?;
+        }
         Task::ReleaseNotes { output } => {
             let changelog = std::fs::read_to_string(metadata.workspace_root.join("CHANGELOG.md"))?;
             std::fs::write(output, release::notes(&changelog, metadata.version()?)?)?;

@@ -256,6 +256,7 @@ fn nothing() -> ActionObservation {
     ActionObservation {
         foreground_window: None,
         screenshot: None,
+        settle: None,
     }
 }
 

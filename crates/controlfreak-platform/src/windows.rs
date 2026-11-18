@@ -58,6 +58,7 @@ use windows::Win32::{
 use windows::core::BOOL;
 mod actions;
 mod activation;
+mod activation_helper;
 mod ocr;
 mod target;
 pub(crate) use ocr::serve_ocr_helper;
@@ -71,6 +72,7 @@ mod indicator;
 mod input;
 mod privilege;
 mod process;
+mod settle;
 mod shell;
 mod stop;
 mod win32;
@@ -92,6 +94,18 @@ pub(crate) fn serve_desktop_glow_helper(arguments: &[String]) -> std::io::Result
     };
     glow::run(config)?;
     Ok(Some(()))
+}
+
+/// Serves `--activation-helper` and returns its exit code, or `None` for any other invocation.
+pub(crate) fn serve_activation_helper(arguments: &[String]) -> Option<i32> {
+    match activation_helper::Request::parse(arguments) {
+        Ok(None) => None,
+        Ok(Some(request)) => Some(activation_helper::serve(request)),
+        Err(error) => {
+            eprintln!("{error}");
+            Some(activation_helper::usage_exit_code())
+        }
+    }
 }
 
 pub(crate) fn server_security_context(
@@ -128,7 +142,8 @@ use windows::{
 };
 
 use controlfreak_core::limits::{
-    MAX_CAPTURE_WIDTH, MAX_MOVE_DURATION_MS, MAX_SCROLL_DELTA, MAX_TEXT_UTF16_UNITS, MAX_WAIT_MS,
+    MAX_CAPTURE_WIDTH, MAX_MOVE_DURATION_MS, MAX_SCROLL_DELTA, MAX_SETTLE_MS, MAX_TEXT_UTF16_UNITS,
+    MAX_WAIT_MS,
 };
 
 const MAX_CAPTURE_BYTES: usize = 512 * 1024 * 1024;
@@ -177,6 +192,9 @@ pub struct Backend {
     next_baseline_id: AtomicU64,
     ocr_helper: Option<OcrHelperCommand>,
     ocr_helpers: OcrHelperPool,
+    /// The server's own executable, started with `--activation-helper` when Windows refuses the
+    /// server's foreground request. `None` keeps `focus_window` to the server's own requests.
+    activation_helper: Option<std::path::PathBuf>,
     security_context: SecurityContext,
 }
 
@@ -193,6 +211,59 @@ struct NativeActivation<'a> {
     control: &'a MutationControl,
     started: Instant,
     attempts: u32,
+    /// The process that owned `hwnd` when it was validated; the helper refuses any other owner.
+    process_id: u32,
+    helper: Option<&'a std::path::Path>,
+    /// The helper is asked at most once per `focus_window`: its answer does not change on retry.
+    helper_tried: bool,
+    /// The request's `timeout_ms`; the helper may use only what is left of it.
+    budget_ms: u32,
+}
+
+impl NativeActivation<'_> {
+    /// Windows refused the server: ask once through a freshly started helper process, which
+    /// Windows still allows (see `activation_helper`). Validation runs again first, because the
+    /// foreground may have changed while the server's own request was refused.
+    fn activate_through_helper(&mut self) -> Result<bool, PlatformError> {
+        let Some(program) = self.helper.filter(|_| !self.helper_tried) else {
+            return Ok(false);
+        };
+        self.helper_tried = true;
+        if activation::Activation::validate(self)? {
+            return Ok(true);
+        }
+        let remaining = Duration::from_millis(
+            u64::from(self.budget_ms).saturating_sub(activation::Activation::elapsed_ms(self)),
+        )
+        .min(activation_helper::HELPER_TIMEOUT);
+        let control = self.control;
+        let previous = control.dispatch_started();
+        let answer = controlfreak_core::timing::time("activation_helper", || {
+            activation_helper::request_activation(
+                program,
+                self.hwnd,
+                self.process_id,
+                remaining,
+                &|| control.is_cancelled(),
+            )
+        });
+        control.activation_helper(answer.outcome());
+        match answer {
+            activation_helper::HelperAnswer::Accepted => {
+                control.dispatch_accepted(0);
+                target::arm_if_foreground(self.approved_id)?;
+                Ok(true)
+            }
+            activation_helper::HelperAnswer::Refused
+            | activation_helper::HelperAnswer::NotDispatched => {
+                control.dispatch_rejected(previous);
+                Ok(false)
+            }
+            // The helper may have changed the foreground before its answer was lost, so delivery
+            // stays unknown; the next poll observes the foreground as usual.
+            activation_helper::HelperAnswer::Indeterminate => Ok(false),
+        }
+    }
 }
 
 impl activation::Activation for NativeActivation<'_> {
@@ -261,10 +332,10 @@ impl activation::Activation for NativeActivation<'_> {
         if accepted {
             self.control.dispatch_accepted(0);
             target::arm_if_foreground(self.approved_id)?;
-        } else {
-            self.control.dispatch_rejected(previous);
+            return Ok(true);
         }
-        Ok(accepted)
+        self.control.dispatch_rejected(previous);
+        self.activate_through_helper()
     }
 
     fn elapsed_ms(&self) -> u64 {
@@ -286,6 +357,7 @@ impl Backend {
             next_baseline_id: AtomicU64::new(1),
             ocr_helper: None,
             ocr_helpers: OcrHelperPool::default(),
+            activation_helper: None,
             security_context,
         }
     }
@@ -298,6 +370,7 @@ impl Backend {
             next_baseline_id: AtomicU64::new(1),
             ocr_helper: None,
             ocr_helpers: OcrHelperPool::default(),
+            activation_helper: None,
             security_context,
         }
     }
@@ -313,8 +386,17 @@ impl Backend {
             next_baseline_id: AtomicU64::new(1),
             ocr_helper: Some(command),
             ocr_helpers: OcrHelperPool::default(),
+            activation_helper: None,
             security_context,
         }
+    }
+
+    /// Lets `focus_window` start `program --activation-helper` when Windows refuses the server's
+    /// own foreground request. `program` must be this server's executable.
+    #[must_use]
+    pub fn with_activation_helper(mut self, program: std::path::PathBuf) -> Self {
+        self.activation_helper = Some(program);
+        self
     }
 
     fn recognize_text(
@@ -954,7 +1036,7 @@ impl WindowBackend for Backend {
             .approved_target()
             .ok_or_else(|| target::invalid("an approved target reference is required"))?;
         let window = find_window(&request.window_id)?;
-        let (hwnd, _) = resolve_window_reference(&request.window_id)?;
+        let (hwnd, process_id) = resolve_window_reference(&request.window_id)?;
         // The approved window, or a window of its own process (one of its dialogs), by the same
         // rule as the foreground and pointer checks; anything else needs a new session.
         if approved != request.window_id && !target::window_serves_target(&approved, hwnd) {
@@ -973,6 +1055,10 @@ impl WindowBackend for Backend {
             minimized: window.is_minimized,
             control,
             started: Instant::now(),
+            process_id,
+            helper: self.activation_helper.as_deref(),
+            helper_tried: false,
+            budget_ms: request.timeout_ms,
         };
         let activation = controlfreak_core::timing::time("activate", || {
             activation::focus(&mut driver, request.timeout_ms)
@@ -1114,7 +1200,17 @@ fn validate_duration(duration_ms: u32) -> Result<(), PlatformError> {
 }
 
 fn validate_observation(options: &ObservationOptions) -> Result<(), PlatformError> {
-    validate_max_width(options.max_width)
+    validate_max_width(options.max_width)?;
+    if options
+        .settle_ms
+        .is_some_and(|settle_ms| settle_ms > MAX_SETTLE_MS)
+    {
+        return Err(PlatformError::InvalidArgument {
+            argument: "observation.settle_ms".to_owned(),
+            reason: format!("must be between 0 and {MAX_SETTLE_MS}"),
+        });
+    }
+    Ok(())
 }
 
 fn last_win32_error(operation: &str) -> PlatformError {
@@ -1173,6 +1269,18 @@ mod tests {
             })
             .collect();
         (answers, recognitions)
+    }
+
+    #[test]
+    fn settle_ms_is_bounded() {
+        let options = |settle_ms| ObservationOptions {
+            settle_ms: Some(settle_ms),
+            ..ObservationOptions::default()
+        };
+        assert!(super::validate_observation(&options(0)).is_ok());
+        assert!(super::validate_observation(&options(super::MAX_SETTLE_MS)).is_ok());
+        let error = super::validate_observation(&options(super::MAX_SETTLE_MS + 1)).unwrap_err();
+        assert!(error.to_string().contains("settle_ms"), "{error}");
     }
 
     #[test]

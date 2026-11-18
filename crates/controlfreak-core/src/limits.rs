@@ -21,3 +21,11 @@ pub const MIN_WAIT_MS: u32 = 0;
 pub const MAX_RUN_ACTIONS_WAIT_MS: u32 = 5_000;
 /// Longest total pause across all wait steps of one `run_actions` call, in milliseconds.
 pub const MAX_RUN_ACTIONS_TOTAL_WAIT_MS: u32 = 15_000;
+/// Longest wait for the window to settle after input when the action returns a screenshot and
+/// the caller gives no `settle_ms`.
+pub const DEFAULT_SETTLE_MS: u32 = 2_000;
+/// Longest wait for the window to settle after input when the action returns no screenshot,
+/// such as a `run_actions` step before the last, and the caller gives no `settle_ms`.
+pub const DEFAULT_QUIET_SETTLE_MS: u32 = 500;
+/// Largest `settle_ms` an action accepts.
+pub const MAX_SETTLE_MS: u32 = 10_000;

@@ -76,15 +76,18 @@ pub fn backend_with_security(security_context: SecurityContext) -> Box<dyn Platf
     Box::new(implementation::Backend::with_security(security_context))
 }
 
+/// The production backend: OCR runs in `ocr_helper`, and a refused foreground request in
+/// `focus_window` is asked once more through `server_executable --activation-helper`.
 #[cfg(target_os = "windows")]
-pub fn backend_with_ocr_helper_and_security(
-    command: OcrHelperCommand,
+pub fn backend_with_helpers_and_security(
+    ocr_helper: OcrHelperCommand,
+    server_executable: PathBuf,
     security_context: SecurityContext,
 ) -> Box<dyn PlatformBackend> {
-    Box::new(implementation::Backend::with_ocr_helper_and_security(
-        command,
-        security_context,
-    ))
+    Box::new(
+        implementation::Backend::with_ocr_helper_and_security(ocr_helper, security_context)
+            .with_activation_helper(server_executable),
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -110,6 +113,14 @@ pub fn spawn_helper_process(
 #[cfg(target_os = "windows")]
 pub fn serve_desktop_glow_helper(arguments: &[String]) -> std::io::Result<Option<()>> {
     implementation::serve_desktop_glow_helper(arguments)
+}
+
+/// Runs the one-shot foreground helper when `arguments` ask for it and returns its exit code.
+/// It writes nothing to stdout.
+#[cfg(target_os = "windows")]
+#[must_use]
+pub fn serve_activation_helper(arguments: &[String]) -> Option<i32> {
+    implementation::serve_activation_helper(arguments)
 }
 
 #[cfg(target_os = "windows")]

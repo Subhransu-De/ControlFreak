@@ -955,6 +955,10 @@ fn pointer_result_contains_post_action_png() {
                 downscale_factor: 1,
                 cursor_marker: false,
             }),
+            settle: Some(controlfreak_core::SettleReport {
+                outcome: controlfreak_core::SettleOutcome::StillChanging,
+                elapsed_ms: 2_000,
+            }),
         },
     };
     let action = serde_json::json!({ "kind": "move" });
@@ -966,6 +970,10 @@ fn pointer_result_contains_post_action_png() {
 
     assert_eq!(serialized["content"][0]["type"], "image");
     assert_eq!(serialized["structuredContent"]["action"]["kind"], "move");
+    assert_eq!(
+        serialized["structuredContent"]["observation"]["settle"],
+        serde_json::json!({ "outcome": "still_changing", "elapsed_ms": 2_000 })
+    );
     assert_eq!(
         serialized["structuredContent"]["observation"]["screenshot"]["downscale_factor"],
         1
@@ -993,6 +1001,7 @@ fn pointer_result_without_screenshot_has_no_image_block() {
         observation: ActionObservation {
             foreground_window: None,
             screenshot: None,
+            settle: None,
         },
     };
     let result = pointer_result(

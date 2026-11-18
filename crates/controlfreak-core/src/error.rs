@@ -109,12 +109,19 @@ impl RefusalCause {
 pub enum FailureCause {
     Cancelled,
     PointerMoved,
+    /// Windows left the pointer somewhere other than the requested point, usually because
+    /// another program confines it with `ClipCursor`. Repeating the same request fails the same
+    /// way, so it is not retryable.
+    PointerNotPlaced,
     KeyHeld,
     InputInterleaved,
     OcrUnavailable,
     DesktopWorkStopped,
     WorkerFailed,
     InputBlocked,
+    /// The window with keyboard focus stopped answering while text was typed, so typing stopped
+    /// instead of queueing keystrokes the application could mistranslate.
+    TargetNotResponding,
 }
 
 impl FailureCause {
@@ -123,12 +130,14 @@ impl FailureCause {
         match self {
             Self::Cancelled => "cancelled",
             Self::PointerMoved => "pointer_moved",
+            Self::PointerNotPlaced => "pointer_not_placed",
             Self::KeyHeld => "key_held",
             Self::InputInterleaved => "input_interleaved",
             Self::OcrUnavailable => "ocr_unavailable",
             Self::DesktopWorkStopped => "desktop_work_stopped",
             Self::WorkerFailed => "worker_failed",
             Self::InputBlocked => "input_blocked",
+            Self::TargetNotResponding => "target_not_responding",
         }
     }
 
@@ -213,6 +222,13 @@ mod tests {
     }
 
     #[test]
+    fn a_pointer_windows_did_not_place_is_its_own_non_retryable_reason() {
+        let error = PlatformError::failed(FailureCause::PointerNotPlaced, "click_mouse", "x");
+        assert_eq!(error.reason_code(), Some("pointer_not_placed"));
+        assert!(!error.retryable(), "the same request is clamped again");
+    }
+
+    #[test]
     fn shared_wire_code_failures_get_distinct_reasons() {
         let control = MutationControl::default();
         control.cancel();
@@ -253,6 +269,11 @@ mod tests {
             (
                 PlatformError::failed(FailureCause::InputBlocked, "SendInput", "x"),
                 "input_blocked",
+                false,
+            ),
+            (
+                PlatformError::failed(FailureCause::TargetNotResponding, "type_text", "x"),
+                "target_not_responding",
                 false,
             ),
             (

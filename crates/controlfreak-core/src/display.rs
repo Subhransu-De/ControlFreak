@@ -96,6 +96,10 @@ pub struct ObservationOptions {
     pub max_width: Option<u32>,
     pub include_cursor: bool,
     pub region: Option<ObservationRegion>,
+    /// Longest wait, in milliseconds, for the approved window to settle after input and before
+    /// the evidence is read. `None` uses the default for the mode; `Some(0)` keeps the short
+    /// fixed wait.
+    pub settle_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +118,7 @@ impl Default for ObservationOptions {
             max_width: None,
             include_cursor: true,
             region: None,
+            settle_ms: None,
         }
     }
 }
@@ -249,4 +254,27 @@ pub struct PointerActionResult {
 pub struct ActionObservation {
     pub foreground_window: Option<crate::WindowInfo>,
     pub screenshot: Option<DisplayScreenshot>,
+    /// How the wait between the input and this evidence ended, for input actions.
+    pub settle: Option<SettleReport>,
+}
+
+/// How an input action's wait for the approved window to settle ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettleOutcome {
+    /// The window changed and then stayed unchanged; the evidence shows the response.
+    Settled,
+    /// The window did not visibly change in time; the evidence may predate the response.
+    Unchanged,
+    /// The window was still changing when the wait ended; the evidence may be mid-change.
+    StillChanging,
+    /// The window was not watched, because `settle_ms` was 0 or the window is unknown or too
+    /// large to read quickly; a short fixed wait was used instead.
+    NotWatched,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettleReport {
+    pub outcome: SettleOutcome,
+    pub elapsed_ms: u32,
 }

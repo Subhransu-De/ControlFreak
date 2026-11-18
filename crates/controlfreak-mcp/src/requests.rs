@@ -3,8 +3,8 @@ use controlfreak_core::{
     FindTextRequest, Key, MouseButton, ObservationMode, ObservationOptions, ObservationRegion,
     OcrRegionRequest, PlatformError, VirtualDesktopDirection,
     limits::{
-        DEFAULT_CAPTURE_WIDTH, MAX_RUN_ACTIONS_TOTAL_WAIT_MS, MAX_RUN_ACTIONS_WAIT_MS,
-        MAX_SCROLL_DELTA, MAX_TEXT_UTF16_UNITS,
+        DEFAULT_CAPTURE_WIDTH, MAX_CAPTURE_WIDTH, MAX_RUN_ACTIONS_TOTAL_WAIT_MS,
+        MAX_RUN_ACTIONS_WAIT_MS, MAX_SCROLL_DELTA, MAX_SETTLE_MS, MAX_TEXT_UTF16_UNITS,
     },
 };
 use rmcp::{ErrorData, model::JsonObject};
@@ -350,6 +350,7 @@ pub(super) struct ObservationInput {
     #[serde(default = "default_true")]
     include_cursor: bool,
     pub(super) region: Option<ObservationRegionInput>,
+    settle_ms: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -369,7 +370,46 @@ impl Default for ObservationInput {
             max_width: None,
             include_cursor: true,
             region: None,
+            settle_ms: None,
         }
+    }
+}
+
+impl ObservationInput {
+    /// Checks the numeric limits the backend enforces, for callers that must refuse a request
+    /// before any of its input is sent.
+    fn check_limits(&self) -> Result<(), PlatformError> {
+        if self
+            .max_width
+            .is_some_and(|width| width == 0 || width > MAX_CAPTURE_WIDTH)
+        {
+            return Err(PlatformError::InvalidArgument {
+                argument: "observation.max_width".to_owned(),
+                reason: format!("must be between 1 and {MAX_CAPTURE_WIDTH}"),
+            });
+        }
+        if self
+            .settle_ms
+            .is_some_and(|settle_ms| settle_ms > MAX_SETTLE_MS)
+        {
+            return Err(PlatformError::InvalidArgument {
+                argument: "observation.settle_ms".to_owned(),
+                reason: format!("must be between 0 and {MAX_SETTLE_MS}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// The options of a tool that sends no input of its own to wait on, which refuses
+    /// `settle_ms` instead of ignoring it.
+    pub(super) fn without_settle(self) -> Result<ObservationOptions, PlatformError> {
+        if self.settle_ms.is_some() {
+            return Err(PlatformError::InvalidArgument {
+                argument: "observation.settle_ms".to_owned(),
+                reason: "applies only to input actions".to_owned(),
+            });
+        }
+        Ok(self.into())
     }
 }
 
@@ -386,6 +426,7 @@ impl From<ObservationInput> for ObservationOptions {
                 width: region.width,
                 height: region.height,
             }),
+            settle_ms: input.settle_ms,
         }
     }
 }
@@ -982,6 +1023,9 @@ impl RunActionsInput {
                 ),
             });
         }
+        // Only the last step uses these options, so the backend would check them after earlier
+        // steps had already sent input.
+        self.observation.check_limits()?;
         Ok(steps)
     }
 }

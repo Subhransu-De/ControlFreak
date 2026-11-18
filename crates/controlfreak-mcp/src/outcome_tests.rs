@@ -67,6 +67,7 @@ fn observation() -> ActionObservation {
     ActionObservation {
         foreground_window: None,
         screenshot: None,
+        settle: None,
     }
 }
 fn pointer() -> PointerActionResult {

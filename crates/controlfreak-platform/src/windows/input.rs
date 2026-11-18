@@ -9,14 +9,27 @@ use super::{
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN,
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, MOVE_FRAME_MS, MouseButton,
     MouseClickRequest, MutationControl, POINT, PlatformError, SendInput, SetCursorPos, VIRTUAL_KEY,
-    size_of, thread, win32_error,
+    current_cursor_position, size_of, thread, win32_error,
 };
+
+/// Whether `move_cursor` checks that Windows put the pointer where it was sent.
+#[derive(Clone, Copy)]
+pub(super) enum Placement {
+    /// A plain move. The result reports wherever the pointer ended up.
+    Unchecked,
+    /// The approach of a click, scroll or drag. `SetCursorPos` succeeds even when Windows keeps
+    /// the pointer inside another program's `ClipCursor` rectangle, and button and wheel events
+    /// fire wherever the pointer is, so a pointer that Windows left elsewhere stops the action
+    /// with `pointer_not_placed` before it can press anything there.
+    Verified,
+}
 
 pub(super) fn move_cursor<F>(
     operation: &str,
     start: POINT,
     target: POINT,
     duration_ms: u32,
+    placement: Placement,
     control: &MutationControl,
     validate_target: F,
 ) -> Result<(), PlatformError>
@@ -32,13 +45,48 @@ where
         control,
         validate_target,
         |point| {
-            // SAFETY: SetCursorPos takes signed screen coordinates and retains no references.
-            unsafe { SetCursorPos(point.x, point.y) }
-                .map_err(|error| win32_error("SetCursorPos", &error))
+            place_pointer(
+                point,
+                placement,
+                |point| {
+                    // SAFETY: SetCursorPos takes signed screen coordinates and retains no
+                    // references.
+                    unsafe { SetCursorPos(point.x, point.y) }
+                        .map_err(|error| win32_error("SetCursorPos", &error))
+                },
+                current_cursor_position,
+            )
         },
     )
 }
 
+/// Sets the pointer and, when placement is checked, returns where Windows left it after the
+/// first and the last try. A mismatch gets one more try: a clip puts the pointer on the same
+/// edge again, a hand that moved the mouse between setting and reading lets the second try
+/// land, and a pointer that is still moving is somewhere else each time.
+fn place_pointer(
+    point: POINT,
+    placement: Placement,
+    mut set: impl FnMut(POINT) -> Result<(), PlatformError>,
+    mut read: impl FnMut() -> Result<POINT, PlatformError>,
+) -> Result<Option<[POINT; 2]>, PlatformError> {
+    set(point)?;
+    if matches!(placement, Placement::Unchecked) {
+        return Ok(None);
+    }
+    let first = read()?;
+    if first == point {
+        return Ok(Some([first, first]));
+    }
+    set(point)?;
+    Ok(Some([first, read()?]))
+}
+
+/// Moves the pointer from `start` to `target`, validating each point before `set_position`.
+/// `set_position` returns where Windows left the pointer when placement is checked, and `None`
+/// when it is not. Once `set_position` returns, the move is recorded as accepted before the
+/// placement check, so a refusal there still reports that the pointer moved; if `set_position`
+/// fails, including when the pointer cannot be read back, delivery stays unknown.
 fn move_cursor_with(
     operation: &str,
     start: POINT,
@@ -46,16 +94,21 @@ fn move_cursor_with(
     duration_ms: u32,
     control: &MutationControl,
     mut validate_target: impl FnMut(POINT) -> Result<(), PlatformError>,
-    mut set_position: impl FnMut(POINT) -> Result<(), PlatformError>,
+    mut set_position: impl FnMut(POINT) -> Result<Option<[POINT; 2]>, PlatformError>,
 ) -> Result<(), PlatformError> {
-    control.check(operation)?;
-    if duration_ms == 0 {
-        validate_target(target)?;
+    let mut move_to = |point: POINT| {
+        validate_target(point)?;
         control.check(operation)?;
         control.dispatch_started();
-        set_position(target)?;
+        let left_at = set_position(point)?;
         control.dispatch_accepted(0);
-        return Ok(());
+        left_at.map_or(Ok(()), |readings| {
+            ensure_pointer_placed(operation, point, readings)
+        })
+    };
+    control.check(operation)?;
+    if duration_ms == 0 {
+        return move_to(target);
     }
 
     let steps = u64::from(duration_ms).div_ceil(MOVE_FRAME_MS).max(1);
@@ -66,15 +119,44 @@ fn move_cursor_with(
         if let Some(remaining) = target_elapsed.checked_sub(started.elapsed()) {
             control.wait(operation, remaining)?;
         }
-        let x = interpolate(start.x, target.x, step, steps);
-        let y = interpolate(start.y, target.y, step, steps);
-        validate_target(POINT { x, y })?;
-        control.check(operation)?;
-        control.dispatch_started();
-        set_position(POINT { x, y })?;
-        control.dispatch_accepted(0);
+        move_to(POINT {
+            x: interpolate(start.x, target.x, step, steps),
+            y: interpolate(start.y, target.y, step, steps),
+        })?;
     }
     Ok(())
+}
+
+/// Refuses to continue when Windows left the pointer somewhere other than `requested`.
+/// `SetCursorPos` reports success when it keeps the pointer inside a `ClipCursor` rectangle,
+/// so only reading the pointer back shows where it went. `readings` are the first and last
+/// read-backs of `place_pointer`: the same wrong point twice is a clip, two different wrong
+/// points are a pointer that someone is moving.
+fn ensure_pointer_placed(
+    operation: &str,
+    requested: POINT,
+    [first, last]: [POINT; 2],
+) -> Result<(), PlatformError> {
+    if last == requested {
+        return Ok(());
+    }
+    if first != last {
+        return Err(PlatformError::failed(
+            controlfreak_core::FailureCause::PointerMoved,
+            operation,
+            "the pointer kept moving away from the requested point; observe again before retrying",
+        ));
+    }
+    Err(PlatformError::failed(
+        controlfreak_core::FailureCause::PointerNotPlaced,
+        operation,
+        format!(
+            "Windows left the pointer at ({}, {}) instead of the requested ({}, {}) in \
+             virtual-desktop pixels, usually because another program confines the pointer; \
+             observe before deciding how to continue",
+            last.x, last.y, requested.x, requested.y
+        ),
+    ))
 }
 
 fn mouse_input(flags: MOUSE_EVENT_FLAGS, data: i32) -> INPUT {
@@ -271,61 +353,205 @@ where
     F: FnMut() -> Result<(), PlatformError>,
 {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-    send_text_checking_held_keys(utf16, control, validate_target, native_send_inputs, |key| {
-        // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
-        unsafe { GetAsyncKeyState(key) < 0 }
-    })
+    send_text_checking_held_keys(
+        utf16,
+        control,
+        validate_target,
+        native_send_inputs,
+        |key| {
+            // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
+            unsafe { GetAsyncKeyState(key) < 0 }
+        },
+        wait_for_previous_keystroke,
+    )
 }
 
 #[cfg(test)]
-fn send_unicode_text_with<F, S>(
+fn send_unicode_text_with<F, S, P>(
     utf16: &[u16],
     control: &MutationControl,
     validate_target: F,
     send: S,
+    pace: P,
 ) -> Result<(), PlatformError>
 where
     F: FnMut() -> Result<(), PlatformError>,
     S: FnMut(&[INPUT]) -> Result<usize, PlatformError>,
+    P: FnMut(&MutationControl) -> Result<(), PlatformError>,
 {
-    send_text_checking_held_keys(utf16, control, validate_target, send, |_| false)
+    send_text_checking_held_keys(utf16, control, validate_target, send, |_| false, pace)
+}
+
+/// Pause between two typed keystrokes, after the keyboard-focus window has answered, so an
+/// application that takes several queued keystrokes before translating them is likely to have
+/// translated the earlier one. Close to the per-key delay of other input tools (`AutoHotkey`'s
+/// `SendEvent` waits 10 ms, xdotool 12 ms).
+const KEYSTROKE_GAP: Duration = Duration::from_millis(10);
+/// Longest wait for the keyboard-focus window to answer before typing stops.
+const KEYSTROKE_ANSWER_LIMIT: Duration = Duration::from_secs(5);
+/// One answer wait. Cancellation is checked between them.
+const KEYSTROKE_ANSWER_SLICE_MS: u32 = 100;
+
+/// What the keyboard-focus window's thread did with one `WM_NULL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// It retrieved messages since the question was sent. That shows it is responsive, not that
+    /// it took the earlier keystroke: a thread that retrieves only some messages can answer
+    /// without taking keyboard input.
+    Answered,
+    /// It did not retrieve messages within one slice.
+    Busy,
+    /// It cannot be asked: no window, a window that is gone, or a refused message. Pacing falls
+    /// back to the gap, and the next target validation reports a lost target.
+    Unavailable,
+}
+
+/// Paces the keystroke about to be sent behind earlier input: waits until the window that
+/// receives keystrokes answers (its thread is retrieving messages), pauses `KEYSTROKE_GAP`, then
+/// waits for another answer (it is retrieving messages again, not stuck handling the keystroke).
+fn wait_for_previous_keystroke(control: &MutationControl) -> Result<(), PlatformError> {
+    let _timer = controlfreak_core::timing::start("keystroke_pace");
+    // Resolved once: if focus moves between the two waits, the second asks the old window, and
+    // the target validation before the keystroke reports the move.
+    let window = keystroke_recipient();
+    let ask = || ask_window(window);
+    wait_for_answer(control, KEYSTROKE_ANSWER_LIMIT, ask)?;
+    thread::sleep(KEYSTROKE_GAP);
+    wait_for_answer(control, KEYSTROKE_ANSWER_LIMIT, ask)
+}
+
+/// The window keystrokes go to: the keyboard focus of the foreground thread, which can belong
+/// to another thread or process than the foreground frame, or the foreground window itself.
+fn keystroke_recipient() -> windows::Win32::Foundation::HWND {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo,
+    };
+    let mut gui = GUITHREADINFO {
+        cbSize: u32::try_from(size_of::<GUITHREADINFO>()).unwrap_or(0),
+        ..Default::default()
+    };
+    // SAFETY: `gui` is a correctly sized writable record for the synchronous call; zero queries
+    // the foreground thread.
+    if unsafe { GetGUIThreadInfo(0, &raw mut gui) }.is_ok() && !gui.hwndFocus.is_invalid() {
+        return gui.hwndFocus;
+    }
+    // SAFETY: GetForegroundWindow takes no arguments and returns a handle value only.
+    unsafe { GetForegroundWindow() }
+}
+
+fn ask_window(window: windows::Win32::Foundation::HWND) -> Answer {
+    use windows::Win32::{
+        Foundation::{ERROR_SUCCESS, ERROR_TIMEOUT, GetLastError, LPARAM, SetLastError, WPARAM},
+        UI::WindowsAndMessaging::{SMTO_NORMAL, SendMessageTimeoutW, WM_NULL},
+    };
+    if window.is_invalid() {
+        return Answer::Unavailable;
+    }
+    let mut result = 0_usize;
+    // SAFETY: SetLastError writes only this thread's last-error value. SendMessageTimeoutW does
+    // not set it on every failure, so it is cleared first to tell a timeout from other failures.
+    unsafe { SetLastError(ERROR_SUCCESS) };
+    // SAFETY: WM_NULL carries no pointers and the receiver ignores it. `result` is writable for
+    // the synchronous call. A window that is destroyed meanwhile fails the call instead.
+    let answered = unsafe {
+        SendMessageTimeoutW(
+            window,
+            WM_NULL,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_NORMAL,
+            KEYSTROKE_ANSWER_SLICE_MS,
+            Some(&raw mut result),
+        )
+    };
+    if answered.0 != 0 {
+        return Answer::Answered;
+    }
+    // SAFETY: GetLastError reads only this thread's last-error value, cleared before the call.
+    let error = unsafe { GetLastError() };
+    if error == ERROR_TIMEOUT {
+        Answer::Busy
+    } else {
+        Answer::Unavailable
+    }
+}
+
+/// Asks until the window answers, cannot be asked, or stays busy past `limit`.
+fn wait_for_answer(
+    control: &MutationControl,
+    limit: Duration,
+    mut ask: impl FnMut() -> Answer,
+) -> Result<(), PlatformError> {
+    let started = Instant::now();
+    loop {
+        control.check("type_text")?;
+        match ask() {
+            Answer::Answered | Answer::Unavailable => return Ok(()),
+            Answer::Busy if started.elapsed() < limit => {}
+            Answer::Busy => {
+                return Err(PlatformError::failed(
+                    controlfreak_core::FailureCause::TargetNotResponding,
+                    "type_text",
+                    format!(
+                        "the window receiving keystrokes stopped processing input for {} s, so \
+                         typing stopped; observe it before typing the rest",
+                        limit.as_secs()
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 /// Virtual keys of the four modifiers: Shift, Ctrl, Alt, and the left and right Win keys.
 const HELD_MODIFIER_KEYS: [i32; 5] = [0x10, 0x11, 0x12, 0x5B, 0x5C];
 
+/// Types one keystroke per `SendInput` call, each paced behind whatever the application was
+/// handling before it, including input from an earlier call such as a previous `run_actions` step.
+///
+/// A `WM_KEYDOWN` for a Unicode packet (`VK_PACKET`) does not carry its character. Windows keeps
+/// the character of the packet most recently taken from the thread's queue, and
+/// `TranslateMessage` reads it from there. An application that takes several queued keystrokes
+/// before translating them, as a busy UI framework can, turns all of them into the last
+/// character: a greeting sent as one burst arrived in Notepad as "Hello,!!!!!!!!!!!". So
+/// every UTF-16 unit goes alone, and `pace` holds the next one back while the application looks
+/// busy. Nothing outside the application can see when it took or translated a keystroke, so
+/// pacing makes this unlikely rather than impossible; `effect_verification` stays `unverified`.
+///
+/// The target is validated before every unit, because pacing leaves time for the foreground to
+/// change. That includes the second half of a surrogate pair, whose halves are paced separately
+/// so an application that took both before translating could not get two low surrogates. A
+/// refusal or cancellation between the halves stops before the second half.
+///
 /// Unicode packets carry no virtual key, so only the Enter and Tab segments can repeat a key the
 /// person already holds. Those go through the same held-key refusal as `press_keys`, before
 /// any input of that segment is sent.
-fn send_text_checking_held_keys<F, S>(
+fn send_text_checking_held_keys<F, S, P>(
     utf16: &[u16],
     control: &MutationControl,
     mut validate_target: F,
     mut send: S,
     mut is_down: impl FnMut(i32) -> bool,
+    mut pace: P,
 ) -> Result<(), PlatformError>
 where
     F: FnMut() -> Result<(), PlatformError>,
     S: FnMut(&[INPUT]) -> Result<usize, PlatformError>,
+    P: FnMut(&MutationControl) -> Result<(), PlatformError>,
 {
     for segment in text_segments(utf16) {
         match segment {
             TextSegment::Text(units) => {
-                for batch in unicode_batches(units) {
+                for unit in units {
+                    pace_or_refuse(control, &mut pace, &mut validate_target)?;
                     control.check("type_text")?;
-                    let mut inputs = Vec::with_capacity(batch.len() * 2);
-                    for unit in batch {
-                        inputs.push(unicode_input(*unit, false));
-                        inputs.push(unicode_input(*unit, true));
-                    }
                     validate_target()?;
+                    let inputs = [unicode_input(*unit, false), unicode_input(*unit, true)];
                     send_releasing("type_text", &inputs, control, &mut send)?;
-                    if batch.len() + 1 >= UNITS_PER_TEXT_BATCH {
-                        thread::sleep(Duration::from_millis(2));
-                    }
                 }
             }
             TextSegment::Key(key) => {
+                pace_or_refuse(control, &mut pace, &mut validate_target)?;
                 control.check("type_text")?;
                 let inputs = [keyboard_input(key, false), keyboard_input(key, true)];
                 // A held modifier would turn the key into a shortcut (Alt+Tab, Ctrl+Enter), which
@@ -345,6 +571,22 @@ where
         }
     }
     Ok(())
+}
+
+/// Paces the next keystroke. If the window did not answer, it may belong to an application that
+/// took the foreground meanwhile, so a target refusal is reported instead. A cancellation is
+/// reported as it is.
+fn pace_or_refuse(
+    control: &MutationControl,
+    pace: &mut impl FnMut(&MutationControl) -> Result<(), PlatformError>,
+    validate_target: &mut impl FnMut() -> Result<(), PlatformError>,
+) -> Result<(), PlatformError> {
+    pace(control).or_else(|error| {
+        if error.reason_code() == Some("target_not_responding") {
+            validate_target()?;
+        }
+        Err(error)
+    })
 }
 
 /// One run of `type_text` input: characters sent as Unicode packets, or a key that must be
@@ -390,25 +632,6 @@ fn text_segments(utf16: &[u16]) -> Vec<TextSegment<'_>> {
         segments.push(TextSegment::Text(&utf16[start..]));
     }
     segments
-}
-
-const UNITS_PER_TEXT_BATCH: usize = 50;
-
-// Batches end before a high surrogate so a refusal between batches cannot leave half a character.
-fn unicode_batches(utf16: &[u16]) -> impl Iterator<Item = &[u16]> {
-    let mut rest = utf16;
-    std::iter::from_fn(move || {
-        if rest.is_empty() {
-            return None;
-        }
-        let mut end = rest.len().min(UNITS_PER_TEXT_BATCH);
-        if end < rest.len() && (0xD800..=0xDBFF).contains(&rest[end - 1]) {
-            end -= 1;
-        }
-        let (batch, remaining) = rest.split_at(end);
-        rest = remaining;
-        Some(batch)
-    })
 }
 
 /// The virtual key for `key` under the foreground window's keyboard layout.
@@ -1232,7 +1455,7 @@ mod progress_tests {
                     |_| ensure_pointer_idle_with("approach", |key| key == button),
                     |_| {
                         dispatched = true;
-                        Ok(())
+                        Ok(None)
                     },
                 );
                 assert!(result.is_err());
@@ -1241,6 +1464,180 @@ mod progress_tests {
             }
         }
         assert!(ensure_pointer_idle_with("approach", |_| false).is_ok());
+    }
+
+    /// A pointer that another program confined to `x < clip_right`, as `ClipCursor` does:
+    /// `SetCursorPos` succeeds and Windows moves the pointer to the clip edge instead.
+    struct ClippedPointer {
+        clip_right: i32,
+        live: std::cell::Cell<POINT>,
+        moves: std::cell::Cell<u32>,
+    }
+
+    impl ClippedPointer {
+        fn new(clip_right: i32) -> Self {
+            Self {
+                clip_right,
+                live: std::cell::Cell::new(POINT::default()),
+                moves: std::cell::Cell::new(0),
+            }
+        }
+
+        fn approach(
+            &self,
+            target: POINT,
+            duration_ms: u32,
+            control: &MutationControl,
+        ) -> Result<(), PlatformError> {
+            move_cursor_with(
+                "click_mouse",
+                POINT::default(),
+                target,
+                duration_ms,
+                control,
+                |_| Ok(()),
+                |point| {
+                    place_pointer(
+                        point,
+                        Placement::Verified,
+                        |point| {
+                            self.moves.set(self.moves.get() + 1);
+                            self.live.set(POINT {
+                                x: point.x.min(self.clip_right - 1),
+                                y: point.y,
+                            });
+                            Ok(())
+                        },
+                        || Ok(self.live.get()),
+                    )
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn a_clipped_pointer_stops_the_approach_where_windows_left_it() {
+        let target = POINT { x: 580, y: 222 };
+        for duration in [0, 48] {
+            let pointer = ClippedPointer::new(440);
+            let control = MutationControl::default();
+            let error = pointer.approach(target, duration, &control).unwrap_err();
+            assert_eq!(error.reason_code(), Some("pointer_not_placed"));
+            assert!(!error.retryable(), "the same request is clamped again");
+            assert!(error.to_string().contains("(439, 222)"), "{error}");
+            // The pointer did move, so the progress says so, but no button or wheel event went.
+            assert_eq!(control.progress().sent_events, 0);
+            assert_eq!(
+                control.progress().input_outcome,
+                InputOutcome::PartiallySent
+            );
+        }
+
+        // A stepped approach stops at the first point Windows clamped: (600, 200) of
+        // (300, 100), (600, 200), (900, 300). That point is tried twice, so three moves.
+        let pointer = ClippedPointer::new(440);
+        let control = MutationControl::default();
+        assert!(
+            pointer
+                .approach(POINT { x: 900, y: 300 }, 48, &control)
+                .is_err()
+        );
+        assert_eq!(pointer.moves.get(), 3);
+        let progress = control.progress();
+        assert_eq!(progress.input_outcome, InputOutcome::PartiallySent);
+        assert_eq!(progress.sent_events, 0);
+        assert_eq!(progress.cleanup, CleanupStatus::NotNeeded);
+    }
+
+    #[test]
+    fn a_clip_is_tried_once_more_and_a_hand_movement_is_not_taken_for_one() {
+        let target = POINT { x: 580, y: 222 };
+        let clamped = POINT { x: 439, y: 222 };
+        // A clip puts the pointer on its edge every time.
+        let mut sets = 0;
+        let left_at = place_pointer(
+            target,
+            Placement::Verified,
+            |_| {
+                sets += 1;
+                Ok(())
+            },
+            || Ok(clamped),
+        );
+        assert_eq!(left_at.unwrap(), Some([clamped, clamped]));
+        assert_eq!(sets, 2);
+
+        // The user's hand moved the mouse between the first set and read; the retry lands.
+        let nudged = POINT { x: 583, y: 220 };
+        let mut reads = [Ok(nudged), Ok(target)].into_iter();
+        let left_at = place_pointer(
+            target,
+            Placement::Verified,
+            |_| Ok(()),
+            || reads.next().unwrap(),
+        );
+        assert_eq!(left_at.unwrap(), Some([nudged, target]));
+    }
+
+    #[test]
+    fn a_pointer_that_cannot_be_read_back_leaves_delivery_unknown() {
+        let control = MutationControl::default();
+        let error = move_cursor_with(
+            "click_mouse",
+            POINT::default(),
+            POINT { x: 10, y: 10 },
+            0,
+            &control,
+            |_| Ok(()),
+            |point| place_pointer(point, Placement::Verified, |_| Ok(()), || Err(failure())),
+        )
+        .unwrap_err();
+        assert_eq!(error.reason_code(), Some("os_call_failed"));
+        assert_eq!(control.progress().input_outcome, InputOutcome::Unknown);
+    }
+
+    #[test]
+    fn a_plain_move_neither_reads_back_nor_refuses_a_clamped_pointer() {
+        let left_at = place_pointer(
+            POINT { x: 580, y: 222 },
+            Placement::Unchecked,
+            |_| Ok(()),
+            || panic!("a plain move must not read the pointer back"),
+        );
+        assert_eq!(left_at.unwrap(), None);
+    }
+
+    #[test]
+    fn an_unclipped_approach_reaches_the_requested_point() {
+        for duration in [0, 48] {
+            let pointer = ClippedPointer::new(i32::MAX);
+            let control = MutationControl::default();
+            let target = POINT {
+                x: -1_920,
+                y: 1_079,
+            };
+            pointer.approach(target, duration, &control).unwrap();
+            assert_eq!(pointer.live.get(), target);
+        }
+    }
+
+    #[test]
+    fn placement_compares_the_exact_requested_point() {
+        let requested = POINT { x: -100, y: 20 };
+        let nudged = POINT { x: -99, y: 20 };
+        assert!(ensure_pointer_placed("drag_mouse", requested, [requested, requested]).is_ok());
+        assert!(ensure_pointer_placed("drag_mouse", requested, [nudged, requested]).is_ok());
+        for actual in [nudged, POINT { x: -100, y: 19 }] {
+            let error =
+                ensure_pointer_placed("drag_mouse", requested, [actual, actual]).unwrap_err();
+            assert_eq!(error.reason_code(), Some("pointer_not_placed"));
+        }
+        // Somewhere else on each try: the pointer is being moved, not held by a clip.
+        let error =
+            ensure_pointer_placed("drag_mouse", requested, [nudged, POINT { x: -98, y: 21 }])
+                .unwrap_err();
+        assert_eq!(error.reason_code(), Some("pointer_moved"));
+        assert!(error.retryable());
     }
 
     #[test]
@@ -1253,7 +1650,8 @@ mod progress_tests {
                 control.cancel();
                 Ok(())
             },
-            |_| panic!("cancelled batch must not dispatch or clean up unowned keys"),
+            |_| panic!("cancelled keystroke must not dispatch or clean up unowned keys"),
+            |_| Ok(()),
         );
         assert!(result.is_err());
         assert_eq!(control.progress().sent_events, 0);
@@ -1425,37 +1823,43 @@ mod progress_tests {
     }
 
     #[test]
-    fn text_batches_preserve_cumulative_progress_and_cleanup() {
-        let text: Vec<u16> = "a\u{1f980}".repeat(40).encode_utf16().collect();
-        for failed_batch in [0, 1, 2] {
-            for accepted in [0, 1, 7] {
+    fn keystroke_failures_preserve_cumulative_progress_and_cleanup() {
+        let text: Vec<u16> = "a\u{1f980}".repeat(4).encode_utf16().collect();
+        for failed_call in [0_usize, 1, 2, 5] {
+            for accepted in [0_usize, 1] {
                 for cleanup_succeeds in [false, true] {
                     let control = MutationControl::default();
-                    let mut batch = 0;
+                    let mut call = 0;
                     let result = send_unicode_text_with(
                         &text,
                         &control,
                         || Ok(()),
                         |inputs| {
-                            let current = batch;
-                            batch += 1;
-                            if current == failed_batch {
+                            let current = call;
+                            call += 1;
+                            if current == failed_call {
                                 Ok(accepted)
-                            } else if current > failed_batch && !cleanup_succeeds {
+                            } else if current > failed_call && !cleanup_succeeds {
                                 Err(failure())
                             } else {
                                 Ok(inputs.len())
                             }
                         },
+                        |_| Ok(()),
                     );
                     assert!(result.is_err());
                     let progress = control.progress();
-                    // The first batch stops one unit early instead of ending on a high surrogate.
-                    let earlier_events = [0, 98, 198][usize::try_from(failed_batch).unwrap()];
-                    assert_eq!(progress.sent_events, earlier_events + accepted as u64);
+                    // Every earlier call sent one unit's down and up.
+                    assert_eq!(
+                        progress.sent_events,
+                        (failed_call * 2 + accepted) as u64,
+                        "call {failed_call}, accepted {accepted}"
+                    );
+                    // A half-sent keystroke gets one compensating up; nothing else is sent after.
+                    assert_eq!(call, failed_call + 1 + accepted);
                     assert_eq!(
                         progress.input_outcome,
-                        if failed_batch == 0 && accepted == 0 {
+                        if failed_call == 0 && accepted == 0 {
                             InputOutcome::NotStarted
                         } else {
                             InputOutcome::PartiallySent
@@ -1477,29 +1881,42 @@ mod progress_tests {
     }
 
     #[test]
-    fn text_batches_never_split_a_surrogate_pair() {
-        for prefix in 0..60 {
-            let text: Vec<u16> = format!("{}\u{1f980}\u{1f980}", "a".repeat(prefix))
-                .encode_utf16()
-                .collect();
-            let batches: Vec<&[u16]> = unicode_batches(&text).collect();
-            assert_eq!(batches.concat(), text);
-            assert!(batches.iter().all(|batch| {
-                !batch.is_empty()
-                    && batch.len() <= UNITS_PER_TEXT_BATCH
-                    && !(0xD800..=0xDBFF).contains(batch.last().unwrap())
-            }));
-        }
+    fn a_target_lost_while_pacing_a_pair_gets_no_second_half() {
+        let control = MutationControl::default();
+        let mut validations = 0;
+        let mut sent = Vec::new();
+        let result = send_unicode_text_with(
+            &utf16("\u{1f980}"),
+            &control,
+            || {
+                validations += 1;
+                // The foreground changes while the first half is paced.
+                if validations == 2 {
+                    Err(failure())
+                } else {
+                    Ok(())
+                }
+            },
+            |inputs| {
+                // SAFETY: Every INPUT here was built by this module as a keyboard event.
+                sent.push(unsafe { inputs[0].Anonymous.ki.wScan });
+                Ok(inputs.len())
+            },
+            |_| Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(sent, [0xD83E]);
+        assert_eq!(control.progress().sent_events, 2);
     }
 
     #[test]
-    fn later_validation_cancellation_and_provider_failure_keep_earlier_batches() {
+    fn later_validation_cancellation_and_provider_failure_keep_earlier_keystrokes() {
         for mode in 0..3 {
             let control = MutationControl::default();
             let mut validations = 0;
-            let mut batches = 0;
+            let mut calls = 0;
             let result = send_unicode_text_with(
-                &[65; 120],
+                &[65; 5],
                 &control,
                 || {
                     validations += 1;
@@ -1510,8 +1927,8 @@ mod progress_tests {
                     }
                 },
                 |inputs| {
-                    batches += 1;
-                    if mode == 2 && batches == 2 {
+                    calls += 1;
+                    if mode == 2 && calls == 2 {
                         return Err(failure());
                     }
                     if mode == 1 {
@@ -1519,9 +1936,10 @@ mod progress_tests {
                     }
                     Ok(inputs.len())
                 },
+                |_| Ok(()),
             );
             assert!(result.is_err());
-            assert_eq!(control.progress().sent_events, 100);
+            assert_eq!(control.progress().sent_events, 2, "mode {mode}");
             assert_eq!(
                 control.progress().input_outcome,
                 if mode == 2 {
@@ -1531,6 +1949,368 @@ mod progress_tests {
                 }
             );
         }
+    }
+
+    /// One step of a typing run, in the order the run took it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Step {
+        Validate,
+        Send(u16),
+        Pace,
+    }
+
+    fn typing_steps(text: &str) -> Vec<Step> {
+        let steps = std::cell::RefCell::new(Vec::new());
+        send_unicode_text_with(
+            &utf16(text),
+            &MutationControl::default(),
+            || {
+                steps.borrow_mut().push(Step::Validate);
+                Ok(())
+            },
+            |inputs| {
+                assert_eq!(inputs.len(), 2, "one keystroke per SendInput call");
+                // SAFETY: Every INPUT here was built by this module as a keyboard event.
+                let key = unsafe { inputs[0].Anonymous.ki };
+                let unit = if key.wVk.0 == 0 { key.wScan } else { key.wVk.0 };
+                steps.borrow_mut().push(Step::Send(unit));
+                Ok(inputs.len())
+            },
+            |_| {
+                steps.borrow_mut().push(Step::Pace);
+                Ok(())
+            },
+        )
+        .unwrap();
+        steps.into_inner()
+    }
+
+    #[test]
+    fn every_keystroke_is_paced_then_validated_then_sent_alone() {
+        use Step::{Pace, Send, Validate};
+        assert_eq!(
+            typing_steps("Hi\u{1f980}\n"),
+            [
+                // The first keystroke waits too: the application may still be handling input
+                // from an earlier call, such as a previous run_actions step.
+                Pace,
+                Validate,
+                Send(0x48),
+                Pace,
+                Validate,
+                Send(0x69),
+                // Both halves of a pair are paced and validated like any other unit.
+                Pace,
+                Validate,
+                Send(0xD83E),
+                Pace,
+                Validate,
+                Send(0xDD80),
+                Pace,
+                Validate,
+                Send(0x0D),
+            ]
+        );
+        assert_eq!(typing_steps("x"), [Pace, Validate, Send(0x78)]);
+    }
+
+    #[test]
+    fn a_window_that_stops_answering_stops_typing_and_keeps_earlier_keystrokes() {
+        let control = MutationControl::default();
+        let mut paces = 0;
+        let mut calls = 0;
+        let error = send_unicode_text_with(
+            &utf16("abcd"),
+            &control,
+            || Ok(()),
+            |inputs| {
+                calls += 1;
+                Ok(inputs.len())
+            },
+            |control| {
+                paces += 1;
+                if paces == 3 {
+                    wait_for_answer(control, Duration::ZERO, || Answer::Busy)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("a window that never answers must stop typing");
+        assert_eq!(error.reason_code(), Some("target_not_responding"));
+        assert_eq!(calls, 2);
+        assert_eq!(control.progress().sent_events, 4);
+        assert_eq!(
+            control.progress().input_outcome,
+            InputOutcome::PartiallySent
+        );
+
+        // A window that is not answering before anything was typed gets nothing.
+        let control = MutationControl::default();
+        let error = send_unicode_text_with(
+            &utf16("ab"),
+            &control,
+            || Ok(()),
+            |_| panic!("nothing may be sent to a window that does not answer"),
+            |control| wait_for_answer(control, Duration::ZERO, || Answer::Busy),
+        )
+        .expect_err("a window that never answers must stop typing");
+        assert_eq!(error.reason_code(), Some("target_not_responding"));
+        assert_eq!(control.progress().input_outcome, InputOutcome::NotStarted);
+    }
+
+    #[test]
+    fn a_window_that_stops_answering_after_the_target_was_lost_reports_the_lost_target() {
+        let control = MutationControl::default();
+        let mut validations = 0;
+        let mut paces = 0;
+        let error = send_unicode_text_with(
+            &utf16("ab"),
+            &control,
+            || {
+                validations += 1;
+                // Another application took the foreground after the first keystroke.
+                if validations >= 2 {
+                    Err(failure())
+                } else {
+                    Ok(())
+                }
+            },
+            |inputs| Ok(inputs.len()),
+            |control| {
+                paces += 1;
+                if paces == 2 {
+                    // Its hung focus window is the one pacing asks.
+                    wait_for_answer(control, Duration::ZERO, || Answer::Busy)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("a lost target must stop typing");
+        assert!(
+            matches!(error, PlatformError::OperationFailed { ref reason, .. } if reason == "injected"),
+            "the refusal, not the unresponsive window, is reported: {error:?}"
+        );
+        assert_eq!(control.progress().sent_events, 2);
+
+        // A cancellation while pacing stays a cancellation even when the target is gone too.
+        let control = MutationControl::default();
+        let mut paces = 0;
+        let error = send_unicode_text_with(
+            &utf16("ab"),
+            &control,
+            || Err(failure()),
+            |inputs| Ok(inputs.len()),
+            |control| {
+                paces += 1;
+                control.cancel();
+                wait_for_answer(control, Duration::ZERO, || Answer::Busy)
+            },
+        )
+        .expect_err("a cancelled run must stop");
+        assert_eq!(error.reason_code(), Some("cancelled"));
+        assert_eq!(paces, 1);
+    }
+
+    #[test]
+    fn cancellation_while_pacing_a_pair_sends_no_second_half() {
+        let control = MutationControl::default();
+        let mut sent = Vec::new();
+        let mut paces = 0;
+        let result = send_unicode_text_with(
+            &utf16("\u{1f980}"),
+            &control,
+            || Ok(()),
+            |inputs| {
+                // SAFETY: Every INPUT here was built by this module as a keyboard event.
+                sent.push(unsafe { inputs[0].Anonymous.ki.wScan });
+                Ok(inputs.len())
+            },
+            |control| {
+                paces += 1;
+                if paces == 2 {
+                    control.cancel();
+                }
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(sent, [0xD83E]);
+        assert_eq!(control.progress().sent_events, 2);
+    }
+
+    /// A window handle carried to the test thread. Only its value is used there.
+    struct WindowValue(windows::Win32::Foundation::HWND);
+    // SAFETY: The handle is a plain value; the receiving thread only passes it to
+    // SendMessageTimeoutW, which accepts handles of windows owned by other threads.
+    unsafe impl Send for WindowValue {}
+
+    #[test]
+    fn asking_a_real_window_tells_answered_busy_and_gone_apart() {
+        use std::sync::mpsc;
+        use windows::{
+            Win32::{
+                Foundation::HWND,
+                UI::WindowsAndMessaging::{
+                    CreateWindowExW, DestroyWindow, DispatchMessageW, HWND_MESSAGE, MSG, PM_REMOVE,
+                    PeekMessageW, WINDOW_EX_STYLE, WINDOW_STYLE,
+                },
+            },
+            core::{PCWSTR, w},
+        };
+        let (window_sender, window_receiver) = mpsc::channel();
+        let (step_sender, step_receiver) = mpsc::channel::<()>();
+        let owner = thread::spawn(move || {
+            // SAFETY: Creates a message-only window of the system STATIC class, owned by this
+            // thread; no pointers are retained.
+            let window = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    PCWSTR::null(),
+                    WINDOW_STYLE(0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .expect("message-only window");
+            window_sender.send(WindowValue(window)).unwrap();
+            // Busy: retrieves no messages until the test moves on. A test that panicked drops
+            // the sender, which ends both phases so the window is still destroyed.
+            let _ = step_receiver.recv();
+            let mut message = MSG::default();
+            while matches!(step_receiver.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+                // SAFETY: `message` is writable; this thread owns the window.
+                while unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    // SAFETY: `message` was filled by PeekMessageW just above.
+                    unsafe { DispatchMessageW(&raw const message) };
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            // SAFETY: The window is owned by this thread and destroyed once.
+            unsafe { DestroyWindow(window) }.expect("destroy the window");
+        });
+        let window = window_receiver.recv().unwrap().0;
+        assert_eq!(ask_window(window), Answer::Busy);
+        step_sender.send(()).unwrap();
+        // A loaded machine may start the pumping thread late, so allow up to 50 slices (5 s).
+        let first_reply = (0..50)
+            .map(|_| ask_window(window))
+            .find(|answer| *answer != Answer::Busy);
+        assert_eq!(first_reply, Some(Answer::Answered));
+        step_sender.send(()).unwrap();
+        owner.join().unwrap();
+        assert_eq!(ask_window(window), Answer::Unavailable);
+        assert_eq!(ask_window(HWND::default()), Answer::Unavailable);
+    }
+
+    #[test]
+    fn waiting_for_an_answer_is_bounded_and_cancellable() {
+        let control = MutationControl::default();
+        for answers in [
+            vec![Answer::Answered],
+            vec![Answer::Unavailable],
+            vec![Answer::Busy, Answer::Busy, Answer::Answered],
+        ] {
+            let mut remaining = answers.clone().into_iter();
+            let mut asked = 0;
+            wait_for_answer(&control, Duration::from_mins(1), || {
+                asked += 1;
+                remaining.next().unwrap()
+            })
+            .unwrap();
+            assert_eq!(asked, answers.len());
+        }
+        let error = wait_for_answer(&control, Duration::ZERO, || Answer::Busy)
+            .expect_err("a busy window past the limit stops typing");
+        assert_eq!(error.reason_code(), Some("target_not_responding"));
+        assert!(!error.retryable());
+        let cancelled = MutationControl::default();
+        cancelled.cancel();
+        let error = wait_for_answer(&cancelled, Duration::from_mins(1), || {
+            panic!("a cancelled run must not ask the window")
+        })
+        .expect_err("cancellation ends the wait");
+        assert_eq!(error.reason_code(), Some("cancelled"));
+    }
+
+    /// How Windows hands Unicode packets to an application that takes every queued keystroke
+    /// before translating any, as Notepad did while busy. A packet's character is not in its
+    /// message: translation reads the character of the packet taken last. The tests let the
+    /// application take its queue while it answers pacing, which is the case pacing is built
+    /// for; an application that answers without taking keyboard input is not covered.
+    #[derive(Default)]
+    struct DrainingApp {
+        queue: Vec<INPUT>,
+        typed: Vec<u16>,
+    }
+
+    impl DrainingApp {
+        fn receive(&mut self, inputs: &[INPUT]) -> usize {
+            self.queue.extend_from_slice(inputs);
+            inputs.len()
+        }
+
+        fn take_and_translate(&mut self) {
+            let mut last_packet = 0;
+            let mut downs = Vec::new();
+            for input in std::mem::take(&mut self.queue) {
+                // SAFETY: Every INPUT here was built by this module as a keyboard event.
+                let key = unsafe { input.Anonymous.ki };
+                if key.dwFlags.contains(KEYEVENTF_UNICODE) {
+                    last_packet = key.wScan;
+                }
+                if !key.dwFlags.contains(KEYEVENTF_KEYUP) {
+                    downs.push(key);
+                }
+            }
+            for key in downs {
+                self.typed.push(if key.dwFlags.contains(KEYEVENTF_UNICODE) {
+                    last_packet
+                } else {
+                    key.wVk.0
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn an_app_that_takes_queued_keystrokes_before_translating_gets_every_character() {
+        let text = "Hello, world! \u{1f44b}\u{65e5}\tz\n";
+        let app = std::cell::RefCell::new(DrainingApp::default());
+        send_unicode_text_with(
+            &utf16(text),
+            &MutationControl::default(),
+            || Ok(()),
+            |inputs| Ok(app.borrow_mut().receive(inputs)),
+            |_| {
+                app.borrow_mut().take_and_translate();
+                Ok(())
+            },
+        )
+        .unwrap();
+        let mut app = app.into_inner();
+        app.take_and_translate();
+        // Tab and Enter arrive as VK_TAB and VK_RETURN, which translate to '\t' and '\r'.
+        assert_eq!(app.typed, utf16(&text.replace('\n', "\r")));
+
+        // The same application given the whole text as one burst, as type_text used to send it,
+        // reproduces what Notepad showed: every character becomes the last one.
+        let mut burst = DrainingApp::default();
+        let inputs: Vec<INPUT> = utf16("world!")
+            .into_iter()
+            .flat_map(|unit| [unicode_input(unit, false), unicode_input(unit, true)])
+            .collect();
+        burst.receive(&inputs);
+        burst.take_and_translate();
+        assert_eq!(burst.typed, utf16("!!!!!!"));
     }
 
     #[test]
@@ -1568,7 +2348,14 @@ mod progress_tests {
             .repeat(30)
             .encode_utf16()
             .collect();
-        send_unicode_text_with(&text, &control, || Ok(()), |inputs| Ok(inputs.len())).unwrap();
+        send_unicode_text_with(
+            &text,
+            &control,
+            || Ok(()),
+            |inputs| Ok(inputs.len()),
+            |_| Ok(()),
+        )
+        .unwrap();
         control.input_complete();
         assert_eq!(control.progress().sent_events, text.len() as u64 * 2);
         assert_eq!(control.progress().input_outcome, InputOutcome::InputSent);
@@ -1634,18 +2421,21 @@ mod progress_tests {
                 );
                 Ok(inputs.len())
             },
+            |_| Ok(()),
         )
         .unwrap();
-        // Text, Enter, Tab, text: each is validated and sent as its own batch.
-        assert_eq!(validations, 4);
-        assert_eq!(sent.len(), 4);
+        // Every character, Enter and Tab is validated and sent as its own keystroke.
+        assert_eq!(validations, 5);
         assert_eq!(
-            sent[0],
-            [(0, 97, false), (0, 97, true), (0, 98, false), (0, 98, true)]
+            sent,
+            [
+                [(0, 97, false), (0, 97, true)],
+                [(0, 98, false), (0, 98, true)],
+                [(0x0D, 0, false), (0x0D, 0, true)],
+                [(0x09, 0, false), (0x09, 0, true)],
+                [(0, 99, false), (0, 99, true)],
+            ]
         );
-        assert_eq!(sent[1], [(0x0D, 0, false), (0x0D, 0, true)]);
-        assert_eq!(sent[2], [(0x09, 0, false), (0x09, 0, true)]);
-        assert_eq!(sent[3], [(0, 99, false), (0, 99, true)]);
         assert_eq!(control.progress().sent_events, 10);
     }
 
@@ -1668,12 +2458,13 @@ mod progress_tests {
                     Ok(inputs.len())
                 },
                 |key| key == held,
+                |_| Ok(()),
             );
             let error = result.expect_err("a held key must be refused");
             assert_eq!(error.reason_code(), Some("key_held"), "{text:?}");
             // Only the text before the key was sent; no down and no compensating up for the key.
             assert_eq!(control.progress().sent_events, earlier, "{text:?}");
-            assert_eq!(batches, usize::from(earlier > 0), "{text:?}");
+            assert_eq!(batches * 2, earlier, "{text:?}");
         }
     }
 
@@ -1691,11 +2482,12 @@ mod progress_tests {
                     Ok(inputs.len())
                 },
                 |key| key == modifier,
+                |_| Ok(()),
             )
             .expect_err("a held modifier must refuse the key segment");
             assert_eq!(error.reason_code(), Some("key_held"), "{modifier:#x}");
             // The text before the key went out; the key itself did not.
-            assert_eq!((batches, control.progress().sent_events), (1, 4));
+            assert_eq!((batches, control.progress().sent_events), (2, 4));
         }
         let control = MutationControl::default();
         send_text_checking_held_keys(
@@ -1704,6 +2496,7 @@ mod progress_tests {
             || Ok(()),
             |inputs| Ok(inputs.len()),
             |_| true,
+            |_| Ok(()),
         )
         .expect("Unicode text carries no virtual key and is not affected by a held modifier");
     }
@@ -1728,6 +2521,7 @@ mod progress_tests {
                 queries += 1;
                 queries > 1
             },
+            |_| Ok(()),
         );
         assert!(result.is_err());
         // Text and the first Enter went out; the second Enter was refused before sending.
@@ -1745,7 +2539,8 @@ mod progress_tests {
             &control,
             || {
                 validations += 1;
-                if validations == 2 {
+                // The third validation is the one before the Enter.
+                if validations == 3 {
                     Err(failure())
                 } else {
                     Ok(())
@@ -1755,9 +2550,10 @@ mod progress_tests {
                 batches += 1;
                 Ok(inputs.len())
             },
+            |_| Ok(()),
         );
         assert!(result.is_err());
-        assert_eq!(batches, 1);
+        assert_eq!(batches, 2);
         assert_eq!(control.progress().sent_events, 4);
     }
 

@@ -99,6 +99,7 @@ fn observation() -> ActionObservation {
     ActionObservation {
         foreground_window: None,
         screenshot: None,
+        settle: None,
     }
 }
 
@@ -543,6 +544,30 @@ async fn platform_failures_carry_retryable_and_a_stable_reason() {
     assert_eq!(error["code"], "unsupported_platform_operation");
     assert_eq!(error["retryable"], false);
     assert!(error.get("reason").is_none());
+    harness.finish().await;
+}
+
+/// A pointer Windows left off the requested point fails the same way on a repeat.
+#[tokio::test]
+async fn a_pointer_not_placed_is_reported_and_not_retryable() {
+    let backend = ContractBackend::new();
+    *backend.click_error.lock().unwrap() = Some(PlatformError::failed(
+        controlfreak_core::FailureCause::PointerNotPlaced,
+        "click_mouse",
+        "Windows left the pointer at (439, 222) instead of the requested (580, 222)",
+    ));
+    let mut harness = harness(backend).await;
+    let result = call(
+        &mut harness,
+        CLICK_MOUSE,
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000001", "x": 1, "y": 1}),
+    )
+    .await;
+    let error = &result["structuredContent"]["error"];
+    assert_eq!(error["code"], "platform_operation_failed", "{result}");
+    assert_eq!(error["reason"], "pointer_not_placed");
+    assert_eq!(error["retryable"], false);
+    assert_eq!(result["structuredContent"]["retry_action"], false);
     harness.finish().await;
 }
 
@@ -1111,30 +1136,90 @@ fn unknown_key_errors_suggest_a_name_and_advertised_keys_parse() {
 /// F-05, F-06, F-13: the instructions and descriptions lead with preconditions and recovery.
 #[test]
 fn guidance_states_the_foreground_rule_dialogs_and_the_permanent_stop() {
+    // Some clients copy the instructions into every tool description, so they stay short and
+    // leave per-tool detail to the tool that needs it.
     assert!(
-        SERVER_INSTRUCTIONS.len() < 2_000,
+        SERVER_INSTRUCTIONS.len() < 900,
         "{}",
         SERVER_INSTRUCTIONS.len()
     );
     for needed in [
         "foreground",
-        "Dialogs and menus of the same application",
+        "dialog or menu of its application",
         "new session",
-        "primary display",
+        "observation_id",
+        "stops changing",
+        "retry_action=false",
         "stop_desktop_work is an emergency stop that closes input permanently",
-        "click the window",
+        "user_stop",
         "1280",
     ] {
         assert!(SERVER_INSTRUCTIONS.contains(needed), "missing: {needed}");
     }
+    for (name, needed) in [
+        (FOCUS_WINDOW, "click the window"),
+        (LIST_DISPLAYS, "primary display"),
+    ] {
+        let description = tool_named(name).description.unwrap();
+        assert!(description.contains(needed), "{name}: {description}");
+    }
     let begin = tool_named(BEGIN_CONTROL_SESSION);
     let description = begin.description.as_deref().unwrap();
     assert!(description.contains("ONE window") && description.contains("foreground"));
+    assert!(description.contains("Dialogs and menus of the same application"));
     let hold = &begin.input_schema["properties"]["expected_seconds"]["description"];
     assert!(hold.as_str().unwrap().contains("45") && hold.as_str().unwrap().contains("120"));
     for name in [PRESS_KEYS, CLICK_MOUSE, TYPE_TEXT, CLICK_TEXT] {
         let description = tool_named(name).description.unwrap();
         assert!(description.contains("foreground"), "{name}: {description}");
+    }
+}
+
+/// Input actions take `settle_ms` through to the backend; tools that send no input of their own
+/// refuse it instead of ignoring it.
+#[test]
+fn settle_ms_reaches_input_actions_and_is_refused_elsewhere() {
+    let typed = parse_arguments::<TypeTextInput>(Some(rmcp::object!({
+        "target_ref": "target-00000000-0000-0000-0000-000000000001",
+        "text": "a",
+        "observation": { "settle_ms": 4_000 }
+    })))
+    .unwrap();
+    let options: controlfreak_core::ObservationOptions = typed.observation.into();
+    assert_eq!(options.settle_ms, Some(4_000));
+    let focus = parse_arguments::<FocusWindowInput>(Some(rmcp::object!({
+        "window_id": "target-00000000-0000-0000-0000-000000000001",
+        "observation": { "settle_ms": 100 }
+    })))
+    .unwrap();
+    let error = focus.observation.without_settle().unwrap_err();
+    assert!(error.to_string().contains("settle_ms"), "{error}");
+    for name in [FOCUS_WINDOW, SWITCH_VIRTUAL_DESKTOP] {
+        let schema = &tool_named(name).input_schema;
+        assert!(
+            schema["properties"]["observation"]["properties"]
+                .get("settle_ms")
+                .is_none(),
+            "{name}"
+        );
+    }
+    for name in [
+        CLICK_MOUSE,
+        CLICK_TEXT,
+        DRAG_MOUSE,
+        MOVE_MOUSE,
+        PRESS_KEYS,
+        RUN_ACTIONS,
+        SCROLL_MOUSE,
+        TYPE_TEXT,
+    ] {
+        let settle =
+            &tool_named(name).input_schema["properties"]["observation"]["properties"]["settle_ms"];
+        assert_eq!(
+            settle["maximum"],
+            controlfreak_core::limits::MAX_SETTLE_MS,
+            "{name}"
+        );
     }
 }
 
@@ -1157,10 +1242,11 @@ fn click_mouse_defaults_to_the_left_button() {
 #[test]
 fn tool_list_stays_compact() {
     let list = serde_json::to_string(&tools()).unwrap();
-    // Measured with `--print-tools`: 115,810 bytes before the compaction, 99,477 after. The
+    // Measured with `--print-tools`: 115,810 bytes before the compaction, 99,477 after, and
+    // 103,216 once every input action gained `settle_ms` and reported `observation.settle`. The
     // limit leaves about 3% of headroom, so a reworded description does not fail this test but
     // a schema that is pasted into every tool does.
-    assert!(list.len() < 102_400, "tools/list is {} bytes", list.len());
+    assert!(list.len() < 106_000, "tools/list is {} bytes", list.len());
     for tool in tools() {
         let output = Value::Object((*tool.output_schema.unwrap()).clone()).to_string();
         assert!(

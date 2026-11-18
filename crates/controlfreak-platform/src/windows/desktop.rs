@@ -54,6 +54,15 @@ pub(super) fn activate_window(hwnd: HWND) -> bool {
     unsafe { SetForegroundWindow(hwnd) }.as_bool()
 }
 
+/// The process that owns `hwnd`, or `None` when the handle no longer names a window.
+pub(super) fn window_process_id(hwnd: HWND) -> Option<u32> {
+    let mut process_id = 0_u32;
+    // SAFETY: `process_id` is a valid writable u32 for this synchronous call. A stale handle is
+    // reported by a zero thread and process ID, not by undefined behavior.
+    let thread = unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut process_id)) };
+    (thread != 0 && process_id != 0).then_some(process_id)
+}
+
 pub(super) fn current_cursor_position() -> Result<POINT, PlatformError> {
     let mut point = POINT::default();
     // SAFETY: `point` is a valid writable POINT for the duration of the synchronous call.
