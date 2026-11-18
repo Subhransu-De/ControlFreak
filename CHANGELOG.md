@@ -9,6 +9,14 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Fixed
+
+- Clicks, scrolls and drags no longer land on a different control of the approved window when another program confines the pointer (`ClipCursor`) or the user moves it during the action. The pointer is now checked against the requested point and the action refused before anything is pressed. A drag that ends off its end point still releases the button and reports `pointer_moved`, so observe before repeating it.
+
+### Added
+
+- `error.reason` `pointer_not_placed` (not retryable): Windows did not put the pointer on the requested point, usually because another program confines it. `pointer_moved` now means the pointer moved away from the requested point.
+
 ## [0.2.2] - 2026-11-17
 
 ### Changed

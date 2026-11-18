@@ -1,5 +1,5 @@
 use super::capture::SettleWatch;
-use super::input::BUTTON_DWELL;
+use super::input::{BUTTON_DWELL, Placement};
 use super::settle::SettlePolicy;
 use super::{
     Backend, Duration, HWND, KeyChordRequest, KeyboardActionResult, KeyboardBackend,
@@ -62,6 +62,11 @@ impl PointerBackend for Backend {
         let (end_x, end_y) = end_display
             .bounds
             .to_virtual(request.end_x, request.end_y)?;
+        let start = POINT {
+            x: start_x,
+            y: start_y,
+        };
+        let end = POINT { x: end_x, y: end_y };
         let _guard = self.lock_input(control)?;
         let foreground_before = foreground_window_handle();
         ensure_interactive_input_desktop("drag_mouse")?;
@@ -69,11 +74,9 @@ impl PointerBackend for Backend {
         move_cursor(
             "drag_mouse",
             current_cursor_position()?,
-            POINT {
-                x: start_x,
-                y: start_y,
-            },
+            start,
             0,
+            Placement::Verified,
             control,
             |point| {
                 super::target::validate(control, "drag_mouse", Some(point))?;
@@ -83,22 +86,21 @@ impl PointerBackend for Backend {
         control.check("drag_mouse")?;
         let watch = settle_watch(control, &request.observation);
         send_drag_press(request.button, &request.modifiers, control, || {
-            super::target::validate(control, "drag_mouse", Some(current_cursor_position()?))
+            ensure_pointer_target(control, "drag_mouse", start)
         })?;
         control.cleanup_status(controlfreak_core::CleanupStatus::Unknown);
         // The button is held from here to the release below; a failure or cancellation in the
-        // dwell or the travel is reported after the release cleanup has run.
+        // dwell or the travel is reported after the release cleanup has run. The release always
+        // happens where the pointer is, so a travel that Windows stopped short still lets go.
         let movement = control
             .wait("drag_mouse", BUTTON_DWELL)
             .and_then(|()| {
                 move_cursor(
                     "drag_mouse",
-                    POINT {
-                        x: start_x,
-                        y: start_y,
-                    },
-                    POINT { x: end_x, y: end_y },
+                    start,
+                    end,
                     effective_drag_duration_ms(request.duration_ms),
+                    Placement::Verified,
                     control,
                     |point| super::target::validate(control, "drag_mouse", Some(point)),
                 )
@@ -109,7 +111,7 @@ impl PointerBackend for Backend {
             &request.modifiers,
             control,
             movement.is_err(),
-            || super::target::validate(control, "drag_mouse", Some(current_cursor_position()?)),
+            || ensure_pointer_target(control, "drag_mouse", end),
         );
         movement?;
         release?;
@@ -166,8 +168,7 @@ impl PointerBackend for Backend {
                 control.check("scroll_mouse")?;
                 let watch = settle_watch(control, &request.observation);
                 send_scroll(request.delta_x, request.delta_y, control, || {
-                    super::target::validate(control, "scroll_mouse", Some(target))?;
-                    ensure_cursor_at("scroll_mouse", target, current_cursor_position()?)
+                    ensure_pointer_target(control, "scroll_mouse", target)
                 })?;
                 settle(
                     "scroll_mouse",
@@ -294,10 +295,7 @@ impl Backend {
                     request.click_count,
                     &request.modifiers,
                     control,
-                    || {
-                        super::target::validate(control, "click_mouse", Some(target))?;
-                        ensure_cursor_at("click_mouse", target, current_cursor_position()?)
-                    },
+                    || ensure_pointer_target(control, "click_mouse", target),
                 )?;
                 settle(
                     "click_mouse",
@@ -378,25 +376,31 @@ impl Backend {
             None
         };
 
+        let requested = POINT {
+            x: target_x,
+            y: target_y,
+        };
+        // A plain move reports wherever the pointer ended up. A click or scroll fires at the
+        // live pointer, so its approach must end exactly on the requested point.
+        let placement = if action.is_some() {
+            Placement::Verified
+        } else {
+            Placement::Unchecked
+        };
         move_cursor(
             operation,
             start,
-            POINT {
-                x: target_x,
-                y: target_y,
-            },
+            requested,
             spec.duration_ms,
+            placement,
             control,
             |point| {
                 super::target::validate(control, operation, Some(point))?;
                 super::input::ensure_pointer_idle(operation)
             },
         )?;
-        // A move-only action is already dispatched. Its next cursor read is observation,
-        // whereas clicks and scrolls still need this read to validate their input target.
         let settled = if let Some(action) = action {
-            let actual_target = current_cursor_position()?;
-            action(control, actual_target)?
+            action(control, requested)?
         } else {
             settle(
                 operation,
@@ -515,19 +519,32 @@ fn settle_watch(control: &MutationControl, options: &ObservationOptions) -> Opti
     SettleWatch::begin(super::target::approved_window_bounds(control))
 }
 
-/// Button and wheel events fire at the live cursor, so refuse if it left the validated point.
-fn ensure_cursor_at(
+/// Checks the window at the requested point, then that the pointer is still on that point.
+/// Button and wheel events fire at the live pointer, not at the requested point, so the
+/// comparison is against the point the client asked for: a pointer that drifted after the
+/// approach (the user's hand, or an application moving it) must not carry the input with it.
+fn ensure_pointer_target(
+    control: &MutationControl,
     operation: &str,
-    validated: POINT,
+    requested: POINT,
+) -> Result<(), PlatformError> {
+    super::target::validate(control, operation, Some(requested))?;
+    ensure_pointer_not_moved(operation, requested, current_cursor_position()?)
+}
+
+/// Refuses dispatch when the live pointer is not on the requested point.
+fn ensure_pointer_not_moved(
+    operation: &str,
+    requested: POINT,
     current: POINT,
 ) -> Result<(), PlatformError> {
-    if current == validated {
+    if current == requested {
         Ok(())
     } else {
         Err(PlatformError::failed(
             controlfreak_core::FailureCause::PointerMoved,
             operation,
-            "the pointer moved after target validation; observe again before retrying",
+            "the pointer moved away from the requested point; observe again before retrying",
         ))
     }
 }
@@ -606,11 +623,12 @@ mod tests {
     }
 
     #[test]
-    fn pointer_drift_after_validation_refuses_dispatch() {
-        let validated = POINT { x: -100, y: 20 };
-        assert!(ensure_cursor_at("click_mouse", validated, validated).is_ok());
-        let error =
-            ensure_cursor_at("click_mouse", validated, POINT { x: -99, y: 20 }).unwrap_err();
-        assert!(error.to_string().contains("pointer moved"));
+    fn pointer_drift_from_the_requested_point_refuses_dispatch() {
+        let requested = POINT { x: -100, y: 20 };
+        assert!(ensure_pointer_not_moved("click_mouse", requested, requested).is_ok());
+        let error = ensure_pointer_not_moved("click_mouse", requested, POINT { x: -99, y: 20 })
+            .unwrap_err();
+        assert_eq!(error.reason_code(), Some("pointer_moved"));
+        assert!(error.retryable());
     }
 }

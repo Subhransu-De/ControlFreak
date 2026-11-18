@@ -547,6 +547,30 @@ async fn platform_failures_carry_retryable_and_a_stable_reason() {
     harness.finish().await;
 }
 
+/// A pointer Windows left off the requested point fails the same way on a repeat.
+#[tokio::test]
+async fn a_pointer_not_placed_is_reported_and_not_retryable() {
+    let backend = ContractBackend::new();
+    *backend.click_error.lock().unwrap() = Some(PlatformError::failed(
+        controlfreak_core::FailureCause::PointerNotPlaced,
+        "click_mouse",
+        "Windows left the pointer at (439, 222) instead of the requested (580, 222)",
+    ));
+    let mut harness = harness(backend).await;
+    let result = call(
+        &mut harness,
+        CLICK_MOUSE,
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000001", "x": 1, "y": 1}),
+    )
+    .await;
+    let error = &result["structuredContent"]["error"];
+    assert_eq!(error["code"], "platform_operation_failed", "{result}");
+    assert_eq!(error["reason"], "pointer_not_placed");
+    assert_eq!(error["retryable"], false);
+    assert_eq!(result["structuredContent"]["retry_action"], false);
+    harness.finish().await;
+}
+
 /// F-03, F-08: titles, honest annotations, and the emergency stop at the end.
 #[test]
 fn every_tool_has_a_title_and_honest_annotations() {
