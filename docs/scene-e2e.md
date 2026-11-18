@@ -66,7 +66,7 @@ This is the "application that confines the pointer" desk. Windows keeps the poin
 
 | Task | What happens |
 | --- | --- |
-| `smoke/click-outside-pointer-clip` | Checks through the fixture that Windows has the clip in force before each click. Clicks the button, inside the clip, and waits for its press. Then clicks the right part of the edit surface, outside it. Checks the refusal is `platform_operation_failed` with reason `pointer_not_placed`, is not retryable and sent no events, and that the fixture logged no click. The harness frees the pointer after it closes the fixture, whatever the outcome, because killing the fixture may not. |
+| `smoke/click-outside-pointer-clip` | Checks through the fixture that Windows has the clip in force before each click. Clicks the button, inside the clip, and waits for its press. Then clicks the right part of the edit surface, outside it. Checks the result is `partially_sent` (only the pointer moved) with error `platform_operation_failed` and reason `pointer_not_placed`, is not retryable and sent no events, and that the fixture logged no click. The harness frees the pointer after it closes the fixture, whatever the outcome, because killing the fixture may not. |
 
 ## with-dialog
 

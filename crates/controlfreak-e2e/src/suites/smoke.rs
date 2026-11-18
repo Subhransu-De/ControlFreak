@@ -120,12 +120,15 @@ fn click_outside_pointer_clip(cx: &mut Ctx<'_>) -> Result<(), Failure> {
     ensure!(outside.0 >= clip[2], "the edit point is inside the clip");
     ensure_clip_in_force(cx, clip)?;
     let downs_before = events::left_downs(&cx.window("app")?.events(), "main").len();
-    let refused = cx.refused(
+    // Only the pointer moved, so the result is `partially_sent` with the error beside it, not
+    // an MCP error: a result whose input began never sets `isError`.
+    let refused = cx.call(
         "click_mouse",
         json!({"target_ref": id, "x": outside.0, "y": outside.1, "observation": {"mode": "none"}}),
     )?;
     ensure!(
-        refused.error_code() == Some("platform_operation_failed")
+        refused.structured["status"] == "partially_sent"
+            && refused.error_code() == Some("platform_operation_failed")
             && refused.error_reason() == Some("pointer_not_placed")
             && refused.structured["error"]["retryable"] == false
             && refused.structured["input"]["sent_events"] == 0,
