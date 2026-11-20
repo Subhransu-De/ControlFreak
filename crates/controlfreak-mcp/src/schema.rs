@@ -73,7 +73,7 @@ pub fn tools() -> Vec<Tool> {
 }
 
 /// Every tool with its full result contract, closed against extra fields, for `--print-tools`.
-/// Names, descriptions, input schemas and annotations are the same as in [`tools`].
+/// Names, descriptions, input schemas and annotations are the same as in `tools/list`.
 ///
 /// The list starts with the tools an agent needs first and ends with the emergency stop.
 pub fn full_tools() -> Vec<Tool> {

@@ -75,8 +75,8 @@ use results::{
     visual_baseline_result, visual_change_result, window_focus_result, window_screenshot_result,
     window_wait_result,
 };
+pub use schema::full_tools as full_tool_definitions;
 use schema::tools;
-pub use schema::{full_tools as full_tool_definitions, tools as tool_definitions};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::{

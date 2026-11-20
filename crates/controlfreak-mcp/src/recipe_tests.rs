@@ -326,7 +326,7 @@ async fn published_recipes_validate_and_run_on_a_synthetic_desktop() {
         .await;
         assert_eq!(
             listed["result"]["tools"],
-            serde_json::to_value(tool_definitions()).unwrap()
+            serde_json::to_value(tools()).unwrap()
         );
         let tools = listed["result"]["tools"].as_array().unwrap();
         for step in recipe["steps"].as_array().unwrap() {
