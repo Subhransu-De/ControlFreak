@@ -69,3 +69,17 @@ impl Drop for CleanupOnDrop {
         }
     }
 }
+
+/// The wire form of a recovery step: `null` while admission is open. Refusals, status, the end
+/// result and the stop notification all use it, so they always agree.
+pub(super) fn recovery_json(
+    recovery: Option<controlfreak_core::StopRecovery>,
+) -> serde_json::Value {
+    recovery.map_or(serde_json::Value::Null, |recovery| {
+        serde_json::json!({
+            "actor": recovery.actor(),
+            "action": recovery.action(),
+            "message": recovery.guidance(),
+        })
+    })
+}

@@ -205,7 +205,10 @@ pub(super) enum SessionError {
     },
     ShuttingDown,
     StillClosing,
-    Stopped(String),
+    Stopped {
+        reason: String,
+        recovery: controlfreak_core::StopRecovery,
+    },
     Environment(String),
     Indicator(String),
     Worker(String),
@@ -226,9 +229,14 @@ impl From<ArbitrationError> for SessionError {
 impl SessionError {
     /// The stop latch is set: by Esc, `stop_desktop_work`, or failed cleanup.
     pub(super) fn stopped(stop: &controlfreak_core::StopController) -> Self {
-        Self::Stopped(stop.refusal_message().unwrap_or_else(|| {
-            "desktop work is stopped; only the user may restart the server".to_owned()
-        }))
+        Self::Stopped {
+            reason: stop.refusal_message().unwrap_or_else(|| {
+                "desktop work is stopped; only the user may restart the server".to_owned()
+            }),
+            recovery: stop
+                .recovery()
+                .unwrap_or(controlfreak_core::StopRecovery::RestartClient),
+        }
     }
 
     pub(super) fn into_tool_result(self, safety_indicator: &SafetyIndicator) -> CallToolResult {
@@ -269,11 +277,14 @@ impl SessionError {
                 true,
                 json!({"remedy": "retry after the prior session finishes closing"}),
             ),
-            Self::Stopped(reason) => (
+            Self::Stopped { reason, recovery } => (
                 "desktop_work_stopped",
                 reason.clone(),
                 false,
-                json!({"reason": reason}),
+                json!({
+                    "reason": reason,
+                    "recovery": super::stop::recovery_json(Some(recovery)),
+                }),
             ),
             Self::Environment(reason) => (
                 "control_environment_unavailable",
@@ -299,6 +310,27 @@ impl SessionError {
                 "details": details,
             }
         }))
+    }
+}
+
+/// What `end_control_session` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EndOutcome {
+    /// The session was released.
+    Closed,
+    /// Pending actions are still finishing; the session is released after them.
+    Closing,
+    /// No session was owned, for example because a stop or the hold already closed it.
+    NotOwned,
+}
+
+impl EndOutcome {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Closing => "closing",
+            Self::NotOwned => "not_owned",
+        }
     }
 }
 
@@ -615,8 +647,21 @@ impl SessionRuntime {
         }
     }
 
-    pub(super) fn end_session(&self) -> Result<(), String> {
-        self.close_session("explicit_end", false)
+    /// Ends the owned session and reports what happened to it.
+    pub(super) fn end_session(&self) -> Result<EndOutcome, String> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.session_owned() {
+            return Ok(EndOutcome::NotOwned);
+        }
+        self.close_session_locked("explicit_end", false)?;
+        Ok(if self.session_owned() {
+            EndOutcome::Closing
+        } else {
+            EndOutcome::Closed
+        })
     }
 
     pub(super) fn close_session(&self, reason: &str, terminate: bool) -> Result<(), String> {
@@ -927,6 +972,8 @@ impl SessionRuntime {
             self.arbitrator.release();
         }
         state.session = ControlSession::dormant(self.short_hold);
+        // A closed session approves no window. A lease still in flight keeps its own clone.
+        state.cancellation = MutationControl::default();
         state.stop_registration = None;
         self.stop.set_session_active(false);
     }

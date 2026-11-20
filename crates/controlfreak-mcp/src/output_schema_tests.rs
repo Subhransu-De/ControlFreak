@@ -325,6 +325,8 @@ fn schemas_describe_idle_busy_and_stopped_server_status() {
         "operations_started": 0, "operations_completed": 0, "operations_failed": 0,
         "recent_operations": [],
         "backend": {"platform": "windows", "display_server": "dwm", "backend_id": "b"},
+        "input_admission": "open",
+        "recovery": null,
         "stop_state": "ready"
     });
     assert!(validator.is_valid(&base));
@@ -333,12 +335,31 @@ fn schemas_describe_idle_busy_and_stopped_server_status() {
         json!({"session": {"state": "busy", "draining": false, "stop_state": "ready"}}),
     );
     assert!(validator.is_valid(&busy), "{busy}");
-    let stopped = with(
-        base.clone(),
-        json!({"stop_state": "stopped", "stop_reason": "user_stop"}),
+    for (stop_state, actor, action) in [
+        ("draining", "agent", "wait_for_drain"),
+        ("stopped", "user", "restart_client"),
+        ("cleanup_failed", "user", "resolve_held_input"),
+    ] {
+        let stopped = with(
+            base.clone(),
+            json!({
+                "stop_state": stop_state, "stop_reason": "user_stop", "input_admission": "closed",
+                "recovery": {"actor": actor, "action": action, "message": "m"}
+            }),
+        );
+        assert!(validator.is_valid(&stopped), "{stopped}");
+    }
+    assert!(!validator.is_valid(&with(base.clone(), json!({"status": "bogus"}))));
+    assert!(
+        !validator.is_valid(&with(
+            base.clone(),
+            json!({"recovery": {"actor": "user", "action": "rearm", "message": "m"}})
+        )),
+        "no recovery action reopens input from MCP"
     );
-    assert!(validator.is_valid(&stopped));
-    assert!(!validator.is_valid(&with(base, json!({"status": "bogus"}))));
+    let mut missing = base;
+    missing.as_object_mut().unwrap().remove("input_admission");
+    assert!(!validator.is_valid(&missing), "input_admission is required");
 }
 
 #[tokio::test]

@@ -212,7 +212,11 @@ async fn assert_human_stop_lifecycle(requested: ProtocolVersion) {
         refused["result"]["structuredContent"]["retry_action"],
         false
     );
-    assert!(refused.to_string().contains("the user stopped"));
+    assert!(refused.to_string().contains("You stopped desktop input"));
+    assert_eq!(
+        refused["result"]["structuredContent"]["error"]["details"]["recovery"]["action"],
+        "restart_client"
+    );
     drop(client);
     tokio::time::timeout(Duration::from_secs(5), serving)
         .await

@@ -9,6 +9,17 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Fixed
+
+- After a user stop, agents are told how to get input back: the user restarts ControlFreak from the MCP client. The refusal says so, and the refusal, `get_server_status`, `end_control_session` and the stop notification carry the same `recovery` step (`wait_for_drain`, `restart_client` or `resolve_held_input`). The stop latch is unchanged: no tool reopens input.
+- `get_server_status` no longer reports a stopped server as plain `ready`: the new `input_admission` field says `closed`.
+- `end_control_session` reports what happened (`closed`, `closing` or `not_owned`) instead of always `closing`.
+- `approved_target_ref` is `null` once a session closes, after an end, an expired hold or a stop.
+
+### Added
+
+- A second `notifications/controlfreak/session_stopped` event, `stop_drained`, when work that was running at a user stop has finished.
+
 ## [0.2.3] - 2026-11-18
 
 ### Fixed

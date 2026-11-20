@@ -55,7 +55,7 @@ See all 27 tools in the [tool reference](https://github.com/Subhransu-De/Control
 | Work across monitors and desktops | Finds windows on every display and switches virtual desktops. |
 
 While an agent is in control, a turquoise line runs along the top of every display with a tab
-that says "An agent is using this PC". Press Esc, or click the **Stop agent** button on the tab, to stop it. The agent cannot press either: ControlFreak ignores injected input for both.
+that says "An agent is using this PC". Press Esc, or click the **Stop agent** button on the tab, to stop it. The agent cannot press either: ControlFreak ignores injected input for both. After a stop, the agent can still read the screen but cannot send input until you restart ControlFreak from your MCP client (its server restart control, or quit and reopen the client). Do not end the process by hand.
 
 ## Install
 
