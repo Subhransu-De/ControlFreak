@@ -54,7 +54,7 @@ async fn harness_with_hold(
 }
 
 /// Serves `backend` with `runtime` over an in-memory transport and completes the handshake.
-pub(super) async fn serve_with_runtime(
+async fn serve_with_runtime(
     backend: Arc<dyn PlatformBackend>,
     runtime: Arc<SessionRuntime>,
 ) -> Harness {

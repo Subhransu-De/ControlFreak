@@ -1315,6 +1315,19 @@ fn end_session_output_schema() -> Arc<JsonObject> {
     )
 }
 
+/// The tool profile in `get_server_status`: `full` or `observe`, and the `--tools` list or null.
+fn profile_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "enum": ["full", "observe"] },
+            "tool_allowlist": { "type": ["array", "null"], "items": { "type": "string" } }
+        },
+        "required": ["name", "tool_allowlist"],
+        "additionalProperties": false
+    })
+}
+
 fn server_status_output_schema() -> Arc<JsonObject> {
     output_schema(
         vec![json!({
@@ -1397,15 +1410,7 @@ fn server_status_output_schema() -> Arc<JsonObject> {
                 "recovery": { "oneOf": [def_ref("recovery"), { "type": "null" }] },
                 "stop_state": { "enum": ["ready", "draining", "stopped", "cleanup_failed"] },
                 "stop_reason": { "const": "user_stop" },
-                "profile": {
-                    "type": "object",
-                    "properties": {
-                        "name": { "enum": ["full", "observe"] },
-                        "tool_allowlist": { "type": ["array", "null"], "items": { "type": "string" } }
-                    },
-                    "required": ["name", "tool_allowlist"],
-                    "additionalProperties": false
-                }
+                "profile": profile_schema()
             },
             "required": [
                 "status", "safety_indicator", "session", "version", "build", "instance_id", "process_id",

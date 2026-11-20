@@ -124,12 +124,12 @@ impl Profile {
 
     /// Whether this profile serves every tool.
     #[must_use]
-    pub const fn is_full(&self) -> bool {
+    pub(super) const fn is_full(&self) -> bool {
         !self.observe && self.allowlist.is_none()
     }
 
     /// Whether the tool of `spec` is served.
-    pub(super) fn serves(&self, spec: &ToolSpec) -> bool {
+    fn serves(&self, spec: &ToolSpec) -> bool {
         match spec.route {
             // The ways out of desktop work and the report of its state are never hidden.
             Route::Stop | Route::Status | Route::EndSession => true,

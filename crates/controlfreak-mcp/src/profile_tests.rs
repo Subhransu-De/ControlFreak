@@ -156,6 +156,11 @@ async fn for_each_profile_the_listed_tools_are_exactly_the_callable_tools() {
             profile.status_json(),
             "{name}: {status}"
         );
+        assert!(
+            output_schema_tests::full_validator(GET_SERVER_STATUS)
+                .is_valid(&status["structuredContent"]),
+            "{name}: {status}"
+        );
         assert_eq!(server.acquisitions.load(Ordering::SeqCst), 0, "{name}");
         assert!(desktop.received().is_empty(), "{name}");
         server.harness.finish().await;
