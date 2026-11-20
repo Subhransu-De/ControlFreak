@@ -2,7 +2,7 @@
 //! malformed request never claims arbitration, arms the idle hold or shows the indicator.
 
 use super::fake_desktop::FakeDesktop;
-use super::session_error_tests::{Harness, call, serve_with_runtime};
+use super::session_error_tests::{Harness, call, serve_with_profile};
 use super::tests::{ExclusiveArbitrator, RecordingIndicator};
 use super::*;
 
@@ -23,17 +23,26 @@ impl ActivityArbitrator for CountingArbitrator {
     }
 }
 
-struct Server {
-    harness: Harness,
-    indicator_starts: Arc<AtomicUsize>,
+pub(super) struct Server {
+    pub(super) harness: Harness,
+    pub(super) indicator_starts: Arc<AtomicUsize>,
     indicator_events: Arc<Mutex<Vec<&'static str>>>,
-    acquisitions: Arc<AtomicUsize>,
+    pub(super) acquisitions: Arc<AtomicUsize>,
 }
 
 impl Server {
     /// A server on `desktop`, sharing the exclusive desktop flag `owned` with other servers. The
     /// hold outlasts the test, so a session that a request did take is still visible afterwards.
-    async fn start(desktop: &Arc<FakeDesktop>, owned: &Arc<AtomicBool>) -> Self {
+    pub(super) async fn start(desktop: &Arc<FakeDesktop>, owned: &Arc<AtomicBool>) -> Self {
+        Self::start_with_profile(desktop, owned, Profile::full()).await
+    }
+
+    /// A server like [`Server::start`] that serves only the tools of `profile`.
+    pub(super) async fn start_with_profile(
+        desktop: &Arc<FakeDesktop>,
+        owned: &Arc<AtomicBool>,
+        profile: Profile,
+    ) -> Self {
         let indicator_starts = Arc::new(AtomicUsize::new(0));
         let indicator_events = Arc::new(Mutex::new(Vec::new()));
         let acquisitions = Arc::new(AtomicUsize::new(0));
@@ -64,19 +73,19 @@ impl Server {
             },
         ));
         Self {
-            harness: serve_with_runtime(desktop.clone(), runtime).await,
+            harness: serve_with_profile(desktop.clone(), runtime, profile).await,
             indicator_starts,
             indicator_events,
             acquisitions,
         }
     }
 
-    async fn call(&mut self, name: &str, arguments: Value) -> Value {
+    pub(super) async fn call(&mut self, name: &str, arguments: Value) -> Value {
         call(&mut self.harness, name, arguments).await
     }
 
     /// The `session` object of `get_server_status`.
-    async fn session(&mut self) -> Value {
+    pub(super) async fn session(&mut self) -> Value {
         self.call(GET_SERVER_STATUS, json!({})).await["structuredContent"]["session"].clone()
     }
 
@@ -144,7 +153,7 @@ fn malformed(target: &str) -> Vec<(&'static str, Value, &'static str)> {
     ]
 }
 
-fn assert_refused(name: &str, result: &Value, code: &str) {
+pub(super) fn assert_refused(name: &str, result: &Value, code: &str) {
     assert_eq!(result["isError"], true, "{name}: {result}");
     let content = &result["structuredContent"];
     assert_eq!(content["error"]["code"], code, "{name}: {result}");
@@ -152,7 +161,7 @@ fn assert_refused(name: &str, result: &Value, code: &str) {
     assert_eq!(content["input"]["sent_events"], 0, "{name}: {result}");
 }
 
-fn assert_untouched(session: &Value) {
+pub(super) fn assert_untouched(session: &Value) {
     assert_eq!(session["owns_arbitration"], false, "{session}");
     assert_eq!(session["call_count"], 0, "{session}");
     assert_eq!(session["state"], "dormant", "{session}");

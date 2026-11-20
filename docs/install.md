@@ -150,6 +150,55 @@ Run `pi install npm:pi-mcp-adapter`, then edit `%USERPROFILE%\.pi\agent\mcp.json
 }
 ```
 
+## Restrict the tools
+
+Two server flags narrow what an agent can call. Without either flag, the server serves every tool, as before.
+
+- `--profile observe` serves only tools that read the desktop. It hides `begin_control_session`, `focus_window`, `switch_virtual_desktop` and every input tool.
+- `--tools a,b,c` serves only the named tools. Names are case-sensitive and come from [the tool list](tools.md#tool-list) or `controlfreak --print-tools`.
+- Both flags together serve the listed tools, and every listed tool must be one that `--profile observe` serves.
+- `get_server_status`, `end_control_session` and `stop_desktop_work` are served in every profile, even if `--tools` leaves them out.
+- A hidden tool is refused like a tool that does not exist. `run_actions` refuses a whole batch, before any step runs, if a step needs a hidden tool: a click step needs `click_mouse`, a scroll step `scroll_mouse`, a type step `type_text` and a key step `press_keys`.
+- A typo, an empty entry or a repeated name in `--tools`, an unknown profile, or `--tools` naming an input tool with `--profile observe` stops the server at startup with an error on stderr. It never falls back to serving every tool. The client then shows the server as failed; its MCP log has the reason.
+- `get_server_status` reports the active profile in `profile`.
+
+Setup never adds these flags. Add them to the client entry by hand, after the executable path. In the examples below, replace `<path>` with the folder of `controlfreak.exe`.
+
+Codex, in `%USERPROFILE%\.codex\config.toml`:
+
+```toml
+[mcp_servers.controlfreak]
+command = '<path>\controlfreak.exe'
+args = ["--profile", "observe"]
+```
+
+To serve a chosen set of tools instead:
+
+```toml
+args = ["--tools", "list_windows,capture_window,read_text_in_region"]
+```
+
+Claude Code. Remove the existing entry first, then add it again with the flag after the path:
+
+```powershell
+claude mcp remove controlfreak --scope user
+claude mcp add --scope user controlfreak -- '<path>\controlfreak.exe' --profile observe
+```
+
+Claude Desktop and Pi take the flags in `args`:
+
+```json
+"args": ["--profile", "observe"]
+```
+
+OpenCode takes them in the `command` array:
+
+```json
+"command": ["<path>\\controlfreak.exe", "--profile", "observe"]
+```
+
+You can register two entries side by side, such as `controlfreak-observe` with `--profile observe` and `controlfreak` with no flags, and enable the full one only for tasks that need input. A profile narrows the MCP tool surface only. It is not a sandbox: see [SECURITY.md](../SECURITY.md#tool-profiles).
+
 ## Build from source
 
 Needs Rust 1.97 or later with the `x86_64-pc-windows-msvc` toolchain and the Microsoft C++ Build

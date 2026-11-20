@@ -18,6 +18,9 @@ get_server_status output anyOf[0].operations_completed required
 get_server_status output anyOf[0].operations_failed required
 get_server_status output anyOf[0].operations_started required
 get_server_status output anyOf[0].process_id required
+get_server_status output anyOf[0].profile required
+get_server_status output anyOf[0].profile.name required
+get_server_status output anyOf[0].profile.tool_allowlist required
 get_server_status output anyOf[0].recent_operations required
 get_server_status output anyOf[0].recent_operations[].elapsed_ms required
 get_server_status output anyOf[0].recent_operations[].gap_ms required

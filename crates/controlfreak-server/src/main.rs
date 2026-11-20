@@ -9,6 +9,7 @@ use std::{
 };
 
 use controlfreak_core::{BuildInfo, PlatformBackend, SecurityContext};
+use controlfreak_mcp::Profile;
 use controlfreak_platform::OcrHelperCommand;
 
 #[cfg(target_os = "windows")]
@@ -40,10 +41,16 @@ const HELP: &str = "ControlFreak native Windows computer-use MCP server
 Usage:
   controlfreak                       Run the local STDIO MCP server
   controlfreak --allow-elevated      Explicitly allow an elevated server token
+  controlfreak --profile observe     Serve observation tools only: no session, focus or input
+  controlfreak --tools a,b,c         Serve only these tools (names from --print-tools)
   controlfreak --print-capabilities  Print the platform capability declaration
   controlfreak --print-tools         Print tool descriptions and the full JSON schemas
   controlfreak --help                Show this help
-  controlfreak --version             Show the version";
+  controlfreak --version             Show the version
+
+--profile and --tools may be combined; every --tools name must then be a tool that
+--profile observe serves. get_server_status, end_control_session and stop_desktop_work
+are served in every profile. An invalid value stops the server at startup.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
@@ -55,11 +62,16 @@ enum Command {
     Version,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Options {
     command: Command,
     allow_elevated: bool,
+    /// The tools the server serves: every tool unless `--profile` or `--tools` narrows them.
+    profile: Profile,
 }
+
+/// Longest part of a rejected argument that a startup error repeats.
+const MAX_ECHOED_ARGUMENT_CHARS: usize = 64;
 
 #[derive(Debug)]
 struct ElevatedStartupError(SecurityContext);
@@ -110,7 +122,7 @@ async fn try_main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let options = parse_options(arguments)?;
     match options.command {
-        Command::Serve => run_server(options.allow_elevated).await,
+        Command::Serve => run_server(options.allow_elevated, options.profile).await,
         Command::OcrHelper => run_ocr_helper(),
         Command::PrintCapabilities => print_capabilities(options.allow_elevated),
         Command::PrintTools => {
@@ -131,12 +143,56 @@ async fn try_main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 }
 
+fn invalid_input(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+/// At most [`MAX_ECHOED_ARGUMENT_CHARS`] characters of `value`, so an error stays bounded.
+fn shortened(value: &str) -> String {
+    value.chars().take(MAX_ECHOED_ARGUMENT_CHARS).collect()
+}
+
+/// The value of option `name`, given as `name=value` (`inline`) or as the next argument. A next
+/// argument that starts with `--` is another option, so the value is missing.
+fn option_value(
+    name: &str,
+    inline: Option<&str>,
+    arguments: &mut impl Iterator<Item = String>,
+) -> io::Result<String> {
+    match inline.map(str::to_owned).or_else(|| arguments.next()) {
+        Some(value) if !value.starts_with("--") => Ok(value),
+        _ => Err(invalid_input(format!("{name} needs a value\n\n{HELP}"))),
+    }
+}
+
 fn parse_options(arguments: impl IntoIterator<Item = String>) -> io::Result<Options> {
     let mut allow_elevated = false;
     let mut command = None;
-    for argument in arguments {
+    let mut profile_name: Option<String> = None;
+    let mut tool_list: Option<String> = None;
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
         if argument == "--allow-elevated" {
             allow_elevated = true;
+            continue;
+        }
+        let (name, inline) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(name, value)| {
+                (name, Some(value))
+            });
+        if name == "--profile" || name == "--tools" {
+            let value = option_value(name, inline, &mut arguments)?;
+            let slot = if name == "--profile" {
+                &mut profile_name
+            } else {
+                &mut tool_list
+            };
+            if slot.replace(value).is_some() {
+                return Err(invalid_input(format!(
+                    "{name} may be given only once\n\n{HELP}"
+                )));
+            }
             continue;
         }
         let next = match argument.as_str() {
@@ -146,10 +202,10 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> io::Result<Opti
             "--help" | "-h" => Command::Help,
             "--version" | "-V" => Command::Version,
             _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown argument '{argument}'\n\n{HELP}"),
-                ));
+                return Err(invalid_input(format!(
+                    "unknown argument '{}'\n\n{HELP}",
+                    shortened(&argument)
+                )));
             }
         };
         if command.replace(next).is_some() {
@@ -173,13 +229,39 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> io::Result<Opti
             ),
         ));
     }
+    if (profile_name.is_some() || tool_list.is_some()) && command != Command::Serve {
+        return Err(invalid_input(format!(
+            "--profile and --tools are valid only for the server\n\n{HELP}"
+        )));
+    }
+    let profile = match profile_name.as_deref() {
+        None => Profile::full(),
+        Some("observe") => Profile::observe(),
+        Some(other) => {
+            return Err(invalid_input(format!(
+                "unknown --profile '{}'; the only profile is observe",
+                shortened(other)
+            )));
+        }
+    };
+    // A malformed list stops startup: the server never falls back to serving every tool.
+    let profile = match tool_list {
+        Some(list) => profile
+            .restrict_to(&list)
+            .map_err(|error| invalid_input(error.to_string()))?,
+        None => profile,
+    };
     Ok(Options {
         command,
         allow_elevated,
+        profile,
     })
 }
 
-async fn run_server(allow_elevated: bool) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn run_server(
+    allow_elevated: bool,
+    profile: Profile,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     #[cfg(target_os = "windows")]
     {
         let security_context = controlfreak_platform::server_security_context(allow_elevated)?;
@@ -276,12 +358,13 @@ async fn run_server(allow_elevated: bool) -> Result<(), Box<dyn Error + Send + S
             arbitrator,
             stop,
             build_info(),
+            profile,
         )
         .await
     }
 
     #[cfg(not(target_os = "windows"))]
-    controlfreak_mcp::serve_stdio(controlfreak_platform::backend(), build_info()).await
+    controlfreak_mcp::serve_stdio(controlfreak_platform::backend(), build_info(), profile).await
 }
 
 /// Starts the tab, off the caller's thread, the first time an observation tool reads the screen
@@ -670,5 +753,97 @@ mod tests {
             "x86_64-pc-windows-msvc",
         );
         assert_eq!(version_text(&build).lines().nth(2), Some("dirty: false"));
+    }
+
+    fn parse(arguments: &[&str]) -> io::Result<Options> {
+        parse_options(arguments.iter().map(|argument| (*argument).to_owned()))
+    }
+
+    #[test]
+    fn no_profile_flag_serves_every_tool() {
+        assert_eq!(parse(&[]).unwrap().profile, Profile::full());
+    }
+
+    #[test]
+    fn profile_and_tool_flags_take_both_forms_and_combine() {
+        let observe = parse(&["--profile", "observe"]).unwrap();
+        assert_eq!(observe.command, Command::Serve);
+        assert_eq!(observe.profile, Profile::observe());
+        assert_eq!(
+            parse(&["--profile=observe", "--allow-elevated"])
+                .unwrap()
+                .profile,
+            Profile::observe()
+        );
+        let listed = Profile::full()
+            .restrict_to("type_text,list_windows")
+            .unwrap();
+        assert_eq!(
+            parse(&["--tools", "type_text,list_windows"])
+                .unwrap()
+                .profile,
+            listed
+        );
+        assert_eq!(
+            parse(&["--tools=type_text,list_windows"]).unwrap().profile,
+            listed
+        );
+        // Combined, in either order: the list narrows the observe profile.
+        let both = Profile::observe().restrict_to("list_windows").unwrap();
+        assert_eq!(
+            parse(&["--tools", "list_windows", "--profile", "observe"])
+                .unwrap()
+                .profile,
+            both
+        );
+        assert_eq!(
+            parse(&["--profile", "observe", "--tools", "list_windows"])
+                .unwrap()
+                .profile,
+            both
+        );
+    }
+
+    #[test]
+    fn malformed_profile_flags_are_refused_with_a_bounded_message() {
+        let long = "x".repeat(10_000);
+        for arguments in [
+            vec!["--profile"],
+            vec!["--profile", "--tools", "list_windows"],
+            vec!["--profile", "full"],
+            vec!["--profile", "Observe"],
+            vec!["--profile="],
+            vec!["--profile", "observe", "--profile", "observe"],
+            vec!["--tools"],
+            vec!["--tools="],
+            vec!["--tools", ""],
+            vec!["--tools", "list_windows,"],
+            vec!["--tools", "list_windows,,type_text"],
+            vec!["--tools", "typo_text"],
+            vec!["--tools", "type_text,type_text"],
+            vec!["--tools", "list_windows", "--tools", "type_text"],
+            vec!["--tools", long.as_str()],
+            vec!["--profile", long.as_str()],
+            vec![long.as_str()],
+            // Contradictory: observe never serves input.
+            vec!["--profile", "observe", "--tools", "type_text"],
+            vec!["--tools", "focus_window", "--profile", "observe"],
+            // Only the server takes a profile.
+            vec!["--print-tools", "--profile", "observe"],
+            vec!["--print-capabilities", "--tools", "list_windows"],
+            vec!["--version", "--tools", "list_windows"],
+        ] {
+            let error = parse(&arguments).expect_err(&format!("{arguments:?}"));
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            let message = error.to_string();
+            assert!(
+                message.len() < 2048,
+                "{arguments:?}: {} bytes",
+                message.len()
+            );
+            assert!(!message.contains(&"x".repeat(65)), "{arguments:?}");
+            let structured = structured_startup_error(&error);
+            assert_eq!(structured["error"]["code"], "server_startup_failed");
+        }
     }
 }

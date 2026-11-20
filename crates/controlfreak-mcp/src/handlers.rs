@@ -4,6 +4,7 @@ use controlfreak_core::{
 };
 
 use super::observations::{resolve_display, resolve_observation};
+use super::profile::Profile;
 use super::requests::{ActionStep, RunActionsInput};
 use std::time::{Duration, Instant};
 
@@ -457,7 +458,10 @@ pub(super) async fn call_wait_for_text(
     }
 }
 
-pub(super) fn prepare_click_text(arguments: Option<JsonObject>) -> PreparedInput {
+pub(super) fn prepare_click_text(
+    arguments: Option<JsonObject>,
+    _profile: &Profile,
+) -> PreparedInput {
     let input = parse_input::<ClickTextInput>(arguments)?;
     let exact_match = input.exact_match().map_err(|error| refuse(&error))?;
     let action = json!({
@@ -503,7 +507,10 @@ pub(super) fn prepare_click_text(arguments: Option<JsonObject>) -> PreparedInput
     }))
 }
 
-pub(super) fn prepare_move_mouse(arguments: Option<JsonObject>) -> PreparedInput {
+pub(super) fn prepare_move_mouse(
+    arguments: Option<JsonObject>,
+    _profile: &Profile,
+) -> PreparedInput {
     let input = parse_input::<MoveMouseInput>(arguments)?;
     let target = input.pointer_target().map_err(|error| refuse(&error))?;
     let duration_ms = input.duration_ms;
@@ -536,7 +543,10 @@ pub(super) fn prepare_move_mouse(arguments: Option<JsonObject>) -> PreparedInput
     }))
 }
 
-pub(super) fn prepare_click_mouse(arguments: Option<JsonObject>) -> PreparedInput {
+pub(super) fn prepare_click_mouse(
+    arguments: Option<JsonObject>,
+    _profile: &Profile,
+) -> PreparedInput {
     let input = parse_input::<ClickMouseInput>(arguments)?;
     let target = input.pointer_target().map_err(|error| refuse(&error))?;
     let button = input.button;
@@ -581,7 +591,10 @@ pub(super) fn prepare_click_mouse(arguments: Option<JsonObject>) -> PreparedInpu
     }))
 }
 
-pub(super) fn prepare_drag_mouse(arguments: Option<JsonObject>) -> PreparedInput {
+pub(super) fn prepare_drag_mouse(
+    arguments: Option<JsonObject>,
+    _profile: &Profile,
+) -> PreparedInput {
     let input = parse_input::<DragMouseInput>(arguments)?;
     let (start, end) = input.pointer_targets().map_err(|error| refuse(&error))?;
     let action = json!({
@@ -661,7 +674,10 @@ pub(super) async fn call_list_virtual_desktops(
     }
 }
 
-pub(super) fn prepare_switch_virtual_desktop(arguments: Option<JsonObject>) -> PreparedInput {
+pub(super) fn prepare_switch_virtual_desktop(
+    arguments: Option<JsonObject>,
+    _profile: &Profile,
+) -> PreparedInput {
     let input = parse_input::<SwitchVirtualDesktopInput>(arguments)?;
     let observation = input
         .observation
@@ -693,7 +709,10 @@ pub(super) fn prepare_switch_virtual_desktop(arguments: Option<JsonObject>) -> P
     }))
 }
 
-pub(super) fn prepare_focus_window(arguments: Option<JsonObject>) -> PreparedInput {
+pub(super) fn prepare_focus_window(
+    arguments: Option<JsonObject>,
+    _profile: &Profile,
+) -> PreparedInput {
     let input = parse_input::<FocusWindowInput>(arguments)?;
     let window_id = input.window_id().map_err(|error| refuse(&error))?;
     let observation = input
@@ -768,7 +787,10 @@ pub(super) async fn call_wait_for_window(
     }
 }
 
-pub(super) fn prepare_press_keys(arguments: Option<JsonObject>) -> PreparedInput {
+pub(super) fn prepare_press_keys(
+    arguments: Option<JsonObject>,
+    _profile: &Profile,
+) -> PreparedInput {
     let input = parse_input::<PressKeysInput>(arguments)?;
     let action_keys = input.keys.clone();
     let request = KeyChordRequest {
@@ -800,7 +822,10 @@ pub(super) fn prepare_press_keys(arguments: Option<JsonObject>) -> PreparedInput
     }))
 }
 
-pub(super) fn prepare_type_text(arguments: Option<JsonObject>) -> PreparedInput {
+pub(super) fn prepare_type_text(
+    arguments: Option<JsonObject>,
+    _profile: &Profile,
+) -> PreparedInput {
     let input = parse_input::<TypeTextInput>(arguments)?;
     controlfreak_core::validate_text_timeout(input.timeout_ms).map_err(|error| refuse(&error))?;
     let text_length = input.text.encode_utf16().count();
@@ -834,7 +859,10 @@ pub(super) fn prepare_type_text(arguments: Option<JsonObject>) -> PreparedInput 
     }))
 }
 
-pub(super) fn prepare_scroll_mouse(arguments: Option<JsonObject>) -> PreparedInput {
+pub(super) fn prepare_scroll_mouse(
+    arguments: Option<JsonObject>,
+    _profile: &Profile,
+) -> PreparedInput {
     let input = parse_input::<ScrollMouseInput>(arguments)?;
     let target = input.pointer_target().map_err(|error| refuse(&error))?;
     let delta_x = input.delta_x;
@@ -913,11 +941,29 @@ where
 /// Runs validated steps in order on one target, stopping at the first failure. Each step uses
 /// the same backend path, target checks, and cleanup as the matching single-action tool;
 /// only the last step captures the requested observation.
-pub(super) fn prepare_run_actions(arguments: Option<JsonObject>) -> PreparedInput {
+pub(super) fn prepare_run_actions(
+    arguments: Option<JsonObject>,
+    profile: &Profile,
+) -> PreparedInput {
     let input = parse_input::<RunActionsInput>(arguments)?;
     // Every step is checked here, before the lease, so a malformed later step neither strands
     // input from earlier steps nor reserves the desktop.
     let steps = input.validated_steps().map_err(|error| refuse(&error))?;
+    // A step runs the same input as its single tool, so a batch must not reach a tool the
+    // profile hides. The whole batch is refused before any step sends input.
+    for (index, step) in steps.iter().enumerate() {
+        if let Some(tool) = step.tool()
+            && !profile.serves_tool(tool)
+        {
+            return Err(refuse(&PlatformError::InvalidArgument {
+                argument: format!("steps[{index}].action"),
+                reason: format!(
+                    "a {} step needs the {tool} tool, which this server's tool profile does not serve; no step was run",
+                    step.kind()
+                ),
+            }));
+        }
+    }
     let final_observation: ObservationOptions = input.observation.into();
     let target_ref = input.target_ref;
     Ok(run_with_lease(move |backend, operation_lease| async move {

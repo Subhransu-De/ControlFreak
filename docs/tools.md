@@ -27,7 +27,7 @@ desktop and run inside a [control session](sessions.md).
 | `capture_visual_baseline` | Observe | Save how a region looks now, for a later wait. |
 | `wait_for_change_since` | Observe | Wait until a region differs from its baseline and settles. |
 | `wait_for_visual_change` | Observe | Wait until a region changes from how it looks now and settles. |
-| `get_server_status` | Observe | Version and `build` identity, privileges, DPI awareness, session and stop state, input admission and the recovery step after a stop, recent operations. |
+| `get_server_status` | Observe | Version and `build` identity, privileges, DPI awareness, session and stop state, input admission and the recovery step after a stop, the tool profile, recent operations. |
 | `begin_control_session` | Session | Reserve the desktop for one approved window. |
 | `end_control_session` | Session | Release the desktop after pending actions finish. Reports `closed`, `closing` or `not_owned`. |
 | `stop_desktop_work` | Session | Emergency stop: cancel all desktop work and close input until the server restarts. |
@@ -41,6 +41,16 @@ desktop and run inside a [control session](sessions.md).
 | `click_text` | Input | Click the unique OCR text that matches, at the matched words. |
 | `switch_virtual_desktop` | Input | Switch one or more virtual desktops (`steps`) left or right. |
 | `run_actions` | Input | Up to 16 clicks, scrolls, keys, text and wait steps in one call. |
+
+## Tool profiles
+
+The server can start with fewer tools: `--profile observe` serves only the tools of kind Observe above plus `end_control_session` and `stop_desktop_work`, and `--tools a,b,c` serves only the named tools. See [Restrict the tools](install.md#restrict-the-tools) for the flags and client examples.
+
+- `tools/list` lists only the served tools, and `tools/call` accepts exactly those. A hidden tool is refused with the same `invalid_arguments` error as a tool that does not exist (`unknown ControlFreak tool '<name>'`), before any session, lock or indicator.
+- `get_server_status`, `end_control_session` and `stop_desktop_work` are served in every profile.
+- `run_actions` checks every step before the first one runs: a click step needs `click_mouse`, a scroll step `scroll_mouse`, a `type_text` step `type_text` and a `press_keys` step `press_keys`. A step whose tool is hidden refuses the whole batch with `invalid_argument` and `status: "not_started"`. A `wait` step needs no tool.
+- `get_server_status` reports `profile`: `name` is `full` or `observe`, and `tool_allowlist` is the `--tools` list in tool-list order, or `null`.
+- The server's MCP instructions add one sentence when a profile hides tools.
 
 ## Targets
 
@@ -214,7 +224,7 @@ A character outside the Basic Multilingual Plane, such as an emoji, is two UTF-1
 
 `run_actions` runs up to 16 `click`, `scroll`, `type_text` and `press_keys` steps on one target:
 
-- All step arguments are checked before the first step. One bad step refuses the whole batch.
+- All step arguments are checked before the first step. One bad step refuses the whole batch. So does a step whose tool the [tool profile](#tool-profiles) hides.
 - Each step gets the same target checks as the single tool.
 - The batch stops at the first failure. `action.steps` reports each step as `completed`,
   `failed` or `skipped`.

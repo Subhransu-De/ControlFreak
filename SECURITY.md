@@ -18,6 +18,12 @@ ControlFreak deliberately exposes no application-launch, shell, filesystem, clip
 network, or elevation tool. That is a tool-surface boundary rather than a security sandbox: keyboard
 input can still reach functionality exposed by an already-running desktop application.
 
+## Tool profiles
+
+`--profile observe` and `--tools` narrow the tools a server serves (see [docs/install.md](docs/install.md#restrict-the-tools)). Discovery, dispatch and `run_actions` steps all check the same profile, so a hidden tool cannot be called by name or through a batch, and is refused before any session, desktop lock or indicator. A malformed profile flag stops the server at startup; it never serves every tool instead. No tool changes the profile: only the client's launch arguments do.
+
+A profile narrows the MCP tool surface. It is not a sandbox. The observe profile still captures the screen and runs OCR, so an agent can read anything visible, with the same privacy rules as any other capture (see [PRIVACY.md](PRIVACY.md)). A profile that serves `press_keys` or `type_text` can still operate any application that the approved window can reach, and the profile does not limit other tools that the MCP client offers. Anyone who can edit the client's configuration can remove the flags.
+
 ## Process integrity and elevation
 
 The optional Windows setup program and its separate `controlfreak-installer.exe` utility edit only
