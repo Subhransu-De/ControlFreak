@@ -47,10 +47,9 @@ approved window.
 
 All of this is in memory and is gone when the server exits:
 
-- Up to 16 visual baselines, each kept for at most 5 minutes, for the visual-change waits.
-- The geometry of up to 64 recent screenshots (position and size only, no pixels), each kept for
-  at most 5 minutes, so the client can click a point in a screenshot.
-- Target references for recently listed windows, each kept for at most 5 minutes.
+- Up to 16 visual baselines, for the visual-change waits. Each holds screen pixels and is removed from memory 5 minutes after it was captured, even if the server is idle. A `wait_for_change_since` call that started before then keeps the baseline until it ends, at most 30 seconds later.
+- The geometry of up to 64 recent screenshots (position and size only, no pixels), so the client can click a point in a screenshot. Each one cannot be used after 5 minutes and is removed at the next screenshot.
+- Target references for recently listed windows. Each one cannot be used 5 minutes after the window was last observed and is removed the next time the server observes windows.
 - The timings and status of the last 32 tool calls, for `get_server_status`.
 
 The server writes diagnostics to standard error: startup errors and one line per finished tool

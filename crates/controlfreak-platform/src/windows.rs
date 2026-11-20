@@ -5,7 +5,7 @@ use std::{
     mem::size_of,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -59,6 +59,7 @@ use windows::core::BOOL;
 mod actions;
 mod activation;
 mod activation_helper;
+mod baselines;
 mod ocr;
 mod target;
 pub(crate) use ocr::serve_ocr_helper;
@@ -166,11 +167,18 @@ const MAX_OCR_RESULTS: u32 = 100;
 
 #[derive(Clone)]
 struct StoredVisualBaseline {
-    id: String,
     display: DisplayInfo,
     bounds: DisplayBounds,
-    frame: Vec<u8>,
-    created_at: Instant,
+    /// Shared with a running wait, so a lookup does not copy the pixels.
+    frame: Arc<[u8]>,
+}
+
+fn visual_baseline_store() -> baselines::BaselineStore<StoredVisualBaseline> {
+    baselines::BaselineStore::new(
+        Duration::from_millis(u64::from(VISUAL_BASELINE_TTL_MS)),
+        MAX_VISUAL_BASELINES,
+        Arc::new(baselines::SystemClock),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -188,7 +196,7 @@ pub struct Backend {
     input_lock: Mutex<()>,
     /// Counts completed input-lock holders, so slow observations can detect intervening input.
     input_generation: AtomicU64,
-    visual_baselines: Mutex<Vec<StoredVisualBaseline>>,
+    visual_baselines: baselines::BaselineStore<StoredVisualBaseline>,
     next_baseline_id: AtomicU64,
     ocr_helper: Option<OcrHelperCommand>,
     ocr_helpers: OcrHelperPool,
@@ -353,7 +361,7 @@ impl Backend {
         Self {
             input_lock: Mutex::new(()),
             input_generation: AtomicU64::new(0),
-            visual_baselines: Mutex::new(Vec::new()),
+            visual_baselines: visual_baseline_store(),
             next_baseline_id: AtomicU64::new(1),
             ocr_helper: None,
             ocr_helpers: OcrHelperPool::default(),
@@ -366,7 +374,7 @@ impl Backend {
         Self {
             input_lock: Mutex::new(()),
             input_generation: AtomicU64::new(0),
-            visual_baselines: Mutex::new(Vec::new()),
+            visual_baselines: visual_baseline_store(),
             next_baseline_id: AtomicU64::new(1),
             ocr_helper: None,
             ocr_helpers: OcrHelperPool::default(),
@@ -382,7 +390,7 @@ impl Backend {
         Self {
             input_lock: Mutex::new(()),
             input_generation: AtomicU64::new(0),
-            visual_baselines: Mutex::new(Vec::new()),
+            visual_baselines: visual_baseline_store(),
             next_baseline_id: AtomicU64::new(1),
             ocr_helper: Some(command),
             ocr_helpers: OcrHelperPool::default(),
@@ -625,25 +633,19 @@ impl DisplayBackend for Backend {
             self.next_baseline_id.fetch_add(1, Ordering::Relaxed)
         );
         let fingerprint = frame_fingerprint(&frame);
-        let created_at = Instant::now();
-        let mut baselines = self
-            .visual_baselines
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        baselines.retain(|baseline| {
-            created_at.saturating_duration_since(baseline.created_at)
-                < Duration::from_millis(u64::from(VISUAL_BASELINE_TTL_MS))
-        });
-        if baselines.len() >= MAX_VISUAL_BASELINES {
-            baselines.remove(0);
-        }
-        baselines.push(StoredVisualBaseline {
-            id: id.clone(),
-            display: display.clone(),
-            bounds,
-            frame,
-            created_at,
-        });
+        self.visual_baselines
+            .insert(
+                id.clone(),
+                StoredVisualBaseline {
+                    display: display.clone(),
+                    bounds,
+                    frame: frame.into(),
+                },
+            )
+            .map_err(|error| PlatformError::OperationFailed {
+                operation: "capture_visual_baseline".to_owned(),
+                reason: format!("the baseline expiry thread could not start: {error}"),
+            })?;
         Ok(VisualBaseline {
             baseline_id: id,
             display,
@@ -674,25 +676,13 @@ impl DisplayBackend for Backend {
             request.stable_ms,
             request.difference_threshold,
         )?;
-        let now = Instant::now();
-        let baseline = {
-            let mut baselines = self
-                .visual_baselines
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            baselines.retain(|baseline| {
-                now.saturating_duration_since(baseline.created_at)
-                    < Duration::from_millis(u64::from(VISUAL_BASELINE_TTL_MS))
-            });
-            baselines
-                .iter()
-                .find(|baseline| baseline.id == request.baseline_id)
-                .cloned()
-        }
-        .ok_or_else(|| PlatformError::InvalidArgument {
-            argument: "baseline_id".to_owned(),
-            reason: "baseline was not found or has expired; capture a new baseline".to_owned(),
-        })?;
+        let baseline = self
+            .visual_baselines
+            .get(&request.baseline_id)
+            .ok_or_else(|| PlatformError::InvalidArgument {
+                argument: "baseline_id".to_owned(),
+                reason: "baseline was not found or has expired; capture a new baseline".to_owned(),
+            })?;
         ensure_dpi_awareness()?;
         ensure_baseline_display(&baseline.display, enumerate_displays()?.as_slice())?;
         let result = wait_for_change(
