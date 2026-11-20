@@ -548,6 +548,9 @@ pub(crate) enum StopStatus {
     Ready,
     Draining,
     Stopped,
+    /// The user's own stop, draining or drained, which the user may reverse (see
+    /// `StopController::user_may_rearm`).
+    ByUser,
     CleanupFailed,
 }
 
@@ -571,6 +574,9 @@ pub(crate) enum TabKind {
     HandedBack {
         after_stop: bool,
     },
+    /// The user stopped the agent and can let it use the PC again with the Allow again button.
+    /// It stays until the user does, or until the server exits.
+    Stopped,
     /// An observation tool is reading the screen. No session is owned and no input is sent.
     Reading,
 }
@@ -597,9 +603,10 @@ pub(crate) struct TabInputs {
 
 /// Decides what the tab shows. Precedence, highest first: input may be held (until the server
 /// exits); stopping (at once on Esc or a client stop); working (at once when an action starts);
-/// waiting (only after [`WAITING_DELAY`] without an action); handed back (after a session ends,
-/// for [`HANDBACK`], cleared at once by a new session); reading the screen (an observation with
-/// no session, for [`READING`]).
+/// waiting (only after [`WAITING_DELAY`] without an action); stopped by the user (after the
+/// session ends, until the user allows input again); handed back (after a session ends, for
+/// [`HANDBACK`], cleared at once by a new session); reading the screen (an observation with no
+/// session, for [`READING`]).
 #[derive(Debug, Default)]
 pub(crate) struct TabModel {
     session_started: Option<Instant>,
@@ -635,7 +642,10 @@ impl TabModel {
             }
             self.was_active = true;
             self.handback = None;
-            if matches!(input.stop, StopStatus::Draining | StopStatus::Stopped) {
+            if matches!(
+                input.stop,
+                StopStatus::Draining | StopStatus::Stopped | StopStatus::ByUser
+            ) {
                 return Some(TabView {
                     kind: TabKind::Stopping,
                     admin,
@@ -661,6 +671,20 @@ impl TabModel {
                 },
                 admin,
                 expanded,
+            });
+        }
+        if input.stop == StopStatus::ByUser {
+            // The user's stop stays on screen with its Allow again button, instead of a handback
+            // that would disappear and leave no way back but a restart.
+            if self.was_active {
+                self.was_active = false;
+                self.last_session_end = Some(now);
+            }
+            self.handback = None;
+            return Some(TabView {
+                kind: TabKind::Stopped,
+                admin: false,
+                expanded: true,
             });
         }
         if self.was_active {
@@ -764,6 +788,14 @@ const WAITING_STATUS: &str = "ControlFreak is waiting for the next action";
 const READING_TITLE: &str = "ControlFreak is reading the screen";
 const READING_STATUS: &str = "It is not using the keyboard or mouse";
 const HELD_TITLE: &str = "A key or mouse button may still be held";
+const STOPPED_TITLE: &str = "You stopped the agent";
+/// The Allow again button takes only a mouse, touch or pen. Screen-reader and voice-control users
+/// hear this card (the window name and a system alert) and restart the agent app instead.
+const STOPPED_STEPS: [&str; 2] = [
+    // A no-break space keeps the button's name on one line.
+    "Press Allow\u{a0}again with a mouse, touch or pen to let ControlFreak act.",
+    "Using a screen reader or voice control? Restart your agent app instead.",
+];
 const CHIP: &str = "Administrator";
 
 fn content(view: TabView) -> Content {
@@ -781,11 +813,13 @@ fn content(view: TabView) -> Content {
             Badge::Pointer { filled: true },
             true,
         ),
+        // While the agent waits, Esc belongs to the application: the hook passes it through, so
+        // the tab does not offer it. The Stop button still works.
         TabKind::Waiting => plain(
             TITLE_ACTIVE,
             WAITING_STATUS,
             Badge::Pointer { filled: false },
-            true,
+            false,
         ),
         TabKind::Stopping => plain(
             "Stopping desktop control",
@@ -813,6 +847,13 @@ fn content(view: TabView) -> Content {
             Badge::Check,
             false,
         ),
+        TabKind::Stopped => Content {
+            title: STOPPED_TITLE,
+            status: "",
+            steps: &STOPPED_STEPS,
+            badge: Badge::Stop,
+            esc: false,
+        },
         // No session, so no Esc: reading never swallows a key.
         TabKind::Reading => plain(
             READING_TITLE,
@@ -860,6 +901,13 @@ fn tones(view: TabView, palette: &Palette) -> Tones {
             AMBER,
             AMBER_INK,
             AMBER.mix(palette.surface, 0.40),
+        ),
+        // Nothing owns the PC any more, so no lamp; the stop square stays.
+        TabKind::Stopped => (
+            None,
+            palette.ink,
+            STOP_INK,
+            STOP_GREY.mix(palette.surface, 0.40),
         ),
         // Neither owns the PC: no lamp, and the neutral grey says nothing is being controlled.
         TabKind::HandedBack { .. } => (
@@ -1197,6 +1245,11 @@ impl Painter {
         self.esc_hint.replace(offered) != offered
     }
 
+    /// Whether tabs may offer Esc now.
+    pub(crate) fn esc_hint_offered(&self) -> bool {
+        self.esc_hint.get()
+    }
+
     /// Whether the bundled Inter loaded; otherwise Segoe UI stands in.
     #[cfg(test)]
     fn uses_inter(&self) -> bool {
@@ -1515,20 +1568,15 @@ impl Painter {
         let chip_width = chip
             .as_ref()
             .map_or(0.0, |chip| (chip.width + dip(12.0)).round());
-        // One row carries the status in the slot after the title. Working and waiting reserve the
-        // wider of their two statuses, so the row never changes width between them.
+        // One row carries the status in the slot after the title. Working shows the stop key and
+        // waiting does not, so the tab changes width between them: the change marks when Esc
+        // stops the agent.
         let attribution = if compact {
             Some(self.text(words.status, REGULAR, 14.0 * t, None)?)
         } else {
             None
         };
-        let mut attribution_slot = attribution.as_ref().map_or(0.0, |text| text.width);
-        if compact && words.esc {
-            for other in [WORKING_STATUS, WAITING_STATUS] {
-                attribution_slot =
-                    attribution_slot.max(self.text(other, REGULAR, 14.0 * t, None)?.width);
-            }
-        }
+        let attribution_slot = attribution.as_ref().map_or(0.0, |text| text.width);
         let held = view.kind == TabKind::InputHeld;
         let full_press = self.text("Press", MEDIUM, 14.0 * t, None)?;
         let key_text = self.text("Esc", SEMIBOLD, 13.0 * t, None)?;
@@ -1557,12 +1605,6 @@ impl Painter {
                 .map_or(0.0, |_| dip(10.0) + attribution_slot);
         if !compact && !held {
             column = column.max(self.text(words.status, REGULAR, 14.0 * t, None)?.width);
-            // Working and waiting share one width so the tab never resizes between them.
-            if words.esc {
-                for other in [WORKING_STATUS, WAITING_STATUS] {
-                    column = column.max(self.text(other, REGULAR, 14.0 * t, None)?.width);
-                }
-            }
         }
         if !words.steps.is_empty() {
             column = column.max(DETAIL_WIDTH * t);
@@ -2589,13 +2631,14 @@ mod tests {
         }
     }
 
-    const ALL_KINDS: [TabKind; 7] = [
+    const ALL_KINDS: [TabKind; 8] = [
         TabKind::Working,
         TabKind::Waiting,
         TabKind::Stopping,
         TabKind::InputHeld,
         TabKind::HandedBack { after_stop: false },
         TabKind::HandedBack { after_stop: true },
+        TabKind::Stopped,
         TabKind::Reading,
     ];
 
@@ -3125,6 +3168,77 @@ mod tests {
     }
 
     #[test]
+    fn the_users_stop_stays_on_screen_until_they_allow_input_again() {
+        let start = Instant::now();
+        let mut model = TabModel::default();
+        model.view(start, input(true, StopStatus::Ready, Activity::Working));
+        let stopping = model
+            .view(
+                at(start, 100),
+                input(true, StopStatus::ByUser, Activity::Idle),
+            )
+            .unwrap();
+        assert_eq!(stopping.kind, TabKind::Stopping, "while the session drains");
+        let stopped = input(false, StopStatus::ByUser, Activity::Idle);
+        for after in [200, 2_800, 600_000] {
+            let view = model.view(at(start, after), stopped).unwrap();
+            assert_eq!(view.kind, TabKind::Stopped, "still there after {after} ms");
+            assert!(view.expanded && !view.admin);
+        }
+        // A screen read does not hide it.
+        let read = TabInputs {
+            reading: true,
+            ..stopped
+        };
+        assert_eq!(
+            model.view(at(start, 600_100), read).unwrap().kind,
+            TabKind::Stopped
+        );
+        // Allowed again: the tab goes dormant at once, with no handback.
+        assert_eq!(
+            model.view(
+                at(start, 600_200),
+                input(false, StopStatus::Ready, Activity::Idle)
+            ),
+            None
+        );
+        // The next session starts as any session does.
+        let next = model
+            .view(
+                at(start, 600_300),
+                input(true, StopStatus::Ready, Activity::Working),
+            )
+            .unwrap();
+        assert_eq!(next.kind, TabKind::Working);
+        // A release that could not be confirmed outranks it.
+        let held = input(false, StopStatus::CleanupFailed, Activity::Idle);
+        assert_eq!(
+            model.view(at(start, 600_400), held).unwrap().kind,
+            TabKind::InputHeld
+        );
+    }
+
+    #[test]
+    fn the_stopped_card_says_how_to_allow_input_and_who_cannot() {
+        let view = TabView {
+            kind: TabKind::Stopped,
+            admin: false,
+            expanded: true,
+        };
+        let words = spoken(view);
+        assert!(words.starts_with("You stopped the agent."), "{words}");
+        assert!(words.contains("Press Allow\u{a0}again with a mouse, touch or pen"));
+        assert!(words.contains("screen reader or voice control"));
+        assert!(words.contains("Restart your agent app"));
+        assert!(!words.contains("Esc"), "nothing to stop: {words}");
+        let painter = Painter::new().unwrap();
+        let tab = painter
+            .paint(view, &Palette::STANDARD, 96, 1920, 1.0)
+            .unwrap();
+        assert_eq!(tab.spoken, words, "the window name is the painted words");
+    }
+
+    #[test]
     fn reading_the_screen_shows_briefly_without_a_session_and_yields_to_everything() {
         let start = Instant::now();
         let mut model = TabModel::default();
@@ -3221,10 +3335,8 @@ mod tests {
             });
             let all = format!("{} {} {:?}", words.title, words.status, words.steps);
             assert!(all.contains("ControlFreak"), "{kind:?}");
-            assert_eq!(
-                words.esc,
-                matches!(kind, TabKind::Working | TabKind::Waiting)
-            );
+            // Esc stops only while the agent acts; while it waits, Esc is the application's.
+            assert_eq!(words.esc, kind == TabKind::Working, "{kind:?}");
         }
     }
 
@@ -3300,14 +3412,17 @@ mod tests {
                     .layout(view, &Palette::STANDARD, dpi, 3840, 1.0)
                     .unwrap();
                 let (_, top, _, bottom) = layout.body;
-                let key = layout.esc.as_ref().unwrap().key;
+                // Only working shows the keycap; waiting has none.
+                let key = layout.esc.as_ref().map(|esc| esc.key);
+                assert_eq!(key.is_some(), kind == TabKind::Working);
+                let key = key.map(|key| ("keycap", (key.1, key.3)));
                 let badge = (layout.badge.1, layout.badge.1 + layout.badge_size);
                 let chip = layout
                     .chip
                     .as_ref()
                     .map(|(rect, _)| ("chip", (rect.1, rect.3)));
-                let parts = [("keycap", (key.1, key.3)), ("badge", badge)];
-                for (name, (y0, y1)) in parts.into_iter().chain(chip) {
+                let parts = key.into_iter().chain([("badge", badge)]);
+                for (name, (y0, y1)) in parts.chain(chip) {
                     let (above, below) = (y0 - top, bottom - y1);
                     assert!(
                         (above - below).abs() <= 1.0,
@@ -3746,7 +3861,10 @@ mod tests {
                         opaque > tab.surface.pixels().len() / 3,
                         "{view:?} paints an opaque body"
                     );
-                    if !matches!(kind, TabKind::HandedBack { .. } | TabKind::Reading) {
+                    if !matches!(
+                        kind,
+                        TabKind::HandedBack { .. } | TabKind::Stopped | TabKind::Reading
+                    ) {
                         // The tab's own lamp segment is opaque edge to edge, so it meets the
                         // helper's lamp without a seam.
                         let lamp = if kind == TabKind::InputHeld {
@@ -3762,12 +3880,12 @@ mod tests {
     }
 
     #[test]
-    fn working_and_waiting_share_one_width() {
+    fn only_working_offers_the_stop_key() {
         let painter = Painter::new().unwrap();
         for (expanded, admin) in [(true, false), (false, false), (true, true), (false, true)] {
-            let width = |kind| {
+            let layout = |kind| {
                 painter
-                    .paint(
+                    .layout(
                         TabView {
                             kind,
                             admin,
@@ -3779,9 +3897,15 @@ mod tests {
                         1.0,
                     )
                     .unwrap()
-                    .width
             };
-            assert_eq!(width(TabKind::Working), width(TabKind::Waiting));
+            let working = layout(TabKind::Working);
+            let waiting = layout(TabKind::Waiting);
+            assert!(working.esc.is_some() && working.spoken.contains("Esc to stop"));
+            assert!(
+                waiting.esc.is_none() && !waiting.spoken.contains("Esc"),
+                "expanded {expanded}, admin {admin}: {}",
+                waiting.spoken
+            );
         }
     }
 
@@ -3852,6 +3976,7 @@ mod tests {
             ("held", TabKind::InputHeld),
             ("back", TabKind::HandedBack { after_stop: false }),
             ("back-stopped", TabKind::HandedBack { after_stop: true }),
+            ("stopped", TabKind::Stopped),
             ("reading", TabKind::Reading),
         ];
         let mut cases = Vec::new();
@@ -3862,6 +3987,7 @@ mod tests {
             TabKind::Stopping | TabKind::InputHeld => view.expanded,
             TabKind::HandedBack { after_stop } => !view.admin && view.expanded == after_stop,
             TabKind::Reading => !view.admin && !view.expanded,
+            TabKind::Stopped => !view.admin && view.expanded,
             _ => true,
         };
         for (name, kind) in names {
@@ -3986,7 +4112,8 @@ mod tests {
             .into_iter()
             .map(|(name, tab)| (name, tab.surface))
             .collect();
-        // The Stop button that hangs under the working and waiting tabs, in each of its looks.
+        // The Stop button that hangs under the working and waiting tabs, and Allow again under
+        // the user's stop, in each of their looks.
         for (palette_name, palette) in [("", Palette::STANDARD), ("hc-night-", night)] {
             for (state_name, state) in [
                 ("rest", ButtonState::Rest),
@@ -3995,13 +4122,16 @@ mod tests {
             ] {
                 for dpi in [96, 120, 144] {
                     let size = (scale_px(104.0, dpi), scale_px(32.0, dpi));
-                    let face = painter
-                        .paint_button("Stop agent", state, &palette, dpi, 1.0, size)
-                        .unwrap();
-                    surfaces.push((
-                        format!("{palette_name}stop-button-{state_name}-{dpi}"),
-                        face,
-                    ));
+                    for (button, label) in [("stop", "Stop agent"), ("allow-again", "Allow again")]
+                    {
+                        let face = painter
+                            .paint_button(label, state, &palette, dpi, 1.0, size)
+                            .unwrap();
+                        surfaces.push((
+                            format!("{palette_name}{button}-button-{state_name}-{dpi}"),
+                            face,
+                        ));
+                    }
                 }
             }
         }

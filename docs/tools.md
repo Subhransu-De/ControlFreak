@@ -308,7 +308,7 @@ When an input tool cannot start a session, `error.code` says why:
 | `desktop_in_use` | Another ControlFreak server owns the desktop. `details` has `retry_after_ms`. | Yes |
 | `session_closing` | The previous session is still closing. | Yes |
 | `server_shutting_down` | The server is shutting down. | No |
-| `desktop_work_stopped` | The user stopped control, or a client called `stop_desktop_work`. `details.recovery` says what allows input again: `wait_for_drain`, `restart_client` or `resolve_held_input`. Only the user restarting the server from the MCP client reopens input. See [Getting input back](sessions.md#getting-input-back). | No |
+| `desktop_work_stopped` | The user stopped control, or a client called `stop_desktop_work`. `details.recovery` says what allows input again: `wait_for_drain`, `allow_again`, `restart_client` or `resolve_held_input`. Only the user reopens input: with Allow again on the session tab after their own stop, or by restarting the server from the MCP client. No tool does. See [Getting input back](sessions.md#getting-input-back). | No |
 | `control_environment_unavailable` | The desktop cannot be controlled, for example while it is locked. | No |
 | `desktop_arbitration_unavailable` | Desktop ownership could not be checked. | No |
 

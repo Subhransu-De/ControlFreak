@@ -141,7 +141,7 @@ pub(super) fn end_control_session() -> Contract {
 
 pub(super) fn get_server_status() -> Contract {
     contract(
-        "Return version, uptime, privileges, DPI awareness, indicator health, input_admission, session state, stop_state and recent operations. status describes the server and indicator; input_admission says whether input is accepted. When it is closed, recovery gives the next step: no tool reopens input, only the user restarting the server from the MCP client. stop_reason=user_stop means the user ended control.",
+        "Return version, uptime, privileges, DPI awareness, indicator health, input_admission, session state, stop_state and recent operations. status describes the server and indicator; input_admission says whether input is accepted. When it is closed, recovery gives the next step: no tool reopens input, only the user (Allow again on the session tab after their own stop, or restarting the server from the MCP client). stop_reason=user_stop means the user ended control.",
         object_schema(JsonObject::new(), &[]),
         server_status_output_schema(),
     )
@@ -1263,7 +1263,7 @@ fn recovery_schema() -> Value {
         "type": "object",
         "properties": {
             "actor": { "enum": ["agent", "user"] },
-            "action": { "enum": ["wait_for_drain", "restart_client", "resolve_held_input"] },
+            "action": { "enum": ["wait_for_drain", "allow_again", "restart_client", "resolve_held_input"] },
             "message": { "type": "string" }
         },
         "required": ["actor", "action", "message"],

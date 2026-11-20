@@ -297,7 +297,8 @@ async fn user_stop_keeps_its_own_message() {
         "{message}"
     );
     assert!(message.contains("server restart control"), "{message}");
-    assert_eq!(recovery, controlfreak_core::StopRecovery::RestartClient);
+    assert!(message.contains("press Allow again"), "{message}");
+    assert_eq!(recovery, controlfreak_core::StopRecovery::AllowAgain);
     harness.finish().await;
 }
 

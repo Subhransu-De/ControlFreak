@@ -52,7 +52,8 @@ pub use platform::{
 pub use report::CapabilityReport;
 pub use security::{IntegrityLevel, SecurityContext};
 pub use stop::{
-    Backoff, EscHook, StopController, StopRecovery, StopRegistration, retry_with_backoff,
+    Backoff, EscHook, RearmRefusal, StopController, StopRecovery, StopRegistration, StopSnapshot,
+    retry_with_backoff,
 };
 pub use text_matching::{discover_text, select_text_candidate, validate_text_discovery};
 pub use window::{
