@@ -949,7 +949,7 @@ impl ComparisonCapture {
         })
     }
 
-    pub(super) const fn bounds(&self) -> DisplayBounds {
+    const fn bounds(&self) -> DisplayBounds {
         self.grabber.bounds
     }
 
