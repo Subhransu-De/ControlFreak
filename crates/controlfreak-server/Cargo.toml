@@ -21,5 +21,8 @@ tokio.workspace = true
 [dev-dependencies]
 base64.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+controlfreak-platform = { workspace = true, features = ["packaging-tests"] }
+
 [lints]
 workspace = true

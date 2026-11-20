@@ -67,6 +67,7 @@ struct ContractBackend {
     /// Truncates `list_windows` like the real backend's cap, without hiding windows from
     /// `wait_for_window`.
     list_cap: Mutex<Option<usize>>,
+    dpi_awareness: Mutex<Option<controlfreak_core::DpiAwarenessStatus>>,
 }
 
 impl ContractBackend {
@@ -79,6 +80,7 @@ impl ContractBackend {
             ]),
             click_error: Mutex::new(None),
             list_cap: Mutex::new(None),
+            dpi_awareness: Mutex::new(None),
         })
     }
 
@@ -144,6 +146,9 @@ impl BackendMetadata for ContractBackend {
     }
     fn permissions(&self) -> Vec<controlfreak_core::PermissionDescriptor> {
         vec![]
+    }
+    fn dpi_awareness(&self) -> Option<controlfreak_core::DpiAwarenessStatus> {
+        self.dpi_awareness.lock().unwrap().clone()
     }
 }
 
@@ -568,6 +573,57 @@ async fn a_pointer_not_placed_is_reported_and_not_retryable() {
     assert_eq!(error["reason"], "pointer_not_placed");
     assert_eq!(error["retryable"], false);
     assert_eq!(result["structuredContent"]["retry_action"], false);
+    harness.finish().await;
+}
+
+/// A server Windows does not let run per-monitor DPI aware names the cause on every refused
+/// action and in `get_server_status`, instead of failing clicks with `pointer_not_placed`.
+#[tokio::test]
+async fn a_server_without_per_monitor_dpi_awareness_says_so() {
+    let backend = ContractBackend::new();
+    let reason = "Windows runs ControlFreak with DPI awareness 'system_aware', not per-monitor";
+    *backend.dpi_awareness.lock().unwrap() = Some(controlfreak_core::DpiAwarenessStatus {
+        awareness: controlfreak_core::DpiAwareness::SystemAware,
+        reason: Some(reason.to_owned()),
+    });
+    *backend.click_error.lock().unwrap() = Some(PlatformError::failed(
+        controlfreak_core::FailureCause::DpiAwarenessUnsupported,
+        "SetProcessDpiAwarenessContext",
+        reason,
+    ));
+    let mut harness = harness(backend.clone()).await;
+    let result = call(
+        &mut harness,
+        CLICK_MOUSE,
+        json!({"target_ref": "target-00000000-0000-0000-0000-000000000001", "x": 1, "y": 1}),
+    )
+    .await;
+    let error = &result["structuredContent"]["error"];
+    assert_eq!(error["code"], "platform_operation_failed", "{result}");
+    assert_eq!(error["reason"], "dpi_awareness_unsupported");
+    assert_eq!(error["retryable"], false);
+    assert!(
+        error["message"].as_str().unwrap().contains("system_aware"),
+        "{result}"
+    );
+
+    let status = call(&mut harness, GET_SERVER_STATUS, json!({})).await;
+    let status = &status["structuredContent"];
+    assert_eq!(status["status"], "degraded", "{status}");
+    assert_eq!(status["dpi_awareness"]["awareness"], "system_aware");
+    assert_eq!(status["dpi_awareness"]["reason"], reason);
+
+    *backend.dpi_awareness.lock().unwrap() = Some(controlfreak_core::DpiAwarenessStatus {
+        awareness: controlfreak_core::DpiAwareness::PerMonitorV2,
+        reason: None,
+    });
+    let status = call(&mut harness, GET_SERVER_STATUS, json!({})).await;
+    let status = &status["structuredContent"];
+    assert_eq!(status["status"], "ready", "{status}");
+    assert_eq!(
+        status["dpi_awareness"],
+        json!({"awareness": "per_monitor_v2", "reason": null})
+    );
     harness.finish().await;
 }
 

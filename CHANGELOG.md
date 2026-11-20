@@ -18,6 +18,7 @@ versioned section and uses that section for the corresponding GitHub Release not
 - While you hold Shift, Ctrl, Alt or Win, key presses, typing, clicks, drags, scrolls and desktop switches are now refused with `key_held` before anything is sent. Before, Windows combined your key with the agent's input, so Delete could arrive as Shift+Delete or a click as a Ctrl-click. Release the key and the agent can retry.
 - A visual baseline, which holds screen pixels, is now removed from memory 5 minutes after `capture_visual_baseline`, as PRIVACY.md says. Before, an idle server kept the last baseline until the next baseline call. Expired IDs are refused as before.
 - Cancelling a `begin_control_session` that renews a live session no longer ends that session. It keeps its hold and deadline. A cancelled first begin still releases the desktop.
+- ControlFreak no longer treats a server that Windows keeps DPI unaware or system aware as per-monitor aware. On a scaled display that made Windows scale coordinates, and since 0.2.3 every click failed with `pointer_not_placed`. `controlfreak.exe` now declares per-monitor v2 awareness in its manifest. If a compatibility override still changes it, captures and input fail with `dpi_awareness_unsupported`, and `get_server_status` reports `degraded` with the awareness in effect. Checked on Windows with a DPI-unaware compatibility layer, but not on a scaled display.
 
 ### Added
 

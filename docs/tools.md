@@ -26,7 +26,7 @@ desktop and run inside a [control session](sessions.md).
 | `capture_visual_baseline` | Observe | Save how a region looks now, for a later wait. |
 | `wait_for_change_since` | Observe | Wait until a region differs from its baseline and settles. |
 | `wait_for_visual_change` | Observe | Wait until a region changes from how it looks now and settles. |
-| `get_server_status` | Observe | Version, privileges, session and stop state, input admission and the recovery step after a stop, recent operations. |
+| `get_server_status` | Observe | Version, privileges, DPI awareness, session and stop state, input admission and the recovery step after a stop, recent operations. |
 | `begin_control_session` | Session | Reserve the desktop for one approved window. |
 | `end_control_session` | Session | Release the desktop after pending actions finish. Reports `closed`, `closing` or `not_owned`. |
 | `stop_desktop_work` | Session | Emergency stop: cancel all desktop work and close input until the server restarts. |
@@ -98,6 +98,7 @@ desktop and run inside a [control session](sessions.md).
 - Observation IDs keep geometry only, expire after 5 minutes, and at most 64 are kept.
 - An image of one window (`capture_window`) maps points only while that window is unchanged. If it moved, resized or closed, its reference changed, and the point is refused with `invalid_argument`. Capture the window again.
 - Screenshots are downscaled by area averaging (`resize_method: area_average`).
+- Physical pixels need a per-monitor DPI aware server. `controlfreak.exe` declares per-monitor v2 in its manifest; per-monitor v1 is also accepted. If Windows keeps the server DPI unaware or system aware, for example through a high DPI compatibility override on the executable, it would scale coordinates on a scaled display. The server then refuses captures and input with `dpi_awareness_unsupported`, and `get_server_status` reports `status: "degraded"` and `dpi_awareness` with the awareness in effect (`per_monitor_v2`, `per_monitor`, `system_aware`, `unaware` or `unknown`) and the reason. Remove the override and restart the server.
 
 ## Waiting for the window to settle
 
@@ -223,6 +224,7 @@ Every error also has `error.retryable`. It says whether repeating the same reque
 | `target_not_responding` | The window with keyboard focus stopped answering while text was typed, so typing stopped. Observe it before typing the rest. | No |
 | `desktop_work_stopped` | Admission is closed. | No |
 | `worker_failed` | A worker failed. Observe before recovery. | No |
+| `dpi_awareness_unsupported` | Windows runs the server DPI unaware or system aware, so it would scale coordinates. The message names the awareness. Remove the high DPI compatibility override from `controlfreak.exe` and restart the server (see [Coordinates](#coordinates)). | No |
 | `os_call_failed` | Any other Windows call failure. | No |
 | `backend_unavailable` | The platform backend is missing. | No |
 

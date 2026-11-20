@@ -206,8 +206,13 @@ pub(super) fn call_get_server_status(
         })
         .collect();
     let security_context = backend.security_context();
+    let dpi_awareness = backend.dpi_awareness();
+    // Without per-monitor awareness Windows scales coordinates, so captures and input refuse.
+    let dpi_unusable = dpi_awareness
+        .as_ref()
+        .is_some_and(|status| !status.is_usable());
     Ok(CallToolResult::structured(json!({
-        "status": if safety_indicator.is_failed() { "degraded" } else { "ready" },
+        "status": if safety_indicator.is_failed() || dpi_unusable { "degraded" } else { "ready" },
         "safety_indicator": {
             "status": safety_indicator.status(),
             "reason": safety_indicator.failure_reason(),
@@ -219,6 +224,7 @@ pub(super) fn call_get_server_status(
         "server_elevated": security_context.elevated,
         "windows_integrity_level": security_context.windows_integrity_level,
         "elevated_operation_allowed": security_context.elevated_operation_allowed,
+        "dpi_awareness": dpi_awareness,
         "uptime_ms": u64::try_from(diagnostics.started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "operations_started": diagnostics.next_operation_id.load(Ordering::Relaxed).saturating_sub(1),
         "operations_completed": diagnostics.completed.load(Ordering::Relaxed),

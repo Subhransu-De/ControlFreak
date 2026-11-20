@@ -3,6 +3,7 @@
 mod capability;
 mod desktop;
 mod display;
+mod dpi;
 mod error;
 mod keyboard;
 pub mod limits;
@@ -30,6 +31,7 @@ pub use display::{
     PointerActionResult, SettleOutcome, SettleReport, VisualBaseline, VisualBaselineRequest,
     VisualChangeResult, WaitForChangeSinceRequest, WaitForVisualChangeRequest,
 };
+pub use dpi::{DpiAwareness, DpiAwarenessStatus};
 pub use error::{FailureCause, PlatformError, RefusalCause};
 pub use keyboard::{Key, KeyChordRequest, KeyboardActionResult, TextInputRequest};
 pub use mutation::MutationControl;

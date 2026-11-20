@@ -3,13 +3,14 @@ use serde::{Deserialize, Serialize};
 use crate::{
     CapabilityDescriptor, CapabilityReport, CaptureDisplayRequest, CaptureRegionRequest,
     CaptureWindowRequest, ClickTextRequest, ClickTextResult, DisplayInfo, DisplayScreenshot,
-    FindTextRequest, FindTextResult, FocusWindowRequest, KeyChordRequest, KeyboardActionResult,
-    MouseClickRequest, MouseDragRequest, MouseMoveRequest, MouseScrollRequest, MutationControl,
-    OcrRegionRequest, OcrResult, PermissionDescriptor, PlatformError, PointerActionResult,
-    SecurityContext, TextInputRequest, VirtualDesktopList, VirtualDesktopSwitchRequest,
-    VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest, VisualChangeResult,
-    WaitForChangeSinceRequest, WaitForTextRequest, WaitForTextResult, WaitForVisualChangeRequest,
-    WaitForWindowRequest, WindowFocusResult, WindowList, WindowScreenshot, WindowWaitResult,
+    DpiAwarenessStatus, FindTextRequest, FindTextResult, FocusWindowRequest, KeyChordRequest,
+    KeyboardActionResult, MouseClickRequest, MouseDragRequest, MouseMoveRequest,
+    MouseScrollRequest, MutationControl, OcrRegionRequest, OcrResult, PermissionDescriptor,
+    PlatformError, PointerActionResult, SecurityContext, TextInputRequest, VirtualDesktopList,
+    VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest,
+    VisualChangeResult, WaitForChangeSinceRequest, WaitForTextRequest, WaitForTextResult,
+    WaitForVisualChangeRequest, WaitForWindowRequest, WindowFocusResult, WindowList,
+    WindowScreenshot, WindowWaitResult,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +54,11 @@ pub trait BackendMetadata: Send + Sync + 'static {
 
     fn security_context(&self) -> SecurityContext {
         SecurityContext::default()
+    }
+
+    /// The DPI awareness the server runs with, or `None` when the backend has no such notion.
+    fn dpi_awareness(&self) -> Option<DpiAwarenessStatus> {
+        None
     }
 
     fn report(&self) -> CapabilityReport {

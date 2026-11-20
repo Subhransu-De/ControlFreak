@@ -321,7 +321,7 @@ fn schemas_describe_idle_busy_and_stopped_server_status() {
         "session": null,
         "version": "1", "instance_id": "i", "process_id": 1,
         "server_elevated": false, "windows_integrity_level": "medium",
-        "elevated_operation_allowed": false, "uptime_ms": 1,
+        "elevated_operation_allowed": false, "dpi_awareness": null, "uptime_ms": 1,
         "operations_started": 0, "operations_completed": 0, "operations_failed": 0,
         "recent_operations": [],
         "backend": {"platform": "windows", "display_server": "dwm", "backend_id": "b"},
@@ -349,6 +349,28 @@ fn schemas_describe_idle_busy_and_stopped_server_status() {
         );
         assert!(validator.is_valid(&stopped), "{stopped}");
     }
+    for awareness in [
+        "per_monitor_v2",
+        "per_monitor",
+        "system_aware",
+        "unaware",
+        "unknown",
+    ] {
+        let reported = with(
+            base.clone(),
+            json!({"dpi_awareness": {"awareness": awareness, "reason": null}}),
+        );
+        assert!(validator.is_valid(&reported), "{reported}");
+    }
+    let refused = with(
+        base.clone(),
+        json!({"status": "degraded", "dpi_awareness": {"awareness": "unaware", "reason": "r"}}),
+    );
+    assert!(validator.is_valid(&refused), "{refused}");
+    assert!(!validator.is_valid(&with(
+        base.clone(),
+        json!({"dpi_awareness": {"awareness": "per_monitor_v3", "reason": null}})
+    )));
     assert!(!validator.is_valid(&with(base.clone(), json!({"status": "bogus"}))));
     assert!(
         !validator.is_valid(&with(

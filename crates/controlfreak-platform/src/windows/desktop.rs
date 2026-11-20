@@ -1,6 +1,6 @@
 #![allow(unsafe_code)]
 
-use super::win32::{set_per_monitor_dpi_awareness, visit_monitors};
+use super::win32::{DpiAwarenessError, set_per_monitor_dpi_awareness, visit_monitors};
 use super::{
     AssertUnwindSafe, BOOL, CLSCTX_ALL, CoCreateInstance, DWMWA_CLOAKED,
     DWMWA_EXTENDED_FRAME_BOUNDS, DisplayBounds, DisplayInfo, DwmGetWindowAttribute, EnumWindows,
@@ -13,6 +13,7 @@ use super::{
     VirtualDesktopManager, WS_EX_TOOLWINDOW, WaitForWindowRequest, WindowBounds, WindowInfo,
     c_void, catch_unwind, last_win32_error, size_of, win32_error,
 };
+use controlfreak_core::{DpiAwareness, DpiAwarenessStatus, FailureCause};
 
 pub(super) fn foreground_window_handle() -> HWND {
     // SAFETY: GetForegroundWindow has no pointer parameters and returns either a valid handle or
@@ -161,15 +162,39 @@ pub(super) fn current_virtual_desktop_id(manager: &IVirtualDesktopManager) -> Op
         .map(|desktop_id| format!("{desktop_id:?}"))
 }
 
+/// Sets per-monitor awareness once and caches the outcome, refusals included: a process's
+/// awareness cannot change after it is set, so a later attempt would fail the same way.
+fn dpi_awareness() -> &'static Result<DpiAwareness, DpiAwarenessError> {
+    static DPI_RESULT: OnceLock<Result<DpiAwareness, DpiAwarenessError>> = OnceLock::new();
+    DPI_RESULT.get_or_init(set_per_monitor_dpi_awareness)
+}
+
 pub(super) fn ensure_dpi_awareness() -> Result<(), PlatformError> {
-    static DPI_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
-    DPI_RESULT
-        .get_or_init(|| set_per_monitor_dpi_awareness().map_err(|error| error.to_string()))
-        .clone()
-        .map_err(|reason| PlatformError::OperationFailed {
+    match dpi_awareness() {
+        Ok(_) => Ok(()),
+        Err(error @ DpiAwarenessError::NotPerMonitor(_)) => Err(PlatformError::failed(
+            FailureCause::DpiAwarenessUnsupported,
+            "SetProcessDpiAwarenessContext",
+            error.to_string(),
+        )),
+        Err(DpiAwarenessError::Os(reason)) => Err(PlatformError::OperationFailed {
             operation: "SetProcessDpiAwarenessContext".to_owned(),
-            reason,
-        })
+            reason: reason.clone(),
+        }),
+    }
+}
+
+pub(super) fn dpi_awareness_status() -> DpiAwarenessStatus {
+    match dpi_awareness() {
+        Ok(awareness) => DpiAwarenessStatus {
+            awareness: *awareness,
+            reason: None,
+        },
+        Err(error) => DpiAwarenessStatus {
+            awareness: error.awareness(),
+            reason: Some(error.to_string()),
+        },
+    }
 }
 
 fn monitor_info(monitor: HMONITOR) -> Result<DisplayInfo, PlatformError> {

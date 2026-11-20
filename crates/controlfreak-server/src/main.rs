@@ -225,8 +225,23 @@ async fn run_server(allow_elevated: bool) -> Result<(), Box<dyn Error + Send + S
             });
         }
         let glow_stop = stop.clone();
+        let backend = platform_backend(security_context)?;
+        // Sets awareness now rather than at the first tool call. A refusal does not stop startup:
+        // captures and input report it, and get_server_status shows it as degraded.
+        if let Some(status) = backend.dpi_awareness()
+            && let Some(reason) = status.reason
+        {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "dpi_awareness_unsupported",
+                    "awareness": status.awareness,
+                    "reason": reason,
+                })
+            );
+        }
         controlfreak_mcp::serve_stdio_with_indicator_and_arbitrator(
-            platform_backend(security_context)?,
+            backend,
             safety_indicator,
             move || {
                 // Debug builds under test run without any desktop indicator, so the test suite

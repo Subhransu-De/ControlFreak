@@ -171,7 +171,7 @@ fn get_server_status_tool() -> Tool {
         GET_SERVER_STATUS,
         "Server status",
         Kind::Observe { idempotent: true },
-        "Return version, uptime, privileges, indicator health, input_admission, session state, stop_state and recent operations. status describes the server and indicator; input_admission says whether input is accepted. When it is closed, recovery gives the next step: no tool reopens input, only the user restarting the server from the MCP client. stop_reason=user_stop means the user ended control.",
+        "Return version, uptime, privileges, DPI awareness, indicator health, input_admission, session state, stop_state and recent operations. status describes the server and indicator; input_admission says whether input is accepted. When it is closed, recovery gives the next step: no tool reopens input, only the user restarting the server from the MCP client. stop_reason=user_stop means the user ended control.",
         object_schema(JsonObject::new(), &[]),
         server_status_output_schema(),
     )
@@ -1290,6 +1290,20 @@ fn server_status_output_schema() -> Arc<JsonObject> {
                 "server_elevated": { "type": "boolean" },
                 "windows_integrity_level": { "enum": ["untrusted", "low", "medium", "medium_plus", "high", "system", "protected", "unknown"] },
                 "elevated_operation_allowed": { "type": "boolean" },
+                "dpi_awareness": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "awareness": { "enum": ["per_monitor_v2", "per_monitor", "system_aware", "unaware", "unknown"] },
+                                "reason": { "type": ["string", "null"] }
+                            },
+                            "required": ["awareness", "reason"],
+                            "additionalProperties": false
+                        },
+                        { "type": "null" }
+                    ]
+                },
                 "uptime_ms": { "type": "integer", "minimum": 0 },
                 "operations_started": { "type": "integer", "minimum": 0 },
                 "operations_completed": { "type": "integer", "minimum": 0 },
@@ -1327,7 +1341,7 @@ fn server_status_output_schema() -> Arc<JsonObject> {
             },
             "required": [
                 "status", "safety_indicator", "session", "version", "instance_id", "process_id",
-                "server_elevated", "windows_integrity_level", "elevated_operation_allowed", "uptime_ms",
+                "server_elevated", "windows_integrity_level", "elevated_operation_allowed", "dpi_awareness", "uptime_ms",
                 "operations_started", "operations_completed", "operations_failed", "recent_operations",
                 "backend", "input_admission", "recovery", "stop_state"
             ],
