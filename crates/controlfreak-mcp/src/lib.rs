@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 #[cfg(test)]
+mod begin_cancel_tests;
+#[cfg(test)]
 mod cleanup_tests;
 #[cfg(test)]
 mod contract_tests;
@@ -507,19 +509,13 @@ impl ControlFreakServer {
             backend
                 .validate_target_reference(&input.target_ref)
                 .map_err(BeginSessionError::Target)?;
-            runtime_for_worker.begin_session(input.expected_seconds, &input.target_ref)?;
-            if work
-                .as_ref()
-                .is_some_and(|work| work.control.is_cancelled())
-            {
-                runtime_for_worker
-                    .end_session()
-                    .map_err(SessionError::Indicator)?;
-                return Err(cancelled(
-                    SessionError::Indicator("session request was cancelled".to_owned()).into(),
-                ));
-            }
-            Ok(())
+            // The runtime checks cancellation under its lifecycle lock, so a cancelled renewal
+            // keeps the session and a request cancelled by a stop reports the stop.
+            runtime_for_worker.begin_session(
+                input.expected_seconds,
+                &input.target_ref,
+                work.as_ref().map(|work| &work.control),
+            )
         })
         .await;
         match started {

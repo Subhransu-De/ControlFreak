@@ -143,7 +143,7 @@ fn failed_arbitration_is_not_reported_as_a_busy_desktop() {
         },
     ));
     let Err(BeginSessionError::Session(error)) =
-        runtime.begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        runtime.begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
     else {
         panic!("broken arbitration must refuse the session");
     };
@@ -475,11 +475,15 @@ fn begin_clamps_expected_seconds_and_end_hides_immediately() {
         },
     ));
 
-    assert!(runtime.begin_session(Some(99), "").is_err());
+    assert!(runtime.begin_session(Some(99), "", None).is_err());
     assert_eq!(runtime.status()["owns_arbitration"], false);
     assert!(events.lock().unwrap().is_empty());
     runtime
-        .begin_session(Some(99), "target-00000000-0000-0000-0000-000000000003")
+        .begin_session(
+            Some(99),
+            "target-00000000-0000-0000-0000-000000000003",
+            None,
+        )
         .unwrap();
     assert_eq!(runtime.status()["hold_ms"], 2_000);
     assert_eq!(runtime.status()["state"], "armed");
@@ -497,7 +501,7 @@ fn begin_clamps_expected_seconds_and_end_hides_immediately() {
             .map(|_| {
                 scope.spawn(|| {
                     assert!(matches!(
-                        runtime.begin_session(Some(1), "different"),
+                        runtime.begin_session(Some(1), "different", None),
                         Err(BeginSessionError::Target(
                             PlatformError::TargetInvalidated { .. }
                         ))
@@ -518,7 +522,7 @@ fn begin_clamps_expected_seconds_and_end_hides_immediately() {
     runtime.end_session().unwrap();
 
     runtime
-        .begin_session(Some(1), "target-00000000-0000-0000-0000-000000000003")
+        .begin_session(Some(1), "target-00000000-0000-0000-0000-000000000003", None)
         .unwrap();
     assert_eq!(runtime.status()["hold_ms"], 1_000);
     runtime.end_session().unwrap();
@@ -542,7 +546,7 @@ async fn begin_keeps_acting_while_a_mutation_is_in_flight() {
 
     let lease = runtime.acquire().await.unwrap();
     runtime
-        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
         .unwrap();
 
     assert_eq!(runtime.status()["state"], "acting");
@@ -576,7 +580,7 @@ async fn explicit_session_hold_survives_the_first_mutation() {
     let _timeouts = manual_timeouts(&runtime);
 
     runtime
-        .begin_session(Some(2), "target-00000000-0000-0000-0000-000000000003")
+        .begin_session(Some(2), "target-00000000-0000-0000-0000-000000000003", None)
         .unwrap();
     drop(runtime.acquire().await.unwrap());
 
@@ -642,11 +646,11 @@ fn refused_server_stays_dark_until_the_owner_ends() {
     ));
 
     first
-        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
         .unwrap();
     assert!(
         second
-            .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+            .begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
             .is_err()
     );
     assert_eq!(second_starts.load(Ordering::Relaxed), 0);
@@ -654,7 +658,7 @@ fn refused_server_stays_dark_until_the_owner_ends() {
 
     first.end_session().unwrap();
     second
-        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
         .unwrap();
     assert_eq!(*second_events.lock().unwrap(), ["armed"]);
     second.end_session().unwrap();
@@ -705,7 +709,7 @@ fn failed_helper_start_releases_arbitration_for_the_next_server() {
     ));
 
     assert!(matches!(
-        first.begin_session(None, "target-00000000-0000-0000-0000-000000000003").unwrap_err(),
+        first.begin_session(None, "target-00000000-0000-0000-0000-000000000003", None).unwrap_err(),
         BeginSessionError::Session(super::SessionError::Indicator(reason))
             if reason == "native indicator initialization failed"
     ));
@@ -714,7 +718,7 @@ fn failed_helper_start_releases_arbitration_for_the_next_server() {
     assert_eq!(first.status()["last_cleanup_reason"], "admission_failure");
 
     second
-        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
         .unwrap();
     second.end_session().unwrap();
     assert_eq!(*events.lock().unwrap(), ["armed", "hide"]);
@@ -736,7 +740,7 @@ async fn end_waits_for_the_outstanding_mutation_guard() {
     ));
 
     runtime
-        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
         .unwrap();
     let lease = runtime.acquire().await.unwrap();
     runtime.end_session().unwrap();
@@ -1075,7 +1079,7 @@ fn recording_runtime(hold: Duration) -> Arc<SessionRuntime> {
 fn a_closed_session_reports_no_approved_target() {
     const TARGET: &str = "target-00000000-0000-0000-0000-000000000003";
     let runtime = recording_runtime(Duration::from_secs(30));
-    runtime.begin_session(None, TARGET).unwrap();
+    runtime.begin_session(None, TARGET, None).unwrap();
     assert_eq!(runtime.status()["approved_target_ref"], TARGET);
     assert_eq!(
         runtime.end_session().unwrap(),
@@ -1099,7 +1103,7 @@ fn a_closed_session_reports_no_approved_target() {
 async fn an_expired_hold_reports_no_approved_target() {
     const TARGET: &str = "target-00000000-0000-0000-0000-000000000003";
     let runtime = recording_runtime(Duration::from_millis(20));
-    runtime.begin_session(None, TARGET).unwrap();
+    runtime.begin_session(None, TARGET, None).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while runtime.status()["owns_arbitration"] == true {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1117,7 +1121,7 @@ async fn an_expired_hold_reports_no_approved_target() {
 async fn an_action_in_flight_keeps_its_target_while_the_session_closes() {
     const TARGET: &str = "target-00000000-0000-0000-0000-000000000003";
     let runtime = recording_runtime(Duration::from_secs(30));
-    runtime.begin_session(None, TARGET).unwrap();
+    runtime.begin_session(None, TARGET, None).unwrap();
     let lease = runtime.acquire().await.unwrap();
     let control = lease.mutation_control();
     assert_eq!(

@@ -576,10 +576,14 @@ impl SessionRuntime {
             .bind_target(target)
     }
 
+    /// Begins or renews the session. `request` is the calling request's cancellation, checked
+    /// under the lifecycle lock before the session changes, so a cancelled renewal leaves the
+    /// existing session as it was and only a cancelled first begin releases the desktop.
     pub(super) fn begin_session(
         self: &Arc<Self>,
         expected_seconds: Option<u64>,
         target: &str,
+        request: Option<&MutationControl>,
     ) -> Result<(), BeginSessionError> {
         let _lifecycle = self
             .lifecycle
@@ -600,7 +604,10 @@ impl SessionRuntime {
             }
             return Err(BeginSessionError::Target(error));
         }
-        if let Err(reason) = self.schedule_close(0, self.max_hold) {
+        // A new session needs the worker running before the indicator starts. An owned session
+        // already has it, with its close pending; replacing that schedule here would leave a
+        // cancelled renewal without its deadline.
+        if !already_owned && let Err(reason) = self.schedule_close(0, self.max_hold) {
             let _ = self.close_session_locked("admission_failure", false);
             return Err(SessionError::Indicator(reason).into());
         }
@@ -618,6 +625,14 @@ impl SessionRuntime {
         self.ensure_indicator_level(level)
             .map_err(SessionError::Indicator)?;
         self.check_environment()?;
+        if request.is_some_and(MutationControl::is_cancelled) {
+            // A stop also cancels the request; report the stop and close as it requires.
+            self.check_environment()?;
+            if !already_owned {
+                let _ = self.close_session_locked("admission_failure", false);
+            }
+            return Err(SessionError::Indicator("session request was cancelled".to_owned()).into());
+        }
         let mut state = self
             .state
             .lock()

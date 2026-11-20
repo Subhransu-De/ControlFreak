@@ -155,7 +155,7 @@ async fn stop_keeps_blocked_worker_ownership_until_cleanup_finishes() {
         assert!(runtime.stop.user_stopped());
         assert!(
             runtime
-                .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+                .begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
                 .is_err()
         );
     }
@@ -292,7 +292,7 @@ fn concurrent_cleanup_waits_for_every_mutation_and_preserves_the_reason() {
         if reason != "explicit_end" {
             assert!(
                 runtime
-                    .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+                    .begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
                     .is_err()
             );
         }
@@ -318,7 +318,7 @@ fn desktop_changes_cancel_active_work_and_refuse_new_admission() {
         assert!(lease.mutation_control().is_cancelled());
         assert!(
             runtime
-                .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+                .begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
                 .is_err()
         );
         assert!(runtime.acquire_mutation_blocking().is_err());
@@ -333,7 +333,7 @@ fn desktop_changes_cancel_active_work_and_refuse_new_admission() {
         );
         *fixture.environment.lock().unwrap() = None;
         runtime
-            .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+            .begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
             .unwrap();
         runtime.close_session("shutdown", true).unwrap();
     }
@@ -344,11 +344,11 @@ fn stale_timeout_cannot_close_a_new_session() {
     let fixture = Arc::new(Fixture::default());
     let runtime = fixture.runtime();
     runtime
-        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
         .unwrap();
     let generation = runtime.state.lock().unwrap().generation;
     runtime
-        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
         .unwrap();
     runtime.close_if_idle(generation);
     assert!(fixture.owned.load(Ordering::SeqCst));
@@ -363,7 +363,7 @@ fn failed_shutdown_keeps_arbitration_until_retry_is_safe() {
     let fixture = Arc::new(Fixture::default());
     let runtime = fixture.runtime();
     runtime
-        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
         .unwrap();
     fixture.shutdown_failed.store(true, Ordering::SeqCst);
     assert!(runtime.close_session("shutdown", true).is_err());
@@ -403,7 +403,7 @@ fn desktop_is_revalidated_after_indicator_startup() {
         if explicit {
             assert!(
                 runtime
-                    .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+                    .begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
                     .is_err()
             );
         } else {
@@ -443,7 +443,7 @@ async fn persistent_shutdown_failure_has_a_bounded_wait_without_releasing_owners
     let fixture = Arc::new(Fixture::default());
     let runtime = fixture.runtime();
     runtime
-        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
         .unwrap();
     fixture.shutdown_failed.store(true, Ordering::SeqCst);
     assert!(runtime.close_session("shutdown", true).is_err());
