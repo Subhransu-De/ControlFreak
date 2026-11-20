@@ -113,6 +113,8 @@ pub(super) fn visual_baseline_result(result: &VisualBaseline) -> CallToolResult 
         "source_bounds": result.source_bounds,
         "fingerprint": result.fingerprint,
         "expires_in_ms": result.expires_in_ms,
+        "baseline_count": result.baseline_count,
+        "bytes": result.bytes,
     }))
 }
 
@@ -435,7 +437,9 @@ pub(super) fn tool_error(error: &PlatformError) -> CallToolResult {
         PlatformError::PermissionDenied { .. } => "permission_denied",
         PlatformError::HigherIntegrityTarget { .. } => "higher_integrity_target",
         PlatformError::TargetIntegrityUnavailable { .. } => "target_integrity_unavailable",
-        PlatformError::InvalidArgument { .. } => "invalid_argument",
+        PlatformError::InvalidArgument { .. } | PlatformError::InvalidBaseline { .. } => {
+            "invalid_argument"
+        }
         PlatformError::OperationFailed { .. }
         | PlatformError::Failed { .. }
         | PlatformError::Unavailable { .. } => "platform_operation_failed",

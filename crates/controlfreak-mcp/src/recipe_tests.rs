@@ -142,6 +142,8 @@ impl DisplayBackend for Fixture {
             source_bounds: bounds(),
             fingerprint: "fixture".into(),
             expires_in_ms: 300_000,
+            baseline_count: 1,
+            bytes: 4,
         })
     }
 

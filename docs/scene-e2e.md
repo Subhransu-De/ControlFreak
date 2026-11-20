@@ -38,7 +38,7 @@ Scenes are compiled into the harness, so a run does not depend on the working di
 
 One green window, `app`, at `[10, 140]`.
 
-This is the plain "one application" desk. Every task here starts a control session on `app`, focuses it, does one thing and checks the result in the fixture's log.
+This is the plain "one application" desk. Every input task here starts a control session on `app`, focuses it, does one thing and checks the result in the fixture's log.
 
 | Task | What happens |
 | --- | --- |
@@ -51,6 +51,7 @@ This is the plain "one application" desk. Every task here starts a control sessi
 | `smoke/injected-allow-again-ignored` | Stops the session the way UI Automation does, with `BM_CLICK` on the Stop button, and waits for `stop_state` `stopped` with recovery `allow_again`. Then sends a real injected click on the tab's Allow again control, and `BM_CLICK` and a left click sent and posted as window messages. Checks input stays closed with the same recovery and a new session is refused with `desktop_work_stopped`. |
 | `smoke/held-modifier-refused` | Holds Shift through the fixture with a real key-down, as a person would. Checks `press_keys`, `type_text`, `click_mouse` and `scroll_mouse` are refused with `key_held`, `not_started` and no events, and the window received no input. Releases Shift, checks Delete then arrives, and records in a note how a Unicode character typed under a held Alt reached the window. |
 | `smoke/moved-window-keeps-session` | Captures the window, then moves it 60 by 40 pixels from another process through the fixture, as a user dragging it would. Checks a click through the old capture's `observation_id` is refused as stale. Captures the window again and checks it kept its `target_ref`. Checks a click at the button through the new capture is refused with `target_moved`, `retryable` and `not_started`, then that the same click succeeds in the same session and the button was pressed once. |
+| `smoke/baseline-refusal-reasons` | Sends no input. Captures 17 visual baselines of a 4 by 4 region and checks each result's `baseline_count` and `bytes` (16 at most, 64 bytes each). Checks `wait_for_change_since` refuses the first ID with `invalid_argument` and reason `evicted`, and an ID the server never issued with `unknown`, and accepts the newest ID. |
 
 ## busy-app
 

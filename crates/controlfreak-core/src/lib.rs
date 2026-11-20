@@ -35,7 +35,7 @@ pub use display::{
     WaitForVisualChangeRequest, scaled_dimensions,
 };
 pub use dpi::{DpiAwareness, DpiAwarenessStatus};
-pub use error::{FailureCause, PlatformError, RefusalCause};
+pub use error::{BaselineFailure, FailureCause, PlatformError, RefusalCause};
 pub use keyboard::{
     Key, KeyChordRequest, KeyboardActionResult, TextInputRequest, validate_text_timeout,
 };

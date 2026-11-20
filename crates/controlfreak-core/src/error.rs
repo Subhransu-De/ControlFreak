@@ -45,6 +45,10 @@ pub enum PlatformError {
     TargetIntegrityUnavailable { operation: String, reason: String },
     #[error("invalid argument '{argument}': {reason}")]
     InvalidArgument { argument: String, reason: String },
+    /// A `baseline_id` that cannot be compared against. It has the wire code of
+    /// `InvalidArgument`, with the cause as its reason.
+    #[error("invalid argument 'baseline_id': {}", cause.message())]
+    InvalidBaseline { cause: BaselineFailure },
     #[error("operation '{operation}' failed: {reason}")]
     OperationFailed { operation: String, reason: String },
     /// A failure the agent can act on, with its cause as data rather than inferred from text.
@@ -105,6 +109,50 @@ impl RefusalCause {
     #[must_use]
     const fn retryable(self) -> bool {
         !matches!(self, Self::OwnIndicator)
+    }
+}
+
+/// Why a visual baseline cannot be used. Every cause needs a new `capture_visual_baseline`, but
+/// the cause tells the agent what went wrong: waiting too long, capturing too many, a changed
+/// display, or an ID this server never issued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineFailure {
+    /// The baseline reached the end of its lifetime and its pixels were removed.
+    Expired,
+    /// The store was full, so a newer baseline replaced it before its lifetime ended.
+    Evicted,
+    /// This server instance did not issue the ID, or no longer remembers it. A restarted server
+    /// knows no ID from before the restart.
+    Unknown,
+    /// The baseline's display moved, resized or disappeared since capture.
+    DisplayChanged,
+}
+
+impl BaselineFailure {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::Evicted => "evicted",
+            Self::Unknown => "unknown",
+            Self::DisplayChanged => "display_changed",
+        }
+    }
+
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Expired => "the baseline expired; capture a new baseline",
+            Self::Evicted => {
+                "newer baselines replaced this one because the store was full; capture a new baseline"
+            }
+            Self::Unknown => {
+                "this server did not issue the baseline or no longer remembers it, for example after a restart; capture a new baseline"
+            }
+            Self::DisplayChanged => {
+                "the display layout changed since this baseline was captured; capture a new baseline"
+            }
+        }
     }
 }
 
@@ -200,7 +248,7 @@ impl PlatformError {
     }
 
     /// A stable sub-code for the errors whose wire code does not say enough: the causes of
-    /// `platform_operation_failed` and of `target_invalidated`. Other errors have their own wire
+    /// `platform_operation_failed`, of `target_invalidated` and of a refused `baseline_id`. Other errors have their own wire
     /// code. The code comes from data set where the error is built, never from its message.
     #[must_use]
     pub fn reason_code(&self) -> Option<&'static str> {
@@ -210,6 +258,7 @@ impl PlatformError {
             Self::Failed { cause, .. } => Some(cause.code()),
             Self::TargetRefused { cause, .. } => Some(cause.code()),
             Self::TargetInvalidated { .. } => Some("target_changed"),
+            Self::InvalidBaseline { cause } => Some(cause.code()),
             _ => None,
         }
     }
@@ -224,7 +273,7 @@ impl PlatformError {
 
 #[cfg(test)]
 mod tests {
-    use super::{FailureCause, PlatformError, RefusalCause};
+    use super::{BaselineFailure, FailureCause, PlatformError, RefusalCause};
     use crate::MutationControl;
 
     fn failed(operation: &str, reason: &str) -> PlatformError {
@@ -352,6 +401,23 @@ mod tests {
             let error = PlatformError::refused(cause, "x");
             assert_eq!(error.reason_code(), Some(reason), "{error}");
             assert_eq!(error.retryable(), retryable, "{error}");
+        }
+    }
+
+    #[test]
+    fn every_baseline_failure_has_its_own_reason_and_names_the_argument() {
+        for (cause, reason) in [
+            (BaselineFailure::Expired, "expired"),
+            (BaselineFailure::Evicted, "evicted"),
+            (BaselineFailure::Unknown, "unknown"),
+            (BaselineFailure::DisplayChanged, "display_changed"),
+        ] {
+            let error = PlatformError::InvalidBaseline { cause };
+            assert_eq!(error.reason_code(), Some(reason), "{error}");
+            assert!(!error.retryable(), "the same ID fails again: {error}");
+            let message = error.to_string();
+            assert!(message.starts_with("invalid argument 'baseline_id': "));
+            assert!(message.ends_with("capture a new baseline"));
         }
     }
 

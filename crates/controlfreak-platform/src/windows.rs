@@ -15,19 +15,19 @@ use std::{
 use crate::OcrHelperCommand;
 use controlfreak_core::limits::MAX_WINDOWS;
 use controlfreak_core::{
-    ActionObservation, BackendIdentity, BackendMetadata, Capability, CapabilityDescriptor,
-    CapabilityState, CaptureDisplayRequest, CaptureRegionRequest, CaptureWindowRequest,
-    ClickTextRequest, ClickTextResult, DisplayBackend, DisplayBounds, DisplayInfo,
-    DisplayScreenshot, DisplayServer, FindTextRequest, FindTextResult, FocusWindowRequest, Key,
-    KeyChordRequest, KeyboardActionResult, KeyboardBackend, MouseButton, MouseClickRequest,
-    MouseDragRequest, MouseMoveRequest, MousePosition, MouseScrollRequest, MutationControl,
-    ObservationMode, ObservationOptions, OcrBackend, OcrLine, OcrRegionRequest, OcrResult, OcrWord,
-    PermissionDescriptor, PermissionId, PermissionState, Platform, PlatformError,
-    PointerActionResult, PointerBackend, SecurityContext, TextInputRequest, VirtualDesktopList,
-    VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest,
-    VisualChangeResult, WaitForChangeSinceRequest, WaitForTextRequest, WaitForTextResult,
-    WaitForVisualChangeRequest, WaitForWindowRequest, WindowBackend, WindowBounds,
-    WindowFocusResult, WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
+    ActionObservation, BackendIdentity, BackendMetadata, BaselineFailure, Capability,
+    CapabilityDescriptor, CapabilityState, CaptureDisplayRequest, CaptureRegionRequest,
+    CaptureWindowRequest, ClickTextRequest, ClickTextResult, DisplayBackend, DisplayBounds,
+    DisplayInfo, DisplayScreenshot, DisplayServer, FindTextRequest, FindTextResult,
+    FocusWindowRequest, Key, KeyChordRequest, KeyboardActionResult, KeyboardBackend, MouseButton,
+    MouseClickRequest, MouseDragRequest, MouseMoveRequest, MousePosition, MouseScrollRequest,
+    MutationControl, ObservationMode, ObservationOptions, OcrBackend, OcrLine, OcrRegionRequest,
+    OcrResult, OcrWord, PermissionDescriptor, PermissionId, PermissionState, Platform,
+    PlatformError, PointerActionResult, PointerBackend, SecurityContext, TextInputRequest,
+    VirtualDesktopList, VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult, VisualBaseline,
+    VisualBaselineRequest, VisualChangeResult, WaitForChangeSinceRequest, WaitForTextRequest,
+    WaitForTextResult, WaitForVisualChangeRequest, WaitForWindowRequest, WindowBackend,
+    WindowBounds, WindowFocusResult, WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
 };
 use windows::Win32::{
     Foundation::{HWND, LPARAM, POINT, RECT},
@@ -164,6 +164,8 @@ const MAX_DESKTOP_SWITCH_STEPS: u8 = 10;
 const DESKTOP_SWITCH_SETTLE_MS: u64 = 300;
 const VISUAL_BASELINE_TTL_MS: u32 = 300_000;
 const MAX_VISUAL_BASELINES: usize = 16;
+/// How many expired or evicted baseline IDs are remembered, with their reason and no pixels.
+const VISUAL_BASELINE_TOMBSTONES: usize = 64;
 #[cfg(test)]
 const MAX_OCR_RESULTS: u32 = 100;
 
@@ -179,8 +181,15 @@ fn visual_baseline_store() -> baselines::BaselineStore<StoredVisualBaseline> {
     baselines::BaselineStore::new(
         Duration::from_millis(u64::from(VISUAL_BASELINE_TTL_MS)),
         MAX_VISUAL_BASELINES,
+        VISUAL_BASELINE_TOMBSTONES,
         Arc::new(baselines::SystemClock),
     )
+}
+
+/// A baseline ID. The process nonce makes an ID from another server instance unknown here, even
+/// when its sequence number matches one this instance issued.
+fn visual_baseline_id(nonce: u128, sequence: u64) -> String {
+    format!("vb-{nonce:032x}-{sequence:016x}")
 }
 
 #[derive(Clone, Copy)]
@@ -636,13 +645,14 @@ impl DisplayBackend for Backend {
             request.height,
         )?;
         let frame = capture_comparison_frame(bounds)?;
-        let id = format!(
-            "vb-{:032x}-{:016x}",
+        let id = visual_baseline_id(
             baseline_process_nonce(),
-            self.next_baseline_id.fetch_add(1, Ordering::Relaxed)
+            self.next_baseline_id.fetch_add(1, Ordering::Relaxed),
         );
         let fingerprint = frame_fingerprint(&frame);
-        self.visual_baselines
+        let bytes = u64::try_from(frame.len()).unwrap_or(u64::MAX);
+        let usage = self
+            .visual_baselines
             .insert(
                 id.clone(),
                 StoredVisualBaseline {
@@ -650,6 +660,7 @@ impl DisplayBackend for Backend {
                     bounds,
                     frame: frame.into(),
                 },
+                bytes,
             )
             .map_err(|error| PlatformError::OperationFailed {
                 operation: "capture_visual_baseline".to_owned(),
@@ -661,6 +672,8 @@ impl DisplayBackend for Backend {
             source_bounds: bounds,
             fingerprint,
             expires_in_ms: VISUAL_BASELINE_TTL_MS,
+            baseline_count: u32::try_from(usage.count).unwrap_or(u32::MAX),
+            bytes: usage.bytes,
         })
     }
 
@@ -688,10 +701,7 @@ impl DisplayBackend for Backend {
         let baseline = self
             .visual_baselines
             .get(&request.baseline_id)
-            .ok_or_else(|| PlatformError::InvalidArgument {
-                argument: "baseline_id".to_owned(),
-                reason: "baseline was not found or has expired; capture a new baseline".to_owned(),
-            })?;
+            .map_err(|cause| PlatformError::InvalidBaseline { cause })?;
         ensure_dpi_awareness()?;
         ensure_baseline_display(&baseline.display, enumerate_displays()?.as_slice())?;
         let result = wait_for_change(
@@ -792,9 +802,8 @@ fn ensure_baseline_display(
     {
         Ok(())
     } else {
-        Err(PlatformError::InvalidArgument {
-            argument: "baseline_id".to_owned(),
-            reason: "the display layout changed since this baseline was captured; capture a new baseline".to_owned(),
+        Err(PlatformError::InvalidBaseline {
+            cause: BaselineFailure::DisplayChanged,
         })
     }
 }
@@ -1212,10 +1221,10 @@ mod tests {
     #![allow(unsafe_code)]
 
     use controlfreak_core::{
-        CaptureDisplayRequest, CaptureRegionRequest, CaptureWindowRequest, DisplayBackend,
-        DisplayBounds, DisplayInfo, Key, MouseButton, MouseMoveRequest, MouseScrollRequest,
-        ObservationOptions, OcrLine, OcrRegionRequest, OcrWord, PlatformError, PointerBackend,
-        TextMatch, WaitForWindowRequest, WindowBackend, WindowBounds, WindowInfo,
+        BaselineFailure, CaptureDisplayRequest, CaptureRegionRequest, CaptureWindowRequest,
+        DisplayBackend, DisplayBounds, DisplayInfo, Key, MouseButton, MouseMoveRequest,
+        MouseScrollRequest, ObservationOptions, OcrLine, OcrRegionRequest, OcrWord, PlatformError,
+        PointerBackend, TextMatch, WaitForWindowRequest, WindowBackend, WindowBounds, WindowInfo,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MOUSE_EVENT_FLAGS, MOUSEEVENTF_HWHEEL,
@@ -1513,11 +1522,39 @@ mod tests {
         let mut resized = captured.clone();
         resized.bounds.width = 2560;
         for current in [vec![], vec![moved], vec![resized]] {
-            assert!(matches!(
+            assert_eq!(
                 super::ensure_baseline_display(&captured, &current),
-                Err(PlatformError::InvalidArgument { argument, .. }) if argument == "baseline_id"
-            ));
+                Err(PlatformError::InvalidBaseline {
+                    cause: BaselineFailure::DisplayChanged
+                })
+            );
         }
+    }
+
+    #[test]
+    fn a_baseline_id_from_another_server_instance_is_unknown() {
+        use super::{baselines, visual_baseline_id};
+        use std::{sync::Arc, time::Duration};
+        let clock = baselines::FakeClock::new();
+        let store = baselines::BaselineStore::new(
+            Duration::from_millis(u64::from(super::VISUAL_BASELINE_TTL_MS)),
+            super::MAX_VISUAL_BASELINES,
+            super::VISUAL_BASELINE_TOMBSTONES,
+            Arc::clone(&clock) as Arc<dyn baselines::Clock>,
+        );
+        let nonce = super::baseline_process_nonce();
+        let ours = visual_baseline_id(nonce, 1);
+        let theirs = visual_baseline_id(nonce ^ 1, 1);
+        store.insert(ours.clone(), (), 4).expect("store a baseline");
+        assert_eq!(store.get(&ours), Ok(()));
+        assert_eq!(store.get(&theirs), Err(BaselineFailure::Unknown));
+
+        // Also once the same sequence number has expired here.
+        clock.advance(Duration::from_millis(u64::from(
+            super::VISUAL_BASELINE_TTL_MS,
+        )));
+        assert_eq!(store.get(&ours), Err(BaselineFailure::Expired));
+        assert_eq!(store.get(&theirs), Err(BaselineFailure::Unknown));
     }
 
     #[test]
@@ -1594,8 +1631,11 @@ mod tests {
                 difference_threshold: 0.01,
             })
             .unwrap_err();
-        assert!(
-            matches!(error, PlatformError::InvalidArgument { argument, .. } if argument == "baseline_id")
+        assert_eq!(
+            error,
+            PlatformError::InvalidBaseline {
+                cause: BaselineFailure::Unknown
+            }
         );
     }
 
