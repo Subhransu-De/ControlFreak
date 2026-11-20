@@ -39,6 +39,13 @@ pub enum Event {
         role: String,
         ch: char,
     },
+    /// A UTF-16 surrogate that did not arrive with its other half: a high surrogate followed by
+    /// another character, or the end of the log, or a low surrogate with no high one before it.
+    /// `typed` shows it as U+FFFD, so a split or dropped half never disappears from the text.
+    Unpaired {
+        role: String,
+        unit: u16,
+    },
     Mouse {
         role: String,
         action: String,
@@ -50,6 +57,30 @@ pub enum Event {
         name: String,
     },
     Other(String),
+}
+
+/// One log line. A `char` line holds one UTF-16 unit of a `WM_CHAR`, so it becomes an event only
+/// once `parse_log` has seen whether a surrogate has its other half.
+enum Line {
+    Event(Event),
+    Unit { role: String, unit: u16 },
+}
+
+impl Line {
+    fn parse(line: &str) -> Self {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if let [role, "char", unit] = parts.as_slice()
+            && let Some(unit) = unit
+                .strip_prefix("U+")
+                .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+        {
+            return Self::Unit {
+                role: (*role).to_owned(),
+                unit,
+            };
+        }
+        Self::Event(Event::parse(line))
+    }
 }
 
 impl Event {
@@ -69,14 +100,6 @@ impl Event {
                 role: (*role).to_owned(),
                 vk,
             }),
-            [role, "char", unit] => unit
-                .strip_prefix("U+")
-                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
-                .and_then(char::from_u32)
-                .map(|ch| Self::Char {
-                    role: (*role).to_owned(),
-                    ch,
-                }),
             [role, "mouse", action, x, y] => match (x.parse(), y.parse()) {
                 (Ok(x), Ok(y)) => Some(Self::Mouse {
                     role: (*role).to_owned(),
@@ -98,7 +121,11 @@ impl Event {
     pub(crate) fn is_input(&self) -> bool {
         matches!(
             self,
-            Self::KeyDown { .. } | Self::KeyUp { .. } | Self::Char { .. } | Self::Mouse { .. }
+            Self::KeyDown { .. }
+                | Self::KeyUp { .. }
+                | Self::Char { .. }
+                | Self::Unpaired { .. }
+                | Self::Mouse { .. }
         )
     }
 }
@@ -121,8 +148,55 @@ fn parse_regions(fields: &[&str]) -> Regions {
     Regions(regions)
 }
 
+const HIGH_SURROGATE: std::ops::RangeInclusive<u16> = 0xD800..=0xDBFF;
+const LOW_SURROGATE: std::ops::RangeInclusive<u16> = 0xDC00..=0xDFFF;
+
+/// Parses a fixture log. Windows delivers a character outside the Basic Multilingual Plane as
+/// two `WM_CHAR` messages, one per UTF-16 surrogate, so a high surrogate waits for the next
+/// character of the same window: a low surrogate completes it, anything else, or the end of the
+/// log, leaves it `Unpaired`. Key and mouse lines between the halves do not break the pair.
 pub(crate) fn parse_log(text: &str) -> Vec<Event> {
-    text.lines().map(Event::parse).collect()
+    let mut events = Vec::new();
+    // The high surrogate each receiving window is waiting to complete; a scene has few windows.
+    let mut pending: Vec<(String, u16)> = Vec::new();
+    for line in text.lines() {
+        let (role, unit) = match Line::parse(line) {
+            Line::Event(event) => {
+                events.push(event);
+                continue;
+            }
+            Line::Unit { role, unit } => (role, unit),
+        };
+        let high = pending
+            .iter()
+            .position(|(waiting, _)| *waiting == role)
+            .map(|index| pending.swap_remove(index).1);
+        if let Some(high) = high {
+            if LOW_SURROGATE.contains(&unit) {
+                if let Some(Ok(ch)) = char::decode_utf16([high, unit]).next() {
+                    events.push(Event::Char { role, ch });
+                }
+                continue;
+            }
+            events.push(Event::Unpaired {
+                role: role.clone(),
+                unit: high,
+            });
+        }
+        if HIGH_SURROGATE.contains(&unit) {
+            pending.push((role, unit));
+        } else if let Some(ch) = char::from_u32(u32::from(unit)) {
+            events.push(Event::Char { role, ch });
+        } else {
+            events.push(Event::Unpaired { role, unit });
+        }
+    }
+    events.extend(
+        pending
+            .into_iter()
+            .map(|(role, unit)| Event::Unpaired { role, unit }),
+    );
+    events
 }
 
 pub(crate) fn ready(events: &[Event]) -> Option<&Regions> {
@@ -139,6 +213,18 @@ pub(crate) fn typed(events: &[Event]) -> String {
             Event::KeyDown { role, vk: 0x0D } if role == "main" => Some('\u{23CE}'),
             Event::KeyDown { role, vk: 0x09 } if role == "main" => Some('\u{21E5}'),
             Event::Char { role, ch } if role == "main" && !ch.is_control() => Some(*ch),
+            Event::Unpaired { role, .. } if role == "main" => Some(char::REPLACEMENT_CHARACTER),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The surrogates the main window received without their other half.
+pub(crate) fn unpaired(events: &[Event]) -> Vec<u16> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Unpaired { role, unit } if role == "main" => Some(*unit),
             _ => None,
         })
         .collect()
@@ -190,6 +276,7 @@ pub(crate) fn near(actual: (i32, i32), wanted: (i32, i32)) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     const LOG: &str = "ready client=10,140,370,400 label=10,140,370,204 edit=26,216,354,296 \
                        button=26,316,146,356\n\
@@ -242,16 +329,97 @@ mod tests {
             "ready edit=1,2,3",
             "main keydown 13",
             "main char U+ZZZZ",
-            "main char U+D800",
+            "main char U+1F980",
             "main mouse left_down x y",
             "main activate yes",
         ] {
-            let event = Event::parse(line);
-            assert!(!event.is_input(), "{line:?} parsed as input: {event:?}");
+            let events = parse_log(line);
+            assert!(
+                events.iter().all(|event| !event.is_input()),
+                "{line:?} parsed as input: {events:?}"
+            );
         }
         assert_eq!(
             ready(&parse_log("ready edit=1,2,3")),
             Some(&Regions::default())
         );
+    }
+
+    /// The log lines a window writes for `text`: one `char` line per UTF-16 unit, as `WM_CHAR`
+    /// delivers it.
+    fn units(role: &str, text: &str) -> String {
+        text.encode_utf16().fold(String::new(), |mut log, unit| {
+            let _ = writeln!(log, "{role} char U+{unit:04X}");
+            log
+        })
+    }
+
+    #[test]
+    fn a_surrogate_pair_is_one_character() {
+        let events = parse_log(&units("main", "A\u{1F980}B"));
+        assert_eq!(typed(&events), "A\u{1F980}B");
+        assert!(unpaired(&events).is_empty());
+        assert_eq!(
+            events.iter().filter(|event| event.is_input()).count(),
+            3,
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn key_lines_between_the_halves_keep_the_pair() {
+        // SendInput delivers each half as its own VK_PACKET keystroke.
+        let log = "main keydown 0xE7\nmain char U+D83E\nmain keyup 0xE7\n\
+                   main keydown 0xE7\nmain char U+DD80\nmain keyup 0xE7\n";
+        assert_eq!(typed(&parse_log(log)), "\u{1F980}");
+    }
+
+    #[test]
+    fn each_window_keeps_its_own_pending_half() {
+        let events = parse_log("main char U+D83E\ndialog char U+0078\nmain char U+DD80\n");
+        assert_eq!(typed(&events), "\u{1F980}");
+        assert!(events.contains(&Event::Char {
+            role: "dialog".into(),
+            ch: 'x'
+        }));
+        assert!(unpaired(&events).is_empty());
+    }
+
+    #[test]
+    fn a_lone_half_is_reported_unpaired() {
+        // A high surrogate followed by another character, a high surrogate at the end of the log,
+        // a low surrogate with no high one, and a high surrogate followed by another high one.
+        for (log, wanted, half) in [
+            ("main char U+D83E\nmain char U+0042\n", "\u{FFFD}B", 0xD83E),
+            ("main char U+0041\nmain char U+D83E\n", "A\u{FFFD}", 0xD83E),
+            ("main char U+DD80\nmain char U+0042\n", "\u{FFFD}B", 0xDD80),
+            (
+                "main char U+D83E\nmain char U+D83E\nmain char U+DD80\n",
+                "\u{FFFD}\u{1F980}",
+                0xD83E,
+            ),
+        ] {
+            let events = parse_log(log);
+            assert_eq!(typed(&events), wanted, "{log:?}");
+            assert_eq!(unpaired(&events), [half], "{log:?}");
+            assert!(
+                events.contains(&Event::Unpaired {
+                    role: "main".into(),
+                    unit: half
+                }),
+                "{log:?}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unpaired_half_of_another_window_stays_out_of_the_main_text() {
+        let events = parse_log("dialog char U+D83E\nmain char U+0041\n");
+        assert_eq!(typed(&events), "A");
+        assert!(unpaired(&events).is_empty());
+        assert!(events.contains(&Event::Unpaired {
+            role: "dialog".into(),
+            unit: 0xD83E
+        }));
     }
 }

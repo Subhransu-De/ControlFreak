@@ -15,7 +15,7 @@ cargo xtask e2e --strict
 
 Every scene window is one `controlfreak-fixture` process. It is a 360 × 260 pixel client area with a label reading `Banana` at the top, an edit surface in the middle that paints the text typed into it, and a `Ping` button below it. With `dialog = true` it also opens a small owned dialog of the same process next to it.
 
-The fixture writes every key, character, click and activation it receives to its own event log, and the tasks check that log, not the server's reply. Its first line, `ready`, reports the screen rectangles of the label, edit surface, button and dialog. Tasks use those rectangles to know where to click. A fixture closes itself after `lifetime_secs` (240 seconds by default), so a crashed run never leaves a window behind.
+The fixture writes every key, character, click and activation it receives to its own event log, and the tasks check that log, not the server's reply. A character outside the Basic Multilingual Plane arrives as two `WM_CHAR` messages, one per UTF-16 surrogate. The fixture logs both, and the harness pairs them per window. A half without its partner becomes an `unpaired` event and shows as U+FFFD in the typed text, so a split or dropped half fails the typing tasks. Its first line, `ready`, reports the screen rectangles of the label, edit surface, button and dialog. Tasks use those rectangles to know where to click. A fixture closes itself after `lifetime_secs` (240 seconds by default), so a crashed run never leaves a window behind.
 
 ## Scene fields
 
@@ -43,7 +43,7 @@ This is the plain "one application" desk. Every task here starts a control sessi
 | --- | --- |
 | `smoke/focus-window` | Focuses the window, waits for its activation event, and checks that `list_windows` reports it in the foreground. |
 | `smoke/click-pixel-and-button` | Clicks the center of the edit surface and checks the click landed within one pixel. Then clicks the button and waits for its press event. |
-| `smoke/type-unicode-enter-tab` | Types `Hi, é日` followed by CRLF, Tab and `z`. Checks the window received exactly those characters, with CRLF as one Enter. |
+| `smoke/type-unicode-enter-tab` | Types `Hi, é日🦀` followed by CRLF, Tab and `z`. Checks the window received exactly those characters, with CRLF as one Enter and 🦀 (U+1F980, outside the Basic Multilingual Plane) as one character from its two UTF-16 halves. |
 | `smoke/press-punctuation-keys` | Presses nine punctuation keys by name, then Enter and Tab. Checks each arrived as the right virtual key and typed the US-layout character. |
 | `smoke/click-text-by-ocr` | Needs OCR. Clicks the word `Banana` by OCR and checks the click landed inside the label. |
 | `smoke/injected-stop-click-ignored` | Finds the session's Stop button. Checks the server refuses a click on it with `own_indicator`. Then sends a real injected click straight to the button through the fixture and checks control did not stop. |
@@ -57,7 +57,7 @@ This is the "application that is busy when input arrives" desk. Windows hands a 
 
 | Task | What happens |
 | --- | --- |
-| `smoke/type-into-busy-app` | Types `Hello, world! é日 0123456789`, Tab and `z`. Checks the window received exactly those characters. Before keystrokes were paced, it received most of them as copies of one character. |
+| `smoke/type-into-busy-app` | Types `Hello, world! é日🦀 0123456789`, Tab and `z`. Checks the window received exactly those characters, with both halves of 🦀 paired. Before keystrokes were paced, it received most of them as copies of one character. |
 
 ## clipped
 
@@ -97,7 +97,7 @@ This is the "copy something from one application into another" desk. A control s
 
 | Task | What happens |
 | --- | --- |
-| `smoke/focus-after-user-input` | Injects a click into `journal` after the server has started, as a user typing in another app does, then focuses `ledger`. Checks that Windows refused the server's own request and the activation helper's was accepted (`input.activation_helper` is `accepted`), that `ledger` logged an activation and is in front, and that a click on it is accepted. |
+| `smoke/focus-after-user-input` | Injects a click into `journal` after the server has started, as a user typing in another app does, then focuses `ledger`. Checks that `ledger` came to the front by either path: Windows granted the server's own request (`input.activation_helper` absent), or refused it and accepted the activation helper's (`accepted`). Any other helper answer fails. Then checks that `ledger` logged an activation and is in front, and that a click on it is accepted. A direct grant means the foreground lock was not reproduced, and the task records that in a note. |
 | `smoke/foreign-window-refused` | With a session on `ledger`, clicks at the center of `journal`. Checks the refusal is `target_invalidated` with reason `foreign_destination`, is retryable and sent no input. Then checks the session still works on `ledger` and `journal` received nothing. |
 | `handoff/sessions-hand-over-cleanly` | Types `A1` into `ledger`, `B2` into `journal` and `C3` into `ledger`, each in its own session. Checks `ledger` received exactly `A1C3` and `journal` exactly `B2`. |
 | `handoff/other-window-refused-in-session` | With a session on `ledger`, tries to type into `journal`. Checks the call is refused, `journal` received no input, and typing into `ledger` still works afterwards. |

@@ -20,9 +20,10 @@ pub enum CleanupStatus {
     Unknown,
 }
 
-/// What the short-lived activation helper did during `focus_window`. Windows lets a process take
-/// the foreground only while no user input has arrived since it started, so a long-running server
-/// is refused once the user has typed anywhere. The helper is a fresh process that asks once.
+/// What the short-lived activation helper did during `focus_window`. Windows refuses
+/// `SetForegroundWindow` from a background process unless one of the conditions Microsoft
+/// documents holds, so a long-running server is usually refused once the user has worked in
+/// another application. The helper is a fresh process that asks once.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActivationHelperOutcome {

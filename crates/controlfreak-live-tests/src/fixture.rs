@@ -28,6 +28,10 @@
 //! main keydown 0x0D | main keyup 0x0D | main char U+0041 | main activate 1
 //! main mouse left_down X Y | dialog mouse left_down X Y | main button ping | main clip on
 //! ```
+//!
+//! A `char` line is one UTF-16 unit of a `WM_CHAR`, so a character outside the Basic Multilingual
+//! Plane is two lines, `main char U+D83E` then `main char U+DD80` for U+1F980. The harness pairs
+//! them per window and reports a half without its partner as unpaired.
 
 #[cfg(not(windows))]
 fn main() {
@@ -140,6 +144,8 @@ mod win {
 
     static LOG: OnceLock<PathBuf> = OnceLock::new();
     static TYPED: Mutex<String> = Mutex::new(String::new());
+    /// The high surrogate the main window (0) and the dialog (1) each wait to pair, for painting.
+    static PENDING_HIGH: Mutex<[Option<u16>; 2]> = Mutex::new([None; 2]);
     /// COLORREF (0x00BBGGRR) of the window background.
     static BACKGROUND: AtomicU32 = AtomicU32::new(0x00D0_D0D0);
     /// Set by `--clip-cursor` before any window exists.
@@ -492,13 +498,18 @@ mod win {
             WM_CHAR => {
                 let unit = u32::try_from(wparam.0).unwrap_or(0);
                 log(&format!("{role} char U+{unit:04X}"));
-                if let Ok(mut typed) = TYPED.lock() {
-                    match char::from_u32(unit) {
-                        Some('\u{8}') => {
-                            typed.pop();
+                if let (Ok(mut typed), Ok(mut pending), Ok(unit)) =
+                    (TYPED.lock(), PENDING_HIGH.lock(), u16::try_from(unit))
+                {
+                    let pending = &mut pending[usize::from(role == "dialog")];
+                    for c in join_surrogates(pending, unit) {
+                        match c {
+                            '\u{8}' => {
+                                typed.pop();
+                            }
+                            c if !c.is_control() => typed.push(c),
+                            _ => {}
                         }
-                        Some(c) if !c.is_control() => typed.push(c),
-                        _ => {}
                     }
                 }
                 // SAFETY: `hwnd` is live and owned by this thread.
@@ -520,6 +531,23 @@ mod win {
             _ => return None,
         }
         Some(LRESULT(0))
+    }
+
+    /// The characters one `WM_CHAR` unit completes, for painting. Windows sends a character
+    /// outside the Basic Multilingual Plane as two messages, one per UTF-16 surrogate, so a high
+    /// surrogate waits in `pending` for its low half. A half without its partner is painted as
+    /// U+FFFD, so a split pair shows on screen. The log keeps the raw units either way, and the
+    /// harness pairs them the same way.
+    fn join_surrogates(pending: &mut Option<u16>, unit: u16) -> Vec<char> {
+        let mut units: Vec<u16> = pending.take().into_iter().collect();
+        if (0xD800..=0xDBFF).contains(&unit) {
+            *pending = Some(unit);
+        } else {
+            units.push(unit);
+        }
+        char::decode_utf16(units)
+            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect()
     }
 
     /// Confines the pointer to `CLIP_AREA` while the main window is active, and frees it when
@@ -853,6 +881,37 @@ mod win {
             let _ = SetForegroundWindow(tray);
             thread::sleep(Duration::from_millis(300));
             i32::from(GetForegroundWindow() != tray)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::join_surrogates;
+
+        fn paint(units: &[u16]) -> String {
+            let mut pending = None;
+            let mut text: String = units
+                .iter()
+                .flat_map(|unit| join_surrogates(&mut pending, *unit))
+                .collect();
+            text.extend(pending.map(|_| char::REPLACEMENT_CHARACTER));
+            text
+        }
+
+        #[test]
+        fn a_surrogate_pair_paints_one_character() {
+            let units: Vec<u16> = "A\u{1F980}B".encode_utf16().collect();
+            assert_eq!(paint(&units), "A\u{1F980}B");
+        }
+
+        #[test]
+        fn a_lone_half_paints_a_replacement_character() {
+            assert_eq!(paint(&[0xD83E, 0x42]), "\u{FFFD}B");
+            assert_eq!(paint(&[0xDD80, 0x42]), "\u{FFFD}B");
+            assert_eq!(paint(&[0xD83E, 0xD83E, 0xDD80]), "\u{FFFD}\u{1F980}");
+            let mut pending = None;
+            assert!(join_surrogates(&mut pending, 0xD83E).is_empty());
+            assert_eq!(pending, Some(0xD83E), "the high half waits for its partner");
         }
     }
 }
