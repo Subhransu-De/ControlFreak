@@ -30,7 +30,7 @@ pub use display::{
     MouseMoveRequest, MousePosition, MouseScrollRequest, ObservationMode, ObservationOptions,
     ObservationRegion, PointerActionResult, SettleOutcome, SettleReport, VisualBaseline,
     VisualBaselineRequest, VisualChangeResult, WaitForChangeSinceRequest,
-    WaitForVisualChangeRequest,
+    WaitForVisualChangeRequest, scaled_dimensions,
 };
 pub use dpi::{DpiAwareness, DpiAwarenessStatus};
 pub use error::{FailureCause, PlatformError, RefusalCause};

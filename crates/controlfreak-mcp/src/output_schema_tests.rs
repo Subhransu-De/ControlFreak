@@ -217,6 +217,13 @@ impl WindowBackend for ObservationBackend {
             truncated: false,
         })
     }
+    fn list_virtual_desktops(&self) -> Result<VirtualDesktopList, PlatformError> {
+        Ok(VirtualDesktopList::from_windows(
+            self.list_windows()?,
+            None,
+            |_| Some(("desktop".into(), true)),
+        ))
+    }
     fn capture_window(
         &self,
         _: &CaptureWindowRequest,
@@ -508,6 +515,7 @@ async fn every_observation_and_session_result_validates_against_tools_list() {
             false,
         ),
         (LIST_WINDOWS, json!({}), false),
+        (LIST_VIRTUAL_DESKTOPS, json!({}), false),
         (
             CAPTURE_WINDOW,
             json!({"window_id":"target-00000000-0000-0000-0000-000000000003"}),

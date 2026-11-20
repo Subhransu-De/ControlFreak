@@ -319,6 +319,7 @@ dependencies = [
 name = "controlfreak-platform"
 version = "0.2.3"
 dependencies = [
+ "base64",
  "controlfreak-core",
  "png",
  "serde",

@@ -54,6 +54,26 @@ impl DisplayBounds {
     }
 }
 
+/// The image size of a capture of a `source_width` x `source_height` rectangle under an optional
+/// `max_width` budget: never wider than the source, the height rounded to keep the aspect ratio,
+/// and at least one pixel high. Image points map back through the source bounds, so this is the
+/// size every observation is registered with.
+#[must_use]
+pub fn scaled_dimensions(
+    source_width: u32,
+    source_height: u32,
+    max_width: Option<u32>,
+) -> (u32, u32) {
+    let image_width = max_width.map_or(source_width, |width| width.min(source_width));
+    let image_height = u32::try_from(
+        (u64::from(source_height) * u64::from(image_width) + u64::from(source_width / 2))
+            / u64::from(source_width),
+    )
+    .unwrap_or(source_height)
+    .max(1);
+    (image_width, image_height)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisplayInfo {
     pub id: String,

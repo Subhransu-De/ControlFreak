@@ -34,3 +34,12 @@ pub const DEFAULT_SETTLE_MS: u32 = 2_000;
 pub const DEFAULT_QUIET_SETTLE_MS: u32 = 500;
 /// Largest `settle_ms` an action accepts.
 pub const MAX_SETTLE_MS: u32 = 10_000;
+/// Most windows `list_windows` returns, and so the most `list_virtual_desktops` groups.
+pub const MAX_WINDOWS: usize = 200;
+/// Most OCR lines one `read_text_in_region` result returns.
+pub const MAX_READ_TEXT_LINES: usize = 200;
+/// Most characters (Unicode scalar values) of line text one `read_text_in_region` result returns.
+pub const MAX_READ_TEXT_CHARS: usize = 8_000;
+/// Most bytes the serialized `lines` of one `read_text_in_region` result take. Each word repeats
+/// its text with a box, so this bounds the structured result the characters do not.
+pub const MAX_READ_TEXT_BYTES: usize = 128 * 1024;

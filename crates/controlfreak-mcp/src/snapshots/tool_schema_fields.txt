@@ -285,6 +285,7 @@ read_text_in_region input x required
 read_text_in_region input y required
 read_text_in_region output anyOf[0].display required
 read_text_in_region output anyOf[0].language required
+read_text_in_region output anyOf[0].limit required
 read_text_in_region output anyOf[0].lines required
 read_text_in_region output anyOf[0].lines[].height required
 read_text_in_region output anyOf[0].lines[].text required
@@ -300,6 +301,7 @@ read_text_in_region output anyOf[0].lines[].y required
 read_text_in_region output anyOf[0].source_bounds required
 read_text_in_region output anyOf[0].target_ref
 read_text_in_region output anyOf[0].text required
+read_text_in_region output anyOf[0].truncated required
 read_text_in_region output anyOf[1].error required
 read_text_in_region output anyOf[1].error.code required
 read_text_in_region output anyOf[1].error.details
@@ -504,6 +506,7 @@ list_virtual_desktops output anyOf[0].desktops[].windows required
 list_virtual_desktops output anyOf[0].includes_empty_desktops required
 list_virtual_desktops output anyOf[0].names_available required
 list_virtual_desktops output anyOf[0].order_available required
+list_virtual_desktops output anyOf[0].truncated required
 list_virtual_desktops output anyOf[1].error required
 list_virtual_desktops output anyOf[1].error.code required
 list_virtual_desktops output anyOf[1].error.details

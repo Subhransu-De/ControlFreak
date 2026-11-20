@@ -1,5 +1,6 @@
 #![allow(unsafe_code)]
 
+pub(super) use controlfreak_core::scaled_dimensions;
 use controlfreak_core::{DisplayLayout, MutationControl, SettleOutcome, timing};
 use windows::System::UserProfile::GlobalizationPreferences;
 use windows::Win32::{
@@ -818,21 +819,6 @@ fn finish_image(
     Ok((png, image_width, image_height, cursor_marker))
 }
 
-pub(super) fn scaled_dimensions(
-    source_width: u32,
-    source_height: u32,
-    max_width: Option<u32>,
-) -> (u32, u32) {
-    let image_width = max_width.map_or(source_width, |width| width.min(source_width));
-    let image_height = u32::try_from(
-        (u64::from(source_height) * u64::from(image_width) + u64::from(source_width / 2))
-            / u64::from(source_width),
-    )
-    .unwrap_or(source_height)
-    .max(1);
-    (image_width, image_height)
-}
-
 /// Changed pixels needed before a repaint counts as the application's response. A blinking
 /// caret changes fewer pixels than this; one typed glyph or a pressed button changes more.
 const SETTLE_MIN_CHANGED_PIXELS: usize = 48;
@@ -1620,39 +1606,108 @@ mod benchmarks {
         )
     }
 
+    /// The 50th and 95th percentile of `samples`, by the nearest-rank method.
+    fn p50_p95(mut samples: Vec<f64>) -> (f64, f64) {
+        samples.sort_by(f64::total_cmp);
+        let rank = |percent: usize| samples[(samples.len() * percent).div_ceil(100) - 1];
+        (rank(50), rank(95))
+    }
+
+    /// The 50th and 95th percentile of `runs` timings of `operation`, in milliseconds.
+    fn percentiles(runs: usize, mut operation: impl FnMut()) -> (f64, f64) {
+        p50_p95(
+            (0..runs)
+                .map(|_| {
+                    let started = Instant::now();
+                    operation();
+                    started.elapsed().as_secs_f64() * 1_000.0
+                })
+                .collect(),
+        )
+    }
+
+    /// p50 and p95 of each stage of a screenshot result on fixed synthetic frames: capture, PNG
+    /// encoding, base64 and the OCR helper's start. Nothing is read from the screen, so capture
+    /// is the work after the screen read (copying the frame, BGRA to RGBA, resizing to the default
+    /// 1280 budget). The helper is this test binary's echo helper, so OCR itself is not timed;
+    /// `synthetic_ocr_stage_latency` times it.
+    ///
     /// Run with `cargo test -p controlfreak-platform --release --lib benchmarks -- --ignored --nocapture`.
     #[test]
     #[ignore = "synthetic latency benchmark; run explicitly"]
     fn synthetic_capture_pipeline_latency() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use controlfreak_core::limits::DEFAULT_CAPTURE_WIDTH;
+        const RUNS: usize = 20;
         for (width, height) in [(1920_u32, 1080_u32), (2560, 1440), (3840, 2160)] {
-            let frame = synthetic_frame(width, height);
-            let (image_width, image_height) = scaled_dimensions(width, height, Some(1280));
+            let grabbed = synthetic_frame(width, height);
+            let (image_width, image_height) =
+                scaled_dimensions(width, height, Some(DEFAULT_CAPTURE_WIDTH));
             let mut resized = Vec::new();
-            let resize = measure(9, || {
+            let capture = percentiles(RUNS, || {
+                let mut frame = grabbed.clone();
+                bgra_to_rgba(&mut frame);
                 resized = resize_rgba_area(&frame, width, height, image_width, image_height);
             });
-            let encode_full = measure(5, || {
-                encode_png(width, height, &frame).unwrap();
+            let encode = percentiles(RUNS, || {
+                std::hint::black_box(encode_png(image_width, image_height, &resized).unwrap());
             });
-            let png_bytes = encode_png(width, height, &frame).unwrap().len();
+            let png = encode_png(image_width, image_height, &resized).unwrap();
+            let base64 = percentiles(RUNS, || {
+                std::hint::black_box(STANDARD.encode(std::hint::black_box(&png)));
+            });
+            let encoded_bytes = STANDARD.encode(&png).len();
+            let encode_full = percentiles(5, || {
+                std::hint::black_box(encode_png(width, height, &grabbed).unwrap());
+            });
+            let full_png = encode_png(width, height, &grabbed).unwrap();
+            let base64_full = percentiles(5, || {
+                std::hint::black_box(STANDARD.encode(std::hint::black_box(&full_png)));
+            });
             let encode_full_rgba = measure(5, || {
-                encode_png_rgba_reference(width, height, &frame);
+                encode_png_rgba_reference(width, height, &grabbed);
             });
-            let png_bytes_rgba = encode_png_rgba_reference(width, height, &frame).len();
-            let encode_action = measure(9, || {
-                encode_png(image_width, image_height, &resized).unwrap();
-            });
+            let png_bytes_rgba = encode_png_rgba_reference(width, height, &grabbed).len();
             let mut compare = Vec::new();
             let downscale_compare = measure(9, || {
-                downscale_comparison_frame(&frame, width, height, &mut compare);
+                downscale_comparison_frame(&grabbed, width, height, &mut compare);
             });
             let difference = measure(9, || {
                 image_difference(&compare, &compare).unwrap();
             });
             eprintln!(
-                "{width}x{height}: resize_to_1280={resize:.1}ms encode_png_full={encode_full:.1}ms ({png_bytes} bytes, RGB) encode_png_full_rgba_reference={encode_full_rgba:.1}ms ({png_bytes_rgba} bytes) encode_png_1280={encode_action:.1}ms compare_downscale={downscale_compare:.1}ms compare_difference={difference:.2}ms"
+                "{width}x{height} -> {image_width}x{image_height} (p50/p95 ms): \
+                 capture={:.1}/{:.1} encode_png={:.1}/{:.1} ({} bytes) \
+                 base64={:.2}/{:.2} ({encoded_bytes} bytes); \
+                 native: encode_png={:.1}/{:.1} ({} bytes, RGB) base64={:.2}/{:.2}; \
+                 median ms: encode_png_rgba_reference={encode_full_rgba:.1} ({png_bytes_rgba} bytes) \
+                 compare_downscale={downscale_compare:.1} compare_difference={difference:.2}",
+                capture.0,
+                capture.1,
+                encode.0,
+                encode.1,
+                png.len(),
+                base64.0,
+                base64.1,
+                encode_full.0,
+                encode_full.1,
+                full_png.len(),
+                base64_full.0,
+                base64_full.1,
             );
         }
+        let spawn = p50_p95(
+            super::super::ocr::synthetic_benchmarks::helper_spawn_samples(
+                u64::try_from(RUNS).unwrap(),
+            )
+            .into_iter()
+            .map(|elapsed| elapsed.as_secs_f64() * 1_000.0)
+            .collect(),
+        );
+        eprintln!(
+            "OCR helper spawn to first reply (echo helper, no OCR) (p50/p95 ms): {:.1}/{:.1}",
+            spawn.0, spawn.1
+        );
     }
 
     /// The CPU cost of one visual-wait poll after the screen read, on a synthetic frame standing

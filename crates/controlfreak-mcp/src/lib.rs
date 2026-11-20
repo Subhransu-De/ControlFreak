@@ -3,6 +3,8 @@
 mod arguments;
 #[cfg(test)]
 mod begin_cancel_tests;
+#[cfg(test)]
+mod bounds_tests;
 mod catalog;
 #[cfg(test)]
 mod catalog_tests;
@@ -67,10 +69,10 @@ use catalog::{Route, ToolSpec};
 use controlfreak_core::{CaptureWindowRequest, WaitForChangeSinceRequest, WaitForWindowRequest};
 use handlers::call_get_server_status;
 use results::{
-    CarriesPng, Encoded, click_text_result, keyboard_result, pointer_result, screenshot_result,
-    tool_error, tool_execution_error, virtual_desktop_list_result, virtual_desktop_switch_result,
-    visual_baseline_result, visual_change_result, window_focus_result, window_screenshot_result,
-    window_wait_result,
+    CarriesPng, Encoded, click_text_result, keyboard_result, pointer_result, read_text_result,
+    screenshot_result, tool_error, tool_execution_error, virtual_desktop_list_result,
+    virtual_desktop_switch_result, visual_baseline_result, visual_change_result,
+    window_focus_result, window_screenshot_result, window_wait_result,
 };
 pub use schema::full_tools as full_tool_definitions;
 use schema::tools;

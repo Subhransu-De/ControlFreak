@@ -1,4 +1,6 @@
 use super::*;
+use controlfreak_core::{OcrLine, OcrResult};
+use serde::Serialize;
 
 /// Results that may carry a PNG.
 pub(super) trait CarriesPng {
@@ -180,9 +182,94 @@ pub(super) fn virtual_desktop_list_result(result: &VirtualDesktopList) -> CallTo
     CallToolResult::structured(json!({
         "count": desktops.len(),
         "desktops": desktops,
-        "includes_empty_desktops": result.includes_empty_desktops,
-        "order_available": result.order_available,
-        "names_available": result.names_available,
+        "includes_empty_desktops": false,
+        "order_available": false,
+        "names_available": false,
+        "truncated": result.truncated,
+    }))
+}
+
+/// Which bound cut a `read_text_in_region` result short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ReadTextLimit {
+    Lines,
+    Characters,
+    Bytes,
+}
+
+/// How many leading lines fit every `read_text_in_region` bound, and the bound that stopped the
+/// rest. Lines are kept whole, in reading order, so a client can read on below the last one.
+fn read_text_budget(lines: &[OcrLine]) -> (usize, Option<ReadTextLimit>) {
+    use controlfreak_core::limits::{
+        MAX_READ_TEXT_BYTES, MAX_READ_TEXT_CHARS, MAX_READ_TEXT_LINES,
+    };
+    let mut characters = 0_usize;
+    // The brackets of the `lines` array.
+    let mut bytes = 2_usize;
+    for (index, line) in lines.iter().enumerate() {
+        if index == MAX_READ_TEXT_LINES {
+            return (index, Some(ReadTextLimit::Lines));
+        }
+        characters += line.text.chars().count();
+        if characters > MAX_READ_TEXT_CHARS {
+            return (index, Some(ReadTextLimit::Characters));
+        }
+        // The comma before every line but the first. A line that cannot be measured is too big.
+        let line_bytes = serde_json::to_vec(line).map_or(usize::MAX, |json| json.len());
+        bytes = bytes
+            .saturating_add(line_bytes)
+            .saturating_add(usize::from(index > 0));
+        if bytes > MAX_READ_TEXT_BYTES {
+            return (index, Some(ReadTextLimit::Bytes));
+        }
+    }
+    (lines.len(), None)
+}
+
+/// The recognized text up to the end of the last kept line. The engine's text separates lines
+/// its own way, so the cut is found in it; if a kept line is not found there in order, the kept
+/// lines are joined with line breaks instead.
+fn text_through(text: &str, kept: &[OcrLine]) -> String {
+    let mut end = 0;
+    for line in kept {
+        let Some(offset) = text[end..].find(line.text.as_str()) else {
+            return kept
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+        };
+        end += offset + line.text.len();
+    }
+    text[..end].to_owned()
+}
+
+/// A `read_text_in_region` result bounded by lines, characters and serialized bytes. When a
+/// bound is hit, `text` and `lines` both stop at the same whole line.
+pub(super) fn read_text_result(result: OcrResult) -> CallToolResult {
+    let OcrResult {
+        target_ref,
+        display,
+        source_bounds,
+        language,
+        mut text,
+        mut lines,
+    } = result;
+    let (kept, limit) = read_text_budget(&lines);
+    if limit.is_some() {
+        lines.truncate(kept);
+        text = text_through(&text, &lines);
+    }
+    CallToolResult::structured(json!({
+        "target_ref": target_ref,
+        "display": display,
+        "source_bounds": source_bounds,
+        "language": language,
+        "text": text,
+        "lines": lines,
+        "truncated": limit.is_some(),
+        "limit": limit,
     }))
 }
 
