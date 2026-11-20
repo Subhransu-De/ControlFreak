@@ -37,6 +37,7 @@ versioned section and uses that section for the corresponding GitHub Release not
 - `click_text` accepts `match_mode` (`exact`, the default, or `substring`), the same name `find_text_on_screen` and `wait_for_text` use. `tolerant` is refused with `invalid_argument`, because a click needs a strict match. `exact_match` still works as an alias and no longer publishes a default; a value that contradicts `match_mode` is refused with `invalid_argument`.
 - `list_virtual_desktops` reports `truncated: true` when more than 200 windows exist, like `list_windows`. Before, it dropped the extra windows without saying so.
 - `read_text_in_region` returns at most 200 lines, 8000 characters and 128 KiB of lines, cut at a whole line. A cut result has `truncated: true` and `limit` (`lines`, `characters` or `bytes`), and its `text` ends with the last returned line. Read the rest with a region below that line.
+- `observation.foreground_window` now describes a window in front that has no target reference, such as a popup menu, untitled dialog, tool window or cloaked window, as `{"id": null, "class_name", "process_id", "same_process_as_target"}`, never with its title. Before, it was `null`, the same as no foreground. `null` now means only that no window is in front. It is also reported with `observation.mode: none` and for every `run_actions` step. A window with a reference keeps its `list_windows` shape. See `docs/tools.md`.
 
 ### Changed
 

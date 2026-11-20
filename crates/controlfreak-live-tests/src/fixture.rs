@@ -10,6 +10,7 @@
 //! ```text
 //! controlfreak-fixture --title TEXT --log FILE [--color RRGGBB] [--pos X,Y] [--topmost]
 //!                      [--with-dialog] [--lifetime-secs N] [--busy-drain-ms N] [--clip-cursor]
+//!                      [--popup-on-ping]
 //! controlfreak-fixture --stop-button-rect     # print the screen rectangle of the Stop agent button
 //! controlfreak-fixture --invoke-stop-button   # send BM_CLICK to it, as UI Automation's Invoke does
 //! controlfreak-fixture --allow-again-rect     # print the screen rectangle of the Allow again control
@@ -24,6 +25,9 @@
 //! With `--clip-cursor` the window confines the pointer to the left part of its client area with
 //! `ClipCursor` whenever it is activated, as games and remote viewers do, and frees it when it is
 //! deactivated.
+//!
+//! With `--popup-on-ping` a press of the button also opens an untitled popup owned by the window
+//! and brings it to the foreground, as a popup menu does. It logs `main popup open`.
 //!
 //! Log lines, screen coordinates in physical pixels:
 //!
@@ -156,6 +160,8 @@ mod win {
     static BACKGROUND: AtomicU32 = AtomicU32::new(0x00D0_D0D0);
     /// Set by `--clip-cursor` before any window exists.
     static CLIP_CURSOR: AtomicBool = AtomicBool::new(false);
+    /// Set by `--popup-on-ping` before any window exists.
+    static POPUP_ON_PING: AtomicBool = AtomicBool::new(false);
 
     struct Options {
         title: String,
@@ -230,6 +236,7 @@ mod win {
                     options.busy_drain_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
                 }
                 "--clip-cursor" => CLIP_CURSOR.store(true, Ordering::Relaxed),
+                "--popup-on-ping" => POPUP_ON_PING.store(true, Ordering::Relaxed),
                 other => {
                     eprintln!("unknown argument {other}");
                     return 2;
@@ -321,6 +328,7 @@ mod win {
     fn create_windows(options: &Options) -> Result<(), String> {
         register(w!("ControlFreakFixture"), main_proc).map_err(|e| e.to_string())?;
         register(w!("ControlFreakFixtureDialog"), dialog_proc).map_err(|e| e.to_string())?;
+        register(w!("ControlFreakFixturePopup"), popup_proc).map_err(|e| e.to_string())?;
         let instance = module().map_err(|e| e.to_string())?;
         let style = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
         let ex_style = if options.topmost {
@@ -681,6 +689,9 @@ mod win {
                     // The click gave the button the focus; keys belong to the surface.
                     // SAFETY: `hwnd` is live and owned by this thread.
                     let _ = unsafe { SetFocus(Some(hwnd)) };
+                    if POPUP_ON_PING.load(Ordering::Relaxed) {
+                        open_popup(hwnd);
+                    }
                 }
                 LRESULT(0)
             }
@@ -702,6 +713,66 @@ mod win {
                 unsafe { PostQuitMessage(0) };
                 LRESULT(0)
             }
+            // SAFETY: Forwards the unchanged arguments of this window procedure.
+            _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        }
+    }
+
+    /// Opens an untitled popup owned by `owner` over its client area and gives it the foreground,
+    /// which this process may do because it holds the foreground while it handles the click.
+    fn open_popup(owner: HWND) {
+        let Ok(instance) = module() else {
+            return;
+        };
+        let origin = screen_rect(owner, CLIENT);
+        // SAFETY: The class is registered at startup and the title is null, so the popup is
+        // untitled. It is owned by `owner`, so Windows destroys it with its owner.
+        let popup = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("ControlFreakFixturePopup"),
+                PCWSTR::null(),
+                WS_POPUP | WS_VISIBLE,
+                origin.left + 200,
+                origin.top + 170,
+                120,
+                60,
+                Some(owner),
+                None,
+                Some(instance),
+                None,
+            )
+        };
+        if let Ok(popup) = popup {
+            // SAFETY: `popup` is live and owned by this thread.
+            let _ = unsafe { SetForegroundWindow(popup) };
+            log("main popup open");
+        }
+    }
+
+    unsafe extern "system" fn popup_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            WM_PAINT | WM_PRINTCLIENT => {
+                paint(hwnd, wparam, |hdc| {
+                    fill(
+                        hdc,
+                        RECT {
+                            left: 0,
+                            top: 0,
+                            right: 120,
+                            bottom: 60,
+                        },
+                        0x00FF_FFFF,
+                    );
+                });
+                LRESULT(0)
+            }
+            WM_CLOSE => destroy(hwnd),
             // SAFETY: Forwards the unchanged arguments of this window procedure.
             _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
         }

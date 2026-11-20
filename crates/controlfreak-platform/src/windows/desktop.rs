@@ -13,7 +13,9 @@ use super::{
     VirtualDesktopManager, WS_EX_TOOLWINDOW, WaitForWindowRequest, WindowBounds, WindowInfo,
     c_void, catch_unwind, last_win32_error, size_of, win32_error,
 };
-use controlfreak_core::{DpiAwareness, DpiAwarenessStatus, FailureCause};
+use controlfreak_core::{
+    DpiAwareness, DpiAwarenessStatus, FailureCause, ForegroundWindow, UnlistedWindow,
+};
 
 pub(super) fn foreground_window_handle() -> HWND {
     // SAFETY: GetForegroundWindow has no pointer parameters and returns either a valid handle or
@@ -464,6 +466,32 @@ pub(super) fn window_info(hwnd: HWND) -> Result<WindowInfo, PlatformError> {
         owner: owner_reference(hwnd),
         ..window
     })
+}
+
+/// The foreground window for an action result: the full description when a reference can be
+/// issued for it, otherwise only its class and process, compared with `target_process`. The
+/// title of a window without a reference is never reported, so a result reveals no more about
+/// another process than `list_windows` does. `None` only when no window holds the foreground or
+/// it closed while it was read.
+pub(super) fn foreground_window(target_process: Option<u32>) -> Option<ForegroundWindow> {
+    let hwnd = foreground_window_handle();
+    if hwnd.is_invalid() {
+        return None;
+    }
+    if let Ok(window) = window_info(hwnd) {
+        return Some(ForegroundWindow::Listed(window));
+    }
+    let mut process_id = 0_u32;
+    // SAFETY: `process_id` is a valid writable u32; a stale handle makes the call return 0.
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut process_id)) };
+    if process_id == 0 {
+        return None;
+    }
+    Some(ForegroundWindow::Unlisted(UnlistedWindow {
+        class_name: window_class_name(hwnd).unwrap_or_default(),
+        process_id,
+        same_process_as_target: target_process.map(|target| target == process_id),
+    }))
 }
 
 /// Reads window metadata with an empty `id`; callers issue a reference only when they return it.

@@ -218,6 +218,7 @@ A character outside the Basic Multilingual Plane, such as an emoji, is two UTF-1
 - Each step gets the same target checks as the single tool.
 - The batch stops at the first failure. `action.steps` reports each step as `completed`,
   `failed` or `skipped`.
+- Each completed step reports `foreground_window`, the window in front after that step (see [Foreground window](#foreground-window)).
 - Only the last step returns a screenshot. Each earlier step waits up to 500 ms for the window to settle (see [Waiting for the window to settle](#waiting-for-the-window-to-settle)). Add a `wait` step before a step that depends on a slower load.
 - A `wait` step (`wait_ms` from 1 to 5000, at most 15000 in total) pauses between steps. It sends no input and cannot be the last step.
 - A `type_text` step takes an optional `timeout_ms` with the same range and meaning as the single tool (see [Keys](#keys)). It limits that step only. A step that runs out of time fails with `deadline_reached`, and the later steps are skipped. The batch as a whole has no overall limit.
@@ -234,6 +235,7 @@ depends on what an earlier step shows.
 | `input.sent_events` | Count of input events Windows accepted |
 | `input.cleanup` | `not_needed`, `succeeded`, `unknown` |
 | `input.target_remained_foreground` | `true`, `false` or `null` after the action |
+| `observation.foreground_window` | The window in front after the action, in every `observation.mode`. See [Foreground window](#foreground-window) |
 | `input.activation_helper` | `focus_window` only, when Windows refused the server: `accepted`, `refused` or `failed` |
 | `input.split_character` | `type_text` and `run_actions` only: `true` when typing stopped between the two halves of a surrogate pair, otherwise absent |
 | `observation_status` | `succeeded`, `failed`, `not_attempted` |
@@ -281,6 +283,16 @@ The reason for `platform_operation_failed` is set by the code that detects the f
 - Accepted input does not prove the application did what was asked. Check the screenshot.
 - After partial or unknown delivery, observe before you act again. Do not replay the whole
   action.
+
+### Foreground window
+
+`observation.foreground_window` says which window holds the foreground once the action is done. It is read in every `observation.mode`, also `none` and `metadata`, and in every `run_actions` step. Reading it takes no capture. It has one of three forms:
+
+- A window the server can issue a target reference for has the same fields as a `list_windows` entry: `id` (its `target_ref`), `title`, `class_name`, `process_id`, `bounds`, `display_id`, `is_foreground`, `is_minimized`, and `owner` for an owned window such as a dialog. Pass the `id` to `focus_window`, `capture_window` or `begin_control_session` like any other reference.
+- A window without a reference has `id: null` and only `class_name`, `process_id` and `same_process_as_target`. These are untitled windows, tool windows and windows the compositor hides (cloaks), for example a popup menu or a drop-down list. Their title is never returned. `same_process_as_target` is `true` when the window belongs to the process of the approved window, `false` when it does not, and `null` when the approved window is no longer known.
+- `null` means that no window holds the foreground, or that the window in front closed while it was read.
+
+`input.target_remained_foreground` answers a different question: whether the approved window, or a window of its process that may stand in for it, holds the foreground, so that the next input can be accepted. Use it to decide whether to call `focus_window`. `same_process_as_target` compares process IDs only. For `explorer.exe`, `ApplicationFrameHost.exe` and targets whose program file cannot be read (see [Targets](#targets)), only the target's own dialogs and popup menus count, so a shell menu can have `same_process_as_target: true` while `input.target_remained_foreground` is `false`.
 
 ## Argument errors
 

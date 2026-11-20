@@ -373,7 +373,7 @@ fn action_result(
     let mut metadata = json!({
         "action": action,
         "observation": {
-            "foreground_window": observation.foreground_window,
+            "foreground_window": foreground_window(observation.foreground_window.as_ref()),
             "screenshot": observation.screenshot.as_ref().map(screenshot_metadata),
         },
     });
@@ -384,6 +384,22 @@ fn action_result(
         metadata["position"] = position;
     }
     image_result(encoded, metadata)
+}
+
+/// `observation.foreground_window`: the window as `list_windows` lists it when it has a target
+/// reference, otherwise `id: null` with its class and process only, and `null` when no window
+/// holds the foreground.
+pub(super) fn foreground_window(window: Option<&ForegroundWindow>) -> Value {
+    match window {
+        None => Value::Null,
+        Some(ForegroundWindow::Listed(window)) => json!(window),
+        Some(ForegroundWindow::Unlisted(window)) => json!({
+            "id": null,
+            "class_name": window.class_name,
+            "process_id": window.process_id,
+            "same_process_as_target": window.same_process_as_target,
+        }),
+    }
 }
 
 /// Builds the result; `encoded` is `None` only when the result has no image.

@@ -23,8 +23,11 @@ The server reads desktop information only when the connected client calls a tool
   Actions return a screenshot by default so the client can see the result.
 - **Text on the screen**, read by the Windows OCR engine on your computer, for
   `read_text_in_region`, `find_text_on_screen`, `wait_for_text` and `click_text`.
-- **Window information**: titles, process IDs, positions and integrity levels of top-level
-  windows, for `list_windows`, `wait_for_window` and the safety checks before each input action.
+- **Window information**: titles, class names, process IDs, positions and integrity levels of
+  top-level windows, for `list_windows`, `wait_for_window` and the safety checks before each input
+  action. Each action result also names the window in front afterwards. When that window has no
+  target reference, for example an untitled popup menu, the result gives only its class name and
+  process ID, never its title.
 - **Display and virtual desktop layout**, to map coordinates and to check the target window.
 - **Action arguments** from the client, such as the text to type or the keys to press. These are
   used to send the input and are not stored.

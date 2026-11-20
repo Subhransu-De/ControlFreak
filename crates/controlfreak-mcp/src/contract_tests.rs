@@ -1529,7 +1529,9 @@ fn a_completed_click_result_stays_small() {
             virtual_y: 110,
         },
         observation: ActionObservation {
-            foreground_window: Some(window("target-00000000-0000-0000-0000-000000000001")),
+            foreground_window: Some(ForegroundWindow::Listed(window(
+                "target-00000000-0000-0000-0000-000000000001",
+            ))),
             screenshot: Some(DisplayScreenshot {
                 target_ref: Some("target-00000000-0000-0000-0000-000000000001".into()),
                 source_bounds: display.bounds,

@@ -30,6 +30,7 @@ The fixture writes every key, character, click and activation it receives to its
 | `window.lifetime_secs` | `240` | Seconds until the fixture closes itself, from 10 to 600. |
 | `window.busy_drain_ms` | `0` | When above 0, at most 1000: the fixture stays busy this many milliseconds whenever a message arrives, then takes every queued keystroke before translating any, like a busy UI framework. |
 | `window.clip_cursor` | `false` | While the window is active, the fixture confines the pointer to the left half of its client area with `ClipCursor`, as games and remote viewers do, and reports that rectangle as `clip` in its ready line. |
+| `window.popup_on_ping` | `false` | A press of the fixture's button also opens an untitled popup owned by the window, of class `ControlFreakFixturePopup`, and brings it to the foreground, as a popup menu does. |
 
 Scenes are compiled into the harness, so a run does not depend on the working directory. Unknown fields, duplicate keys and invalid colors are refused when the scene loads.
 
@@ -41,7 +42,7 @@ This is the plain "one application" desk. Every task here starts a control sessi
 
 | Task | What happens |
 | --- | --- |
-| `smoke/focus-window` | Focuses the window, waits for its activation event, and checks that `list_windows` reports it in the foreground. |
+| `smoke/focus-window` | Focuses the window with `observation.mode` `none` and checks the result still reports it as `observation.foreground_window`. Waits for its activation event, and checks that `list_windows` reports it in the foreground. |
 | `smoke/click-pixel-and-button` | Clicks the center of the edit surface and checks the click landed within one pixel. Then clicks the button and waits for its press event. |
 | `smoke/type-unicode-enter-tab` | Types `Hi, é日🦀` followed by CRLF, Tab and `z`. Checks the window received exactly those characters, with CRLF as one Enter and 🦀 (U+1F980, outside the Basic Multilingual Plane) as one character from its two UTF-16 halves. |
 | `smoke/press-punctuation-keys` | Presses nine punctuation keys by name, then Enter and Tab. Checks each arrived as the right virtual key and typed the US-layout character. |
@@ -80,6 +81,16 @@ This is the "application with a modal-style dialog" desk. It shows that a sessio
 | Task | What happens |
 | --- | --- |
 | `smoke/owned-dialog-accepted` | Checks `list_windows` lists the dialog with `owner` set to the main window and the same process ID. Clicks inside the dialog, then clicks the main window's button. Both clicks must be accepted and both must reach the fixture. |
+
+## with-popup
+
+One green window, `app`, with `popup_on_ping = true`.
+
+This is the "application that opens a popup menu" desk. A popup menu has no title, so the server issues no target reference for it, and the result must still say that a window of the target's process is in front.
+
+| Task | What happens |
+| --- | --- |
+| `smoke/untitled-popup-described` | Clicks the button with `observation.mode` `none` and waits for the popup. Checks `observation.foreground_window` is `{"id": null, "class_name": "ControlFreakFixturePopup", "process_id": <fixture pid>, "same_process_as_target": true}`, with no title, and that `input.target_remained_foreground` is `true`. |
 
 ## covered
 

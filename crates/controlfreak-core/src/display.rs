@@ -315,7 +315,8 @@ pub struct PointerActionResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionObservation {
-    pub foreground_window: Option<crate::WindowInfo>,
+    /// `None` only when no window holds the foreground.
+    pub foreground_window: Option<crate::ForegroundWindow>,
     pub screenshot: Option<DisplayScreenshot>,
     /// How the wait between the input and this evidence ended, for input actions.
     pub settle: Option<SettleReport>,

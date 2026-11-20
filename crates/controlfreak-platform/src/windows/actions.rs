@@ -130,6 +130,7 @@ impl PointerBackend for Backend {
             foreground_before,
             &request.observation,
             settled,
+            control,
         )
     }
 
@@ -207,7 +208,7 @@ impl KeyboardBackend for Backend {
             control,
         )?;
         super::target::evidence(control);
-        let mut observation = observe_foreground(&request.observation)
+        let mut observation = observe_foreground(&request.observation, control)
             .map_err(|error| post_action_error("press_keys", error.to_string()))?;
         observation.settle = Some(settled);
         Ok(KeyboardActionResult { observation })
@@ -254,7 +255,7 @@ impl KeyboardBackend for Backend {
             control,
         )?;
         super::target::evidence(control);
-        let mut observation = observe_foreground(&request.observation)
+        let mut observation = observe_foreground(&request.observation, control)
             .map_err(|error| post_action_error("type_text", error.to_string()))?;
         observation.settle = Some(settled);
         Ok(KeyboardActionResult { observation })
@@ -427,7 +428,13 @@ impl Backend {
             )?
         };
         super::target::evidence(control);
-        Self::pointer_action_result(operation, foreground_before, spec.observation, settled)
+        Self::pointer_action_result(
+            operation,
+            foreground_before,
+            spec.observation,
+            settled,
+            control,
+        )
     }
 
     fn pointer_action_result(
@@ -435,6 +442,7 @@ impl Backend {
         foreground_before: HWND,
         options: &ObservationOptions,
         settled: SettleReport,
+        control: &MutationControl,
     ) -> Result<PointerActionResult, PlatformError> {
         let actual = current_cursor_position()
             .map_err(|error| post_action_error(operation, error.to_string()))?;
@@ -464,7 +472,7 @@ impl Backend {
             } else {
                 actual_display.id.clone()
             };
-        let mut observation = observe_display(&observation_display_id, options)
+        let mut observation = observe_display(&observation_display_id, options, control)
             .map_err(|error| post_action_error(operation, error.to_string()))?;
         observation.settle = Some(settled);
 
