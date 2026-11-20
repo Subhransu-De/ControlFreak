@@ -1,13 +1,23 @@
 //! A short-lived process that asks Windows once to bring one window to the foreground.
 //!
-//! Windows grants `SetForegroundWindow` to a process only while no user input has arrived since
-//! that process started (or when it received the last input itself). The server runs for the
-//! whole client session and the user always types the request after it starts, so its own calls
-//! are refused from then on, however often they are retried. A process started after that input
-//! is still allowed, so when the server's request is refused, `focus_window` starts this helper
-//! from the server's own executable. It makes the same documented call once, for the window the
-//! server already validated, and exits. It sends no input and touches no other window; the
-//! server validates the foreground again on every poll afterwards, exactly as without it.
+//! Microsoft documents when Windows grants `SetForegroundWindow`
+//! (<https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow>).
+//! All of these must hold: the caller is a desktop app, the foreground process has not called
+//! `LockSetForegroundWindow`, and no menu is active. At least one of these must also hold: the
+//! foreground-lock timeout (`SPI_GETFOREGROUNDLOCKTIMEOUT`) has expired, the caller is the
+//! foreground process, was started by it or received the last input event, there is no
+//! foreground window, or the caller or the foreground process is being debugged. Windows may
+//! refuse even then.
+//!
+//! The server runs for the whole client session and the user types the request in another
+//! application after it starts, so its own calls are usually refused, however often they are
+//! retried, and granted only when a condition such as the lock timeout happens to hold. In
+//! practice Windows still lets a process started after that input take the foreground, which the
+//! documentation does not list; the live scene `smoke/focus-after-user-input` checks it whenever
+//! it reproduces the lock. So when the server's request is refused, `focus_window` starts this
+//! helper from the server's own executable. It makes the same documented call once, for the
+//! window the server already validated, and exits. It sends no input and touches no other window;
+//! the server validates the foreground again on every poll afterwards, exactly as without it.
 
 use super::{
     HWND, c_void,

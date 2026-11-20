@@ -10,12 +10,14 @@
 //! - Input is accepted while the foreground window belongs to the approved window's process. Any
 //!   other foreground is refused for that action only; the session survives.
 //! - Pointer input lands on the foreground window.
+//! - A refused focus request is followed by one activation helper answer when a test sets one,
+//!   as `focus_window` asks the helper once after Windows refuses the server's own request.
 
 use controlfreak_core::{
-    ActionObservation, BackendIdentity, BackendMetadata, CapabilityDescriptor,
-    CaptureWindowRequest, DisplayBackend, DisplayBounds, DisplayInfo, FocusWindowRequest,
-    KeyChordRequest, KeyboardActionResult, KeyboardBackend, MouseClickRequest, MousePosition,
-    MutationControl, OcrBackend, PermissionDescriptor, Platform, PlatformError,
+    ActionObservation, ActivationHelperOutcome, BackendIdentity, BackendMetadata,
+    CapabilityDescriptor, CaptureWindowRequest, DisplayBackend, DisplayBounds, DisplayInfo,
+    FocusWindowRequest, KeyChordRequest, KeyboardActionResult, KeyboardBackend, MouseClickRequest,
+    MousePosition, MutationControl, OcrBackend, PermissionDescriptor, Platform, PlatformError,
     PointerActionResult, PointerBackend, TextInputRequest, WaitForWindowRequest, WindowBackend,
     WindowBounds, WindowFocusResult, WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
 };
@@ -49,6 +51,8 @@ struct State {
     received: Vec<Received>,
     /// How many upcoming `focus_window` calls Windows refuses to activate.
     focus_refusals: u32,
+    /// What the activation helper answers after such a refusal. `None` is a server without one.
+    helper: Option<ActivationHelperOutcome>,
 }
 
 #[derive(Default)]
@@ -208,6 +212,11 @@ impl FakeDesktop {
     /// Makes the next `count` focus requests fail like Windows refusing a background activation.
     pub(super) fn refuse_focus(&self, count: u32) {
         self.state().focus_refusals = count;
+    }
+
+    /// Makes the activation helper give `answer` whenever the server's own request is refused.
+    pub(super) fn answer_helper(&self, answer: ActivationHelperOutcome) {
+        self.state().helper = Some(answer);
     }
 
     pub(super) fn received(&self) -> Vec<Received> {
@@ -372,12 +381,17 @@ impl WindowBackend for FakeDesktop {
         }
         if state.focus_refusals > 0 {
             state.focus_refusals -= 1;
+            if let Some(answer) = state.helper {
+                control.activation_helper(answer);
+            }
             // A refused activation leaves the target alone, like the Windows backend.
-            return Err(PlatformError::ActivationFailed {
-                reason: "activation_refused".into(),
-                attempts: 3,
-                elapsed_ms: 400,
-            });
+            if state.helper != Some(ActivationHelperOutcome::Accepted) {
+                return Err(PlatformError::ActivationFailed {
+                    reason: "activation_refused".into(),
+                    attempts: 3,
+                    elapsed_ms: 400,
+                });
+            }
         }
         state.foreground = Some(window.key);
         state.received.push(Received::Focus { window: window.key });

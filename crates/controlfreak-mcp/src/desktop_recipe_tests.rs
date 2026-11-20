@@ -4,6 +4,7 @@
 use super::fake_desktop::{FakeDesktop, Received};
 use super::session_error_tests::{Harness, call, harness_with_backend};
 use super::*;
+use controlfreak_core::ActivationHelperOutcome;
 
 async fn start(desktop: &Arc<FakeDesktop>) -> Harness {
     harness_with_backend(desktop.clone(), Arc::new(AtomicBool::new(false))).await
@@ -160,6 +161,72 @@ async fn a_refused_focus_is_retryable_and_does_not_poison_the_session() {
         desktop.received(),
         [Received::Focus { window: app }, clicked(app)]
     );
+    harness.finish().await;
+}
+
+/// The reference of the window `list_windows` reports in the foreground.
+async fn foreground(harness: &mut Harness) -> String {
+    let windows = call(harness, LIST_WINDOWS, json!({})).await;
+    let listed = windows["structuredContent"]["windows"].as_array().unwrap();
+    let front: Vec<&Value> = listed
+        .iter()
+        .filter(|window| window["is_foreground"] == true)
+        .collect();
+    assert_eq!(front.len(), 1, "{windows}");
+    front[0]["id"].as_str().unwrap().to_owned()
+}
+
+/// The foreground lock, without a desktop: Windows refuses the server's own request after the
+/// user worked in another application, and the activation helper's answer decides the result.
+#[tokio::test]
+async fn the_activation_helper_answer_decides_a_refused_focus() {
+    let focus = |target: &str| json!({"window_id": target, "observation": {"mode": "none"}});
+
+    // Own call refused, helper accepted: the window is in front and takes input.
+    let desktop = FakeDesktop::new();
+    let app = desktop.open("Editor", 10);
+    let target = desktop.id(app);
+    let mut harness = start(&desktop).await;
+    begin(&mut harness, &target).await;
+    desktop.open("Chat notification", 20);
+    desktop.refuse_focus(1);
+    desktop.answer_helper(ActivationHelperOutcome::Accepted);
+    let focused = call(&mut harness, FOCUS_WINDOW, focus(&target)).await;
+    accepted(&focused);
+    let input = &focused["structuredContent"]["input"];
+    assert_eq!(input["activation_helper"], "accepted", "{focused}");
+    assert_eq!(foreground(&mut harness).await, target);
+    accepted(&click(&mut harness, &target).await);
+    assert_eq!(
+        desktop.received(),
+        [Received::Focus { window: app }, clicked(app)]
+    );
+    harness.finish().await;
+
+    // Own call and helper refused: `activation_refused`, nothing sent, the session kept.
+    let desktop = FakeDesktop::new();
+    let app = desktop.open("Editor", 10);
+    let target = desktop.id(app);
+    let mut harness = start(&desktop).await;
+    begin(&mut harness, &target).await;
+    let chat = desktop.open("Chat notification", 20);
+    desktop.refuse_focus(1);
+    desktop.answer_helper(ActivationHelperOutcome::Refused);
+    let refused = call(&mut harness, FOCUS_WINDOW, focus(&target)).await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    let structured = &refused["structuredContent"];
+    assert_eq!(
+        structured["error"]["code"], "activation_refused",
+        "{refused}"
+    );
+    assert_eq!(structured["error"]["retryable"], true, "{refused}");
+    assert_eq!(
+        structured["input"]["activation_helper"], "refused",
+        "{refused}"
+    );
+    assert_eq!(foreground(&mut harness).await, desktop.id(chat));
+    assert!(desktop.received().is_empty());
+    accepted(&call(&mut harness, FOCUS_WINDOW, focus(&target)).await);
     harness.finish().await;
 }
 

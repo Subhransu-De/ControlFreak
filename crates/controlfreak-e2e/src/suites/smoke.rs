@@ -163,29 +163,41 @@ fn ensure_clip_in_force(cx: &mut Ctx<'_>, clip: [i32; 4]) -> Result<(), Failure>
 
 fn type_unicode(cx: &mut Ctx<'_>) -> Result<(), Failure> {
     let id = control(cx, "app")?;
-    cx.type_text(&id, "Hi, \u{e9}\u{65e5}\r\n\tz")?;
-    let wanted = "Hi, \u{e9}\u{65e5}\u{23CE}\u{21E5}z";
+    // U+1F980 is outside the Basic Multilingual Plane: it arrives as two UTF-16 halves.
+    cx.type_text(&id, "Hi, \u{e9}\u{65e5}\u{1f980}\r\n\tz")?;
+    let wanted = "Hi, \u{e9}\u{65e5}\u{1f980}\u{23CE}\u{21E5}z";
     let events = cx.expect("app", "all typed text", |e| {
         events::typed(e).chars().count() >= wanted.chars().count()
     })?;
-    let typed = events::typed(&events);
-    ensure!(typed == wanted, "typed {typed:?}, wanted {wanted:?}");
+    ensure_typed(&events, wanted)?;
     cx.end()
+}
+
+/// The main window received exactly `wanted`, with every surrogate pair whole.
+fn ensure_typed(events: &[Event], wanted: &str) -> Result<(), Failure> {
+    let unpaired = events::unpaired(events);
+    ensure!(
+        unpaired.is_empty(),
+        "the window received surrogate halves without their partner: {unpaired:04X?}"
+    );
+    let typed = events::typed(events);
+    ensure!(typed == wanted, "typed {typed:?}, wanted {wanted:?}");
+    Ok(())
 }
 
 /// An application that takes several queued keystrokes before translating them turns a burst of
 /// Unicode packets into copies of the last character ("Hello,!!!!!!!!!!!" in Notepad). Every
-/// character must arrive as typed.
+/// character must arrive as typed, including both halves of a surrogate pair, which such an
+/// application could otherwise take together and receive as two low halves.
 fn type_into_busy_app(cx: &mut Ctx<'_>) -> Result<(), Failure> {
     let id = control(cx, "app")?;
-    let text = "Hello, world! \u{e9}\u{65e5} 0123456789\tz";
+    let text = "Hello, world! \u{e9}\u{65e5}\u{1f980} 0123456789\tz";
     cx.type_text(&id, text)?;
     let wanted = text.replace('\t', "\u{21E5}");
     let events = cx.expect("app", "all typed text", |e| {
         events::typed(e).chars().count() >= wanted.chars().count()
     })?;
-    let typed = events::typed(&events);
-    ensure!(typed == wanted, "typed {typed:?}, wanted {wanted:?}");
+    ensure_typed(&events, &wanted)?;
     cx.end()
 }
 
@@ -394,12 +406,14 @@ fn foreign_refused(cx: &mut Ctx<'_>) -> Result<(), Failure> {
     cx.end()
 }
 
-/// Windows lets a process take the foreground only while no input has arrived since it started.
-/// The server starts before the user types the request, so on a real desktop its own
-/// `SetForegroundWindow` is refused from then on. This task recreates that: the harness starts
-/// the server, then a click is injected into `journal`, the "app the user was working in". The
-/// server's own request for `ledger` must now be refused, and the activation helper must still
-/// bring `ledger` to the front.
+/// Windows refuses `SetForegroundWindow` from a process that is not in front once the user has
+/// worked in another application, unless one of the conditions Microsoft documents holds, such
+/// as an expired foreground-lock timeout. The server starts before the user types the request,
+/// so on a real desktop its own call is usually refused. This task recreates that: the harness
+/// starts the server, then a click is injected into `journal`, the "app the user was working
+/// in". `ledger` must then come to the front, by the server's own call when Windows grants it or
+/// through the activation helper when it does not, and take a click. A direct grant means the
+/// lock was not reproduced; the task records that in a note.
 fn focus_after_user_input(cx: &mut Ctx<'_>) -> Result<(), Failure> {
     let ledger = cx.target("ledger")?;
     let journal = cx.center("journal", "edit")?;
@@ -424,10 +438,13 @@ fn focus_after_user_input(cx: &mut Ctx<'_>) -> Result<(), Failure> {
         "focus_window",
         json!({"window_id": ledger, "observation": {"mode": "none"}}),
     )?;
-    ensure!(
-        focused["input"]["activation_helper"] == "accepted",
-        "the foreground lock was not reproduced or not overcome: the server's own request must be refused and the helper's accepted: {focused}"
-    );
+    match foreground_path(&focused["input"]) {
+        Ok(ForegroundPath::Helper) => {}
+        Ok(ForegroundPath::Direct) => cx.note(
+            "Windows granted the server's own foreground request, so the foreground lock was not reproduced and the activation helper was not needed",
+        ),
+        Err(reason) => return Err(Failure::assertion(format!("{reason}: {focused}"))),
+    }
     cx.expect("ledger", "an activation after the click", |e| {
         events::activations(e) > activations_before
     })?;
@@ -448,6 +465,25 @@ fn focus_after_user_input(cx: &mut Ctx<'_>) -> Result<(), Failure> {
         !events::left_downs(e, "main").is_empty()
     })?;
     cx.end()
+}
+
+/// How `focus_window` brought the window to the front, by its `input.activation_helper`.
+#[derive(Debug, PartialEq, Eq)]
+enum ForegroundPath {
+    /// Windows granted the server's own request; the field is absent.
+    Direct,
+    /// Windows refused the server and the helper's request was accepted.
+    Helper,
+}
+
+fn foreground_path(input: &serde_json::Value) -> Result<ForegroundPath, String> {
+    match &input["activation_helper"] {
+        serde_json::Value::Null => Ok(ForegroundPath::Direct),
+        helper if helper == "accepted" => Ok(ForegroundPath::Helper),
+        helper => Err(format!(
+            "the activation helper answered {helper} although focus_window succeeded"
+        )),
+    }
 }
 
 fn taskbar_target(cx: &mut Ctx<'_>) -> Result<(), Failure> {
@@ -625,4 +661,24 @@ fn release_key(cx: &mut Ctx<'_>, key: &str) -> Result<(), Failure> {
         "the fixture could not release key {key}; it may still be held"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_foreground_may_come_from_a_direct_grant_or_the_helper() {
+        assert_eq!(
+            foreground_path(&json!({"input_outcome": "delivered"})),
+            Ok(ForegroundPath::Direct)
+        );
+        assert_eq!(
+            foreground_path(&json!({"activation_helper": "accepted"})),
+            Ok(ForegroundPath::Helper)
+        );
+        for helper in ["refused", "failed"] {
+            assert!(foreground_path(&json!({ "activation_helper": helper })).is_err());
+        }
+    }
 }
