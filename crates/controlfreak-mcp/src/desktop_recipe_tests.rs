@@ -475,7 +475,7 @@ async fn a_titled_dialog_in_front_is_described_as_list_windows_lists_it() {
 }
 
 #[tokio::test]
-async fn every_run_actions_step_reports_the_window_in_front() {
+async fn every_run_actions_input_step_reports_the_window_in_front() {
     let desktop = FakeDesktop::new();
     let app = desktop.open("Editor", 10);
     let target = desktop.id(app);
@@ -488,6 +488,7 @@ async fn every_run_actions_step_reports_the_window_in_front() {
         RUN_ACTIONS,
         json!({"target_ref": target, "steps": [
             {"action": "press_keys", "keys": ["down"]},
+            {"action": "wait", "wait_ms": 1},
             {"action": "press_keys", "keys": ["enter"]}
         ], "observation": {"mode": "none"}}),
     )
@@ -497,9 +498,10 @@ async fn every_run_actions_step_reports_the_window_in_front() {
     let steps = result["structuredContent"]["action"]["steps"]
         .as_array()
         .unwrap();
-    assert_eq!(steps.len(), 2, "{result}");
-    for step in steps {
-        assert_eq!(step["foreground_window"], popup, "{step}");
-    }
+    assert_eq!(steps.len(), 3, "{result}");
+    assert_eq!(steps[0]["foreground_window"], popup, "{result}");
+    // A wait sends no input and reads nothing; the step after it reports the window in front.
+    assert!(steps[1].get("foreground_window").is_none(), "{result}");
+    assert_eq!(steps[2]["foreground_window"], popup, "{result}");
     harness.finish().await;
 }

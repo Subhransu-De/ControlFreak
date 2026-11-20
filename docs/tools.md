@@ -218,7 +218,7 @@ A character outside the Basic Multilingual Plane, such as an emoji, is two UTF-1
 - Each step gets the same target checks as the single tool.
 - The batch stops at the first failure. `action.steps` reports each step as `completed`,
   `failed` or `skipped`.
-- Each completed step reports `foreground_window`, the window in front after that step (see [Foreground window](#foreground-window)).
+- Each completed `click`, `scroll`, `type_text` and `press_keys` step reports `foreground_window`, the window in front after that step (see [Foreground window](#foreground-window)). A `wait` step sends no input and reads nothing, and it is never the last step, so the step after it reports the window in front.
 - Only the last step returns a screenshot. Each earlier step waits up to 500 ms for the window to settle (see [Waiting for the window to settle](#waiting-for-the-window-to-settle)). Add a `wait` step before a step that depends on a slower load.
 - A `wait` step (`wait_ms` from 1 to 5000, at most 15000 in total) pauses between steps. It sends no input and cannot be the last step.
 - A `type_text` step takes an optional `timeout_ms` with the same range and meaning as the single tool (see [Keys](#keys)). It limits that step only. A step that runs out of time fails with `deadline_reached`, and the later steps are skipped. The batch as a whole has no overall limit.
@@ -286,7 +286,7 @@ The reason for `platform_operation_failed` is set by the code that detects the f
 
 ### Foreground window
 
-`observation.foreground_window` says which window holds the foreground once the action is done. It is read in every `observation.mode`, also `none` and `metadata`, and in every `run_actions` step. Reading it takes no capture. It has one of three forms:
+`observation.foreground_window` says which window holds the foreground once the action is done. It is read in every `observation.mode`, also `none` and `metadata`, and in every `run_actions` step except `wait`. Reading it takes no capture. It has one of three forms:
 
 - A window the server can issue a target reference for has the same fields as a `list_windows` entry: `id` (its `target_ref`), `title`, `class_name`, `process_id`, `bounds`, `display_id`, `is_foreground`, `is_minimized`, and `owner` for an owned window such as a dialog. Pass the `id` to `focus_window`, `capture_window` or `begin_control_session` like any other reference.
 - A window without a reference has `id: null` and only `class_name`, `process_id` and `same_process_as_target`. These are untitled windows, tool windows and windows the compositor hides (cloaks), for example a popup menu or a drop-down list. Their title is never returned. `same_process_as_target` is `true` when the window belongs to the process of the approved window, `false` when it does not, and `null` when the approved window is no longer known.
