@@ -234,13 +234,37 @@ pub struct WaitForChangeSinceRequest {
     pub difference_threshold: f64,
 }
 
+/// How a visual-change wait ended. The wait samples the region, so a change that comes and goes
+/// between two polls is not seen, and a visible change does not show that an application did
+/// what was asked.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VisualChangeResult {
-    pub changed: bool,
-    pub timed_out: bool,
+    /// A polled frame differed from the baseline by at least the threshold at some point,
+    /// even if the region later returned to how the baseline looks.
+    pub changed_once: bool,
+    /// The last polled frame, the one `difference` describes, differs from the baseline by at
+    /// least the threshold.
+    pub currently_changed: bool,
+    /// After the first change, consecutive frames stayed still for `stable_ms`.
+    pub settled: bool,
+    /// The last polled frame's difference from the baseline, from 0 to 1.
     pub difference: f64,
     pub elapsed_ms: u64,
     pub screenshot: DisplayScreenshot,
+}
+
+impl VisualChangeResult {
+    /// The published `changed` field, kept for compatibility. It means `changed_once`.
+    #[must_use]
+    pub const fn changed(&self) -> bool {
+        self.changed_once
+    }
+
+    /// The wait reached its deadline before the region settled.
+    #[must_use]
+    pub const fn timed_out(&self) -> bool {
+        !self.settled
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

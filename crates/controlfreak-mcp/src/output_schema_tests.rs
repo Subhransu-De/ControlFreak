@@ -57,11 +57,14 @@ fn window() -> controlfreak_core::WindowInfo {
     }
 }
 
-fn visual_change(changed: bool) -> controlfreak_core::VisualChangeResult {
+/// A region that changed at some point. `reverted` means it then returned to the baseline and
+/// settled there; otherwise the wait timed out while it still differed.
+fn visual_change(reverted: bool) -> controlfreak_core::VisualChangeResult {
     controlfreak_core::VisualChangeResult {
-        changed,
-        timed_out: !changed,
-        difference: 0.25,
+        changed_once: true,
+        currently_changed: !reverted,
+        settled: reverted,
+        difference: if reverted { 0.0 } else { 0.25 },
         elapsed_ms: 3,
         screenshot: screenshot(),
     }
@@ -539,6 +542,14 @@ async fn every_observation_and_session_result_validates_against_tools_list() {
             .iter()
             .any(|block| block["type"] == "image");
         assert_eq!(has_image_block, has_image, "{name}");
+        if name == WAIT_FOR_VISUAL_CHANGE {
+            // Changed once, changed back and settled: the result tells the two apart.
+            assert_eq!(content["changed"], true);
+            assert_eq!(content["changed_once"], true);
+            assert_eq!(content["currently_changed"], false);
+            assert_eq!(content["settled"], true);
+            assert_eq!(content["timed_out"], false);
+        }
     }
     harness.finish().await;
 }

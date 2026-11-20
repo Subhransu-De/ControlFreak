@@ -62,6 +62,7 @@ mod activation_helper;
 mod baselines;
 mod ocr;
 mod target;
+mod visual_change;
 pub(crate) use ocr::serve_ocr_helper;
 use ocr::{OcrHelperPool, recognize_text_with_helper_fingerprinted};
 mod arbitration;
@@ -1605,6 +1606,22 @@ mod tests {
                 matches!(error, PlatformError::InvalidArgument { argument, .. } if argument == "ocr_confusions")
             );
         }
+    }
+
+    #[test]
+    fn an_unknown_baseline_is_refused_before_display_access() {
+        use controlfreak_core::{DisplayBackend, WaitForChangeSinceRequest};
+        let error = Backend::new()
+            .wait_for_change_since(&WaitForChangeSinceRequest {
+                baseline_id: "vb-00000000000000000000000000000000-0000000000000001".into(),
+                timeout_ms: 30_000,
+                stable_ms: 0,
+                difference_threshold: 0.01,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(error, PlatformError::InvalidArgument { argument, .. } if argument == "baseline_id")
+        );
     }
 
     fn unique_text_candidate(

@@ -200,8 +200,9 @@ impl DisplayBackend for ContractBackend {
             .visual_waits
             .push(request.clone());
         Ok(controlfreak_core::VisualChangeResult {
-            changed: false,
-            timed_out: true,
+            changed_once: false,
+            currently_changed: false,
+            settled: false,
             difference: 0.0,
             elapsed_ms: 1,
             screenshot: self.screenshot(None),

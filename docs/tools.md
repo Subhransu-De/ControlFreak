@@ -189,6 +189,19 @@ A character outside the Basic Multilingual Plane, such as an emoji, is two UTF-1
   for its effect afterwards. Up to 16 baselines, each kept for 5 minutes.
 - `wait_for_visual_change`: wait for a region to change from how it looks at call time.
 - A timeout is a normal result, not an error.
+- Both waits look at the region every 100 ms. They end once it has changed from the baseline by at least `difference_threshold` and then stayed still for `stable_ms`. Stillness compares each frame with the one before it, not with the baseline, so a region that changes and changes back also settles.
+- The result keeps "changed at some point" apart from "different now":
+
+| Field | Meaning |
+| --- | --- |
+| `changed_once` | A polled frame differed from the baseline by at least `difference_threshold`, even if the region changed back afterwards. |
+| `currently_changed` | The last polled frame still differs from the baseline by at least `difference_threshold`. |
+| `settled` | After the first change, the region stayed still for `stable_ms`. Always the opposite of `timed_out`. |
+| `difference` | How much the last polled frame differs from the baseline, from 0 to 1. |
+| `changed` | Kept for compatibility. Always equal to `changed_once`. |
+
+- A region that goes A, B and back to A, and then stays at A for `stable_ms`, returns `changed_once: true`, `currently_changed: false` and `settled: true`. If the deadline comes first, `settled` is `false`. Read `currently_changed` before you rely on the new state.
+- The waits sample the screen. A change that comes and goes between two polls is not seen. A visible change also does not show that the application did what was asked: confirm the result, for example with `read_text_in_region`. The returned screenshot is taken just after the last poll, so it can differ slightly from that poll.
 
 ## Action batches
 

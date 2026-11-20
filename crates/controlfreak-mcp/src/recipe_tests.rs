@@ -162,8 +162,9 @@ impl DisplayBackend for Fixture {
             .expect("capture baseline before waiting")
             != &text;
         Ok(VisualChangeResult {
-            changed,
-            timed_out: !changed,
+            changed_once: changed,
+            currently_changed: changed,
+            settled: changed,
             difference: if changed { 1.0 } else { 0.0 },
             elapsed_ms: if changed { 100 } else { 500 },
             screenshot: screenshot(),
