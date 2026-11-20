@@ -20,8 +20,8 @@ desktop and run inside a [control session](sessions.md).
 | `capture_window` | Observe | Screenshot of a window's visible frame, without focusing it. The window renders itself (`capture_method` `windows_print_window`), so windows covering it do not appear. The render is bounded: a window that Windows flags as hung is not asked, and one that does not answer within 2 seconds is given up on. The screen rectangle is then copied (`windows_gdi`), which shows whatever covers the window, so `capture_method` says which one you got. Menus, popups and dropdowns are separate windows and never appear in it; use an action's screenshot or `capture_display` to see them. Only one render runs at a time: a second `capture_window` call made meanwhile waits for it while it is still rendering, within the same 2 seconds, and copies the screen if that time runs out; if that render was already given up on, the screen is copied at once. Every screenshot result reports `capture_method` as one of `windows_print_window` or `windows_gdi`; display and region captures always report `windows_gdi`. |
 | `list_windows` | Observe | Visible titled windows, including owned dialogs (with an `owner` field), foreground first. At most 200. |
 | `wait_for_window` | Observe | Wait for a window that matches title, class or process. |
-| `list_virtual_desktops` | Observe | Windows grouped by virtual desktop, with the current one marked. |
-| `read_text_in_region` | Observe | OCR lines and words with bounds. |
+| `list_virtual_desktops` | Observe | Windows grouped by virtual desktop, with the current one marked. Groups at most the 200 windows `list_windows` returns; `truncated: true` means more exist. |
+| `read_text_in_region` | Observe | OCR lines and words with bounds. At most 200 lines, 8000 characters and 128 KiB of lines; see Text (OCR). |
 | `find_text_on_screen` | Observe | Find text with OCR. Discovery only. |
 | `wait_for_text` | Observe | Repeat OCR until text appears or disappears. |
 | `capture_visual_baseline` | Observe | Save how a region looks now, for a later wait. |
@@ -98,6 +98,7 @@ desktop and run inside a [control session](sessions.md).
 - Every screenshot also records the display layout it was captured on: the ID and bounds of each display. If a display was added, removed or moved since then, an image point is refused with `invalid_argument` and nothing is sent, because the old rectangle may now lie on another display. Capture again. A screenshot taken while the layout changes fails instead of recording a layout its bounds do not belong to.
 - An image pixel maps to the source pixel under its centre: `source_bounds.left + floor((2 * image_x + 1) * source_bounds.width / (2 * image_width))`, and the same for `y` with `top` and `height`, each axis on its own. A source pixel taken to the image pixel that shows it and back lands within one source pixel of where it started when the image is downscaled less than 2×. An unresized image maps one to one.
 - Screenshots are downscaled by area averaging. An image is resized when `image_width` and `image_height` differ from the size of `source_bounds`.
+- For every `max_width` from 1 to 7680 and for `native`, each image pixel maps inside `source_bounds`, onto a source pixel it shows, and a source pixel comes back within half an image pixel's footprint plus one pixel.
 - Physical pixels need a per-monitor DPI aware server. `controlfreak.exe` declares per-monitor v2 in its manifest; per-monitor v1 is also accepted. If Windows keeps the server DPI unaware or system aware, for example through a high DPI compatibility override on the executable, it would scale coordinates on a scaled display. The server then refuses captures and input with `dpi_awareness_unsupported`, and `get_server_status` reports `status: "degraded"` and `dpi_awareness` with the awareness in effect (`per_monitor_v2`, `per_monitor`, `system_aware`, `unaware` or `unknown`) and the reason. Remove the override and restart the server.
 
 ## Waiting for the window to settle
@@ -122,6 +123,12 @@ Without `language`, OCR uses the first language in the Windows language list tha
 | `click_text` | `match_mode`: `exact` (default) or `substring` | Yes, only for one unique match |
 | `find_text_on_screen` | `match_mode`: `substring` (default), `exact`, `tolerant` | No |
 | `wait_for_text` | Same as `find_text_on_screen`, until `appears` or `disappears` | No |
+
+`read_text_in_region`:
+
+- Returns whole lines in reading order, up to 200 lines, 8000 characters of line text and 128 KiB of serialized `lines`.
+- When a bound is reached, the result stops before the line that would pass it: `truncated` is `true` and `limit` is `lines`, `characters` or `bytes`. `text` then ends with the last returned line, so it agrees with `lines`. Otherwise `truncated` is `false` and `limit` is `null`.
+- To read the rest, read again with a region that starts below the last returned line.
 
 `click_text`:
 

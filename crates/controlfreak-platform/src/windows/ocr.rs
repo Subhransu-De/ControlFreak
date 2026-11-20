@@ -1079,7 +1079,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod synthetic_benchmarks {
+pub(super) mod synthetic_benchmarks {
     #![allow(unsafe_code)]
 
     use super::super::capture::{ocr_bitmap, recognize_bitmap};
@@ -1200,14 +1200,11 @@ mod synthetic_benchmarks {
             .arg("--quiet")
     }
 
-    /// Times each OCR stage on synthetic text: helper spawn, engine creation, the profile
-    /// language read that validates a cached default engine, and recognition, then compares a
-    /// call that creates its engine (before) with one that reuses it (after).
-    #[test]
-    #[ignore = "runs Windows OCR on synthetic images; needs an installed OCR language"]
-    fn synthetic_ocr_stage_latency() {
-        const SAMPLES: usize = 25;
-        let spawn: Vec<Duration> = (0..10)
+    /// Starts a helper `count` times and times each start up to its first reply. The helper is
+    /// this test binary's echo helper, which runs no OCR, so the samples are process start and
+    /// one request round trip only.
+    pub(in crate::windows) fn helper_spawn_samples(count: u64) -> Vec<Duration> {
+        (0..count)
             .map(|id| {
                 let line = serde_json::to_vec(&OcrHelperRequest {
                     id,
@@ -1226,7 +1223,17 @@ mod synthetic_benchmarks {
                 drop(helper);
                 elapsed
             })
-            .collect();
+            .collect()
+    }
+
+    /// Times each OCR stage on synthetic text: helper spawn, engine creation, the profile
+    /// language read that validates a cached default engine, and recognition, then compares a
+    /// call that creates its engine (before) with one that reuses it (after).
+    #[test]
+    #[ignore = "runs Windows OCR on synthetic images; needs an installed OCR language"]
+    fn synthetic_ocr_stage_latency() {
+        const SAMPLES: usize = 25;
+        let spawn = helper_spawn_samples(10);
         eprintln!(
             "helper spawn to first reply (test binary, no OCR): median={:.1}ms",
             median_ms(spawn)

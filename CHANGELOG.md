@@ -33,6 +33,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 - `type_text` and the `run_actions` `type_text` step take an optional `timeout_ms` (1 to 300000) that limits how long typing may take. At the limit, typing stops between two keystrokes with reason `deadline_reached` (not retryable), `status: "partially_sent"` and the exact `input.sent_events`. Observe the text before typing the rest. Without `timeout_ms` nothing changes.
 - `invalid_arguments` errors say which field is wrong: `error.details` has `path` (such as `steps[2].text`), `problem`, `expected`, `received_kind` and, for an unknown field, up to 32 `valid_fields`. `error.code` is unchanged.
 - `click_text` accepts `match_mode` (`exact`, the default, or `substring`), the same name `find_text_on_screen` and `wait_for_text` use. `tolerant` is refused with `invalid_argument`, because a click needs a strict match. `exact_match` still works as an alias and no longer publishes a default; a value that contradicts `match_mode` is refused with `invalid_argument`.
+- `list_virtual_desktops` reports `truncated: true` when more than 200 windows exist, like `list_windows`. Before, it dropped the extra windows without saying so.
+- `read_text_in_region` returns at most 200 lines, 8000 characters and 128 KiB of lines, cut at a whole line. A cut result has `truncated: true` and `limit` (`lines`, `characters` or `bytes`), and its `text` ends with the last returned line. Read the rest with a region below that line.
 
 ### Changed
 

@@ -471,6 +471,93 @@ mod tests {
         );
     }
 
+    /// Every `max_width` budget a capture accepts, and none, sizes the image with the same
+    /// arithmetic the backend uses. Each image pixel then maps onto a source pixel inside the
+    /// source rectangle that overlaps the span it shows, and a source pixel comes back at most
+    /// half an image pixel's footprint (plus one pixel of rounding) away on each axis.
+    #[test]
+    fn image_points_round_trip_for_every_max_width_budget() {
+        use controlfreak_core::{limits::MAX_CAPTURE_WIDTH, scaled_dimensions};
+        let sources = [
+            bounds(-1920, -200, 1920, 1080), // left of a primary display, above its top
+            bounds(0, 0, 3840, 2160),
+            bounds(-1280, -1024, 1280, 1024),
+            bounds(2560, 0, 1366, 768),
+            bounds(37, -11, 401, 3), // a thin crop with odd sizes
+            bounds(0, 0, 7680, 4320),
+        ];
+        // The image pixel that covers a source pixel, as the image was made.
+        let to_image = |offset: u32, source: u32, image: u32| {
+            u32::try_from(u64::from(offset) * u64::from(image) / u64::from(source)).unwrap()
+        };
+        // `mapped` lies in the source and overlaps `[image * source / size, (image + 1) * source / size)`.
+        let overlaps = |image: u32, mapped: i64, source: u32, size: u32| {
+            let Ok(mapped) = u64::try_from(mapped) else {
+                return false;
+            };
+            let (image, source, size) = (u64::from(image), u64::from(source), u64::from(size));
+            mapped < source
+                && (mapped + 1) * size > image * source
+                && mapped * size < (image + 1) * source
+        };
+        for budget in (1..=MAX_CAPTURE_WIDTH).map(Some).chain([None]) {
+            for source in sources {
+                let (width, height) = (source.width, source.height);
+                let (image_width, image_height) = scaled_dimensions(width, height, budget);
+                let context = format!("{budget:?} {source:?} -> {image_width}x{image_height}");
+                assert_eq!(
+                    image_width,
+                    budget.map_or(width, |budget| budget.min(width)),
+                    "{context}"
+                );
+                assert!((1..=height).contains(&image_height), "{context}");
+                let mapping = image(source, image_width, image_height);
+                let (left, top) = (i64::from(source.left), i64::from(source.top));
+                for (image_x, image_y) in [
+                    (0, 0),
+                    (image_width / 3, image_height * 2 / 3),
+                    (image_width / 2, image_height / 2),
+                    (image_width - 1, image_height - 1),
+                ] {
+                    let (virtual_x, virtual_y) = to_virtual(&mapping, image_x, image_y).unwrap();
+                    assert!(
+                        overlaps(image_x, virtual_x - left, width, image_width)
+                            && overlaps(image_y, virtual_y - top, height, image_height),
+                        "{context}: image ({image_x}, {image_y}) -> ({virtual_x}, {virtual_y})"
+                    );
+                }
+                assert!(to_virtual(&mapping, image_width, 0).is_err(), "{context}");
+                assert!(to_virtual(&mapping, 0, image_height).is_err(), "{context}");
+                for (source_x, source_y) in [
+                    (0, 0),
+                    (width / 3, height * 2 / 3),
+                    (width / 2, height / 2),
+                    (width - 1, height - 1),
+                ] {
+                    let (virtual_x, virtual_y) = to_virtual(
+                        &mapping,
+                        to_image(source_x, width, image_width),
+                        to_image(source_y, height, image_height),
+                    )
+                    .unwrap();
+                    // |error| < footprint / 2 + 1, kept in integers.
+                    let close = |error: i64, source: u32, size: u32| {
+                        2 * error.abs() * i64::from(size) < i64::from(source) + 2 * i64::from(size)
+                    };
+                    let error_x = left + i64::from(source_x) - virtual_x;
+                    let error_y = top + i64::from(source_y) - virtual_y;
+                    assert!(
+                        close(error_x, width, image_width) && close(error_y, height, image_height),
+                        "{context}: ({source_x}, {source_y}) came back ({error_x}, {error_y}) away"
+                    );
+                    if image_width == width && image_height == height {
+                        assert_eq!((error_x, error_y), (0, 0), "{context}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn observations_are_bounded_and_unknown_ids_are_refused() {
         // A local store: the process-wide one is shared with every parallel test, and filling it

@@ -13,6 +13,7 @@ use std::{
 };
 
 use crate::OcrHelperCommand;
+use controlfreak_core::limits::MAX_WINDOWS;
 use controlfreak_core::{
     ActionObservation, BackendIdentity, BackendMetadata, Capability, CapabilityDescriptor,
     CapabilityState, CaptureDisplayRequest, CaptureRegionRequest, CaptureWindowRequest,
@@ -22,11 +23,11 @@ use controlfreak_core::{
     MouseDragRequest, MouseMoveRequest, MousePosition, MouseScrollRequest, MutationControl,
     ObservationMode, ObservationOptions, OcrBackend, OcrLine, OcrRegionRequest, OcrResult, OcrWord,
     PermissionDescriptor, PermissionId, PermissionState, Platform, PlatformError,
-    PointerActionResult, PointerBackend, SecurityContext, TextInputRequest, VirtualDesktopInfo,
-    VirtualDesktopList, VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult, VisualBaseline,
-    VisualBaselineRequest, VisualChangeResult, WaitForChangeSinceRequest, WaitForTextRequest,
-    WaitForTextResult, WaitForVisualChangeRequest, WaitForWindowRequest, WindowBackend,
-    WindowBounds, WindowFocusResult, WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
+    PointerActionResult, PointerBackend, SecurityContext, TextInputRequest, VirtualDesktopList,
+    VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest,
+    VisualChangeResult, WaitForChangeSinceRequest, WaitForTextRequest, WaitForTextResult,
+    WaitForVisualChangeRequest, WaitForWindowRequest, WindowBackend, WindowBounds,
+    WindowFocusResult, WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
 };
 use windows::Win32::{
     Foundation::{HWND, LPARAM, POINT, RECT},
@@ -155,7 +156,6 @@ const POST_INPUT_SETTLE_MS: u64 = 75;
 const POST_FOCUS_SETTLE_MS: u64 = 150;
 const MAX_ACTION_IMAGE_WIDTH: u32 = 1_280;
 const MAX_CHORD_KEYS: usize = 8;
-const MAX_WINDOWS: usize = 200;
 const MAX_WINDOW_TITLE_UTF16_UNITS: usize = 512;
 const MAX_CLICK_COUNT: u8 = 3;
 const VISUAL_POLL_MS: u64 = 100;
@@ -933,44 +933,19 @@ impl WindowBackend for Backend {
         let _apartment = initialize_com()?;
         let manager = virtual_desktop_manager()?;
         let current_id = current_virtual_desktop_id(&manager);
-        let mut current_ids = std::collections::BTreeSet::<String>::new();
-        let mut grouped = std::collections::BTreeMap::<String, Vec<WindowInfo>>::new();
-        for window in enumerate_windows()?.0 {
-            let Ok((hwnd, _)) = resolve_window_reference(&window.id) else {
-                continue;
-            };
-            let Ok(desktop_id) = window_desktop_id(&manager, hwnd) else {
-                continue;
-            };
-            let id = format!("{desktop_id:?}");
-            if window_is_on_current_desktop(&manager, hwnd) {
-                current_ids.insert(id.clone());
-            }
-            grouped.entry(id).or_default().push(window);
-        }
-        if current_ids.is_empty()
-            && let Some(current_id) = &current_id
-        {
-            grouped.entry(current_id.clone()).or_default();
-        }
-        let desktops = grouped
-            .into_iter()
-            .map(|(id, windows)| VirtualDesktopInfo {
-                is_current: if current_ids.is_empty() {
-                    current_id.as_ref().is_some_and(|current| current == &id)
-                } else {
-                    current_ids.contains(&id)
-                },
-                id,
-                windows,
-            })
-            .collect();
-        Ok(VirtualDesktopList {
-            desktops,
-            includes_empty_desktops: false,
-            order_available: false,
-            names_available: false,
-        })
+        let (windows, truncated) = enumerate_windows()?;
+        Ok(VirtualDesktopList::from_windows(
+            WindowList { windows, truncated },
+            current_id.as_deref(),
+            |window| {
+                let (hwnd, _) = resolve_window_reference(&window.id).ok()?;
+                let desktop_id = window_desktop_id(&manager, hwnd).ok()?;
+                Some((
+                    format!("{desktop_id:?}"),
+                    window_is_on_current_desktop(&manager, hwnd),
+                ))
+            },
+        ))
     }
 
     fn switch_virtual_desktop_controlled(
@@ -1900,9 +1875,6 @@ mod tests {
         let desktops = backend
             .list_virtual_desktops()
             .expect("group windows by virtual desktop");
-        assert!(!desktops.includes_empty_desktops);
-        assert!(!desktops.order_available);
-        assert!(!desktops.names_available);
         assert!(
             desktops
                 .desktops

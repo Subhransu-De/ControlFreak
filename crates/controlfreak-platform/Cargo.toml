@@ -55,3 +55,6 @@ workspace = true
 
 [features]
 packaging-tests = ["dep:winreg", "windows/Win32_Storage_FileSystem", "windows/Win32_Security_Authorization"]
+
+[dev-dependencies]
+base64.workspace = true

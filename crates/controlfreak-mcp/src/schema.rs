@@ -257,7 +257,7 @@ pub(super) fn read_text_in_region() -> Contract {
     let mut properties = region_properties();
     add_ocr_language(&mut properties);
     contract(
-        "Read the text in a region with OCR. Returns lines and words with display-local pixel bounds, no image and no confidence scores. Needs a Windows OCR language pack.",
+        "Read the text in a region with OCR. Returns lines and words with display-local pixel bounds, no image and no confidence scores. Needs a Windows OCR language pack. Returns at most 200 lines, 8000 characters and 128 KiB of lines, cut at a whole line: truncated=true and limit name the bound, so read the rest with a region below the last line.",
         object_schema(properties, &["x", "y", "width", "height"]),
         read_text_output_schema(),
     )
@@ -339,7 +339,7 @@ pub(super) fn click_text() -> Contract {
 
 pub(super) fn list_virtual_desktops() -> Contract {
     contract(
-        "Group the discoverable titled windows by virtual desktop and mark the current one. Empty desktops, names and desktop order are not available.",
+        "Group the discoverable titled windows by virtual desktop and mark the current one. Empty desktops, names and desktop order are not available. Groups at most 200 windows, as list_windows; truncated=true means more exist, so a desktop may be incomplete or missing.",
         object_schema(JsonObject::new(), &[]),
         output_schema(
             vec![json!({
@@ -362,9 +362,10 @@ pub(super) fn list_virtual_desktops() -> Contract {
                     },
                     "includes_empty_desktops": { "const": false },
                     "order_available": { "const": false },
-                    "names_available": { "const": false }
+                    "names_available": { "const": false },
+                    "truncated": { "type": "boolean" }
                 },
-                "required": ["count", "desktops", "includes_empty_desktops", "order_available", "names_available"],
+                "required": ["count", "desktops", "includes_empty_desktops", "order_available", "names_available", "truncated"],
                 "additionalProperties": false
             })],
             false,
@@ -1429,9 +1430,11 @@ fn read_text_output_schema() -> Arc<JsonObject> {
                 "source_bounds": def_ref("bounds"),
                 "language": { "type": "string" },
                 "text": { "type": "string" },
-                "lines": { "type": "array", "items": line }
+                "lines": { "type": "array", "items": line },
+                "truncated": { "type": "boolean" },
+                "limit": { "enum": ["lines", "characters", "bytes", null] }
             },
-            "required": ["display", "source_bounds", "language", "text", "lines"],
+            "required": ["display", "source_bounds", "language", "text", "lines", "truncated", "limit"],
             "additionalProperties": false
         })],
         false,
