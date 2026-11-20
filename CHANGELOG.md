@@ -26,6 +26,7 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 - `switch_virtual_desktop` reports `before_id`, `after_id` and `transition` (`confirmed_changed`, `confirmed_unchanged` or `unknown`) in `action`. Only two known desktops confirm a result. A missing foreground window, as on an empty desktop, gives `unknown`. `changed` keeps its old meaning for compatibility, so it can read `true` for a switch that was not confirmed: use `transition`. The desktop before the switch is now read while the server holds its input lock.
 - A second `notifications/controlfreak/session_stopped` event, `stop_drained`, when work that was running at a user stop has finished.
+- `input.split_character: true` when `type_text` or a `run_actions` `type_text` step stops between the two halves of an emoji or other non-BMP character. The application then holds half a character, so delete it before typing again. A stop, cancel or refusal still never sends the second half.
 
 ## [0.2.3] - 2026-11-18
 

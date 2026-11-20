@@ -60,4 +60,16 @@ pub struct MutationProgress {
     pub(crate) activation_elapsed_ms: u64,
     #[serde(default, skip_serializing_if = "ActivationHelperOutcome::is_not_used")]
     pub(crate) activation_helper: ActivationHelperOutcome,
+    /// Typing stopped after the high half of a surrogate pair was sent and before its low half,
+    /// so the application holds an unpaired surrogate. Absent when that is not known to happen.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub split_character: bool,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }

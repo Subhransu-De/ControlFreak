@@ -570,7 +570,10 @@ fn ensure_input_idle(
 /// The target is validated before every unit, because pacing leaves time for the foreground to
 /// change. That includes the second half of a surrogate pair, whose halves are paced separately
 /// so an application that took both before translating could not get two low surrogates. A
-/// refusal or cancellation between the halves stops before the second half.
+/// refusal or cancellation between the halves stops before the second half: a refusal because
+/// it could reach another window, a cancellation because a stop means no more input. Either way
+/// the progress records `split_character`, so the result says the application got half a
+/// character.
 ///
 /// Every unit is refused while the person holds a modifier, like `press_keys`: a held Alt can
 /// turn typed characters into menu mnemonics, and a held modifier turns Enter and Tab into
@@ -593,15 +596,22 @@ where
     for segment in text_segments(utf16) {
         match segment {
             TextSegment::Text(units) => {
-                for unit in units {
-                    pace_or_refuse(control, &mut pace, &mut validate_target)?;
-                    control.check("type_text")?;
-                    validate_target()?;
-                    // After validation, which queries windows, so the check is the last before
-                    // dispatch.
-                    ensure_no_modifier_held_with("type_text", &mut is_down)?;
-                    let inputs = [unicode_input(*unit, false), unicode_input(*unit, true)];
-                    send_releasing("type_text", &inputs, control, &mut send)?;
+                for (index, unit) in units.iter().enumerate() {
+                    let sent_before = control.progress().sent_events;
+                    let typed = type_unit(
+                        *unit,
+                        control,
+                        &mut validate_target,
+                        &mut send,
+                        &mut is_down,
+                        &mut pace,
+                    );
+                    if let Err(error) = typed {
+                        if stopped_inside_pair(units, index, sent_before, control) {
+                            control.split_character();
+                        }
+                        return Err(error);
+                    }
                 }
             }
             TextSegment::Key(key) => {
@@ -615,6 +625,52 @@ where
         }
     }
     Ok(())
+}
+
+/// Paces, checks and sends one UTF-16 unit as a Unicode keystroke.
+fn type_unit(
+    unit: u16,
+    control: &MutationControl,
+    validate_target: &mut impl FnMut() -> Result<(), PlatformError>,
+    send: &mut impl FnMut(&[INPUT]) -> Result<usize, PlatformError>,
+    is_down: &mut impl FnMut(i32) -> bool,
+    pace: &mut impl FnMut(&MutationControl) -> Result<(), PlatformError>,
+) -> Result<(), PlatformError> {
+    pace_or_refuse(control, pace, validate_target)?;
+    control.check("type_text")?;
+    validate_target()?;
+    // After validation, which queries windows, so the check is the last before dispatch.
+    ensure_no_modifier_held_with("type_text", is_down)?;
+    let inputs = [unicode_input(unit, false), unicode_input(unit, true)];
+    send_releasing("type_text", &inputs, control, send)
+}
+
+/// Whether typing that failed at `units[index]` left the application with the high half of a
+/// surrogate pair and no low half. A unit arrives with its key-down, so a high half counts as
+/// sent once any of its events was accepted, and a low half as not sent only when none was and
+/// delivery is known; an unknown dispatch is reported by `input_outcome` instead. Well-formed
+/// UTF-16 puts every low half right after its high half, inside one text segment.
+fn stopped_inside_pair(
+    units: &[u16],
+    index: usize,
+    sent_before: u64,
+    control: &MutationControl,
+) -> bool {
+    const HIGH: std::ops::RangeInclusive<u16> = 0xD800..=0xDBFF;
+    const LOW: std::ops::RangeInclusive<u16> = 0xDC00..=0xDFFF;
+    let progress = control.progress();
+    let unit_sent = progress.sent_events > sent_before;
+    let unit = units[index];
+    if HIGH.contains(&unit) {
+        unit_sent && units.get(index + 1).is_some_and(|next| LOW.contains(next))
+    } else if LOW.contains(&unit) {
+        !unit_sent
+            && progress.input_outcome != controlfreak_core::InputOutcome::Unknown
+            && index > 0
+            && HIGH.contains(&units[index - 1])
+    } else {
+        false
+    }
 }
 
 /// Paces the next keystroke. If the window did not answer, it may belong to an application that
@@ -2207,6 +2263,15 @@ mod progress_tests {
                         (failed_call * 2 + accepted) as u64,
                         "call {failed_call}, accepted {accepted}"
                     );
+                    // Calls 1 and 4 send a high half, 2 and 5 its low half. A unit arrives with
+                    // its key-down, so the pair is split when the high half got any event and
+                    // the low half none.
+                    let split = (failed_call % 3 == 1 && accepted == 1)
+                        || (failed_call % 3 == 2 && accepted == 0);
+                    assert_eq!(
+                        progress.split_character, split,
+                        "call {failed_call}, accepted {accepted}"
+                    );
                     // A half-sent keystroke gets one compensating up; nothing else is sent after.
                     assert_eq!(call, failed_call + 1 + accepted);
                     assert_eq!(
@@ -2259,6 +2324,7 @@ mod progress_tests {
         assert!(result.is_err());
         assert_eq!(sent, [0xD83E]);
         assert_eq!(control.progress().sent_events, 2);
+        assert!(control.progress().split_character);
     }
 
     #[test]
@@ -2490,6 +2556,76 @@ mod progress_tests {
         assert!(result.is_err());
         assert_eq!(sent, [0xD83E]);
         assert_eq!(control.progress().sent_events, 2);
+        // A stop means no more input: the pair stays split, and the result says so.
+        assert!(control.progress().split_character);
+    }
+
+    #[test]
+    fn a_split_pair_is_reported_only_when_it_is_known() {
+        // A modifier pressed between the halves refuses the low half.
+        let control = MutationControl::default();
+        let mut sent = 0;
+        let mut checks = 0;
+        let result = send_text_checking_held_keys(
+            &utf16("a\u{1f980}"),
+            &control,
+            || Ok(()),
+            |inputs| {
+                sent += 1;
+                Ok(inputs.len())
+            },
+            |_| {
+                checks += 1;
+                // Five modifier keys are read per unit; the third unit sees Shift held.
+                checks > 10
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(result.unwrap_err().reason_code(), Some("key_held"));
+        assert_eq!(sent, 2);
+        assert!(control.progress().split_character);
+
+        // A failed dispatch of the low half leaves delivery unknown, not known to be split.
+        let control = MutationControl::default();
+        let mut calls = 0;
+        let result = send_unicode_text_with(
+            &utf16("\u{1f980}"),
+            &control,
+            || Ok(()),
+            |inputs| {
+                calls += 1;
+                if calls == 2 {
+                    Err(failure())
+                } else {
+                    Ok(inputs.len())
+                }
+            },
+            |_| Ok(()),
+        );
+        assert!(result.is_err());
+        let progress = control.progress();
+        assert_eq!(progress.input_outcome, InputOutcome::Unknown);
+        assert!(!progress.split_character);
+
+        // Stopping anywhere in text without a pair, or before a pair starts, splits nothing.
+        for text in ["abc", "a\u{1f980}"] {
+            let control = MutationControl::default();
+            let result = send_unicode_text_with(
+                &utf16(text),
+                &control,
+                || Ok(()),
+                |inputs| {
+                    control.cancel();
+                    Ok(inputs.len())
+                },
+                |_| Ok(()),
+            );
+            assert!(result.is_err());
+            assert_eq!(control.progress().sent_events, 2, "{text:?}");
+            assert!(!control.progress().split_character, "{text:?}");
+            let serialized = serde_json::to_value(control.progress()).unwrap();
+            assert!(serialized.get("split_character").is_none(), "{serialized}");
+        }
     }
 
     /// A window handle carried to the test thread. Only its value is used there.
