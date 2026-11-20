@@ -609,15 +609,25 @@ mod tests {
         }
         let lower = version_text(&build).to_ascii_lowercase();
         assert!(!lower.contains(&env!("CARGO_MANIFEST_DIR").to_ascii_lowercase()));
-        for variable in ["USERNAME", "USER", "COMPUTERNAME", "HOSTNAME", "USERDOMAIN"] {
-            if let Ok(name) = env::var(variable)
-                && name.len() >= 3
-            {
-                assert!(
-                    !lower.contains(&name.to_ascii_lowercase()),
-                    "the build identity contains {variable}"
-                );
+        // The real account and host names can collide with the triple (a user named `windows`),
+        // so the format check is tested with synthetic ones in every field instead.
+        let target = build.target.as_str();
+        for (field, value) in [
+            ("revision", r"C:\Users\cf-test-user\src"),
+            ("revision", "cf-test-user@cf-test-host"),
+            ("revision", "cf-test-host"),
+            ("version", "0.2.3+cf-test-user@cf-test-host"),
+            ("version", "0.2.3 cf-test-user"),
+            ("target", "/home/cf-test-user/target"),
+            ("target", "cf-test-host:x86_64"),
+        ] {
+            let mut leaked = BuildInfo::new(&build.version, &build.revision, None, target);
+            match field {
+                "revision" => leaked.revision = value.to_owned(),
+                "version" => leaked.version = value.to_owned(),
+                _ => leaked.target = value.to_owned(),
             }
+            assert!(!leaked.is_well_formed(), "{field} = {value} passed");
         }
     }
 
