@@ -232,9 +232,9 @@ pub fn publish(directory: &Path, tag: &str, metadata: &Metadata) -> Result<()> {
     let event = std::env::var("GITHUB_EVENT_NAME").unwrap_or_default();
     let reference = std::env::var("GITHUB_REF").unwrap_or_default();
     let tag_ref = format!("refs/tags/{tag}");
-    let allowed = (event == "push" && reference == tag_ref)
-        || (event == "workflow_dispatch"
-            && (reference == "refs/heads/main" || reference == tag_ref));
+    // Only a pushed tag or a retry on that tag publishes. Releases reach main
+    // through a pull request, so no run on a branch publishes.
+    let allowed = reference == tag_ref && (event == "push" || event == "workflow_dispatch");
     if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true") || !allowed {
         return Err("Publication is restricted to the GitHub Actions release workflow".into());
     }
