@@ -46,6 +46,8 @@ mod outcome_tests;
 #[cfg(test)]
 mod output_schema_tests;
 #[cfg(test)]
+mod prepare_tests;
+#[cfg(test)]
 mod protocol_tests;
 #[cfg(test)]
 mod recipe_tests;
@@ -60,12 +62,12 @@ mod session_error_tests;
 use controlfreak_core::{CaptureWindowRequest, WaitForChangeSinceRequest, WaitForWindowRequest};
 use handlers::{
     call_capture_display, call_capture_region, call_capture_visual_baseline, call_capture_window,
-    call_click_mouse, call_click_text, call_drag_mouse, call_find_text_on_screen,
-    call_focus_window, call_get_server_status, call_list_displays, call_list_virtual_desktops,
-    call_list_windows, call_move_mouse, call_press_keys, call_read_text_in_region,
-    call_run_actions, call_scroll_mouse, call_switch_virtual_desktop, call_type_text,
+    call_find_text_on_screen, call_get_server_status, call_list_displays,
+    call_list_virtual_desktops, call_list_windows, call_read_text_in_region,
     call_wait_for_change_since, call_wait_for_text, call_wait_for_visual_change,
-    call_wait_for_window,
+    call_wait_for_window, prepare_click_mouse, prepare_click_text, prepare_drag_mouse,
+    prepare_focus_window, prepare_move_mouse, prepare_press_keys, prepare_run_actions,
+    prepare_scroll_mouse, prepare_switch_virtual_desktop, prepare_type_text,
 };
 use results::{
     CarriesPng, Encoded, click_text_result, keyboard_result, pointer_result, screenshot_result,
@@ -158,6 +160,16 @@ type ToolFuture =
 type ToolHandler =
     fn(Arc<dyn PlatformBackend>, Option<JsonObject>, Option<OperationLease>) -> ToolFuture;
 
+/// The run phase of an input request that passed parsing and static validation. It needs the
+/// backend and, when sessions are enabled, the operation lease.
+type InputRun =
+    Box<dyn FnOnce(Arc<dyn PlatformBackend>, Option<OperationLease>) -> ToolFuture + Send>;
+/// Parses an input request and runs its static checks, with no backend and no lease. `Err` is the
+/// refusal to return as is: `invalid_arguments` or `invalid_argument`, with `not_started`
+/// progress. Live checks (target, display, observation lookup) stay in the run, after the lease.
+type PreparedInput = Result<InputRun, Box<CallToolResponse>>;
+type InputPrepare = fn(Option<JsonObject>) -> PreparedInput;
+
 /// Wraps a tool function as a [`ToolHandler`].
 macro_rules! handler {
     ($function:path) => {
@@ -181,8 +193,9 @@ enum Route {
     /// A read that can wait for seconds. A stop cancels it while it runs, but a new one is still
     /// admitted after a stop, because reading the screen is safe.
     Watch(ToolHandler),
-    /// Changes the desktop. Needs admission and runs under an operation lease.
-    Input(ToolHandler),
+    /// Changes the desktop. Needs admission and runs under an operation lease, which is taken only
+    /// after the request is prepared, so a malformed request never reserves the desktop.
+    Input(InputPrepare),
 }
 
 /// Every tool by name and how it runs. A tool missing here does not exist, and `tools()` must
@@ -235,19 +248,19 @@ static ROUTES: &[(&str, Route)] = &[
         LIST_VIRTUAL_DESKTOPS,
         Route::Observe(handler!(call_list_virtual_desktops)),
     ),
-    (CLICK_TEXT, Route::Input(handler!(call_click_text))),
-    (MOVE_MOUSE, Route::Input(handler!(call_move_mouse))),
-    (CLICK_MOUSE, Route::Input(handler!(call_click_mouse))),
-    (DRAG_MOUSE, Route::Input(handler!(call_drag_mouse))),
-    (SCROLL_MOUSE, Route::Input(handler!(call_scroll_mouse))),
+    (CLICK_TEXT, Route::Input(prepare_click_text)),
+    (MOVE_MOUSE, Route::Input(prepare_move_mouse)),
+    (CLICK_MOUSE, Route::Input(prepare_click_mouse)),
+    (DRAG_MOUSE, Route::Input(prepare_drag_mouse)),
+    (SCROLL_MOUSE, Route::Input(prepare_scroll_mouse)),
     (
         SWITCH_VIRTUAL_DESKTOP,
-        Route::Input(handler!(call_switch_virtual_desktop)),
+        Route::Input(prepare_switch_virtual_desktop),
     ),
-    (FOCUS_WINDOW, Route::Input(handler!(call_focus_window))),
-    (PRESS_KEYS, Route::Input(handler!(call_press_keys))),
-    (TYPE_TEXT, Route::Input(handler!(call_type_text))),
-    (RUN_ACTIONS, Route::Input(handler!(call_run_actions))),
+    (FOCUS_WINDOW, Route::Input(prepare_focus_window)),
+    (PRESS_KEYS, Route::Input(prepare_press_keys)),
+    (TYPE_TEXT, Route::Input(prepare_type_text)),
+    (RUN_ACTIONS, Route::Input(prepare_run_actions)),
 ];
 
 fn route(tool: &str) -> Option<Route> {
@@ -442,10 +455,16 @@ impl ControlFreakServer {
             Route::Observe(handler) | Route::Watch(handler) => {
                 handler(backend, request.arguments, None).await
             }
-            Route::Input(handler) => {
+            Route::Input(prepare) => {
                 let is_switch = request.name == SWITCH_VIRTUAL_DESKTOP;
+                // Parse and check the arguments before taking the desktop: a refused request must
+                // not claim arbitration, arm the idle hold or show the indicator.
+                let run = match prepare(request.arguments) {
+                    Ok(run) => run,
+                    Err(refusal) => return Ok(*refusal),
+                };
                 let Some(runtime) = self.session_runtime.as_ref() else {
-                    return handler(backend, request.arguments, None).await;
+                    return run(backend, None).await;
                 };
                 let lease = match runtime.acquire_mutation().await {
                     Ok(lease) => lease,
@@ -456,7 +475,7 @@ impl ControlFreakServer {
                         ));
                     }
                 };
-                let response = handler(backend, request.arguments, Some(lease)).await?;
+                let response = run(backend, Some(lease)).await?;
                 if is_switch && results::input_was_sent(&response) {
                     // The approved window is no longer on screen, so the session ends with the switch.
                     let runtime = Arc::clone(runtime);

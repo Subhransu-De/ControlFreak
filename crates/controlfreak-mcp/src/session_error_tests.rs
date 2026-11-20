@@ -50,6 +50,14 @@ async fn harness_with_hold(
             max_hold: hold.max(Duration::from_secs(5)),
         },
     ));
+    serve_with_runtime(backend, runtime).await
+}
+
+/// Serves `backend` with `runtime` over an in-memory transport and completes the handshake.
+pub(super) async fn serve_with_runtime(
+    backend: Arc<dyn PlatformBackend>,
+    runtime: Arc<SessionRuntime>,
+) -> Harness {
     let server = ControlFreakServer::with_indicator(
         backend,
         SafetyIndicator::dormant(),

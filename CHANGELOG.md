@@ -19,6 +19,7 @@ versioned section and uses that section for the corresponding GitHub Release not
 - A visual baseline, which holds screen pixels, is now removed from memory 5 minutes after `capture_visual_baseline`, as PRIVACY.md says. Before, an idle server kept the last baseline until the next baseline call. Expired IDs are refused as before.
 - Cancelling a `begin_control_session` that renews a live session no longer ends that session. It keeps its hold and deadline. A cancelled first begin still releases the desktop.
 - ControlFreak no longer treats a server that Windows keeps DPI unaware or system aware as per-monitor aware. On a scaled display that made Windows scale coordinates, and since 0.2.3 every click failed with `pointer_not_placed`. `controlfreak.exe` now declares per-monitor v2 awareness in its manifest. If a compatibility override still changes it, captures and input fail with `dpi_awareness_unsupported`, and `get_server_status` reports `degraded` with the awareness in effect. Checked on Windows with a DPI-unaware compatibility layer, but not on a scaled display.
+- An input tool called with invalid arguments no longer reserves the desktop. It is refused with `invalid_arguments` or `invalid_argument` and `status: "not_started"` before it starts a session, so it arms no hold, shows no indicator and no longer blocks another server with `desktop_in_use` for 8 seconds. `run_actions` checks every step first.
 
 ### Added
 
