@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
+controlfreak-core.workspace = true
 controlfreak-platform = { workspace = true, features = ["packaging-tests"] }
 semver = "1.0.27"
 serde.workspace = true

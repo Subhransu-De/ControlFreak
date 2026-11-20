@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{BackendIdentity, CapabilityDescriptor, PermissionDescriptor, SecurityContext};
+use crate::{
+    BackendIdentity, BuildInfo, CapabilityDescriptor, PermissionDescriptor, SecurityContext,
+};
 
 const CAPABILITY_REPORT_SCHEMA_VERSION: u32 = 2;
 
@@ -11,6 +13,9 @@ pub struct CapabilityReport {
     pub capabilities: Vec<CapabilityDescriptor>,
     permissions: Vec<PermissionDescriptor>,
     security_context: SecurityContext,
+    /// The executable's build identity. A backend does not know it; the server adds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    build: Option<BuildInfo>,
 }
 
 impl CapabilityReport {
@@ -26,6 +31,13 @@ impl CapabilityReport {
             capabilities,
             permissions,
             security_context,
+            build: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_build(mut self, build: BuildInfo) -> Self {
+        self.build = Some(build);
+        self
     }
 }

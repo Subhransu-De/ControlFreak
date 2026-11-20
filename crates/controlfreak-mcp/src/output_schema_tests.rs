@@ -394,7 +394,9 @@ fn schemas_describe_idle_busy_and_stopped_server_status() {
         "status": "ready",
         "safety_indicator": {"status": "dormant", "reason": null},
         "session": null,
-        "version": "1", "instance_id": "i", "process_id": 1,
+        "version": "1",
+        "build": {"schema_version": 1, "version": "1", "revision": "unknown", "dirty": null, "target": "unknown"},
+        "instance_id": "i", "process_id": 1,
         "server_elevated": false, "windows_integrity_level": "medium",
         "elevated_operation_allowed": false, "dpi_awareness": null, "uptime_ms": 1,
         "operations_started": 0, "operations_completed": 0, "operations_failed": 0,
@@ -443,6 +445,21 @@ fn schemas_describe_idle_busy_and_stopped_server_status() {
         json!({"status": "degraded", "dpi_awareness": {"awareness": "unaware", "reason": "r"}}),
     );
     assert!(validator.is_valid(&refused), "{refused}");
+    let built = with(
+        base.clone(),
+        json!({"build": {"schema_version": 1, "version": "1", "revision": "a".repeat(40), "dirty": false, "target": "x86_64-pc-windows-msvc"}}),
+    );
+    assert!(validator.is_valid(&built), "{built}");
+    for build in [
+        json!({"schema_version": 1, "version": "1", "revision": r"C:\src", "dirty": null, "target": "unknown"}),
+        json!({"schema_version": 1, "version": "1", "revision": "unknown", "dirty": null, "target": "unknown", "built_at": "t"}),
+        json!({"schema_version": 1, "version": "1", "revision": "unknown", "target": "unknown"}),
+    ] {
+        assert!(
+            !validator.is_valid(&with(base.clone(), json!({"build": build}))),
+            "{build}"
+        );
+    }
     assert!(!validator.is_valid(&with(
         base.clone(),
         json!({"dpi_awareness": {"awareness": "per_monitor_v3", "reason": null}})
@@ -457,6 +474,10 @@ fn schemas_describe_idle_busy_and_stopped_server_status() {
     );
     assert!(published.is_valid(&base));
     assert!(!published.is_valid(&with(base.clone(), json!({"status": "bogus"}))));
+    let mut no_build = base.clone();
+    no_build.as_object_mut().unwrap().remove("build");
+    assert!(!validator.is_valid(&no_build), "build is required");
+    assert!(!published.is_valid(&no_build), "build is required");
     let mut missing = base;
     missing.as_object_mut().unwrap().remove("input_admission");
     assert!(!validator.is_valid(&missing), "input_admission is required");

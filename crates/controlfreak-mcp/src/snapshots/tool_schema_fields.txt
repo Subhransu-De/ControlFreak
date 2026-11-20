@@ -2,6 +2,12 @@ get_server_status output anyOf[0].backend required
 get_server_status output anyOf[0].backend.backend_id required
 get_server_status output anyOf[0].backend.display_server required
 get_server_status output anyOf[0].backend.platform required
+get_server_status output anyOf[0].build required
+get_server_status output anyOf[0].build.dirty required
+get_server_status output anyOf[0].build.revision required
+get_server_status output anyOf[0].build.schema_version required
+get_server_status output anyOf[0].build.target required
+get_server_status output anyOf[0].build.version required
 get_server_status output anyOf[0].dpi_awareness required
 get_server_status output anyOf[0].dpi_awareness.oneOf[0].awareness required
 get_server_status output anyOf[0].dpi_awareness.oneOf[0].reason required

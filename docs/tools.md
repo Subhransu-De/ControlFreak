@@ -27,7 +27,7 @@ desktop and run inside a [control session](sessions.md).
 | `capture_visual_baseline` | Observe | Save how a region looks now, for a later wait. |
 | `wait_for_change_since` | Observe | Wait until a region differs from its baseline and settles. |
 | `wait_for_visual_change` | Observe | Wait until a region changes from how it looks now and settles. |
-| `get_server_status` | Observe | Version, privileges, DPI awareness, session and stop state, input admission and the recovery step after a stop, recent operations. |
+| `get_server_status` | Observe | Version and `build` identity, privileges, DPI awareness, session and stop state, input admission and the recovery step after a stop, recent operations. |
 | `begin_control_session` | Session | Reserve the desktop for one approved window. |
 | `end_control_session` | Session | Release the desktop after pending actions finish. Reports `closed`, `closing` or `not_owned`. |
 | `stop_desktop_work` | Session | Emergency stop: cancel all desktop work and close input until the server restarts. |
@@ -313,6 +313,20 @@ When an input tool cannot start a session, `error.code` says why:
 | `desktop_arbitration_unavailable` | Desktop ownership could not be checked. | No |
 
 After a stop, observation tools keep working: `list_displays`, `list_windows`, `list_virtual_desktops`, the captures, `read_text_in_region`, `find_text_on_screen`, `wait_for_text`, `wait_for_window`, `wait_for_visual_change`, `wait_for_change_since` and `get_server_status`. A wait that is already running is cancelled by the stop. Input tools stay refused.
+
+## Build identity
+
+`get_server_status.build`, the `build` object of `controlfreak --print-capabilities` and the lines after the first of `controlfreak --version` report the same build identity, fixed when the executable was compiled:
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | Version of this object, now `1`. |
+| `version` | The package version, as in the first `--version` line and `serverInfo.version`. |
+| `revision` | The full Git commit hash of the source. |
+| `dirty` | `true` if tracked files differed from `revision`, `false` if not. Untracked files do not count. |
+| `target` | The Rust target triple, such as `x86_64-pc-windows-msvc`. |
+
+A build from a source archive without `.git` takes `revision` from the `CONTROLFREAK_BUILD_REVISION` environment variable (a full commit hash), or reports `unknown`, and reports `dirty: null`. Two such builds of the same source report the same object. The object never holds a build time, path, user name or host name. Every release build must report its tagged commit with `dirty: false`, or the release fails. `serverInfo` carries only the version, because the MCP `Implementation` object has no field for the rest.
 
 ## Limits
 

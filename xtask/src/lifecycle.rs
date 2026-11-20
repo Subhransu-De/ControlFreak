@@ -159,7 +159,7 @@ fn exercise(fixture: &Fixture, installer: &Path, directory: &Path, version: &str
             return Err("Installer and ZIP binaries differ".into());
         }
     }
-    verify::server(&fixture.install.join("controlfreak.exe"), version)?;
+    verify::server(&fixture.install.join("controlfreak.exe"), version, None)?;
     for path in CLIENT_PATHS {
         if !fs::read_to_string(fixture.profile.join(path))?.contains("controlfreak") {
             return Err("Selected client configuration missing".into());

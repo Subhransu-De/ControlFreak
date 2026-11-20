@@ -1,7 +1,7 @@
 use controlfreak_core::{
-    BackendIdentity, BackendMetadata, Capability, CapabilityDescriptor, CapabilityReport,
-    CapabilityState, DisplayBackend, DisplayBounds, DisplayServer, KeyboardBackend, OcrBackend,
-    Platform, PlatformBackend, PointerBackend, WindowBackend,
+    BackendIdentity, BackendMetadata, BuildInfo, Capability, CapabilityDescriptor,
+    CapabilityReport, CapabilityState, DisplayBackend, DisplayBounds, DisplayServer,
+    KeyboardBackend, OcrBackend, Platform, PlatformBackend, PointerBackend, WindowBackend,
 };
 
 fn assert_object_safe(_: &dyn PlatformBackend) {}
@@ -49,8 +49,18 @@ fn capability_report_round_trips_with_stable_field_names() {
     assert!(json.get("capabilities").is_some());
     assert!(json.get("permissions").is_some());
 
+    // A backend does not know the executable's build; only the server adds it.
+    assert!(json.get("build").is_none());
+
     let decoded: CapabilityReport = serde_json::from_value(json).expect("deserialize report");
     assert_eq!(decoded, report);
+
+    let built = report.with_build(BuildInfo::new("0.2.3", "unknown", None, "unknown"));
+    let json = serde_json::to_value(&built).expect("serialize report");
+    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["build"]["revision"], "unknown");
+    let decoded: CapabilityReport = serde_json::from_value(json).expect("deserialize report");
+    assert_eq!(decoded, built);
 }
 
 #[test]

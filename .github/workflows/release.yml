@@ -236,6 +236,9 @@ jobs:
         run: cargo test --workspace --release --locked
 
       - name: Build auditable server and setup helper
+        env:
+          # Used only when the checkout has no Git metadata.
+          CONTROLFREAK_BUILD_REVISION: ${{ github.sha }}
         run: cargo auditable build -p controlfreak-server -p controlfreak-installer --release --locked
 
       - name: Generate CycloneDX SBOMs
@@ -248,7 +251,17 @@ jobs:
         run: cargo xtask package --compiler "$env:RUNNER_TEMP/inno/compiler/ISCC.exe" --output dist --tag $env:RELEASE_TAG --require-sbom
 
       - name: Verify packaged executable and checksums
-        run: cargo xtask verify --package dist --output "$env:RUNNER_TEMP/portable test 日本語"
+        run: |
+          $verify = @('xtask', 'verify', '--package', 'dist', '--output', "$env:RUNNER_TEMP/portable test 日本語")
+          # A tag build must report the tagged commit with a clean tree. A dry run on a branch
+          # bumps the version first, so it is honestly dirty and is not held to this.
+          if ($env:GITHUB_REF.StartsWith('refs/tags/')) {
+            $commit = git rev-parse HEAD
+            if ($LASTEXITCODE -ne 0) { throw 'Could not read the tagged commit.' }
+            $verify += @('--expect-revision', $commit)
+          }
+          cargo @verify
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged executable verification failed.' }
 
       - name: Verify the production installer in a synthetic profile
         run: cargo xtask test-installer --package dist --output "$env:RUNNER_TEMP/installer-test" --production-installer

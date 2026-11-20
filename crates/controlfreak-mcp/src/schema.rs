@@ -1304,6 +1304,18 @@ fn server_status_output_schema() -> Arc<JsonObject> {
                 },
                 "session": { "oneOf": [def_ref("session"), { "type": "null" }] },
                 "version": { "type": "string" },
+                "build": {
+                    "type": "object",
+                    "properties": {
+                        "schema_version": { "const": controlfreak_core::BUILD_INFO_SCHEMA_VERSION },
+                        "version": { "type": "string" },
+                        "revision": { "type": "string", "pattern": "^(unknown|[0-9a-f]{40}|[0-9a-f]{64})$" },
+                        "dirty": { "type": ["boolean", "null"] },
+                        "target": { "type": "string", "pattern": "^[a-z0-9_-]+$" }
+                    },
+                    "required": ["schema_version", "version", "revision", "dirty", "target"],
+                    "additionalProperties": false
+                },
                 "instance_id": { "type": "string" },
                 "process_id": { "type": "integer", "minimum": 0 },
                 "server_elevated": { "type": "boolean" },
@@ -1359,7 +1371,7 @@ fn server_status_output_schema() -> Arc<JsonObject> {
                 "stop_reason": { "const": "user_stop" }
             },
             "required": [
-                "status", "safety_indicator", "session", "version", "instance_id", "process_id",
+                "status", "safety_indicator", "session", "version", "build", "instance_id", "process_id",
                 "server_elevated", "windows_integrity_level", "elevated_operation_allowed", "dpi_awareness", "uptime_ms",
                 "operations_started", "operations_completed", "operations_failed", "recent_operations",
                 "backend", "input_admission", "recovery", "stop_state"

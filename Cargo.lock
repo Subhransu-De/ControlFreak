@@ -1785,6 +1785,7 @@ name = "xtask"
 version = "0.2.3"
 dependencies = [
  "clap",
+ "controlfreak-core",
  "controlfreak-platform",
  "semver",
  "serde",
