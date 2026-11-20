@@ -42,6 +42,7 @@ pub(crate) fn suite() -> Suite {
                 .budget_secs(40),
             task("held-modifier-refused", held_modifier_refused).scene("single"),
             task("moved-window-keeps-session", moved_window_keeps_session).scene("single"),
+            task("baseline-refusal-reasons", baseline_refusal_reasons).scene("single"),
         ],
     }
 }
@@ -336,6 +337,45 @@ fn press_punctuation(cx: &mut Ctx<'_>) -> Result<(), Failure> {
         );
     }
     cx.end()
+}
+
+/// Each baseline result counts what the server holds, and a refused baseline says why: the 17th
+/// capture evicts the first, and an ID this server never issued is unknown. It sends no input.
+fn baseline_refusal_reasons(cx: &mut Ctx<'_>) -> Result<(), Failure> {
+    // A 4x4 region is compared as 16 RGBA pixels.
+    const BYTES: u64 = 64;
+    let region = json!({"x": 0, "y": 0, "width": 4, "height": 4});
+    let mut ids = Vec::new();
+    for captured in 1..=17_u64 {
+        let baseline = cx.ok("capture_visual_baseline", region.clone())?;
+        let held = captured.min(16);
+        ensure!(
+            baseline["baseline_count"] == held && baseline["bytes"] == held * BYTES,
+            "baseline {captured} reports the wrong usage: {baseline}"
+        );
+        let id = baseline["baseline_id"]
+            .as_str()
+            .ok_or_else(|| Failure::assertion(format!("no baseline_id: {baseline}")))?;
+        ids.push(id.to_owned());
+    }
+    let wait = |id: &str| json!({"baseline_id": id, "timeout_ms": 1, "stable_ms": 0});
+    for (id, reason) in [
+        (ids[0].as_str(), "evicted"),
+        (
+            "vb-00000000000000000000000000000000-0000000000000001",
+            "unknown",
+        ),
+    ] {
+        let refused = cx.refused("wait_for_change_since", wait(id))?;
+        ensure!(
+            refused.error_code() == Some("invalid_argument")
+                && refused.error_reason() == Some(reason),
+            "expected {reason}: {}",
+            refused.structured
+        );
+    }
+    cx.ok("wait_for_change_since", wait(&ids[16]))?;
+    Ok(())
 }
 
 fn capture_occluded(cx: &mut Ctx<'_>) -> Result<(), Failure> {

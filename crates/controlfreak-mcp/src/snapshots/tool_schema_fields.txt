@@ -231,7 +231,9 @@ capture_visual_baseline input height required
 capture_visual_baseline input width required
 capture_visual_baseline input x required
 capture_visual_baseline input y required
+capture_visual_baseline output anyOf[0].baseline_count required
 capture_visual_baseline output anyOf[0].baseline_id required
+capture_visual_baseline output anyOf[0].bytes required
 capture_visual_baseline output anyOf[0].display required
 capture_visual_baseline output anyOf[0].expires_in_ms required
 capture_visual_baseline output anyOf[0].fingerprint required

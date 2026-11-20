@@ -202,8 +202,17 @@ A character outside the Basic Multilingual Plane, such as an emoji, is two UTF-1
 
 ## Waiting for changes
 
-- `capture_visual_baseline` then `wait_for_change_since`: save a region before an action and wait
-  for its effect afterwards. Up to 16 baselines, each kept for 5 minutes.
+- `capture_visual_baseline` then `wait_for_change_since`: save a region before an action and wait for its effect afterwards. Up to 16 baselines, each kept for 5 minutes from its capture; using one does not extend it. The 17th capture removes the oldest.
+- `capture_visual_baseline` returns `expires_in_ms`, `baseline_count` (baselines held now, this one included) and `bytes` (pixel bytes they hold together). A baseline keeps a downscaled copy of the region, at most 320 pixels wide, at 4 bytes per pixel.
+- A `baseline_id` that cannot be used is refused with `error.code` `invalid_argument`, `retryable: false`, and an `error.reason`. Every reason needs a new `capture_visual_baseline`:
+
+| `reason` | Meaning |
+| --- | --- |
+| `expired` | The baseline is older than 5 minutes. Capture it closer to the wait. |
+| `evicted` | 16 newer baselines were captured since, so it was removed before it expired. Capture fewer. |
+| `display_changed` | Its display moved, resized or disappeared since the capture, or during the wait. |
+| `unknown` | This server did not issue it, or no longer remembers it. A restarted server knows no ID from before. The server remembers the last 64 expired or evicted IDs, with no pixels; an older one is `unknown`. |
+
 - `wait_for_visual_change`: wait for a region to change from how it looks at call time.
 - A timeout is a normal result, not an error.
 - Both waits look at the region every 100 ms. They end once it has changed from the baseline by at least `difference_threshold` and then stayed still for `stable_ms`. Stillness compares each frame with the one before it, not with the baseline, so a region that changes and changes back also settles.
@@ -282,6 +291,8 @@ Every error also has `error.retryable`. It says whether repeating the same reque
 | `own_indicator` | The point is under ControlFreak's own Stop button. Choose another point. The session is kept. | No |
 | `target_moved` | The target moved or was resized since the last check. Input stopped before its next event; `status` and `input` say what was already sent, which is nothing for an action that had not started. Observe again and use coordinates from the new screenshot. The session is kept with the window's new bounds, so an action that starts after this refusal is not refused for this move. | Yes |
 | `target_changed` | The target changed (window, process, display layout or desktop), or an earlier change ended the approval. End the session and observe again. | No |
+
+A refused `baseline_id` is `invalid_argument` with a `reason` too (see [Waiting for changes](#waiting-for-changes)). Other `invalid_argument` errors have none.
 
 `higher_integrity_target` and `target_integrity_unavailable` have no `reason` and are not retryable. When the code is about the foreground window, the keyboard focus or the pointer destination, the session is kept, and retrying cannot help until the user changes which window is in front. When it is about the target window itself, the session ends.
 

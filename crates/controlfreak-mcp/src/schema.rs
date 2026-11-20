@@ -237,9 +237,11 @@ pub(super) fn capture_visual_baseline() -> Contract {
                     "display": def_ref("display"),
                     "source_bounds": def_ref("bounds"),
                     "fingerprint": { "type": "string" },
-                    "expires_in_ms": { "type": "integer", "minimum": 0 }
+                    "expires_in_ms": { "type": "integer", "minimum": 0 },
+                    "baseline_count": { "type": "integer", "minimum": 1 },
+                    "bytes": { "type": "integer", "minimum": 0 }
                 },
-                "required": ["baseline_id", "display", "source_bounds", "fingerprint", "expires_in_ms"],
+                "required": ["baseline_id", "display", "source_bounds", "fingerprint", "expires_in_ms", "baseline_count", "bytes"],
                 "additionalProperties": false
             })],
             false,

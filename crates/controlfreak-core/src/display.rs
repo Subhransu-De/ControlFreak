@@ -244,6 +244,10 @@ pub struct VisualBaseline {
     pub source_bounds: DisplayBounds,
     pub fingerprint: String,
     pub expires_in_ms: u32,
+    /// How many baselines the server holds, this one included.
+    pub baseline_count: u32,
+    /// The pixel bytes all held baselines take together, this one included.
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -149,12 +149,17 @@ impl DisplayBackend for ObservationBackend {
             source_bounds: bounds(),
             fingerprint: "00ff".into(),
             expires_in_ms: 300_000,
+            baseline_count: 1,
+            bytes: 4,
         })
     }
     fn wait_for_change_since(
         &self,
-        _: &WaitForChangeSinceRequest,
+        request: &WaitForChangeSinceRequest,
     ) -> Result<controlfreak_core::VisualChangeResult, PlatformError> {
+        if let Some(cause) = refused_baseline(&request.baseline_id) {
+            return Err(PlatformError::InvalidBaseline { cause });
+        }
         // A timeout is a normal result and carries a screenshot too.
         Ok(visual_change(false))
     }
@@ -580,6 +585,80 @@ async fn every_observation_and_session_result_validates_against_tools_list() {
             assert_eq!(content["settled"], true);
             assert_eq!(content["timed_out"], false);
         }
+    }
+    harness.finish().await;
+}
+
+/// The synthetic backend refuses every baseline but `BASELINE_ID`, choosing the cause from the
+/// ID's last digit.
+fn refused_baseline(id: &str) -> Option<controlfreak_core::BaselineFailure> {
+    use controlfreak_core::BaselineFailure;
+    match id.chars().last() {
+        _ if id == BASELINE_ID => None,
+        Some('1') => Some(BaselineFailure::Expired),
+        Some('2') => Some(BaselineFailure::Evicted),
+        Some('3') => Some(BaselineFailure::DisplayChanged),
+        _ => Some(BaselineFailure::Unknown),
+    }
+}
+
+#[tokio::test]
+async fn a_refused_baseline_keeps_invalid_argument_and_says_why_in_its_reason() {
+    let mut harness = harness_with_backend(
+        Arc::new(ObservationBackend),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+    let published = outcome_tests::exchange(
+        &mut harness.client,
+        json!({"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}),
+    )
+    .await;
+    // The capture result reports what the server holds, and the contract requires it.
+    let captured = call(&mut harness, CAPTURE_VISUAL_BASELINE, region()).await;
+    let captured = &captured["structuredContent"];
+    assert_eq!(captured["baseline_count"], 1, "{captured}");
+    assert_eq!(captured["bytes"], 4, "{captured}");
+    let mut missing = captured.clone();
+    missing.as_object_mut().unwrap().remove("bytes");
+    assert!(!full_validator(CAPTURE_VISUAL_BASELINE).is_valid(&missing));
+
+    let schema = published["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == WAIT_FOR_CHANGE_SINCE)
+        .unwrap()["outputSchema"]
+        .clone();
+    let published = jsonschema::validator_for(&schema).unwrap();
+    let full = full_validator(WAIT_FOR_CHANGE_SINCE);
+    for (last, reason) in [
+        ('1', "expired"),
+        ('2', "evicted"),
+        ('3', "display_changed"),
+        ('4', "unknown"),
+    ] {
+        let id = format!("vb-{}-000000000000000{last}", "0".repeat(32));
+        let result = call(
+            &mut harness,
+            WAIT_FOR_CHANGE_SINCE,
+            json!({"baseline_id": id}),
+        )
+        .await;
+        assert_eq!(result["isError"], true, "{result}");
+        let content = &result["structuredContent"];
+        let error = &content["error"];
+        assert_eq!(error["code"], "invalid_argument", "{result}");
+        assert_eq!(error["reason"], reason, "{result}");
+        assert_eq!(error["retryable"], false);
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("invalid argument 'baseline_id'")),
+            "{result}"
+        );
+        assert!(published.is_valid(content), "{content}");
+        assert!(full.is_valid(content), "{content}");
     }
     harness.finish().await;
 }
