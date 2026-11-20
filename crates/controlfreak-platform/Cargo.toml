@@ -20,6 +20,7 @@ windows = { workspace = true, features = [
     "Graphics_Imaging",
     "Media_Ocr",
     "Storage_Streams",
+    "System_UserProfile",
     "Win32_Foundation",
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
