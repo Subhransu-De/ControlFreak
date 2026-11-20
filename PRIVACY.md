@@ -52,6 +52,8 @@ All of this is in memory and is gone when the server exits:
 - Target references for recently listed windows. Each one cannot be used 5 minutes after the window was last observed and is removed the next time the server observes windows.
 - The timings and status of the last 32 tool calls, for `get_server_status`.
 
+The build identity in `get_server_status`, `--version`, `--print-capabilities` and the `server_started` diagnostic line is fixed at compile time: the version, the Git commit, a dirty marker and the target triple. It contains no build time, path, user name or host name.
+
 The server writes diagnostics to standard error: startup errors and one line per finished tool
 call with the tool name, status and timings. These lines contain no tool arguments, screenshots,
 OCR text, typed text or window titles. Your MCP client decides whether standard error is shown or

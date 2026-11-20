@@ -92,13 +92,13 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use controlfreak_core::{
-    ActionObservation, CaptureDisplayRequest, CaptureRegionRequest, ClickTextRequest,
+    ActionObservation, BuildInfo, CaptureDisplayRequest, CaptureRegionRequest, ClickTextRequest,
     ClickTextResult, DisplayScreenshot, FocusWindowRequest, KeyChordRequest, KeyboardActionResult,
     MouseClickRequest, MouseDragRequest, MouseMoveRequest, MouseScrollRequest, MutationControl,
     OcrRegionRequest, PlatformBackend, PlatformError, PointerActionResult, TextInputRequest,
-    VirtualDesktopList, VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult, VisualBaseline,
-    VisualBaselineRequest, VisualChangeResult, WaitForVisualChangeRequest, WindowFocusResult,
-    WindowScreenshot, WindowWaitResult,
+    UNKNOWN_REVISION, VirtualDesktopList, VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult,
+    VisualBaseline, VisualBaselineRequest, VisualChangeResult, WaitForVisualChangeRequest,
+    WindowFocusResult, WindowScreenshot, WindowWaitResult,
 };
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
@@ -180,6 +180,7 @@ struct ControlFreakServer {
     safety_indicator: SafetyIndicator,
     session_runtime: Option<Arc<SessionRuntime>>,
     stop: controlfreak_core::StopController,
+    build: Arc<BuildInfo>,
 }
 
 impl ControlFreakServer {
@@ -199,6 +200,13 @@ impl ControlFreakServer {
             diagnostics: Arc::new(Diagnostics::new()),
             safety_indicator,
             session_runtime,
+            // The executable that serves passes its own build; this crate cannot see it.
+            build: Arc::new(BuildInfo::new(
+                env!("CARGO_PKG_VERSION"),
+                UNKNOWN_REVISION,
+                None,
+                "unknown",
+            )),
         }
     }
 
@@ -244,6 +252,7 @@ impl ControlFreakServer {
             // `status` describes server and indicator health; whether input is accepted is
             // reported on its own, with the step that reopens it.
             let recovery = self.stop.recovery();
+            content["build"] = json!(*self.build);
             content["input_admission"] = json!(if recovery.is_some() { "closed" } else { "open" });
             content["recovery"] = stop::recovery_json(recovery);
             content["stop_state"] = json!(controlfreak_core::StopRecovery::stop_state(recovery));
@@ -609,8 +618,9 @@ fn join_error(error: &tokio::task::JoinError) -> ErrorData {
 #[cfg(not(target_os = "windows"))]
 pub async fn serve_stdio(
     backend: Box<dyn PlatformBackend>,
+    build: BuildInfo,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    serve_stdio_inner(Arc::from(backend), SafetyIndicator::ready(), None).await
+    serve_stdio_inner(Arc::from(backend), SafetyIndicator::ready(), None, build).await
 }
 
 pub async fn serve_stdio_with_indicator_and_arbitrator<F, G>(
@@ -619,6 +629,7 @@ pub async fn serve_stdio_with_indicator_and_arbitrator<F, G>(
     start_indicator: F,
     arbitrator: Arc<dyn ActivityArbitrator>,
     stop: controlfreak_core::StopController,
+    build: BuildInfo,
 ) -> Result<(), Box<dyn Error + Send + Sync>>
 where
     F: Fn() -> Result<G, String> + Send + Sync + 'static,
@@ -634,7 +645,7 @@ where
     runtime.stop = stop;
     runtime.environment = Some(Arc::clone(&backend));
     let session_runtime = Arc::new(runtime);
-    serve_stdio_inner(backend, safety_indicator, Some(session_runtime)).await
+    serve_stdio_inner(backend, safety_indicator, Some(session_runtime), build).await
 }
 
 // rmcp drains responses after EOF. Close admission at EOF itself, before that drain.
@@ -700,9 +711,11 @@ async fn serve_stdio_inner(
     backend: Arc<dyn PlatformBackend>,
     safety_indicator: SafetyIndicator,
     session_runtime: Option<Arc<SessionRuntime>>,
+    build: BuildInfo,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let cleanup = ServerCleanup(session_runtime.clone());
-    let server = ControlFreakServer::with_indicator(backend, safety_indicator, session_runtime);
+    let mut server = ControlFreakServer::with_indicator(backend, safety_indicator, session_runtime);
+    server.build = Arc::new(build);
     let instance_id = server.diagnostics.instance_id.clone();
     eprintln!(
         "{}",
@@ -711,6 +724,7 @@ async fn serve_stdio_inner(
             "instance_id": instance_id,
             "process_id": std::process::id(),
             "version": env!("CARGO_PKG_VERSION"),
+            "build": *server.build,
         })
     );
     let (stdin, stdout) = stdio();

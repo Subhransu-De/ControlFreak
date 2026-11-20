@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use controlfreak_core::{PlatformBackend, SecurityContext};
+use controlfreak_core::{BuildInfo, PlatformBackend, SecurityContext};
 use controlfreak_platform::OcrHelperCommand;
 
 #[cfg(target_os = "windows")]
@@ -125,7 +125,7 @@ async fn try_main() -> Result<(), Box<dyn Error + Send + Sync>> {
             Ok(())
         }
         Command::Version => {
-            println!("controlfreak {}", env!("CARGO_PKG_VERSION"));
+            println!("{}", version_text(&build_info()));
             Ok(())
         }
     }
@@ -275,12 +275,13 @@ async fn run_server(allow_elevated: bool) -> Result<(), Box<dyn Error + Send + S
             },
             arbitrator,
             stop,
+            build_info(),
         )
         .await
     }
 
     #[cfg(not(target_os = "windows"))]
-    controlfreak_mcp::serve_stdio(controlfreak_platform::backend()).await
+    controlfreak_mcp::serve_stdio(controlfreak_platform::backend(), build_info()).await
 }
 
 /// Starts the tab, off the caller's thread, the first time an observation tool reads the screen
@@ -369,8 +370,37 @@ fn print_capabilities(allow_elevated: bool) -> Result<(), Box<dyn Error + Send +
     let security_context = controlfreak_platform::server_security_context(allow_elevated)?;
     let backend: Box<dyn PlatformBackend> =
         controlfreak_platform::backend_with_security(security_context);
-    println!("{}", serde_json::to_string_pretty(&backend.report())?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&backend.report().with_build(build_info()))?
+    );
     Ok(())
+}
+
+/// The build identity that build.rs embedded.
+fn build_info() -> BuildInfo {
+    let dirty = match env!("CONTROLFREAK_DIRTY") {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    };
+    BuildInfo::new(
+        env!("CARGO_PKG_VERSION"),
+        env!("CONTROLFREAK_REVISION"),
+        dirty,
+        env!("CONTROLFREAK_TARGET"),
+    )
+}
+
+/// The `--version` text. The first line stays `controlfreak <version>` for scripts that read it.
+fn version_text(build: &BuildInfo) -> String {
+    let dirty = build
+        .dirty
+        .map_or("unknown", |dirty| if dirty { "true" } else { "false" });
+    format!(
+        "controlfreak {}\nrevision: {}\ndirty: {dirty}\ntarget: {}",
+        build.version, build.revision, build.target
+    )
 }
 
 fn enforce_elevated_startup_policy(
@@ -563,5 +593,72 @@ mod tests {
         for other in ["--print-capabilities", "--help", "--allow-elevated"] {
             assert!(parse_options(["--print-tools".to_owned(), other.to_owned()]).is_err());
         }
+    }
+
+    /// #8: the embedded identity has its documented format and names no path, user or host.
+    #[test]
+    fn the_build_identity_carries_no_path_user_or_host_name() {
+        let build = build_info();
+        assert!(build.is_well_formed(), "{build:?}");
+        assert_eq!(build.version, env!("CARGO_PKG_VERSION"));
+        for field in [&build.version, &build.revision, &build.target] {
+            assert!(
+                !field.contains(['\\', '/', ':', '@', ' ']),
+                "{field} looks like a path, an address or a timestamp"
+            );
+        }
+        let lower = version_text(&build).to_ascii_lowercase();
+        assert!(!lower.contains(&env!("CARGO_MANIFEST_DIR").to_ascii_lowercase()));
+        for variable in ["USERNAME", "USER", "COMPUTERNAME", "HOSTNAME", "USERDOMAIN"] {
+            if let Ok(name) = env::var(variable)
+                && name.len() >= 3
+            {
+                assert!(
+                    !lower.contains(&name.to_ascii_lowercase()),
+                    "the build identity contains {variable}"
+                );
+            }
+        }
+    }
+
+    /// The revision is the commit the test binary was built from, so build.rs reruns when the
+    /// commit changes. Skipped in a source archive or without Git.
+    #[test]
+    fn the_embedded_revision_is_the_checked_out_commit() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        if !workspace.join(".git").exists() {
+            return;
+        }
+        let Ok(output) = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["rev-parse", "HEAD"])
+            .output()
+        else {
+            return;
+        };
+        if !output.status.success() {
+            return;
+        }
+        let head = String::from_utf8(output.stdout).unwrap();
+        let build = build_info();
+        assert_eq!(build.revision, head.trim());
+        assert!(build.dirty.is_some());
+    }
+
+    #[test]
+    fn the_version_text_keeps_its_first_line() {
+        let build = BuildInfo::new("1.2.3", "unknown", None, "x86_64-pc-windows-msvc");
+        assert_eq!(
+            version_text(&build),
+            "controlfreak 1.2.3\nrevision: unknown\ndirty: unknown\ntarget: x86_64-pc-windows-msvc"
+        );
+        let build = BuildInfo::new(
+            "1.2.3",
+            "a".repeat(40),
+            Some(false),
+            "x86_64-pc-windows-msvc",
+        );
+        assert_eq!(version_text(&build).lines().nth(2), Some("dirty: false"));
     }
 }

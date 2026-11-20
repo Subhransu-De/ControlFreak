@@ -63,6 +63,10 @@ enum Task {
         package: PathBuf,
         #[arg(long)]
         output: PathBuf,
+        /// The commit the package must report, with a clean tree. Release builds pass the tag's
+        /// commit.
+        #[arg(long)]
+        expect_revision: Option<String>,
     },
     /// Exercise installation in synthetic profiles using a separate test identity.
     TestInstaller {
@@ -124,8 +128,17 @@ fn run(cli: Cli) -> Result<()> {
             metadata.validate_tag(tag.as_deref())?;
             package::build(&metadata, &compiler, &output, require_sbom, test_setup)?;
         }
-        Task::Verify { package, output } => {
-            verify::package(&package, &output, metadata.version()?)?;
+        Task::Verify {
+            package,
+            output,
+            expect_revision,
+        } => {
+            verify::package(
+                &package,
+                &output,
+                metadata.version()?,
+                expect_revision.as_deref(),
+            )?;
         }
         Task::TestInstaller {
             package,

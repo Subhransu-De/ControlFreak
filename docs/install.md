@@ -80,6 +80,8 @@ executables inside the ZIP also have GitHub build provenance attestations:
 gh attestation verify ControlFreak-<version>.exe --repo Subhransu-De/ControlFreak
 ```
 
+`controlfreak --version` prints the version, then the Git commit it was built from, whether the source had uncommitted changes (`dirty`) and the target. A release reports its tagged commit and `dirty: false`.
+
 The binaries are not code-signed, so Windows SmartScreen can show a warning.
 
 ## Configure a client by hand

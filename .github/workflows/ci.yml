@@ -139,8 +139,9 @@ jobs:
       - name: Build Windows installer and portable package
         run: cargo xtask package --compiler "$env:RUNNER_TEMP/inno/compiler/ISCC.exe" --output "$env:RUNNER_TEMP/installer-package" --test-setup
 
+      # The same check as a release: the package must report this commit, clean.
       - name: Verify portable executable and package checksums
-        run: cargo xtask verify --package "$env:RUNNER_TEMP/installer-package" --output "$env:RUNNER_TEMP/portable test 日本語"
+        run: cargo xtask verify --package "$env:RUNNER_TEMP/installer-package" --output "$env:RUNNER_TEMP/portable test 日本語" --expect-revision (git rev-parse HEAD)
 
       - name: Verify installation lifecycle with synthetic client profiles
         run: cargo xtask test-installer --package "$env:RUNNER_TEMP/installer-package" --output "$env:RUNNER_TEMP/installer-test"
