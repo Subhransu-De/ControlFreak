@@ -11,16 +11,17 @@ use super::{
     Arc, CallToolResponse, CallToolResult, CaptureDisplayInput, CaptureDisplayRequest,
     CaptureRegionInput, CaptureRegionRequest, CaptureWindowInput, CarriesPng, ClickMouseInput,
     ClickTextInput, ClickTextRequest, Diagnostics, DragMouseInput, Encoded, ErrorData,
-    FindTextInput, FocusWindowInput, FocusWindowRequest, JsonObject, KeyChordRequest,
+    FindTextInput, FocusWindowInput, FocusWindowRequest, InputRun, JsonObject, KeyChordRequest,
     MouseClickRequest, MouseDragRequest, MouseMoveRequest, MouseScrollRequest, MoveMouseInput,
     NoArguments, OcrRegionInput, OcrRegionRequest, OperationLease, Ordering, PlatformBackend,
-    PressKeysInput, SafetyIndicator, ScrollMouseInput, SessionRuntime, SwitchVirtualDesktopInput,
-    TextInputRequest, TypeTextInput, Value, VirtualDesktopSwitchRequest, VisualBaselineInput,
-    VisualBaselineRequest, WaitForChangeSinceInput, WaitForTextInput, WaitForVisualChangeInput,
-    WaitForVisualChangeRequest, WaitForWindowInput, click_text_result, join_error, json,
-    keyboard_result, parse_arguments, pointer_result, screenshot_result, tool_error,
-    virtual_desktop_list_result, virtual_desktop_switch_result, visual_baseline_result,
-    visual_change_result, window_focus_result, window_screenshot_result, window_wait_result,
+    PreparedInput, PressKeysInput, SafetyIndicator, ScrollMouseInput, SessionRuntime,
+    SwitchVirtualDesktopInput, TextInputRequest, TypeTextInput, Value, VirtualDesktopSwitchRequest,
+    VisualBaselineInput, VisualBaselineRequest, WaitForChangeSinceInput, WaitForTextInput,
+    WaitForVisualChangeInput, WaitForVisualChangeRequest, WaitForWindowInput, click_text_result,
+    join_error, json, keyboard_result, parse_arguments, pointer_result, screenshot_result,
+    tool_error, tool_execution_error, virtual_desktop_list_result, virtual_desktop_switch_result,
+    visual_baseline_result, visual_change_result, window_focus_result, window_screenshot_result,
+    window_wait_result,
 };
 
 pub(super) async fn run_platform_operation<T, F>(
@@ -456,12 +457,8 @@ pub(super) async fn call_wait_for_text(
     }
 }
 
-pub(super) async fn call_click_text(
-    backend: Arc<dyn PlatformBackend>,
-    arguments: Option<JsonObject>,
-    operation_lease: Option<OperationLease>,
-) -> Result<CallToolResponse, ErrorData> {
-    let input = parse_arguments::<ClickTextInput>(arguments)?;
+pub(super) fn prepare_click_text(arguments: Option<JsonObject>) -> PreparedInput {
+    let input = parse_input::<ClickTextInput>(arguments)?;
     let action = json!({
         "kind": "click_text",
         "query": input.query,
@@ -481,125 +478,110 @@ pub(super) async fn call_click_text(
         duration_ms: input.duration_ms,
         observation: input.observation.into(),
     };
-    let (result, progress) = run_encoded_mutation(
-        operation_lease,
-        Some(input.target_ref),
-        Arc::clone(&backend),
-        move |control| {
-            let mut request = request;
-            request.region.display_id =
-                resolve_display(backend.as_ref(), &request.region.display_id)?;
-            resolve_observation(backend.as_ref(), &mut request.observation)?;
-            backend.click_text_controlled(&request, control)
-        },
-    )
-    .await;
-    match result {
-        Ok(result) => Ok(click_text_result(result, &action).into()),
-        Err(error) => Ok(tool_error(&error).into()),
-    }
-    .map(|response| super::results::with_progress(response, progress))
+    let target_ref = input.target_ref;
+    Ok(run_with_lease(move |backend, operation_lease| async move {
+        let (result, progress) = run_encoded_mutation(
+            operation_lease,
+            Some(target_ref),
+            Arc::clone(&backend),
+            move |control| {
+                let mut request = request;
+                request.region.display_id =
+                    resolve_display(backend.as_ref(), &request.region.display_id)?;
+                resolve_observation(backend.as_ref(), &mut request.observation)?;
+                backend.click_text_controlled(&request, control)
+            },
+        )
+        .await;
+        match result {
+            Ok(result) => Ok(click_text_result(result, &action).into()),
+            Err(error) => Ok(tool_error(&error).into()),
+        }
+        .map(|response| super::results::with_progress(response, progress))
+    }))
 }
 
-pub(super) async fn call_move_mouse(
-    backend: Arc<dyn PlatformBackend>,
-    arguments: Option<JsonObject>,
-    operation_lease: Option<OperationLease>,
-) -> Result<CallToolResponse, ErrorData> {
-    let input = parse_arguments::<MoveMouseInput>(arguments)?;
-    let target = match input.pointer_target() {
-        Ok(target) => target,
-        Err(error) => return Ok(not_started(&error)),
-    };
+pub(super) fn prepare_move_mouse(arguments: Option<JsonObject>) -> PreparedInput {
+    let input = parse_input::<MoveMouseInput>(arguments)?;
+    let target = input.pointer_target().map_err(|error| refuse(&error))?;
     let duration_ms = input.duration_ms;
     let mut observation = input.observation.into();
-    let (result, progress) = run_encoded_mutation(
-        operation_lease,
-        Some(input.target_ref),
-        Arc::clone(&backend),
-        move |control| {
-            let (display_id, x, y) = target.resolve(backend.as_ref())?;
-            resolve_observation(backend.as_ref(), &mut observation)?;
-            let request = MouseMoveRequest {
-                display_id,
-                x,
-                y,
-                duration_ms,
-                observation,
-            };
-            backend.move_mouse_controlled(&request, control)
-        },
-    )
-    .await;
-    match result {
-        Ok(result) => Ok(pointer_result(result, &json!({ "kind": "move" })).into()),
-        Err(error) => Ok(tool_error(&error).into()),
-    }
-    .map(|response| super::results::with_progress(response, progress))
+    let target_ref = input.target_ref;
+    Ok(run_with_lease(move |backend, operation_lease| async move {
+        let (result, progress) = run_encoded_mutation(
+            operation_lease,
+            Some(target_ref),
+            Arc::clone(&backend),
+            move |control| {
+                let (display_id, x, y) = target.resolve(backend.as_ref())?;
+                resolve_observation(backend.as_ref(), &mut observation)?;
+                let request = MouseMoveRequest {
+                    display_id,
+                    x,
+                    y,
+                    duration_ms,
+                    observation,
+                };
+                backend.move_mouse_controlled(&request, control)
+            },
+        )
+        .await;
+        match result {
+            Ok(result) => Ok(pointer_result(result, &json!({ "kind": "move" })).into()),
+            Err(error) => Ok(tool_error(&error).into()),
+        }
+        .map(|response| super::results::with_progress(response, progress))
+    }))
 }
 
-pub(super) async fn call_click_mouse(
-    backend: Arc<dyn PlatformBackend>,
-    arguments: Option<JsonObject>,
-    operation_lease: Option<OperationLease>,
-) -> Result<CallToolResponse, ErrorData> {
-    let input = parse_arguments::<ClickMouseInput>(arguments)?;
-    let target = match input.pointer_target() {
-        Ok(target) => target,
-        Err(error) => return Ok(not_started(&error)),
-    };
+pub(super) fn prepare_click_mouse(arguments: Option<JsonObject>) -> PreparedInput {
+    let input = parse_input::<ClickMouseInput>(arguments)?;
+    let target = input.pointer_target().map_err(|error| refuse(&error))?;
     let button = input.button;
     let click_count = input.click_count;
-    let modifiers = input.modifiers.clone();
+    let action = json!({
+        "kind": "click",
+        "button": button,
+        "click_count": click_count,
+        "modifiers": input.modifiers,
+    });
+    let modifiers = input.modifiers;
     let duration_ms = input.duration_ms;
     let mut observation = input.observation.into();
-    let (result, progress) = run_encoded_mutation(
-        operation_lease,
-        Some(input.target_ref),
-        Arc::clone(&backend),
-        move |control| {
-            let (display_id, x, y) = target.resolve(backend.as_ref())?;
-            resolve_observation(backend.as_ref(), &mut observation)?;
-            let click_request = MouseClickRequest {
-                display_id,
-                x,
-                y,
-                button,
-                click_count,
-                modifiers,
-                duration_ms,
-                observation,
-            };
-            backend.click_mouse_controlled(&click_request, control)
-        },
-    )
-    .await;
-    match result {
-        Ok(result) => Ok(pointer_result(
-            result,
-            &json!({
-                "kind": "click",
-                "button": button,
-                "click_count": input.click_count,
-                "modifiers": input.modifiers,
-            }),
+    let target_ref = input.target_ref;
+    Ok(run_with_lease(move |backend, operation_lease| async move {
+        let (result, progress) = run_encoded_mutation(
+            operation_lease,
+            Some(target_ref),
+            Arc::clone(&backend),
+            move |control| {
+                let (display_id, x, y) = target.resolve(backend.as_ref())?;
+                resolve_observation(backend.as_ref(), &mut observation)?;
+                let click_request = MouseClickRequest {
+                    display_id,
+                    x,
+                    y,
+                    button,
+                    click_count,
+                    modifiers,
+                    duration_ms,
+                    observation,
+                };
+                backend.click_mouse_controlled(&click_request, control)
+            },
         )
-        .into()),
-        Err(error) => Ok(tool_error(&error).into()),
-    }
-    .map(|response| super::results::with_progress(response, progress))
+        .await;
+        match result {
+            Ok(result) => Ok(pointer_result(result, &action).into()),
+            Err(error) => Ok(tool_error(&error).into()),
+        }
+        .map(|response| super::results::with_progress(response, progress))
+    }))
 }
 
-pub(super) async fn call_drag_mouse(
-    backend: Arc<dyn PlatformBackend>,
-    arguments: Option<JsonObject>,
-    operation_lease: Option<OperationLease>,
-) -> Result<CallToolResponse, ErrorData> {
-    let input = parse_arguments::<DragMouseInput>(arguments)?;
-    let (start, end) = match input.pointer_targets() {
-        Ok(targets) => targets,
-        Err(error) => return Ok(not_started(&error)),
-    };
+pub(super) fn prepare_drag_mouse(arguments: Option<JsonObject>) -> PreparedInput {
+    let input = parse_input::<DragMouseInput>(arguments)?;
+    let (start, end) = input.pointer_targets().map_err(|error| refuse(&error))?;
     let action = json!({
         "kind": "drag",
         "button": input.button,
@@ -611,35 +593,38 @@ pub(super) async fn call_drag_mouse(
     let modifiers = input.modifiers;
     let duration_ms = input.duration_ms;
     let mut observation = input.observation.into();
-    let (result, progress) = run_encoded_mutation(
-        operation_lease,
-        Some(input.target_ref),
-        Arc::clone(&backend),
-        move |control| {
-            let (start_display_id, start_x, start_y) = start.resolve(backend.as_ref())?;
-            let (end_display_id, end_x, end_y) = end.resolve(backend.as_ref())?;
-            resolve_observation(backend.as_ref(), &mut observation)?;
-            let request = MouseDragRequest {
-                start_display_id,
-                start_x,
-                start_y,
-                end_display_id,
-                end_x,
-                end_y,
-                button,
-                modifiers,
-                duration_ms,
-                observation,
-            };
-            backend.drag_mouse_controlled(&request, control)
-        },
-    )
-    .await;
-    match result {
-        Ok(result) => Ok(pointer_result(result, &action).into()),
-        Err(error) => Ok(tool_error(&error).into()),
-    }
-    .map(|response| super::results::with_progress(response, progress))
+    let target_ref = input.target_ref;
+    Ok(run_with_lease(move |backend, operation_lease| async move {
+        let (result, progress) = run_encoded_mutation(
+            operation_lease,
+            Some(target_ref),
+            Arc::clone(&backend),
+            move |control| {
+                let (start_display_id, start_x, start_y) = start.resolve(backend.as_ref())?;
+                let (end_display_id, end_x, end_y) = end.resolve(backend.as_ref())?;
+                resolve_observation(backend.as_ref(), &mut observation)?;
+                let request = MouseDragRequest {
+                    start_display_id,
+                    start_x,
+                    start_y,
+                    end_display_id,
+                    end_x,
+                    end_y,
+                    button,
+                    modifiers,
+                    duration_ms,
+                    observation,
+                };
+                backend.drag_mouse_controlled(&request, control)
+            },
+        )
+        .await;
+        match result {
+            Ok(result) => Ok(pointer_result(result, &action).into()),
+            Err(error) => Ok(tool_error(&error).into()),
+        }
+        .map(|response| super::results::with_progress(response, progress))
+    }))
 }
 
 pub(super) async fn call_list_windows(
@@ -674,79 +659,73 @@ pub(super) async fn call_list_virtual_desktops(
     }
 }
 
-pub(super) async fn call_switch_virtual_desktop(
-    backend: Arc<dyn PlatformBackend>,
-    arguments: Option<JsonObject>,
-    operation_lease: Option<OperationLease>,
-) -> Result<CallToolResponse, ErrorData> {
-    let input = parse_arguments::<SwitchVirtualDesktopInput>(arguments)?;
-    let observation = match input.observation.without_settle() {
-        Ok(observation) => observation,
-        Err(error) => return Ok(not_started(&error)),
-    };
+pub(super) fn prepare_switch_virtual_desktop(arguments: Option<JsonObject>) -> PreparedInput {
+    let input = parse_input::<SwitchVirtualDesktopInput>(arguments)?;
+    let observation = input
+        .observation
+        .without_settle()
+        .map_err(|error| refuse(&error))?;
     let request = VirtualDesktopSwitchRequest {
         direction: input.direction,
         steps: input.steps,
         observation,
     };
-    let (result, progress) = run_encoded_mutation(
-        operation_lease,
-        input.target_ref,
-        Arc::clone(&backend),
-        move |control| {
-            let mut request = request;
-            resolve_observation(backend.as_ref(), &mut request.observation)?;
-            backend.switch_virtual_desktop_controlled(&request, control)
-        },
-    )
-    .await;
-    match result {
-        Ok(result) => Ok(virtual_desktop_switch_result(result).into()),
-        Err(error) => Ok(tool_error(&error).into()),
-    }
-    .map(|response| super::results::with_progress(response, progress))
+    let target_ref = input.target_ref;
+    Ok(run_with_lease(move |backend, operation_lease| async move {
+        let (result, progress) = run_encoded_mutation(
+            operation_lease,
+            target_ref,
+            Arc::clone(&backend),
+            move |control| {
+                let mut request = request;
+                resolve_observation(backend.as_ref(), &mut request.observation)?;
+                backend.switch_virtual_desktop_controlled(&request, control)
+            },
+        )
+        .await;
+        match result {
+            Ok(result) => Ok(virtual_desktop_switch_result(result).into()),
+            Err(error) => Ok(tool_error(&error).into()),
+        }
+        .map(|response| super::results::with_progress(response, progress))
+    }))
 }
 
-pub(super) async fn call_focus_window(
-    backend: Arc<dyn PlatformBackend>,
-    arguments: Option<JsonObject>,
-    operation_lease: Option<OperationLease>,
-) -> Result<CallToolResponse, ErrorData> {
-    let input = parse_arguments::<FocusWindowInput>(arguments)?;
-    let window_id = match input.window_id() {
-        Ok(window_id) => window_id,
-        Err(error) => return Ok(not_started(&error)),
-    };
-    let observation = match input.observation.without_settle() {
-        Ok(observation) => observation,
-        Err(error) => return Ok(not_started(&error)),
-    };
+pub(super) fn prepare_focus_window(arguments: Option<JsonObject>) -> PreparedInput {
+    let input = parse_input::<FocusWindowInput>(arguments)?;
+    let window_id = input.window_id().map_err(|error| refuse(&error))?;
+    let observation = input
+        .observation
+        .without_settle()
+        .map_err(|error| refuse(&error))?;
     let request = FocusWindowRequest {
         timeout_ms: input.timeout_ms,
         window_id,
         observation,
     };
-    // Inside a session the approved window stays bound, and the backend decides whether the
-    // requested window may be focused: the approved window itself or a dialog of its process.
-    let approved = operation_lease
-        .as_ref()
-        .and_then(|lease| lease.mutation_control().approved_target());
-    let (result, progress) = run_encoded_mutation(
-        operation_lease,
-        Some(approved.unwrap_or_else(|| request.window_id.clone())),
-        Arc::clone(&backend),
-        move |control| {
-            let mut request = request;
-            resolve_observation(backend.as_ref(), &mut request.observation)?;
-            backend.focus_window_controlled(&request, control)
-        },
-    )
-    .await;
-    match result {
-        Ok(result) => Ok(window_focus_result(result).into()),
-        Err(error) => Ok(tool_error(&error).into()),
-    }
-    .map(|response| super::results::with_progress(response, progress))
+    Ok(run_with_lease(move |backend, operation_lease| async move {
+        // Inside a session the approved window stays bound, and the backend decides whether the
+        // requested window may be focused: the approved window itself or a dialog of its process.
+        let approved = operation_lease
+            .as_ref()
+            .and_then(|lease| lease.mutation_control().approved_target());
+        let (result, progress) = run_encoded_mutation(
+            operation_lease,
+            Some(approved.unwrap_or_else(|| request.window_id.clone())),
+            Arc::clone(&backend),
+            move |control| {
+                let mut request = request;
+                resolve_observation(backend.as_ref(), &mut request.observation)?;
+                backend.focus_window_controlled(&request, control)
+            },
+        )
+        .await;
+        match result {
+            Ok(result) => Ok(window_focus_result(result).into()),
+            Err(error) => Ok(tool_error(&error).into()),
+        }
+        .map(|response| super::results::with_progress(response, progress))
+    }))
 }
 
 pub(super) async fn call_capture_window(
@@ -787,182 +766,200 @@ pub(super) async fn call_wait_for_window(
     }
 }
 
-pub(super) async fn call_press_keys(
-    backend: Arc<dyn PlatformBackend>,
-    arguments: Option<JsonObject>,
-    operation_lease: Option<OperationLease>,
-) -> Result<CallToolResponse, ErrorData> {
-    let input = parse_arguments::<PressKeysInput>(arguments)?;
+pub(super) fn prepare_press_keys(arguments: Option<JsonObject>) -> PreparedInput {
+    let input = parse_input::<PressKeysInput>(arguments)?;
     let action_keys = input.keys.clone();
     let request = KeyChordRequest {
         keys: input.keys,
         observation: input.observation.into(),
     };
-    let (result, progress) = run_encoded_mutation(
-        operation_lease,
-        Some(input.target_ref),
-        Arc::clone(&backend),
-        move |control| {
-            let mut request = request;
-            resolve_observation(backend.as_ref(), &mut request.observation)?;
-            backend.press_keys_controlled(&request, control)
-        },
-    )
-    .await;
-    match result {
-        Ok(result) => Ok(keyboard_result(
-            result,
-            &json!({ "kind": "key_chord", "keys": action_keys }),
+    let target_ref = input.target_ref;
+    Ok(run_with_lease(move |backend, operation_lease| async move {
+        let (result, progress) = run_encoded_mutation(
+            operation_lease,
+            Some(target_ref),
+            Arc::clone(&backend),
+            move |control| {
+                let mut request = request;
+                resolve_observation(backend.as_ref(), &mut request.observation)?;
+                backend.press_keys_controlled(&request, control)
+            },
         )
-        .into()),
-        Err(error) => Ok(tool_error(&error).into()),
-    }
-    .map(|response| super::results::with_progress(response, progress))
+        .await;
+        match result {
+            Ok(result) => Ok(keyboard_result(
+                result,
+                &json!({ "kind": "key_chord", "keys": action_keys }),
+            )
+            .into()),
+            Err(error) => Ok(tool_error(&error).into()),
+        }
+        .map(|response| super::results::with_progress(response, progress))
+    }))
 }
 
-pub(super) async fn call_type_text(
-    backend: Arc<dyn PlatformBackend>,
-    arguments: Option<JsonObject>,
-    operation_lease: Option<OperationLease>,
-) -> Result<CallToolResponse, ErrorData> {
-    let input = parse_arguments::<TypeTextInput>(arguments)?;
+pub(super) fn prepare_type_text(arguments: Option<JsonObject>) -> PreparedInput {
+    let input = parse_input::<TypeTextInput>(arguments)?;
     let text_length = input.text.encode_utf16().count();
     let request = TextInputRequest {
         text: input.text,
         observation: input.observation.into(),
     };
-    let (result, progress) = run_encoded_mutation(
-        operation_lease,
-        Some(input.target_ref),
-        Arc::clone(&backend),
-        move |control| {
-            let mut request = request;
-            resolve_observation(backend.as_ref(), &mut request.observation)?;
-            backend.type_text_controlled(&request, control)
-        },
-    )
-    .await;
-    match result {
-        Ok(result) => Ok(keyboard_result(
-            result,
-            &json!({ "kind": "text", "requested_utf16_units": text_length }),
+    let target_ref = input.target_ref;
+    Ok(run_with_lease(move |backend, operation_lease| async move {
+        let (result, progress) = run_encoded_mutation(
+            operation_lease,
+            Some(target_ref),
+            Arc::clone(&backend),
+            move |control| {
+                let mut request = request;
+                resolve_observation(backend.as_ref(), &mut request.observation)?;
+                backend.type_text_controlled(&request, control)
+            },
         )
-        .into()),
-        Err(error) => Ok(tool_error(&error).into()),
-    }
-    .map(|response| super::results::with_progress(response, progress))
+        .await;
+        match result {
+            Ok(result) => Ok(keyboard_result(
+                result,
+                &json!({ "kind": "text", "requested_utf16_units": text_length }),
+            )
+            .into()),
+            Err(error) => Ok(tool_error(&error).into()),
+        }
+        .map(|response| super::results::with_progress(response, progress))
+    }))
 }
 
-pub(super) async fn call_scroll_mouse(
-    backend: Arc<dyn PlatformBackend>,
-    arguments: Option<JsonObject>,
-    operation_lease: Option<OperationLease>,
-) -> Result<CallToolResponse, ErrorData> {
-    let input = parse_arguments::<ScrollMouseInput>(arguments)?;
-    let target = match input.pointer_target() {
-        Ok(target) => target,
-        Err(error) => return Ok(not_started(&error)),
-    };
+pub(super) fn prepare_scroll_mouse(arguments: Option<JsonObject>) -> PreparedInput {
+    let input = parse_input::<ScrollMouseInput>(arguments)?;
+    let target = input.pointer_target().map_err(|error| refuse(&error))?;
     let delta_x = input.delta_x;
     let delta_y = input.delta_y;
     let duration_ms = input.duration_ms;
     let mut observation = input.observation.into();
-    let (result, progress) = run_encoded_mutation(
-        operation_lease,
-        Some(input.target_ref),
-        Arc::clone(&backend),
-        move |control| {
-            let (display_id, x, y) = target.resolve(backend.as_ref())?;
-            resolve_observation(backend.as_ref(), &mut observation)?;
-            let scroll_request = MouseScrollRequest {
-                display_id,
-                x,
-                y,
-                delta_x,
-                delta_y,
-                duration_ms,
-                observation,
-            };
-            backend.scroll_mouse_controlled(&scroll_request, control)
-        },
-    )
-    .await;
-    match result {
-        Ok(result) => Ok(pointer_result(
-            result,
-            &json!({
-                "kind": "scroll",
-                "delta_x": delta_x,
-                "delta_y": delta_y,
-            }),
+    let target_ref = input.target_ref;
+    Ok(run_with_lease(move |backend, operation_lease| async move {
+        let (result, progress) = run_encoded_mutation(
+            operation_lease,
+            Some(target_ref),
+            Arc::clone(&backend),
+            move |control| {
+                let (display_id, x, y) = target.resolve(backend.as_ref())?;
+                resolve_observation(backend.as_ref(), &mut observation)?;
+                let scroll_request = MouseScrollRequest {
+                    display_id,
+                    x,
+                    y,
+                    delta_x,
+                    delta_y,
+                    duration_ms,
+                    observation,
+                };
+                backend.scroll_mouse_controlled(&scroll_request, control)
+            },
         )
-        .into()),
-        Err(error) => Ok(tool_error(&error).into()),
-    }
-    .map(|response| super::results::with_progress(response, progress))
+        .await;
+        match result {
+            Ok(result) => Ok(pointer_result(
+                result,
+                &json!({
+                    "kind": "scroll",
+                    "delta_x": delta_x,
+                    "delta_y": delta_y,
+                }),
+            )
+            .into()),
+            Err(error) => Ok(tool_error(&error).into()),
+        }
+        .map(|response| super::results::with_progress(response, progress))
+    }))
 }
 
 /// A tool error for a request rejected before any desktop work, with not-started progress.
-fn not_started(error: &PlatformError) -> CallToolResponse {
-    super::results::with_progress(tool_error(error).into(), MutationProgress::default())
+fn refuse(error: &PlatformError) -> Box<CallToolResponse> {
+    Box::new(super::results::with_progress(
+        tool_error(error).into(),
+        MutationProgress::default(),
+    ))
+}
+
+/// Parses an input tool's arguments. A malformed request gets the same `invalid_arguments`
+/// result, with not-started progress, that dispatch gives any other argument error.
+fn parse_input<T>(arguments: Option<JsonObject>) -> Result<T, Box<CallToolResponse>>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    parse_arguments(arguments).map_err(|error| {
+        Box::new(super::results::with_progress(
+            tool_execution_error(&error).into(),
+            MutationProgress::default(),
+        ))
+    })
+}
+
+/// Wraps the part of an input tool that needs the backend and the operation lease.
+fn run_with_lease<F, R>(run: F) -> InputRun
+where
+    F: FnOnce(Arc<dyn PlatformBackend>, Option<OperationLease>) -> R + Send + 'static,
+    R: Future<Output = Result<CallToolResponse, ErrorData>> + Send + 'static,
+{
+    Box::new(move |backend, operation_lease| Box::pin(run(backend, operation_lease)))
 }
 
 /// Runs validated steps in order on one target, stopping at the first failure. Each step uses
 /// the same backend path, target checks, and cleanup as the matching single-action tool;
 /// only the last step captures the requested observation.
-pub(super) async fn call_run_actions(
-    backend: Arc<dyn PlatformBackend>,
-    arguments: Option<JsonObject>,
-    operation_lease: Option<OperationLease>,
-) -> Result<CallToolResponse, ErrorData> {
-    let input = parse_arguments::<RunActionsInput>(arguments)?;
-    let steps = match input.validated_steps() {
-        Ok(steps) => steps,
-        Err(error) => return Ok(not_started(&error)),
-    };
+pub(super) fn prepare_run_actions(arguments: Option<JsonObject>) -> PreparedInput {
+    let input = parse_input::<RunActionsInput>(arguments)?;
+    // Every step is checked here, before the lease, so a malformed later step neither strands
+    // input from earlier steps nor reserves the desktop.
+    let steps = input.validated_steps().map_err(|error| refuse(&error))?;
     let final_observation: ObservationOptions = input.observation.into();
-    let reports = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
-    let worker_reports = Arc::clone(&reports);
-    let (result, progress) = run_encoded_mutation(
-        operation_lease,
-        Some(input.target_ref),
-        Arc::clone(&backend),
-        move |control| {
-            let mut final_observation = final_observation;
-            resolve_observation(backend.as_ref(), &mut final_observation)?;
-            run_steps(
-                backend.as_ref(),
-                &steps,
-                &final_observation,
-                control,
-                &worker_reports,
-            )
-            .map(|observation| KeyboardActionResult { observation })
-        },
-    )
-    .await;
-    let steps = std::mem::take(
-        &mut *reports
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    );
-    let action = json!({ "kind": "run_actions", "steps": steps });
-    match result {
-        Ok(result) => Ok(keyboard_result(result, &action).into()),
-        Err(error) => {
-            let mut response = tool_error(&error);
-            if let Some(content) = response.structured_content.as_mut() {
-                if content.get("error").is_some() {
-                    content["error"]["details"]["steps"] = action["steps"].clone();
-                } else {
-                    // The completed-but-unverified variant carries a warning, not an error.
-                    content["details"] = json!({ "steps": action["steps"] });
+    let target_ref = input.target_ref;
+    Ok(run_with_lease(move |backend, operation_lease| async move {
+        let reports = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let worker_reports = Arc::clone(&reports);
+        let (result, progress) = run_encoded_mutation(
+            operation_lease,
+            Some(target_ref),
+            Arc::clone(&backend),
+            move |control| {
+                let mut final_observation = final_observation;
+                resolve_observation(backend.as_ref(), &mut final_observation)?;
+                run_steps(
+                    backend.as_ref(),
+                    &steps,
+                    &final_observation,
+                    control,
+                    &worker_reports,
+                )
+                .map(|observation| KeyboardActionResult { observation })
+            },
+        )
+        .await;
+        let steps = std::mem::take(
+            &mut *reports
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let action = json!({ "kind": "run_actions", "steps": steps });
+        match result {
+            Ok(result) => Ok(keyboard_result(result, &action).into()),
+            Err(error) => {
+                let mut response = tool_error(&error);
+                if let Some(content) = response.structured_content.as_mut() {
+                    if content.get("error").is_some() {
+                        content["error"]["details"]["steps"] = action["steps"].clone();
+                    } else {
+                        // The completed-but-unverified variant carries a warning, not an error.
+                        content["details"] = json!({ "steps": action["steps"] });
+                    }
                 }
+                Ok(response.into())
             }
-            Ok(response.into())
         }
-    }
-    .map(|response| super::results::with_progress(response, progress))
+        .map(|response| super::results::with_progress(response, progress))
+    }))
 }
 
 /// A step point as a display ID and display-local pixels.
