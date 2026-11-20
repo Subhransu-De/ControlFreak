@@ -15,7 +15,7 @@ pub struct CapabilityReport {
     security_context: SecurityContext,
     /// The executable's build identity. A backend does not know it; the server adds it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build: Option<BuildInfo>,
+    build: Option<BuildInfo>,
 }
 
 impl CapabilityReport {

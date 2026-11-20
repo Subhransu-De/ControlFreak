@@ -20,7 +20,7 @@ mod text_matching;
 pub mod timing;
 mod window;
 
-pub use build_info::{BUILD_INFO_SCHEMA_VERSION, BuildInfo, UNKNOWN_REVISION, is_commit_hash};
+pub use build_info::{BUILD_INFO_SCHEMA_VERSION, BuildInfo, UNKNOWN_REVISION};
 pub use capability::{Capability, CapabilityDescriptor, CapabilityState};
 pub use desktop::{
     VirtualDesktopDirection, VirtualDesktopInfo, VirtualDesktopList, VirtualDesktopSwitchRequest,

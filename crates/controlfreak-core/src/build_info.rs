@@ -11,7 +11,7 @@ pub const UNKNOWN_REVISION: &str = "unknown";
 /// same source report the same object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildInfo {
-    pub schema_version: u32,
+    schema_version: u32,
     /// The package version, as in `serverInfo.version`.
     pub version: String,
     /// The full Git commit hash, or `unknown`.
@@ -64,7 +64,7 @@ impl BuildInfo {
 
 /// A full SHA-1 or SHA-256 Git object name in lowercase hex.
 #[must_use]
-pub fn is_commit_hash(value: &str) -> bool {
+fn is_commit_hash(value: &str) -> bool {
     matches!(value.len(), 40 | 64)
         && value
             .bytes()
