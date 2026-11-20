@@ -37,6 +37,7 @@ pub(crate) fn suite() -> Suite {
                 .scene("single")
                 .budget_secs(40),
             task("held-modifier-refused", held_modifier_refused).scene("single"),
+            task("moved-window-keeps-session", moved_window_keeps_session).scene("single"),
         ],
     }
 }
@@ -83,6 +84,51 @@ fn click_pixel_and_button(cx: &mut Ctx<'_>) -> Result<(), Failure> {
     cx.expect("app", "the button press", |e| {
         events::button_pressed(e, "ping")
     })?;
+    cx.end()
+}
+
+/// A window moved by someone else is still the approved window. The next action is refused once
+/// with `target_moved` and sends nothing; the action after it, at the button's new position,
+/// reaches the window in the same session.
+fn moved_window_keeps_session(cx: &mut Ctx<'_>) -> Result<(), Failure> {
+    const OFFSET: (i32, i32) = (60, 40);
+    let id = control(cx, "app")?;
+    let title = cx.window("app")?.title.clone();
+    let offset = format!("{},{}", OFFSET.0, OFFSET.1);
+    let moved = cx.helper(&["--move-window", &title, &offset])?;
+    ensure!(
+        moved.status.success(),
+        "the fixture could not move the window: {}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    let (x, y) = cx.center("app", "button")?;
+    let button = (x + OFFSET.0, y + OFFSET.1);
+    let refused = cx.refused(
+        "click_mouse",
+        json!({"target_ref": id, "x": button.0, "y": button.1, "observation": {"mode": "none"}}),
+    )?;
+    ensure!(
+        refused.error_code() == Some("target_invalidated")
+            && refused.error_reason() == Some("target_moved")
+            && refused.structured["error"]["retryable"] == true
+            && refused.structured["input"]["input_outcome"] == "not_started",
+        "wrong refusal: {}",
+        refused.structured
+    );
+    let result = cx.click(&id, button)?;
+    ensure!(
+        !result.is_error && result.structured["status"] == "completed",
+        "the click after the refusal failed: {}",
+        result.structured
+    );
+    let events = cx.expect("app", "the button press at the new position", |e| {
+        events::button_pressed(e, "ping")
+    })?;
+    let presses = events
+        .iter()
+        .filter(|event| matches!(event, Event::Button { .. }))
+        .count();
+    ensure!(presses == 1, "the button was pressed {presses} times");
     cx.end()
 }
 

@@ -31,11 +31,9 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ### Changed
 
+- A session now survives a move or resize of its window, including maximize and restore. The next action is refused once with `target_invalidated`, reason `target_moved` and `retryable: true`, and sends nothing. Observe again and act with the new coordinates in the same session. A different window, process or desktop, or a changed display layout, still ends the session. An `observation_id` of the window from before the move is still refused.
 - `tools/list` is 67,493 bytes instead of 104,995 (128,944 to 91,442 for a client that appends the server instructions to every tool). Every tool's `outputSchema` success branch now lists only its top-level fields with their types and allows other fields. Error branches are unchanged and still closed. `controlfreak --print-tools` prints the full contract with every field, and `docs/tools.md` describes it. Tool names, descriptions and input schemas are unchanged.
 - Removed result fields: `downscale_factor` and `resize_method` from every screenshot (compare `image_width` and `image_height` with `source_bounds`), `effect_verification` (always `unverified`) from input results, `retry_action` from `completed` input results (every other status still sends `retry_action: false`), and `owner_instance_id` (always `null`) from `desktop_in_use` details. A completed `click_mouse` result is 108 bytes smaller, and it is sent twice: as structured content and as text.
-
-### Changed
-
 - `wait_for_visual_change` and `wait_for_change_since` use less CPU and memory per poll. A wait now keeps one screen reader and one comparison buffer instead of a new full-size frame every 100 ms. On synthetic frames, the work after each screen read drops from about 10 to 2 ms at 1080p and from about 35 to 7.5 ms at 4K. Comparison frames, fingerprints and thresholds are unchanged, so existing baselines stay valid.
 
 ## [0.2.3] - 2026-11-18

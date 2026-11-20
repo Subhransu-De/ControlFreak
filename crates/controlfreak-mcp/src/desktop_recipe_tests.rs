@@ -267,32 +267,94 @@ async fn focus_window_can_bring_back_a_dialog_of_the_approved_application() {
     harness.finish().await;
 }
 
+fn assert_moved(result: &Value) {
+    assert_eq!(refused_code(result), "target_invalidated");
+    let error = &result["structuredContent"]["error"];
+    assert_eq!(error["reason"], "target_moved", "{result}");
+    assert_eq!(error["retryable"], true, "{result}");
+}
+
 #[tokio::test]
-async fn a_resized_window_loses_its_reference_and_needs_a_new_session() {
+async fn a_resized_window_keeps_its_session_after_one_refused_action() {
     let desktop = FakeDesktop::new();
     let app = desktop.open("Editor", 10);
-    let old = desktop.id(app);
+    let target = desktop.id(app);
     let mut harness = start(&desktop).await;
-    begin(&mut harness, &old).await;
-    accepted(&click(&mut harness, &old).await);
+    begin(&mut harness, &target).await;
+    accepted(&click(&mut harness, &target).await);
+
+    // Maximize, restore or a drag: the same window, so the same reference.
+    desktop.resize(app);
+    assert_eq!(desktop.id(app), target);
+    assert_moved(&click(&mut harness, &target).await);
+    // Refused once: the next action, with coordinates for the new bounds, needs no new session.
+    accepted(&click(&mut harness, &target).await);
+    assert_eq!(desktop.received(), [clicked(app), clicked(app)]);
+
+    // Every later move is refused once again.
+    desktop.resize(app);
+    assert_moved(
+        &call(
+            &mut harness,
+            TYPE_TEXT,
+            json!({"target_ref": target, "text": "x", "observation": {"mode": "none"}}),
+        )
+        .await,
+    );
+    accepted(&click(&mut harness, &target).await);
+    assert_eq!(desktop.received().len(), 3, "the refused text sent nothing");
+    harness.finish().await;
+}
+
+#[tokio::test]
+async fn an_image_of_the_approved_window_from_before_a_move_never_maps_points() {
+    let desktop = FakeDesktop::new();
+    let app = desktop.open("Editor", 10);
+    let target = desktop.id(app);
+    let mut harness = start(&desktop).await;
+    begin(&mut harness, &target).await;
+    let point = |capture: &Value| {
+        json!({
+            "target_ref": target,
+            "observation_id": capture["structuredContent"]["observation_id"],
+            "image_x": 10,
+            "image_y": 10,
+            "observation": {"mode": "none"},
+        })
+    };
+    let before = call(&mut harness, CAPTURE_WINDOW, json!({"window_id": target})).await;
+    accepted(&before);
 
     desktop.resize(app);
-    let new = desktop.id(app);
-    assert_ne!(old, new);
-    assert_eq!(
-        refused_code(&click(&mut harness, &old).await),
-        "target_invalidated"
+    let stale = call(&mut harness, CLICK_MOUSE, point(&before)).await;
+    assert_eq!(refused_code(&stale), "invalid_argument");
+    assert!(
+        stale.to_string().contains("moved, resized or closed"),
+        "{stale}"
     );
-    // The session cannot adopt the new reference: the target changed under it.
-    assert_eq!(
-        refused_code(&click(&mut harness, &new).await),
-        "target_invalidated"
-    );
+    // Display coordinates are not refused by the image check, but the move is.
+    assert_moved(&click(&mut harness, &target).await);
+    // The reference took the new bounds, so it is unchanged; the old image is still refused.
+    let still_stale = call(&mut harness, CLICK_MOUSE, point(&before)).await;
+    assert_eq!(refused_code(&still_stale), "invalid_argument");
+    assert!(desktop.received().is_empty(), "nothing was sent");
 
-    accepted(&call(&mut harness, END_CONTROL_SESSION, json!({})).await);
-    begin(&mut harness, &new).await;
-    accepted(&click(&mut harness, &new).await);
-    assert_eq!(desktop.received(), [clicked(app), clicked(app)]);
+    let after = call(&mut harness, CAPTURE_WINDOW, json!({"window_id": target})).await;
+    accepted(&after);
+    assert_eq!(
+        after["structuredContent"]["window"]["id"], target,
+        "an observation returns the session's reference"
+    );
+    accepted(&call(&mut harness, CLICK_MOUSE, point(&after)).await);
+    // The new image maps through the new bounds: the window starts at 100, 100.
+    assert_eq!(
+        desktop.received(),
+        [Received::Click {
+            window: app,
+            x: 110,
+            y: 110
+        }]
+    );
     harness.finish().await;
 }
 

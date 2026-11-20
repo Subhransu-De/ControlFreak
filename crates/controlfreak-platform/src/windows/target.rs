@@ -111,7 +111,7 @@ fn accepts_same_process(target: &WindowFacts, shell_host: bool, window: &WindowF
 /// foreground or destination that is wrong right now only refuses this action.
 #[derive(Debug)]
 enum Failure {
-    /// The target changed identity, geometry or desktop, or its own integrity cannot be
+    /// The target changed identity, desktop or display layout, or its own integrity cannot be
     /// verified, or the input desktop is not usable.
     Fatal(PlatformError),
     /// The foreground window, the keyboard focus or the pointer destination is wrong. The target
@@ -119,6 +119,11 @@ enum Failure {
     /// without a new session. The error keeps its own code (a higher-integrity foreground is
     /// still `higher_integrity_target`); it just does not end the session.
     Recoverable(PlatformError),
+    /// The target is the same window on the same display layout, and only its bounds differ:
+    /// it moved, was resized, maximized or restored. The reference adopts these bounds and this
+    /// one action is refused, so the agent observes again before it acts. Coordinates chosen
+    /// for the old bounds are never sent.
+    Moved([i32; 4]),
 }
 
 impl From<PlatformError> for Failure {
@@ -158,24 +163,46 @@ impl Hit {
 
 impl Reference {
     /// The checks that do not depend on which window is in front or on which desktop is current:
-    /// the same live window, and unchanged bounds and display layout. Any change is permanent.
+    /// the same live window, the same display layout, and the same window bounds. A change of
+    /// identity or display layout is permanent. A change of bounds alone is not: the window is
+    /// still the approved one, so it only refuses this action (see `Failure::Moved`). Identity
+    /// and layout are checked first, so a move that comes with either change stays fatal.
     fn validate_unchanged(
         &self,
         current: &Identity,
         bounds: [i32; 4],
         displays: &[DisplayInfo],
     ) -> Result<(), Failure> {
-        if &self.identity != current {
-            return Err(Failure::Fatal(invalid(
-                "window, process lifetime, owner, or desktop changed",
-            )));
+        self.validate_identity(current)?;
+        self.validate_display_layout(displays)?;
+        self.validate_window_bounds(bounds)
+    }
+
+    fn validate_identity(&self, current: &Identity) -> Result<(), Failure> {
+        if &self.identity == current {
+            return Ok(());
         }
-        if self.bounds != bounds || self.displays != displays {
-            return Err(Failure::Fatal(invalid(
-                "window bounds or display layout changed; end the session and observe again",
-            )));
+        Err(Failure::Fatal(invalid(
+            "window, process lifetime, owner, or desktop changed",
+        )))
+    }
+
+    /// Displays added, removed, moved or rescaled since the observation. Which of those may keep
+    /// a target is not decided, so every one of them ends the approval.
+    fn validate_display_layout(&self, displays: &[DisplayInfo]) -> Result<(), Failure> {
+        if self.displays == displays {
+            return Ok(());
         }
-        Ok(())
+        Err(Failure::Fatal(invalid(
+            "display layout changed; end the session and observe again",
+        )))
+    }
+
+    fn validate_window_bounds(&self, bounds: [i32; 4]) -> Result<(), Failure> {
+        if self.bounds == bounds {
+            return Ok(());
+        }
+        Err(Failure::Moved(bounds))
     }
 
     fn validate_snapshot(
@@ -593,11 +620,18 @@ fn refresh_reference(
     displays: &[DisplayInfo],
     now: Instant,
 ) -> Option<String> {
-    let index = references.iter().position(|reference| {
+    let matches = |reference: &Reference| {
         &reference.identity == identity
             && reference.bounds == bounds
             && reference.displays == displays
-    })?;
+    };
+    // An observation between a move and the next action issued a second reference for the new
+    // bounds before the session's reference adopted them. The session's own reference wins, so
+    // observations return the `target_ref` that its input tools take.
+    let index = references
+        .iter()
+        .position(|reference| reference.armed && matches(reference))
+        .or_else(|| references.iter().position(matches))?;
     let mut reference = references.remove(index)?;
     reference.issued = now;
     let id = reference.id.clone();
@@ -713,10 +747,30 @@ pub(super) fn validate(
     let id = control
         .approved_target()
         .ok_or_else(|| invalid("an approved target reference is required"))?;
-    let result = validate_reference(&id, operation, point);
+    conclude(control, &id, validate_reference(&id, operation, point))
+}
+
+/// Turns a validation result into the action's result. A fatal failure ends the session's
+/// approval. A moved target keeps it: its reference adopts the new bounds, so the refusal
+/// happens once, and the next action is checked against where the window is now.
+fn conclude(
+    control: &MutationControl,
+    id: &str,
+    result: Result<(), Failure>,
+) -> Result<(), PlatformError> {
     match result {
         Ok(()) => Ok(()),
         Err(Failure::Recoverable(error)) => Err(error),
+        Err(Failure::Moved(bounds)) => {
+            adopt_bounds(
+                &mut REFERENCES
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                id,
+                bounds,
+            );
+            Err(moved())
+        }
         Err(Failure::Fatal(error)) => {
             control.invalidate_target();
             Err(error)
@@ -724,14 +778,32 @@ pub(super) fn validate(
     }
 }
 
+/// Stores the bounds the approved window has now in its reference, and marks the reference as
+/// in use so that observations keep returning it (see `refresh_reference`). Only the bounds
+/// change: the same validation found the identity and the display layout unchanged.
+fn adopt_bounds(references: &mut VecDeque<Reference>, id: &str, bounds: [i32; 4]) {
+    if let Some(reference) = references.iter_mut().find(|reference| reference.id == id) {
+        reference.bounds = bounds;
+        reference.armed = true;
+    }
+}
+
+fn moved() -> PlatformError {
+    refused(
+        RefusalCause::TargetMoved,
+        "the approved window moved or was resized; nothing was sent and the session is kept; observe it again and act with coordinates from the new screenshot",
+    )
+}
+
 /// Validation for the second and later hops of `switch_virtual_desktop`. The first hop has
 /// already passed `validate`, so the approved window was foreground and on the current desktop.
 /// After a hop the approved window is on another desktop and a window of some other application
 /// holds the foreground, so the current-desktop and same-process rules cannot apply again. Every
 /// other check stays: cancellation and the session's target state, the unlocked Default input
-/// desktop, the approved window being the same live window with unchanged bounds and display
-/// layout, its integrity, and the integrity of whatever window holds the foreground and keyboard
-/// focus, since the shortcut goes to it. Anything unreadable refuses, so this fails closed.
+/// desktop, the approved window being the same live window with unchanged display layout and
+/// bounds (a move refuses the hop as it refuses any action), its integrity, and the integrity of
+/// whatever window holds the foreground and keyboard focus, since the shortcut goes to it.
+/// Anything unreadable refuses, so this fails closed.
 pub(super) fn validate_after_switch(control: &MutationControl) -> Result<(), PlatformError> {
     let operation = super::input::DESKTOP_SWITCH_OPERATION;
     control.check(operation)?;
@@ -739,14 +811,7 @@ pub(super) fn validate_after_switch(control: &MutationControl) -> Result<(), Pla
     let id = control
         .approved_target()
         .ok_or_else(|| invalid("an approved target reference is required"))?;
-    match validate_switch_hop(&id, operation) {
-        Ok(()) => Ok(()),
-        Err(Failure::Recoverable(error)) => Err(error),
-        Err(Failure::Fatal(error)) => {
-            control.invalidate_target();
-            Err(error)
-        }
-    }
+    conclude(control, &id, validate_switch_hop(&id, operation))
 }
 
 fn validate_switch_hop(id: &str, operation: &str) -> Result<(), Failure> {
@@ -1318,52 +1383,137 @@ mod tests {
         }
     }
 
-    #[test]
-    fn refuses_restarts_reused_handles_ownership_desktop_and_geometry_changes() {
-        let expected = reference();
-        for change in 0..9 {
-            let mut current = expected.clone();
-            match change {
-                0 => current.identity.hwnd += 1,
-                1 => current.identity.pid += 1,
-                2 => current.identity.created += 1,
-                3 => current.identity.thread += 1,
-                4 => current.identity.owner += 1,
-                5 => current.identity.class = "replacement".into(),
-                6 => current.identity.desktop = "desktop-b".into(),
-                7 => current.bounds[0] += 1,
-                _ => current.displays.push(DisplayInfo {
-                    id: "new".into(),
-                    name: "synthetic".into(),
-                    bounds: controlfreak_core::DisplayBounds {
-                        left: 0,
-                        top: 0,
-                        width: 100,
-                        height: 100,
-                    },
-                    is_primary: true,
-                }),
-            }
-            // Every one of these is permanent: the session's target is gone or moved.
-            assert!(
-                matches!(
-                    expected.validate_snapshot(
-                        &current.identity,
-                        current.bounds,
-                        &current.displays,
-                        &target_facts(),
-                        &target_facts(),
-                        None
-                    ),
-                    Err(Failure::Fatal(_))
-                ),
-                "change {change}"
-            );
+    fn added_display() -> DisplayInfo {
+        DisplayInfo {
+            id: "new".into(),
+            name: "synthetic".into(),
+            bounds: controlfreak_core::DisplayBounds {
+                left: 0,
+                top: 0,
+                width: 100,
+                height: 100,
+            },
+            is_primary: true,
         }
     }
 
     #[test]
-    fn a_later_switch_hop_still_refuses_changed_identity_bounds_and_display_layout() {
+    fn refuses_restarts_reused_handles_ownership_desktop_and_display_changes() {
+        let expected = reference();
+        for change in 0..8 {
+            for also_moved in [false, true] {
+                let mut current = expected.clone();
+                match change {
+                    0 => current.identity.hwnd += 1,
+                    1 => current.identity.pid += 1,
+                    2 => current.identity.created += 1,
+                    3 => current.identity.thread += 1,
+                    4 => current.identity.owner += 1,
+                    5 => current.identity.class = "replacement".into(),
+                    6 => current.identity.desktop = "desktop-b".into(),
+                    _ => current.displays.push(added_display()),
+                }
+                if also_moved {
+                    current.bounds[2] += 40;
+                }
+                // Every one of these is permanent, and a move at the same time does not soften
+                // it: the session's target is gone, or the display layout changed.
+                assert!(
+                    matches!(
+                        expected.validate_snapshot(
+                            &current.identity,
+                            current.bounds,
+                            &current.displays,
+                            &target_facts(),
+                            &target_facts(),
+                            None
+                        ),
+                        Err(Failure::Fatal(_))
+                    ),
+                    "change {change}, moved {also_moved}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_moved_or_resized_target_is_refused_once_and_keeps_its_reference() {
+        let approved = reference();
+        for change in 0..4 {
+            let mut bounds = approved.bounds;
+            bounds[change] += 25;
+            assert!(
+                matches!(
+                    approved.validate_snapshot(
+                        &approved.identity,
+                        bounds,
+                        &approved.displays,
+                        &target_facts(),
+                        &target_facts(),
+                        None
+                    ),
+                    Err(Failure::Moved(adopted)) if adopted == bounds
+                ),
+                "edge {change}"
+            );
+        }
+
+        // An observation between the move and the action already issued a second reference for
+        // the new bounds. Adopting them keeps the session's reference, which observations return.
+        let mut new_bounds = approved.bounds;
+        new_bounds[0] -= 300;
+        new_bounds[2] += 200;
+        let mut observed = reference();
+        observed.id = "observed-after-the-move".into();
+        observed.bounds = new_bounds;
+        let mut references = VecDeque::from([observed, approved.clone()]);
+        adopt_bounds(&mut references, &approved.id, new_bounds);
+        adopt_bounds(&mut references, "unknown", [0; 4]);
+        let adopted = references
+            .iter()
+            .find(|reference| reference.id == approved.id)
+            .unwrap();
+        assert!(
+            adopted.identity == approved.identity,
+            "identity is never adopted"
+        );
+        assert_eq!(adopted.displays, approved.displays);
+        assert!(adopted.armed);
+        // The next action at the new bounds passes: the refusal happened once.
+        assert!(
+            adopted
+                .validate_snapshot(
+                    &approved.identity,
+                    new_bounds,
+                    &approved.displays,
+                    &target_facts(),
+                    &target_facts(),
+                    None
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            refresh_reference(
+                &mut references,
+                &approved.identity,
+                new_bounds,
+                &[],
+                Instant::now()
+            ),
+            Some(approved.id.clone())
+        );
+        assert_eq!(
+            references[1].bounds, new_bounds,
+            "the other reference is left alone"
+        );
+
+        let error = moved();
+        assert_eq!(error.reason_code(), Some("target_moved"));
+        assert!(error.retryable());
+    }
+
+    #[test]
+    fn a_later_switch_hop_refuses_a_move_and_still_ends_on_identity_or_display_layout() {
         let expected = reference();
         assert!(
             expected
@@ -1374,21 +1524,16 @@ mod tests {
         moved[0] += 1;
         let mut other = expected.identity.clone();
         other.created += 1;
-        let layout = [DisplayInfo {
-            id: "new".into(),
-            name: "synthetic".into(),
-            bounds: controlfreak_core::DisplayBounds {
-                left: 0,
-                top: 0,
-                width: 100,
-                height: 100,
-            },
-            is_primary: true,
-        }];
-        for result in [
+        let layout = [added_display()];
+        assert!(matches!(
             expected.validate_unchanged(&expected.identity, moved, &expected.displays),
+            Err(Failure::Moved(bounds)) if bounds == moved
+        ));
+        for result in [
             expected.validate_unchanged(&other, expected.bounds, &expected.displays),
+            expected.validate_unchanged(&other, moved, &expected.displays),
             expected.validate_unchanged(&expected.identity, expected.bounds, &layout),
+            expected.validate_unchanged(&expected.identity, moved, &layout),
         ] {
             assert!(matches!(result, Err(Failure::Fatal(_))));
         }
@@ -1556,6 +1701,9 @@ mod tests {
             Err(Failure::Fatal(error)) => {
                 panic!("expected a recoverable refusal, got fatal: {error}")
             }
+            Err(Failure::Moved(bounds)) => {
+                panic!("expected a recoverable refusal, got a move to {bounds:?}")
+            }
             Ok(()) => panic!("expected a refusal"),
         }
     }
@@ -1689,13 +1837,13 @@ mod tests {
         assert_recoverable(check(&foreign, None), "focus_window");
         // The same reference passes again once the target is back in front.
         check(&target_facts(), None).unwrap();
-        // Geometry, identity and desktop changes stay fatal even with the target in front.
-        let mut moved = expected.bounds;
-        moved[2] += 1;
+        // A change of the window itself stays fatal even with the target in front.
+        let mut other = expected.identity.clone();
+        other.pid += 1;
         assert!(matches!(
             expected.validate_snapshot(
-                &expected.identity,
-                moved,
+                &other,
+                expected.bounds,
                 &[],
                 &target_facts(),
                 &target_facts(),

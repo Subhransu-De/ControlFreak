@@ -6,7 +6,7 @@ use crate::IntegrityLevel;
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlatformError {
-    /// The target changed identity, geometry or desktop, or the session is poisoned. The
+    /// The target changed identity, display layout or desktop, or the session is poisoned. The
     /// session cannot continue; end it and observe again.
     #[error("approved target invalidated: {reason}")]
     TargetInvalidated { reason: String },
@@ -80,6 +80,10 @@ pub enum RefusalCause {
     OwnIndicator,
     /// The window that would receive the input cannot be identified.
     DestinationUnidentified,
+    /// The approved window is the same window, but it moved or was resized since the last check.
+    /// The session keeps it with its new bounds; observe again so that coordinates match where
+    /// it is now, then act.
+    TargetMoved,
 }
 
 impl RefusalCause {
@@ -92,6 +96,7 @@ impl RefusalCause {
             Self::ForeignDestination => "foreign_destination",
             Self::OwnIndicator => "own_indicator",
             Self::DestinationUnidentified => "destination_unidentified",
+            Self::TargetMoved => "target_moved",
         }
     }
 
@@ -318,38 +323,33 @@ mod tests {
                 "target_changed",
                 false,
             ),
+        ];
+        for (error, reason, retryable) in cases {
+            assert_eq!(error.reason_code(), Some(reason), "{error}");
+            assert_eq!(error.retryable(), retryable, "{error}");
+        }
+    }
+
+    #[test]
+    fn every_refusal_cause_has_its_own_reason() {
+        for (cause, reason, retryable) in [
+            (RefusalCause::NotForeground, "not_foreground", true),
+            (RefusalCause::ForegroundChanged, "foreground_changed", true),
+            (RefusalCause::ObservationStale, "observation_stale", true),
             (
-                PlatformError::refused(RefusalCause::NotForeground, "x"),
-                "not_foreground",
-                true,
-            ),
-            (
-                PlatformError::refused(RefusalCause::ForegroundChanged, "x"),
-                "foreground_changed",
-                true,
-            ),
-            (
-                PlatformError::refused(RefusalCause::ObservationStale, "x"),
-                "observation_stale",
-                true,
-            ),
-            (
-                PlatformError::refused(RefusalCause::ForeignDestination, "x"),
+                RefusalCause::ForeignDestination,
                 "foreign_destination",
                 true,
             ),
             (
-                PlatformError::refused(RefusalCause::DestinationUnidentified, "x"),
+                RefusalCause::DestinationUnidentified,
                 "destination_unidentified",
                 true,
             ),
-            (
-                PlatformError::refused(RefusalCause::OwnIndicator, "x"),
-                "own_indicator",
-                false,
-            ),
-        ];
-        for (error, reason, retryable) in cases {
+            (RefusalCause::OwnIndicator, "own_indicator", false),
+            (RefusalCause::TargetMoved, "target_moved", true),
+        ] {
+            let error = PlatformError::refused(cause, "x");
             assert_eq!(error.reason_code(), Some(reason), "{error}");
             assert_eq!(error.retryable(), retryable, "{error}");
         }
