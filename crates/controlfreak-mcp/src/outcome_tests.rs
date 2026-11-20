@@ -1,7 +1,6 @@
 use super::*;
 use controlfreak_core::{
-    BackendMetadata, DisplayBackend, KeyboardBackend, OcrBackend, PointerBackend,
-    VirtualDesktopDirection, WindowBackend,
+    BackendMetadata, DisplayBackend, KeyboardBackend, OcrBackend, PointerBackend, WindowBackend,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -197,17 +196,13 @@ impl WindowBackend for SyntheticBackend {
     }
     fn switch_virtual_desktop_controlled(
         &self,
-        _: &VirtualDesktopSwitchRequest,
+        request: &VirtualDesktopSwitchRequest,
         control: &MutationControl,
     ) -> Result<VirtualDesktopSwitchResult, PlatformError> {
+        let desktop = || Some("desktop-a".to_owned());
         self.act(
             control,
-            VirtualDesktopSwitchResult {
-                direction: VirtualDesktopDirection::Right,
-                requested_steps: 1,
-                changed: false,
-                observation: observation(),
-            },
+            VirtualDesktopSwitchResult::from_readings(request, desktop(), desktop(), observation()),
         )
     }
 }

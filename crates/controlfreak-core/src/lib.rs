@@ -22,7 +22,7 @@ mod window;
 pub use capability::{Capability, CapabilityDescriptor, CapabilityState};
 pub use desktop::{
     VirtualDesktopDirection, VirtualDesktopInfo, VirtualDesktopList, VirtualDesktopSwitchRequest,
-    VirtualDesktopSwitchResult,
+    VirtualDesktopSwitchResult, VirtualDesktopTransition,
 };
 pub use display::{
     ActionObservation, CaptureDisplayRequest, CaptureRegionRequest, DisplayBounds, DisplayInfo,

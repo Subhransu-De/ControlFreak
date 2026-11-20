@@ -448,9 +448,21 @@ fn switch_virtual_desktop_tool() -> Tool {
         SWITCH_VIRTUAL_DESKTOP,
         "Switch virtual desktop",
         Kind::Input { idempotent: false },
-        "Switch left or right across existing virtual desktops. Needs the session's window in the foreground. The switch ends the control session, because that window is no longer on screen: begin a new session on a window of the new desktop. target_ref is optional and defaults to the session's window, or to the foreground window when no session is active. changed=false means no switch was detected.",
+        "Switch left or right across existing virtual desktops. Needs the session's window in the foreground. The switch ends the control session, because that window is no longer on screen: begin a new session on a window of the new desktop. target_ref is optional and defaults to the session's window, or to the foreground window when no session is active. Trust action.transition, not the legacy changed: unknown means the foreground desktop was unreadable before or after, as an empty desktop may be.",
         object_schema(properties, &["direction"]),
-        action_output_schema(false),
+        action_output_schema_with(
+            false,
+            &json!({
+                "type": "object",
+                "properties": {
+                    "changed": { "type": "boolean" },
+                    "before_id": { "type": ["string", "null"] },
+                    "after_id": { "type": ["string", "null"] },
+                    "transition": { "enum": ["confirmed_changed", "confirmed_unchanged", "unknown"] }
+                },
+                "required": ["changed", "before_id", "after_id", "transition"]
+            }),
+        ),
     )
 }
 
@@ -1105,10 +1117,15 @@ fn settle_schema() -> Value {
 }
 
 fn action_output_schema(include_position: bool) -> Arc<JsonObject> {
+    action_output_schema_with(include_position, &json!({ "type": "object" }))
+}
+
+/// `action_output_schema` with a tool's own `action` schema.
+fn action_output_schema_with(include_position: bool, action: &Value) -> Arc<JsonObject> {
     let mut success = json!({
         "type": "object",
         "properties": {
-            "action": { "type": "object" },
+            "action": action,
             "observation": {
                 "type": "object",
                 "properties": {
