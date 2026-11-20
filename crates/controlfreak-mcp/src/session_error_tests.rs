@@ -7,7 +7,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 
 pub(super) struct Harness {
     pub(super) client: BufReader<tokio::io::DuplexStream>,
-    runtime: Arc<SessionRuntime>,
+    pub(super) runtime: Arc<SessionRuntime>,
     serving: tokio::task::JoinHandle<()>,
 }
 
@@ -199,7 +199,10 @@ fn every_session_error_has_a_distinct_wire_shape() {
             false,
         ),
         (
-            SessionError::Stopped("stopped".to_owned()),
+            SessionError::Stopped {
+                reason: "stopped".to_owned(),
+                recovery: controlfreak_core::StopRecovery::RestartClient,
+            },
             "desktop_work_stopped",
             false,
         ),
@@ -261,7 +264,7 @@ async fn stop_during_admission_is_reported_as_stopped() {
     let Err(error) = harness.runtime.acquire_mutation_blocking() else {
         panic!("a stopped server admitted a mutation");
     };
-    assert!(matches!(error, SessionError::Stopped(_)), "{error:?}");
+    assert!(matches!(error, SessionError::Stopped { .. }), "{error:?}");
     harness.finish().await;
 }
 
@@ -274,10 +277,19 @@ async fn user_stop_keeps_its_own_message() {
     let Err(error) = harness.runtime.acquire_mutation_blocking() else {
         panic!("a user-stopped server admitted a mutation");
     };
-    let SessionError::Stopped(message) = error else {
+    let SessionError::Stopped {
+        reason: message,
+        recovery,
+    } = error
+    else {
         panic!("expected a stopped error, got {error:?}");
     };
-    assert!(message.starts_with("the user stopped the control session"));
+    assert!(
+        message.starts_with("You stopped desktop input."),
+        "{message}"
+    );
+    assert!(message.contains("server restart control"), "{message}");
+    assert_eq!(recovery, controlfreak_core::StopRecovery::RestartClient);
     harness.finish().await;
 }
 

@@ -1057,3 +1057,84 @@ fn higher_integrity_targets_have_a_dedicated_structured_code() {
         "higher_integrity_target"
     );
 }
+
+fn recording_runtime(hold: Duration) -> Arc<SessionRuntime> {
+    Arc::new(SessionRuntime::new_with_idle_delay(
+        SafetyIndicator::dormant(),
+        || {
+            Ok(RecordingIndicator {
+                events: Arc::new(Mutex::new(Vec::new())),
+                fail_hide: false,
+            })
+        },
+        hold,
+    ))
+}
+
+#[test]
+fn a_closed_session_reports_no_approved_target() {
+    const TARGET: &str = "target-00000000-0000-0000-0000-000000000003";
+    let runtime = recording_runtime(Duration::from_secs(30));
+    runtime.begin_session(None, TARGET).unwrap();
+    assert_eq!(runtime.status()["approved_target_ref"], TARGET);
+    assert_eq!(
+        runtime.end_session().unwrap(),
+        super::session::EndOutcome::Closed
+    );
+    let status = runtime.status();
+    assert_eq!(status["state"], "dormant");
+    assert_eq!(
+        status["approved_target_ref"],
+        serde_json::Value::Null,
+        "{status}"
+    );
+    assert_eq!(
+        runtime.end_session().unwrap(),
+        super::session::EndOutcome::NotOwned,
+        "a second end owns nothing"
+    );
+}
+
+#[tokio::test]
+async fn an_expired_hold_reports_no_approved_target() {
+    const TARGET: &str = "target-00000000-0000-0000-0000-000000000003";
+    let runtime = recording_runtime(Duration::from_millis(20));
+    runtime.begin_session(None, TARGET).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime.status()["owns_arbitration"] == true {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the hold expires");
+    assert_eq!(
+        runtime.status()["approved_target_ref"],
+        serde_json::Value::Null
+    );
+}
+
+#[tokio::test]
+async fn an_action_in_flight_keeps_its_target_while_the_session_closes() {
+    const TARGET: &str = "target-00000000-0000-0000-0000-000000000003";
+    let runtime = recording_runtime(Duration::from_secs(30));
+    runtime.begin_session(None, TARGET).unwrap();
+    let lease = runtime.acquire().await.unwrap();
+    let control = lease.mutation_control();
+    assert_eq!(
+        runtime.end_session().unwrap(),
+        super::session::EndOutcome::Closing,
+        "the session waits for the action"
+    );
+    assert_eq!(control.approved_target().as_deref(), Some(TARGET));
+    drop(lease);
+    assert_eq!(runtime.status()["owns_arbitration"], false);
+    assert_eq!(
+        runtime.status()["approved_target_ref"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        control.approved_target().as_deref(),
+        Some(TARGET),
+        "the finished action's own binding is untouched"
+    );
+}

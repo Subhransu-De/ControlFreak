@@ -94,19 +94,24 @@ After a stop:
   `begin_control_session` and `end_control_session` cannot clear it.
 - Observation tools, `get_server_status` and session cleanup still work.
 - Input already sent to an application cannot be undone.
-- On a user stop, the server sends `notifications/controlfreak/session_stopped` with
-  `reason="user_stop"` and `retry_action=false`. It advertises this as
-  `experimental.controlfreak/user-stop`. `get_server_status` reports `stop_reason="user_stop"`.
-- Agents must not restart the server or resume desktop actions without the user's permission.
+- On a user stop, the server sends `notifications/controlfreak/session_stopped` with `event="user_stopped_session"`, `reason="user_stop"` and `retry_action=false`. If work was still finishing, it sends a second one with `event="stop_drained"` when the drain ends. It advertises this as `experimental.controlfreak/user-stop`. `get_server_status` reports `stop_reason="user_stop"`.
+- `get_server_status` reports `input_admission` (`open` or `closed`) separately from `status`, which describes the server and its indicator. A stopped server can report `status: "ready"` with `input_admission: "closed"`.
+- `end_control_session` reports `closed`, `closing` while pending actions finish, or `not_owned` when the stop or the hold already closed the session. A closed session reports `approved_target_ref: null`.
 
-`get_server_status.stop_state`:
+### Getting input back
 
-| Value | Meaning |
-| --- | --- |
-| `ready` | Accepting work. |
-| `draining` | Stopped. In-flight work is finishing. |
-| `stopped` | Stopped. Nothing is running. |
-| `cleanup_failed` | Held keys or buttons could not be released for certain. The desktop stays reserved. |
+Only the user can allow input again, by restarting this server from the MCP client: use the client's server restart control, or fully quit and reopen the client. Then list windows and begin a new session. The agent should ask the user before it resumes.
+
+Do not end `controlfreak.exe` by hand, for example in Task Manager. Most clients do not start a STDIO server again on their own, so the read-only tools stop working too until the client restarts.
+
+The refusal (`error.details.recovery`), `get_server_status.recovery`, the `end_control_session` result and the stop notification carry the same `recovery` object: `actor`, `action` and a `message` the agent can pass on. It is `null` while input is open.
+
+| `stop_state` | `recovery.action` | `recovery.actor` | Meaning |
+| --- | --- | --- | --- |
+| `ready` | none | none | Accepting work. |
+| `draining` | `wait_for_drain` | `agent` | Stopped. In-flight work is finishing. Wait for `stopped`. |
+| `stopped` | `restart_client` | `user` | Stopped. Nothing is running. The user restarts the server from the client. |
+| `cleanup_failed` | `resolve_held_input` | `user` | Held keys or buttons could not be released for certain. The desktop stays reserved. The user releases any stuck key or button, then restarts the server from the client. |
 
 To cancel a single request without stopping the server, send the MCP `notifications/cancelled`
 notification.

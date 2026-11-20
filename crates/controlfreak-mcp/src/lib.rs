@@ -17,6 +17,8 @@ mod requests;
 mod session;
 mod stop;
 #[cfg(test)]
+mod stop_recovery_tests;
+#[cfg(test)]
 mod stop_tests;
 
 use diagnostics::Diagnostics;
@@ -135,7 +137,7 @@ const WAIT_FOR_WINDOW: &str = "wait_for_window";
 const PRESS_KEYS: &str = "press_keys";
 const TYPE_TEXT: &str = "type_text";
 
-const SERVER_INSTRUCTIONS: &str = "ControlFreak drives a Windows desktop. Workflow: list_windows (or any screenshot) gives a target_ref; begin_control_session(target_ref) once; focus_window; input tools; end_control_session when done. Input works only while the approved window, or a dialog or menu of its application, is in the foreground; another process needs a new session. x and y are display-local physical pixels, or pass a screenshot's observation_id with image_x and image_y. Each action returns a 1280 px screenshot taken once the window stops changing (see observation.settle); reuse it instead of capturing. Check isError and status; never repeat an action when retry_action=false. stop_desktop_work is an emergency stop that closes input permanently. stop_reason=user_stop or a notifications/controlfreak/session_stopped event means the user ended control: do not resume without their permission.";
+const SERVER_INSTRUCTIONS: &str = "ControlFreak drives a Windows desktop. Workflow: list_windows (or any screenshot) gives a target_ref; begin_control_session(target_ref) once; focus_window; input tools; end_control_session when done. Input works only while the approved window, or a dialog or menu of its application, is in the foreground; another process needs a new session. x and y are display-local physical pixels, or pass a screenshot's observation_id with image_x and image_y. Each action returns a 1280 px screenshot taken once the window stops changing (see observation.settle); reuse it instead of capturing. Check isError and status; never repeat an action when retry_action=false. stop_desktop_work is an emergency stop that closes input permanently. stop_reason=user_stop or a session_stopped notification means the user ended control: ask before resuming; only a client restart reopens input (see recovery).";
 
 #[derive(Debug)]
 enum BeginSessionError {
@@ -324,7 +326,12 @@ impl ControlFreakServer {
         if let CallToolResponse::Complete(result) = result
             && let Some(mut content) = result.structured_content
         {
-            content["stop_state"] = json!(self.stop.status());
+            // `status` describes server and indicator health; whether input is accepted is
+            // reported on its own, with the step that reopens it.
+            let recovery = self.stop.recovery();
+            content["input_admission"] = json!(if recovery.is_some() { "closed" } else { "open" });
+            content["recovery"] = stop::recovery_json(recovery);
+            content["stop_state"] = json!(controlfreak_core::StopRecovery::stop_state(recovery));
             if self.stop.user_stopped() {
                 content["stop_reason"] = json!("user_stop");
             }
@@ -345,14 +352,22 @@ impl ControlFreakServer {
             ));
         };
         let worker = Arc::clone(&runtime);
-        tokio::task::spawn_blocking(move || worker.end_session())
+        let outcome = tokio::task::spawn_blocking(move || worker.end_session())
             .await
             .map_err(|error| join_error(&error))?
-            .map_err(|reason| indicator_unavailable(&self.safety_indicator, &reason))?;
-        Ok(
-            CallToolResult::structured(json!({"status": "closing", "session": runtime.status()}))
-                .into(),
-        )
+            .map_err(|reason| {
+                let mut error = indicator_unavailable(&self.safety_indicator, &reason);
+                if let Some(data) = error.data.as_mut() {
+                    data["recovery"] = stop::recovery_json(self.stop.recovery());
+                }
+                error
+            })?;
+        Ok(CallToolResult::structured(json!({
+            "status": outcome.as_str(),
+            "session": runtime.status(),
+            "recovery": stop::recovery_json(self.stop.recovery()),
+        }))
+        .into())
     }
 
     /// Admits a request that acts on the desktop or reads it, and runs it to completion.
@@ -552,15 +567,28 @@ impl ServerHandler for ControlFreakServer {
                     .map(|changed| changed.notify_one())
                     .is_some()
             });
+            // One notification when the user stops, and one more when a drain ends, so the
+            // client learns when the restart step applies.
+            let mut reported: Option<controlfreak_core::StopRecovery> = None;
             while !context.peer.is_transport_closed() {
-                if stop.user_stopped() {
+                let recovery = stop.recovery();
+                if stop.user_stopped()
+                    && let Some(current) = recovery
+                    && reported != Some(current)
+                {
+                    let event = if reported.is_none() {
+                        "user_stopped_session"
+                    } else {
+                        "stop_drained"
+                    };
                     let notification = rmcp::model::CustomNotification::new(
                         "notifications/controlfreak/session_stopped",
                         Some(json!({
-                            "event": "user_stopped_session",
+                            "event": event,
                             "reason": "user_stop",
-                            "message": "The user stopped the ControlFreak session. Do not resume desktop actions or restart the server without the user's permission.",
-                            "stop_state": stop.status(),
+                            "message": format!("You stopped desktop input. {}", current.guidance()),
+                            "stop_state": controlfreak_core::StopRecovery::stop_state(recovery),
+                            "recovery": stop::recovery_json(recovery),
                             "retry_action": false,
                         })),
                     );
@@ -570,7 +598,10 @@ impl ServerHandler for ControlFreakServer {
                             notification,
                         ))
                         .await;
-                    break;
+                    reported = Some(current);
+                    if current != controlfreak_core::StopRecovery::WaitForDrain {
+                        break;
+                    }
                 }
                 let _ = tokio::time::timeout(Duration::from_secs(5), changed.notified()).await;
             }

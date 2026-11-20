@@ -160,9 +160,9 @@ fn end_control_session_tool() -> Tool {
         END_CONTROL_SESSION,
         "End control session",
         Kind::Session,
-        "The normal way to finish. Stops accepting input and releases desktop control after pending actions finish. Call it when the task is done, or before approving another window. Safe to call twice.",
+        "The normal way to finish. Stops accepting input and releases desktop control after pending actions finish. Call it when the task is done, or before approving another window. Safe to call twice: status is closed, closing while pending actions finish, or not_owned when no session was held. After a stop, recovery says what allows input again.",
         object_schema(JsonObject::new(), &[]),
-        session_change_output_schema("closing"),
+        end_session_output_schema(),
     )
 }
 
@@ -171,7 +171,7 @@ fn get_server_status_tool() -> Tool {
         GET_SERVER_STATUS,
         "Server status",
         Kind::Observe { idempotent: true },
-        "Return version, uptime, privileges, indicator health, session state, stop_state and recent operations. stop_reason=user_stop means the user ended control: do not resume without their permission.",
+        "Return version, uptime, privileges, indicator health, input_admission, session state, stop_state and recent operations. status describes the server and indicator; input_admission says whether input is accepted. When it is closed, recovery gives the next step: no tool reopens input, only the user restarting the server from the MCP client. stop_reason=user_stop means the user ended control.",
         object_schema(JsonObject::new(), &[]),
         server_status_output_schema(),
     )
@@ -1007,7 +1007,7 @@ fn strip_lower_bounds(schema: &mut Value) {
     }
 }
 
-const DEFS: [&str; 7] = [
+const DEFS: [&str; 8] = [
     "bounds",
     "display",
     "window",
@@ -1015,6 +1015,7 @@ const DEFS: [&str; 7] = [
     "window_screenshot",
     "session",
     "input",
+    "recovery",
 ];
 
 fn def_ref(name: &str) -> Value {
@@ -1030,6 +1031,7 @@ fn definition(name: &str) -> Value {
         "window_screenshot" => window_screenshot_body(),
         "session" => session_status_schema(),
         "input" => input_progress_schema(),
+        "recovery" => recovery_schema(),
         other => unreachable!("unknown schema definition {other}"),
     }
 }
@@ -1236,6 +1238,36 @@ fn session_change_output_schema(status: &str) -> Arc<JsonObject> {
     )
 }
 
+/// The step that lets this server accept input again after its stop latch closed.
+fn recovery_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "actor": { "enum": ["agent", "user"] },
+            "action": { "enum": ["wait_for_drain", "restart_client", "resolve_held_input"] },
+            "message": { "type": "string" }
+        },
+        "required": ["actor", "action", "message"],
+        "additionalProperties": false
+    })
+}
+
+fn end_session_output_schema() -> Arc<JsonObject> {
+    output_schema(
+        vec![json!({
+            "type": "object",
+            "properties": {
+                "status": { "enum": ["closed", "closing", "not_owned"] },
+                "session": def_ref("session"),
+                "recovery": { "oneOf": [def_ref("recovery"), { "type": "null" }] }
+            },
+            "required": ["status", "session", "recovery"],
+            "additionalProperties": false
+        })],
+        false,
+    )
+}
+
 fn server_status_output_schema() -> Arc<JsonObject> {
     output_schema(
         vec![json!({
@@ -1288,14 +1320,16 @@ fn server_status_output_schema() -> Arc<JsonObject> {
                     "required": ["platform", "display_server", "backend_id"],
                     "additionalProperties": false
                 },
-                "stop_state": { "type": "string" },
+                "input_admission": { "enum": ["open", "closed"] },
+                "recovery": { "oneOf": [def_ref("recovery"), { "type": "null" }] },
+                "stop_state": { "enum": ["ready", "draining", "stopped", "cleanup_failed"] },
                 "stop_reason": { "const": "user_stop" }
             },
             "required": [
                 "status", "safety_indicator", "session", "version", "instance_id", "process_id",
                 "server_elevated", "windows_integrity_level", "elevated_operation_allowed", "uptime_ms",
                 "operations_started", "operations_completed", "operations_failed", "recent_operations",
-                "backend", "stop_state"
+                "backend", "input_admission", "recovery", "stop_state"
             ],
             "additionalProperties": false
         })],

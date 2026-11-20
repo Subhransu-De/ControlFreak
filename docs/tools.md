@@ -26,9 +26,9 @@ desktop and run inside a [control session](sessions.md).
 | `capture_visual_baseline` | Observe | Save how a region looks now, for a later wait. |
 | `wait_for_change_since` | Observe | Wait until a region differs from its baseline and settles. |
 | `wait_for_visual_change` | Observe | Wait until a region changes from how it looks now and settles. |
-| `get_server_status` | Observe | Version, privileges, session and stop state, recent operations. |
+| `get_server_status` | Observe | Version, privileges, session and stop state, input admission and the recovery step after a stop, recent operations. |
 | `begin_control_session` | Session | Reserve the desktop for one approved window. |
-| `end_control_session` | Session | Release the desktop after pending actions finish. |
+| `end_control_session` | Session | Release the desktop after pending actions finish. Reports `closed`, `closing` or `not_owned`. |
 | `stop_desktop_work` | Session | Emergency stop: cancel all desktop work and close input until the server restarts. |
 | `focus_window` | Input | Restore and focus a window, then verify it is in the foreground. |
 | `move_mouse` | Input | Move the pointer. |
@@ -256,7 +256,7 @@ When an input tool cannot start a session, `error.code` says why:
 | `desktop_in_use` | Another ControlFreak server owns the desktop. `details` has `retry_after_ms`. | Yes |
 | `session_closing` | The previous session is still closing. | Yes |
 | `server_shutting_down` | The server is shutting down. | No |
-| `desktop_work_stopped` | The user stopped control, or a client called `stop_desktop_work`. | No |
+| `desktop_work_stopped` | The user stopped control, or a client called `stop_desktop_work`. `details.recovery` says what allows input again: `wait_for_drain`, `restart_client` or `resolve_held_input`. Only the user restarting the server from the MCP client reopens input. See [Getting input back](sessions.md#getting-input-back). | No |
 | `control_environment_unavailable` | The desktop cannot be controlled, for example while it is locked. | No |
 | `desktop_arbitration_unavailable` | Desktop ownership could not be checked. | No |
 

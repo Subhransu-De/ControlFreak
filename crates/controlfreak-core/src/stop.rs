@@ -50,6 +50,20 @@ struct State {
     active: Vec<(u64, MutationControl)>,
 }
 
+impl State {
+    fn recovery(&self) -> Option<StopRecovery> {
+        if self.cleanup_failed {
+            Some(StopRecovery::ResolveHeldInput)
+        } else if self.stop_reason.is_none() {
+            None
+        } else if self.active.is_empty() {
+            Some(StopRecovery::RestartClient)
+        } else {
+            Some(StopRecovery::WaitForDrain)
+        }
+    }
+}
+
 /// Outcome of `StopController::wait_for_esc_hook`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EscHook {
@@ -62,6 +76,66 @@ pub enum EscHook {
     /// No Esc monitor exists, so no hook is expected.
     NotMonitored,
 }
+
+/// What has to happen before this server can accept input again, once its stop latch is closed.
+/// No MCP call reopens the latch, so every path ends in a restart the user controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopRecovery {
+    /// Work admitted before the stop is still finishing. Wait for the drain to end.
+    WaitForDrain,
+    /// Nothing is running. The user must restart the server from the MCP client.
+    RestartClient,
+    /// A key or mouse button may still be held. The user must release it, then restart.
+    ResolveHeldInput,
+}
+
+impl StopRecovery {
+    /// Who acts next: the agent waits for a drain; everything else is up to the user.
+    #[must_use]
+    pub const fn actor(self) -> &'static str {
+        match self {
+            Self::WaitForDrain => "agent",
+            Self::RestartClient | Self::ResolveHeldInput => "user",
+        }
+    }
+
+    #[must_use]
+    pub const fn action(self) -> &'static str {
+        match self {
+            Self::WaitForDrain => "wait_for_drain",
+            Self::RestartClient => "restart_client",
+            Self::ResolveHeldInput => "resolve_held_input",
+        }
+    }
+
+    /// The `stop_state` that goes with a recovery step, `ready` when there is none. Reading both
+    /// from one snapshot keeps them in agreement.
+    #[must_use]
+    pub const fn stop_state(recovery: Option<Self>) -> &'static str {
+        match recovery {
+            None => "ready",
+            Some(Self::WaitForDrain) => "draining",
+            Some(Self::RestartClient) => "stopped",
+            Some(Self::ResolveHeldInput) => "cleanup_failed",
+        }
+    }
+
+    /// One sentence an agent can pass on to the user.
+    #[must_use]
+    pub const fn guidance(self) -> &'static str {
+        match self {
+            Self::WaitForDrain => {
+                "Work that started before the stop is finishing. Wait until stop_state is stopped; input stays closed."
+            }
+            Self::RestartClient => RESTART_GUIDANCE,
+            Self::ResolveHeldInput => {
+                "ControlFreak could not confirm that every key and mouse button was released. Press and release any key or button that seems stuck, then use your MCP client's server restart control or fully quit and reopen the client."
+            }
+        }
+    }
+}
+
+const RESTART_GUIDANCE: &str = "This ControlFreak instance cannot accept more input. To allow input again, use your MCP client's server restart control or fully quit and reopen the client, then list windows and select the target again.";
 
 impl StopController {
     fn state(&self) -> MutexGuard<'_, State> {
@@ -289,16 +363,13 @@ impl StopController {
     }
 
     pub fn status(&self) -> &'static str {
-        let state = self.state();
-        if state.cleanup_failed {
-            "cleanup_failed"
-        } else if state.stop_reason.is_some() && !state.active.is_empty() {
-            "draining"
-        } else if state.stop_reason.is_some() {
-            "stopped"
-        } else {
-            "ready"
-        }
+        StopRecovery::stop_state(self.recovery())
+    }
+
+    /// The next recovery step, or `None` while admission is open. It follows `status`: draining
+    /// waits, stopped needs a client restart, and a failed cleanup needs held input released first.
+    pub fn recovery(&self) -> Option<StopRecovery> {
+        self.state().recovery()
     }
 
     /// Register before queuing work. The guard stays with the blocking worker through cleanup.
@@ -355,12 +426,12 @@ impl Drop for StopRegistration {
     }
 }
 
-fn stop_message(reason: Option<StopReason>) -> Option<&'static str> {
+fn stop_message(reason: Option<StopReason>) -> Option<String> {
     match reason? {
-        StopReason::User => Some(
-            "the user stopped the control session; do not resume or restart without the user's permission",
-        ),
-        StopReason::Other => Some("desktop work is stopped; only the user may restart the server"),
+        StopReason::User => Some(format!("You stopped desktop input. {RESTART_GUIDANCE}")),
+        StopReason::Other => {
+            Some("desktop work is stopped; only the user may restart the server".to_owned())
+        }
     }
 }
 
@@ -414,7 +485,7 @@ fn refusal(reason: Option<StopReason>, failure: Option<&str>) -> Option<String> 
     let message = stop_message(reason)?;
     Some(match failure {
         Some(failure) => format!("{message} ({failure})"),
-        None => message.to_owned(),
+        None => message,
     })
 }
 
@@ -440,7 +511,44 @@ mod tests {
         assert_eq!(stop.status(), "stopped");
         assert!(stop.user_stopped());
         let error = stop.register(MutationControl::default()).err().unwrap();
-        assert!(error.to_string().contains("the user stopped"));
+        assert!(error.to_string().contains("You stopped desktop input"));
+        assert!(error.to_string().contains("server restart control"));
+    }
+
+    #[test]
+    fn recovery_follows_the_stop_state_and_never_reopens_admission() {
+        let stop = StopController::default();
+        assert_eq!(stop.recovery(), None, "admission is open");
+        let control = MutationControl::default();
+        let guard = stop.register(control.clone()).unwrap();
+        stop.set_session_active(true);
+        assert!(stop.stop_by_user());
+        assert_eq!(stop.recovery(), Some(StopRecovery::WaitForDrain));
+        assert_eq!(StopRecovery::WaitForDrain.actor(), "agent");
+        drop(guard);
+        let recovery = stop.recovery().unwrap();
+        assert_eq!(recovery, StopRecovery::RestartClient);
+        assert_eq!(
+            (recovery.actor(), recovery.action()),
+            ("user", "restart_client")
+        );
+        assert!(recovery.guidance().contains("server restart control"));
+        assert!(stop.register(MutationControl::default()).is_err());
+
+        let stop = StopController::default();
+        let control = MutationControl::default();
+        let guard = stop.register(control.clone()).unwrap();
+        stop.set_session_active(true);
+        assert!(stop.stop_by_user());
+        control.cleanup_status(CleanupStatus::Unknown);
+        drop(guard);
+        let recovery = stop.recovery().unwrap();
+        assert_eq!(recovery, StopRecovery::ResolveHeldInput);
+        assert_eq!(
+            (recovery.actor(), recovery.action()),
+            ("user", "resolve_held_input")
+        );
+        assert_eq!(stop.status(), "cleanup_failed");
     }
 
     #[test]
