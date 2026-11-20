@@ -92,11 +92,23 @@ remote tag points to the built commit. Release notes come from the matching chan
 
 ## Releasing
 
-Releases start from the **Release** workflow in the Actions tab with **Run workflow** on `main`. Enter a version such as `0.3.0` or `0.3.0-rc.1`, or leave it empty for the next patch version (the release of a prerelease, for example `0.3.0-rc.1` to `0.3.0`). Tick **Dry run** to build and verify on any branch without committing, tagging or publishing.
+Keep changes under `## Unreleased` in `CHANGELOG.md` during development. A ruleset protects `main`: every change, including a release, reaches it through a pull request with passing CI checks. The release workflow never pushes to `main`.
 
-A release needs a passing CI run on the selected `main` commit. The build job prepares the version and changelog, builds, tests and verifies the package, and writes the version and release notes to the run summary. The publish job then waits on the `release` environment. Open the run, read the summary, and use **Review deployments** to approve or reject it. Approval commits the version and changelog to `main`, tags the commit, and publishes the GitHub release; stable releases are then submitted to winget. Rejecting it changes nothing. If `main` moves while the release waits, the push fails and nothing is published, so start a new release. To retry publication of an existing tag, run the workflow on that tag.
+1. In the Actions tab, open the **Release** workflow and use **Run workflow** on `main`. Enter a version such as `0.3.0` or `0.3.0-rc.1`, or leave it empty for the next patch version (or the release of a prerelease, for example `0.3.0-rc.1` to `0.3.0`). CI must have passed on that `main` commit. The workflow updates the version, moves the Unreleased entries into `## [<version>] - YYYY-MM-DD` (UTC date), pushes the `release/vX.Y.Z` branch and opens the `chore: release vX.Y.Z` pull request with the release notes.
+2. Close and reopen that pull request to start CI. Pull requests opened by the workflow token do not start workflows, and the ruleset blocks the merge until CI passes.
+3. When CI passes, squash merge the pull request and keep its title.
+4. When CI passes on `main` for the merged commit, tag that commit and push the tag: `git fetch origin`, `git tag vX.Y.Z <merged commit>`, `git push origin vX.Y.Z`.
+5. The tag starts the **Release** workflow. The build job requires a passing CI run on `main` for the tagged commit and a tag that matches the workspace version. It runs release-mode tests, builds, verifies and attests the package, and writes the release notes to the run summary. The publish job then waits on the `release` environment. Read the summary and use **Review deployments** to approve or reject it. Approval publishes the GitHub release; stable releases are then submitted to winget. Rejecting it publishes nothing and keeps the tag, so you can publish later by running the workflow on that tag.
 
-The `release` environment must exist with the maintainer as a required reviewer and deployments limited to `main` and `v*` tags. Without it, GitHub creates an unprotected environment and the release publishes without approval.
+To stop a release before step 4, close its pull request and delete its branch. Do the same and start again if the pull request conflicts with `main`. Tick **Dry run** to build and verify on any branch without opening a pull request, tagging or publishing.
+
+If publication fails, use **Re-run failed jobs**, or run the workflow on the existing tag: `gh workflow run release.yml --ref vX.Y.Z`. This retries the same source without changing versions or tags. A published release is never overwritten; inspect it before any retry. Release commits that the earlier workflow pushed to `main`, up to v0.2.3, have no CI run, so the workflow refuses to retry their tags.
+
+`cargo xtask prepare-release` updates the workspace version and local dependency requirements in `Cargo.toml`, fetches the complete locked dependency graph before using Cargo to update workspace versions in `Cargo.lock`, and preserves the changelog history. Versions cannot decrease or reuse an existing release section or tag, and empty releases are refused. `semver` validates versions and `toml_edit` preserves the manifest layout; both are also used by the setup helper, and the release preparation commands remain developer-only. Alpha, beta and RC versions are prereleases.
+
+The `release` environment must exist with the maintainer as a required reviewer and deployments limited to `v*` tags. Publication only runs on tags, so `main` does not need to be allowed. Without the environment, GitHub creates an unprotected one and the release publishes without approval. The repository setting **Allow GitHub Actions to create and approve pull requests** (Settings, Actions, General) must be on, or the workflow pushes the release branch but cannot open its pull request. The ruleset requires no approvals, so the setting lets Actions skip no review. Publishing needs no personal access token.
+
+After a stable release is published, a separate job uses a pinned, checksum-verified Komac to open a pull request in [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) for `SubhransuDe.ControlFreak`. It needs a `WINGET_TOKEN` repository secret: a classic personal access token with the `public_repo` and `workflow` scopes, whose owner has a fork of winget-pkgs. Without the secret the job only records a notice, and prereleases are never submitted. Komac can only add a version to a package that winget-pkgs already lists, so until the first submission is merged there the job also skips with a notice instead of failing; it submits by itself once the package is listed. If only this job fails, use **Re-run failed jobs** on the same workflow run.
 
 Automated package checks make only version/capability and MCP initialize, tools/list and server-status
 requests. They do not capture desktop content or inject input. An elevated runner additionally checks
@@ -118,35 +130,3 @@ Keep each pull request focused, update tests for behavior changes, and update `C
 ## License
 
 ControlFreak uses the [MIT License](LICENSE). Contributions are accepted under the same license.
-
-## Publishing a release
-
-Keep changes under `## Unreleased` in `CHANGELOG.md` during development. To release:
-
-1. Merge the intended changes into `main`.
-2. Open GitHub Actions, select **Release**, then **Run workflow** on `main`.
-3. Enter a semantic version without `v`, such as `0.1.0-alpha` or `0.1.0`.
-
-The workflow updates the workspace version and local dependency requirements in `Cargo.toml`,
-fetches the complete locked dependency graph before using Cargo to update workspace versions in
-`Cargo.lock`, and moves Unreleased entries into
-`## [<version>] - YYYY-MM-DD` using the UTC date. Existing changelog history is preserved.
-Versions cannot decrease or reuse an existing release section/tag, and empty releases are refused.
-`semver` validates versions and `toml_edit` preserves the manifest layout; both are also used by
-the setup helper, and the release preparation commands remain developer-only.
-
-After the tests and package checks pass, the workflow commits those three files and pushes `main`
-and the version tag atomically. If `main` advances during the build, the push fails without adding
-a tag; run again from the updated `main`. Repository rules must permit the workflow token to push
-this release commit. Publishing needs no personal access token. The same workflow then publishes the
-installer, ZIP, checksums and the version's changelog notes. Alpha/beta/RC versions are prereleases.
-
-After a stable release is published, a separate job uses a pinned, checksum-verified Komac to open a pull request in [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) for `SubhransuDe.ControlFreak`. It needs a `WINGET_TOKEN` repository secret: a classic personal access token with the `public_repo` and `workflow` scopes, whose owner has a fork of winget-pkgs. Without the secret the job only records a notice, and prereleases are never submitted. Komac can only add a version to a package that winget-pkgs already lists, so until the first submission is merged there the job also skips with a notice instead of failing; it submits by itself once the package is listed. If only this job fails, use **Re-run failed jobs** on the same workflow run.
-
-Manual tag pushes remain supported for versions whose manifest and dated changelog section have
-already been prepared. If publication fails after the tag was pushed, dispatch **Release** against
-that existing tag with its matching version using
-`gh workflow run release.yml --ref v0.1.0-alpha -f version=0.1.0-alpha` (substitute the version).
-This retries the same source without bumping versions or moving tags. An already published release is never overwritten; inspect it before any retry.
-
-The workflow does not create a release until explicitly started or a version tag is pushed.
