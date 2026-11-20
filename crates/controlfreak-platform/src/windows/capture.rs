@@ -133,7 +133,7 @@ pub(super) fn capture_display_bounds(
     include_cursor_marker: bool,
 ) -> Result<DisplayScreenshot, PlatformError> {
     let target_before = super::target::observe();
-    let (png, image_width, image_height, downscale_factor, cursor_marker) =
+    let (png, image_width, image_height, cursor_marker) =
         capture_bounds(source_bounds, max_width, include_cursor_marker)?;
     Ok(DisplayScreenshot {
         target_ref: super::target::finish_observation(target_before),
@@ -142,7 +142,6 @@ pub(super) fn capture_display_bounds(
         png,
         image_width,
         image_height,
-        downscale_factor,
         cursor_marker,
     })
 }
@@ -700,7 +699,6 @@ pub(super) struct WindowCapture {
     pub(super) png: Vec<u8>,
     pub(super) image_width: u32,
     pub(super) image_height: u32,
-    pub(super) downscale_factor: u32,
     pub(super) cursor_marker: bool,
     pub(super) capture_method: &'static str,
 }
@@ -720,13 +718,12 @@ pub(super) fn capture_window_bounds(
     let (rgba, capture_method) = window_pixels(printed, || {
         timing::time("capture_gdi", || capture_rgba(bounds))
     })?;
-    let (png, image_width, image_height, downscale_factor, cursor_marker) =
+    let (png, image_width, image_height, cursor_marker) =
         finish_image(rgba, bounds, max_width, include_cursor_marker)?;
     Ok(WindowCapture {
         png,
         image_width,
         image_height,
-        downscale_factor,
         cursor_marker,
         capture_method,
     })
@@ -736,7 +733,7 @@ fn capture_bounds(
     bounds: DisplayBounds,
     max_width: Option<u32>,
     include_cursor_marker: bool,
-) -> Result<(Vec<u8>, u32, u32, u32, bool), PlatformError> {
+) -> Result<(Vec<u8>, u32, u32, bool), PlatformError> {
     let rgba = timing::time("capture_gdi", || capture_rgba(bounds))?;
     finish_image(rgba, bounds, max_width, include_cursor_marker)
 }
@@ -747,9 +744,8 @@ fn finish_image(
     bounds: DisplayBounds,
     max_width: Option<u32>,
     include_cursor_marker: bool,
-) -> Result<(Vec<u8>, u32, u32, u32, bool), PlatformError> {
-    let (image_width, image_height, downscale_factor) =
-        scaled_dimensions(bounds.width, bounds.height, max_width);
+) -> Result<(Vec<u8>, u32, u32, bool), PlatformError> {
+    let (image_width, image_height) = scaled_dimensions(bounds.width, bounds.height, max_width);
     let mut rgba = if image_width == bounds.width && image_height == bounds.height {
         bgra
     } else {
@@ -784,20 +780,14 @@ fn finish_image(
     let png = timing::time("encode_png", || {
         encode_png(image_width, image_height, &rgba)
     })?;
-    Ok((
-        png,
-        image_width,
-        image_height,
-        downscale_factor,
-        cursor_marker,
-    ))
+    Ok((png, image_width, image_height, cursor_marker))
 }
 
 pub(super) fn scaled_dimensions(
     source_width: u32,
     source_height: u32,
     max_width: Option<u32>,
-) -> (u32, u32, u32) {
+) -> (u32, u32) {
     let image_width = max_width.map_or(source_width, |width| width.min(source_width));
     let image_height = u32::try_from(
         (u64::from(source_height) * u64::from(image_width) + u64::from(source_width / 2))
@@ -805,8 +795,7 @@ pub(super) fn scaled_dimensions(
     )
     .unwrap_or(source_height)
     .max(1);
-    let legacy_downscale_factor = source_width.div_ceil(image_width);
-    (image_width, image_height, legacy_downscale_factor)
+    (image_width, image_height)
 }
 
 /// Changed pixels needed before a repaint counts as the application's response. A blinking
@@ -1539,7 +1528,7 @@ mod benchmarks {
     fn synthetic_capture_pipeline_latency() {
         for (width, height) in [(1920_u32, 1080_u32), (2560, 1440), (3840, 2160)] {
             let frame = synthetic_frame(width, height);
-            let (image_width, image_height, _) = scaled_dimensions(width, height, Some(1280));
+            let (image_width, image_height) = scaled_dimensions(width, height, Some(1280));
             let mut resized = Vec::new();
             let resize = measure(9, || {
                 resized = resize_rgba_area(&frame, width, height, image_width, image_height);
@@ -1781,7 +1770,7 @@ mod live_encode_benchmarks {
             .find(|display| display.is_primary)
             .unwrap();
         let frame = capture_rgba(display.bounds).unwrap();
-        let (width, height, _) =
+        let (width, height) =
             scaled_dimensions(display.bounds.width, display.bounds.height, Some(1280));
         let resized = resize_rgba_area(
             &frame,

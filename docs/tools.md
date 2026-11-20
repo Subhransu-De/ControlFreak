@@ -5,6 +5,7 @@ ControlFreak exposes 27 MCP tools. Every tool publishes a title, an input schema
 - Tools are listed in the order an agent needs them. `stop_desktop_work` is last.
 - Every input tool is annotated `destructiveHint: true` and `openWorldHint: true`. `stop_desktop_work` is also destructive, because it closes input permanently. Use `end_control_session` to finish normally.
 - Every `outputSchema` accepts both the success result and the error result of its tool, so clients that validate `structuredContent` (such as the official TypeScript SDK) can read errors. Refused input actions carry their progress fields next to `error`.
+- `tools/list` publishes a compact `outputSchema`. Each success branch names its top-level fields with their JSON types (or their fixed values) and allows other fields. The error branch is complete and allows no other fields. `controlfreak --print-tools` prints the same tools with the full result contract, which describes every field and allows no others.
 
 ## Tool list
 
@@ -98,7 +99,7 @@ desktop and run inside a [control session](sessions.md).
   resize. Give one form per point.
 - Observation IDs keep geometry only, expire after 5 minutes, and at most 64 are kept.
 - An image of one window (`capture_window`) maps points only while that window is unchanged. If it moved, resized or closed, its reference changed, and the point is refused with `invalid_argument`. Capture the window again.
-- Screenshots are downscaled by area averaging (`resize_method: area_average`).
+- Screenshots are downscaled by area averaging. An image is resized when `image_width` and `image_height` differ from the size of `source_bounds`.
 - Physical pixels need a per-monitor DPI aware server. `controlfreak.exe` declares per-monitor v2 in its manifest; per-monitor v1 is also accepted. If Windows keeps the server DPI unaware or system aware, for example through a high DPI compatibility override on the executable, it would scale coordinates on a scaled display. The server then refuses captures and input with `dpi_awareness_unsupported`, and `get_server_status` reports `status: "degraded"` and `dpi_awareness` with the awareness in effect (`per_monitor_v2`, `per_monitor`, `system_aware`, `unaware` or `unknown`) and the reason. Remove the override and restart the server.
 
 ## Waiting for the window to settle
@@ -211,8 +212,7 @@ depends on what an earlier step shows.
 | `input.activation_helper` | `focus_window` only, when Windows refused the server: `accepted`, `refused` or `failed` |
 | `input.split_character` | `type_text` and `run_actions` only: `true` when typing stopped between the two halves of a surrogate pair, otherwise absent |
 | `observation_status` | `succeeded`, `failed`, `not_attempted` |
-| `effect_verification` | Always `unverified` |
-| `retry_action` | Always `false` |
+| `retry_action` | `false` on every status except `completed`, which omits it |
 
 Every error also has `error.retryable`. It says whether repeating the same request can succeed after the stated recovery. A result with `retry_action: false` always wins over `retryable`. `platform_operation_failed` adds `error.reason`, a stable sub-code:
 

@@ -1117,7 +1117,6 @@ impl WindowBackend for Backend {
             png: capture.png,
             image_width: capture.image_width,
             image_height: capture.image_height,
-            downscale_factor: capture.downscale_factor,
             cursor_marker: capture.cursor_marker,
             capture_method: capture.capture_method,
         })
@@ -1791,9 +1790,9 @@ mod tests {
 
     #[test]
     fn proportional_dimensions_use_the_requested_width_without_integer_steps() {
-        assert_eq!(scaled_dimensions(1920, 1080, Some(1600)), (1600, 900, 2));
-        assert_eq!(scaled_dimensions(1920, 1080, Some(1400)), (1400, 788, 2));
-        assert_eq!(scaled_dimensions(1920, 1080, None), (1920, 1080, 1));
+        assert_eq!(scaled_dimensions(1920, 1080, Some(1600)), (1600, 900));
+        assert_eq!(scaled_dimensions(1920, 1080, Some(1400)), (1400, 788));
+        assert_eq!(scaled_dimensions(1920, 1080, None), (1920, 1080));
     }
 
     #[test]
@@ -1848,7 +1847,6 @@ mod tests {
 
         assert_eq!(screenshot.display, *primary);
         assert_eq!(screenshot.source_bounds, primary.bounds);
-        assert_eq!(screenshot.downscale_factor, 1);
         assert_eq!(&screenshot.png[..8], b"\x89PNG\r\n\x1a\n");
 
         let region = backend

@@ -81,9 +81,7 @@
         "expect": {
           "/status": "completed",
           "/position/virtual_x": -1720,
-          "/position/virtual_y": -90,
-          "/effect_verification": "unverified",
-          "/retry_action": false
+          "/position/virtual_y": -90
         }
       },
       {
@@ -219,8 +217,7 @@
         "expect": {
           "/status": "partially_sent",
           "/input/sent_events": 2,
-          "/retry_action": false,
-          "/effect_verification": "unverified"
+          "/retry_action": false
         }
       },
       {
@@ -303,9 +300,7 @@
           }
         },
         "expect": {
-          "/status": "completed",
-          "/retry_action": false,
-          "/effect_verification": "unverified"
+          "/status": "completed"
         }
       },
       {

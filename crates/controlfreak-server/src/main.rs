@@ -20,7 +20,6 @@ impl controlfreak_mcp::ActivityArbitrator for PlatformArbitrator {
         match self.0.try_acquire() {
             Ok(true) => Ok(()),
             Ok(false) => Err(controlfreak_mcp::ArbitrationBusy {
-                owner_instance_id: None,
                 retry_after_ms: 500,
             }
             .into()),
@@ -42,7 +41,7 @@ Usage:
   controlfreak                       Run the local STDIO MCP server
   controlfreak --allow-elevated      Explicitly allow an elevated server token
   controlfreak --print-capabilities  Print the platform capability declaration
-  controlfreak --print-tools         Print tool descriptions and JSON schemas
+  controlfreak --print-tools         Print tool descriptions and the full JSON schemas
   controlfreak --help                Show this help
   controlfreak --version             Show the version";
 
@@ -117,7 +116,7 @@ async fn try_main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Command::PrintTools => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&controlfreak_mcp::tool_definitions())?
+                serde_json::to_string_pretty(&controlfreak_mcp::full_tool_definitions())?
             );
             Ok(())
         }

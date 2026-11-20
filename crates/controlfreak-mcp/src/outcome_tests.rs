@@ -426,6 +426,8 @@ fn action_requests() -> [(&'static str, Value); 9] {
     })
 }
 
+/// Checks a real action result against the schema `tools/list` published and against the full
+/// contract `--print-tools` exports, so neither can drift from what the server sends.
 fn validate_action_response(
     response: &Value,
     validator: &jsonschema::Validator,
@@ -436,18 +438,26 @@ fn validate_action_response(
     let result = &response["result"];
     let content = &result["structuredContent"];
     assert_eq!(content["status"], status, "{name}: {response}");
-    assert!(
-        validator.is_valid(content),
-        "{name}: {content}: {:?}",
-        validator.iter_errors(content).collect::<Vec<_>>()
-    );
+    let full = output_schema_tests::full_validator(name);
+    for (contract, validator) in [("published", validator), ("full", &full)] {
+        assert!(
+            validator.is_valid(content),
+            "{name} {contract}: {content}: {:?}",
+            validator.iter_errors(content).collect::<Vec<_>>()
+        );
+    }
     if mode == 0 && name == CLICK_TEXT {
         assert_eq!(content["action"]["match_tier"], "exact");
         assert_eq!(content["action"]["matched_text"]["width"], 1);
         assert_eq!(content["action"]["matched_text"]["height"], 1);
     }
-    assert_eq!(content["retry_action"], false);
-    assert_eq!(content["effect_verification"], "unverified");
+    // Only a completed action may omit the guidance; every other status keeps it.
+    if status == "completed" {
+        assert!(content.get("retry_action").is_none(), "{name}: {content}");
+    } else {
+        assert_eq!(content["retry_action"], false, "{name}: {content}");
+    }
+    assert!(content.get("effect_verification").is_none(), "{name}");
     assert_eq!(
         content["input"]["sent_events"],
         if mode == 4 { 0 } else { 100 }
@@ -462,10 +472,17 @@ fn validate_action_response(
         .as_str()
         .unwrap();
     assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *content);
+    // The full contract is closed; the published one allows extra fields only on success.
+    let mut extended = content.clone();
+    extended["unexpected"] = json!(true);
+    assert!(!full.is_valid(&extended), "{name}");
+    assert_eq!(
+        validator.is_valid(&extended),
+        status == "completed",
+        "{name}"
+    );
     let mut invalid = content.clone();
-    invalid["unexpected"] = json!(true);
-    assert!(!validator.is_valid(&invalid));
-    invalid = content.clone();
     invalid.as_object_mut().unwrap().remove("input");
     assert!(!validator.is_valid(&invalid));
+    assert!(!full.is_valid(&invalid));
 }
