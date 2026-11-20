@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::{ActionObservation, ObservationOptions};
+use crate::{ActionObservation, ObservationOptions, PlatformError};
 
 /// Declares every key once, so the enum, the canonical names and `Key::ALL` cannot drift apart.
 macro_rules! keys {
@@ -304,7 +304,29 @@ pub struct KeyChordRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextInputRequest {
     pub text: String,
+    /// Longest time typing may take, in milliseconds, counted from the first keystroke's
+    /// pacing. Typing stops between keystrokes when it runs out. `None` sets no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u32>,
     pub observation: ObservationOptions,
+}
+
+/// Refuses a `type_text` `timeout_ms` outside [`MIN_TEXT_TIMEOUT_MS`] to [`MAX_TEXT_TIMEOUT_MS`].
+/// `None` sets no limit and is always accepted.
+///
+/// [`MIN_TEXT_TIMEOUT_MS`]: crate::limits::MIN_TEXT_TIMEOUT_MS
+/// [`MAX_TEXT_TIMEOUT_MS`]: crate::limits::MAX_TEXT_TIMEOUT_MS
+pub fn validate_text_timeout(timeout_ms: Option<u32>) -> Result<(), PlatformError> {
+    use crate::limits::{MAX_TEXT_TIMEOUT_MS, MIN_TEXT_TIMEOUT_MS};
+    match timeout_ms {
+        Some(timeout_ms) if !(MIN_TEXT_TIMEOUT_MS..=MAX_TEXT_TIMEOUT_MS).contains(&timeout_ms) => {
+            Err(PlatformError::InvalidArgument {
+                argument: "timeout_ms".to_owned(),
+                reason: format!("must be between {MIN_TEXT_TIMEOUT_MS} and {MAX_TEXT_TIMEOUT_MS}"),
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +340,21 @@ mod tests {
 
     fn parse(name: &str) -> Option<Key> {
         serde_json::from_value(serde_json::Value::String(name.to_owned())).ok()
+    }
+
+    #[test]
+    fn a_text_timeout_is_optional_and_bounded() {
+        use crate::limits::{MAX_TEXT_TIMEOUT_MS, MIN_TEXT_TIMEOUT_MS};
+        for accepted in [None, Some(MIN_TEXT_TIMEOUT_MS), Some(MAX_TEXT_TIMEOUT_MS)] {
+            super::validate_text_timeout(accepted).unwrap();
+        }
+        for refused in [0, MAX_TEXT_TIMEOUT_MS + 1, u32::MAX] {
+            let error = super::validate_text_timeout(Some(refused)).unwrap_err();
+            assert!(
+                matches!(&error, crate::PlatformError::InvalidArgument { argument, .. } if argument == "timeout_ms"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

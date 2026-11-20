@@ -95,6 +95,18 @@ fn malformed(target: &str) -> Vec<(&'static str, Value, &'static str)> {
     vec![
         (TYPE_TEXT, json!({}), "invalid_arguments"),
         (
+            TYPE_TEXT,
+            json!({"target_ref": target, "text": "a", "timeout_ms": 0}),
+            "invalid_argument",
+        ),
+        (
+            RUN_ACTIONS,
+            json!({"target_ref": target, "steps": [
+                {"action": "type_text", "text": "a", "timeout_ms": 300_001},
+            ]}),
+            "invalid_argument",
+        ),
+        (
             CLICK_MOUSE,
             json!({"target_ref": target}),
             "invalid_argument",

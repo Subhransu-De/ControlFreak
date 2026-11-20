@@ -233,11 +233,17 @@ impl KeyboardBackend for Backend {
                 reason: format!("must contain at most {MAX_TEXT_UTF16_UNITS} UTF-16 code units"),
             });
         }
+        controlfreak_core::validate_text_timeout(request.timeout_ms)?;
+        let timeout = request
+            .timeout_ms
+            .map(|timeout_ms| Duration::from_millis(timeout_ms.into()));
 
         let _guard = self.lock_input(control)?;
         super::target::validate(control, "type_text", None)?;
         let watch = settle_watch(control, &request.observation);
-        send_unicode_text(&utf16, control, || {
+        // The deadline starts here, after the input lock and the first target check, so it
+        // bounds the typing itself; the settle wait and screenshot after it have their own limits.
+        send_unicode_text(&utf16, timeout, control, || {
             super::target::validate(control, "type_text", None)
         })?;
         let settled = settle(

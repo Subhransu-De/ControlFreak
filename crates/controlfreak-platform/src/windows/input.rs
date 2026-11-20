@@ -340,21 +340,59 @@ pub(super) fn key_chord_inputs(keys: &[Key]) -> Vec<INPUT> {
     inputs
 }
 
+/// Types `utf16`, stopping between keystrokes with `deadline_reached` once `timeout` has passed
+/// since the call. Without a timeout, typing runs until it is finished, refused or stopped.
 pub(super) fn send_unicode_text<F>(
     utf16: &[u16],
+    timeout: Option<Duration>,
     control: &MutationControl,
     validate_target: F,
 ) -> Result<(), PlatformError>
 where
     F: FnMut() -> Result<(), PlatformError>,
 {
+    let deadline = TypingDeadline::after(timeout, Instant::now);
+    let at = deadline.at;
     send_text_checking_held_keys(
         utf16,
         control,
+        &deadline,
         validate_target,
         native_send_inputs,
         key_is_down,
-        wait_for_previous_keystroke,
+        |control| wait_for_previous_keystroke(control, at),
+    )
+}
+
+/// The end of one typing run's `timeout_ms`, read from a clock that tests replace.
+struct TypingDeadline<C> {
+    at: Option<Instant>,
+    now: C,
+}
+
+impl<C: Fn() -> Instant> TypingDeadline<C> {
+    /// A deadline `timeout` from now, or none.
+    fn after(timeout: Option<Duration>, now: C) -> Self {
+        let at = timeout.and_then(|timeout| now().checked_add(timeout));
+        Self { at, now }
+    }
+
+    /// Refuses the next keystroke once the deadline has passed.
+    fn check(&self) -> Result<(), PlatformError> {
+        match self.at {
+            Some(at) if (self.now)() >= at => Err(deadline_reached()),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn deadline_reached() -> PlatformError {
+    PlatformError::failed(
+        controlfreak_core::FailureCause::DeadlineReached,
+        "type_text",
+        "typing reached its timeout_ms before the text was finished and stopped between two \
+         keystrokes; input.sent_events shows how much was sent, so observe the target before \
+         typing the rest",
     )
 }
 
@@ -371,7 +409,15 @@ where
     S: FnMut(&[INPUT]) -> Result<usize, PlatformError>,
     P: FnMut(&MutationControl) -> Result<(), PlatformError>,
 {
-    send_text_checking_held_keys(utf16, control, validate_target, send, |_| false, pace)
+    send_text_checking_held_keys(
+        utf16,
+        control,
+        &TypingDeadline::after(None, Instant::now),
+        validate_target,
+        send,
+        |_| false,
+        pace,
+    )
 }
 
 /// Pause between two typed keystrokes, after the keyboard-focus window has answered, so an
@@ -401,15 +447,20 @@ enum Answer {
 /// Paces the keystroke about to be sent behind earlier input: waits until the window that
 /// receives keystrokes answers (its thread is retrieving messages), pauses `KEYSTROKE_GAP`, then
 /// waits for another answer (it is retrieving messages again, not stuck handling the keystroke).
-fn wait_for_previous_keystroke(control: &MutationControl) -> Result<(), PlatformError> {
+/// Both waits end at `deadline`, so a busy window cannot hold typing past the run's `timeout_ms`
+/// by more than one answer slice and the gap.
+fn wait_for_previous_keystroke(
+    control: &MutationControl,
+    deadline: Option<Instant>,
+) -> Result<(), PlatformError> {
     let _timer = controlfreak_core::timing::start("keystroke_pace");
     // Resolved once: if focus moves between the two waits, the second asks the old window, and
     // the target validation before the keystroke reports the move.
     let window = keystroke_recipient();
     let ask = || ask_window(window);
-    wait_for_answer(control, KEYSTROKE_ANSWER_LIMIT, ask)?;
+    wait_for_answer(control, KEYSTROKE_ANSWER_LIMIT, deadline, ask)?;
     thread::sleep(KEYSTROKE_GAP);
-    wait_for_answer(control, KEYSTROKE_ANSWER_LIMIT, ask)
+    wait_for_answer(control, KEYSTROKE_ANSWER_LIMIT, deadline, ask)
 }
 
 /// The window keystrokes go to: the keyboard focus of the foreground thread, which can belong
@@ -468,15 +519,20 @@ fn ask_window(window: windows::Win32::Foundation::HWND) -> Answer {
     }
 }
 
-/// Asks until the window answers, cannot be asked, or stays busy past `limit`.
+/// Asks until the window answers, cannot be asked, or stays busy past `limit`, and stops with
+/// `deadline_reached` once the run's `deadline` has passed.
 fn wait_for_answer(
     control: &MutationControl,
     limit: Duration,
+    deadline: Option<Instant>,
     mut ask: impl FnMut() -> Answer,
 ) -> Result<(), PlatformError> {
     let started = Instant::now();
     loop {
         control.check("type_text")?;
+        if deadline.is_some_and(|at| Instant::now() >= at) {
+            return Err(deadline_reached());
+        }
         match ask() {
             Answer::Answered | Answer::Unavailable => return Ok(()),
             Answer::Busy if started.elapsed() < limit => {}
@@ -575,6 +631,10 @@ fn ensure_input_idle(
 /// the progress records `split_character`, so the result says the application got half a
 /// character.
 ///
+/// The `deadline` is checked after the pacing of every unit, where cancellation is checked, and
+/// stops typing the same way: it never lets the second half of a pair out once it has passed,
+/// and records the split.
+///
 /// Every unit is refused while the person holds a modifier, like `press_keys`: a held Alt can
 /// turn typed characters into menu mnemonics, and a held modifier turns Enter and Tab into
 /// shortcuts (Alt+Tab, Ctrl+Enter). Unicode packets carry no virtual key, so only the Enter and
@@ -583,6 +643,7 @@ fn ensure_input_idle(
 fn send_text_checking_held_keys<F, S, P>(
     utf16: &[u16],
     control: &MutationControl,
+    deadline: &TypingDeadline<impl Fn() -> Instant>,
     mut validate_target: F,
     mut send: S,
     mut is_down: impl FnMut(i32) -> bool,
@@ -601,6 +662,7 @@ where
                     let typed = type_unit(
                         *unit,
                         control,
+                        deadline,
                         &mut validate_target,
                         &mut send,
                         &mut is_down,
@@ -617,6 +679,7 @@ where
             TextSegment::Key(key) => {
                 pace_or_refuse(control, &mut pace, &mut validate_target)?;
                 control.check("type_text")?;
+                deadline.check()?;
                 let inputs = [keyboard_input(key, false), keyboard_input(key, true)];
                 validate_target()?;
                 ensure_input_idle("type_text", &inputs, &mut is_down)?;
@@ -631,6 +694,7 @@ where
 fn type_unit(
     unit: u16,
     control: &MutationControl,
+    deadline: &TypingDeadline<impl Fn() -> Instant>,
     validate_target: &mut impl FnMut() -> Result<(), PlatformError>,
     send: &mut impl FnMut(&[INPUT]) -> Result<usize, PlatformError>,
     is_down: &mut impl FnMut(i32) -> bool,
@@ -638,6 +702,7 @@ fn type_unit(
 ) -> Result<(), PlatformError> {
     pace_or_refuse(control, pace, validate_target)?;
     control.check("type_text")?;
+    deadline.check()?;
     validate_target()?;
     // After validation, which queries windows, so the check is the last before dispatch.
     ensure_no_modifier_held_with("type_text", is_down)?;
@@ -2220,6 +2285,7 @@ mod progress_tests {
         send_text_checking_held_keys(
             &utf16("a\tb\n"),
             &control,
+            &TypingDeadline::after(None, Instant::now),
             || Ok(()),
             |inputs| Ok(keys.accept(inputs)),
             |key| keys.is_down(key),
@@ -2448,7 +2514,7 @@ mod progress_tests {
             |control| {
                 paces += 1;
                 if paces == 3 {
-                    wait_for_answer(control, Duration::ZERO, || Answer::Busy)
+                    wait_for_answer(control, Duration::ZERO, None, || Answer::Busy)
                 } else {
                     Ok(())
                 }
@@ -2470,7 +2536,7 @@ mod progress_tests {
             &control,
             || Ok(()),
             |_| panic!("nothing may be sent to a window that does not answer"),
-            |control| wait_for_answer(control, Duration::ZERO, || Answer::Busy),
+            |control| wait_for_answer(control, Duration::ZERO, None, || Answer::Busy),
         )
         .expect_err("a window that never answers must stop typing");
         assert_eq!(error.reason_code(), Some("target_not_responding"));
@@ -2499,7 +2565,7 @@ mod progress_tests {
                 paces += 1;
                 if paces == 2 {
                     // Its hung focus window is the one pacing asks.
-                    wait_for_answer(control, Duration::ZERO, || Answer::Busy)
+                    wait_for_answer(control, Duration::ZERO, None, || Answer::Busy)
                 } else {
                     Ok(())
                 }
@@ -2523,7 +2589,7 @@ mod progress_tests {
             |control| {
                 paces += 1;
                 control.cancel();
-                wait_for_answer(control, Duration::ZERO, || Answer::Busy)
+                wait_for_answer(control, Duration::ZERO, None, || Answer::Busy)
             },
         )
         .expect_err("a cancelled run must stop");
@@ -2569,6 +2635,7 @@ mod progress_tests {
         let result = send_text_checking_held_keys(
             &utf16("a\u{1f980}"),
             &control,
+            &TypingDeadline::after(None, Instant::now),
             || Ok(()),
             |inputs| {
                 sent += 1;
@@ -2626,6 +2693,131 @@ mod progress_tests {
             let serialized = serde_json::to_value(control.progress()).unwrap();
             assert!(serialized.get("split_character").is_none(), "{serialized}");
         }
+    }
+
+    /// What a typing run with `timeout_ms` sent, on a fake clock that each pacing advances by
+    /// `pace_ms`: the result, the run's progress, and every keystroke's unit in order.
+    fn type_on_fake_clock(
+        text: &str,
+        timeout_ms: Option<u64>,
+        pace_ms: u64,
+    ) -> (Result<(), PlatformError>, MutationControl, Vec<u16>) {
+        let clock = std::cell::Cell::new(Instant::now());
+        let deadline = TypingDeadline::after(timeout_ms.map(Duration::from_millis), || clock.get());
+        let control = MutationControl::default();
+        let mut sent = Vec::new();
+        let result = send_text_checking_held_keys(
+            &utf16(text),
+            &control,
+            &deadline,
+            || Ok(()),
+            |inputs| {
+                // SAFETY: Every INPUT here was built by this module as a keyboard event.
+                let key = unsafe { inputs[0].Anonymous.ki };
+                sent.push(if key.wVk.0 == 0 { key.wScan } else { key.wVk.0 });
+                Ok(inputs.len())
+            },
+            |_| false,
+            |_| {
+                clock.set(clock.get() + Duration::from_millis(pace_ms));
+                Ok(())
+            },
+        );
+        (result, control, sent)
+    }
+
+    #[test]
+    fn a_deadline_stops_typing_between_keystrokes_and_keeps_what_was_sent() {
+        // Paced at 10, 20 and 30 ms, then at 40 ms, past the 35 ms deadline.
+        let (result, control, sent) = type_on_fake_clock("abcdef", Some(35), 10);
+        let error = result.unwrap_err();
+        assert_eq!(error.reason_code(), Some("deadline_reached"));
+        assert!(!error.retryable(), "part of the text was sent");
+        assert_eq!(sent, utf16("abc"));
+        let progress = control.progress();
+        assert_eq!(progress.sent_events, 6);
+        assert_eq!(progress.input_outcome, InputOutcome::PartiallySent);
+        assert_eq!(progress.cleanup, CleanupStatus::NotNeeded);
+        assert!(!progress.split_character);
+
+        // A deadline reached at exactly a keystroke's pacing stops before that keystroke.
+        let (result, _, sent) = type_on_fake_clock("abcdef", Some(30), 10);
+        assert_eq!(result.unwrap_err().reason_code(), Some("deadline_reached"));
+        assert_eq!(sent, utf16("ab"));
+
+        // Enter and Tab are keystrokes too: the deadline stops before them like before a character.
+        let (result, _, sent) = type_on_fake_clock("a\nb", Some(15), 10);
+        assert_eq!(result.unwrap_err().reason_code(), Some("deadline_reached"));
+        assert_eq!(sent, utf16("a"));
+    }
+
+    #[test]
+    fn a_deadline_reached_while_pacing_the_first_keystroke_sends_nothing() {
+        let (result, control, sent) = type_on_fake_clock("abc", Some(5), 10);
+        assert_eq!(result.unwrap_err().reason_code(), Some("deadline_reached"));
+        assert!(sent.is_empty());
+        let progress = control.progress();
+        assert_eq!(progress.sent_events, 0);
+        assert_eq!(progress.input_outcome, InputOutcome::NotStarted);
+    }
+
+    #[test]
+    fn without_a_timeout_slow_typing_finishes() {
+        // Four units at a minute each, far past any timeout_ms a request may set.
+        let (result, control, sent) = type_on_fake_clock("a\u{1f980}\n", None, 60_000);
+        result.unwrap();
+        assert_eq!(sent, [0x61, 0xD83E, 0xDD80, 0x0D]);
+        assert_eq!(control.progress().sent_events, 8);
+        // A deadline the run never reaches changes nothing either.
+        let (result, _, sent) = type_on_fake_clock("a\u{1f980}\n", Some(300_000), 10);
+        result.unwrap();
+        assert_eq!(sent, [0x61, 0xD83E, 0xDD80, 0x0D]);
+    }
+
+    #[test]
+    fn a_deadline_between_the_halves_of_a_pair_sends_no_low_half_and_reports_the_split() {
+        // `a` at 10 ms and the high half at 20 ms; the low half is paced at 30 ms, past 25 ms.
+        let (result, control, sent) = type_on_fake_clock("a\u{1f980}b", Some(25), 10);
+        assert_eq!(result.unwrap_err().reason_code(), Some("deadline_reached"));
+        assert_eq!(sent, [0x61, 0xD83E]);
+        let progress = control.progress();
+        assert_eq!(progress.sent_events, 4);
+        assert!(progress.split_character);
+
+        // A deadline reached before the pair starts splits nothing.
+        let (result, control, sent) = type_on_fake_clock("a\u{1f980}b", Some(15), 10);
+        assert_eq!(result.unwrap_err().reason_code(), Some("deadline_reached"));
+        assert_eq!(sent, [0x61]);
+        assert!(!control.progress().split_character);
+    }
+
+    #[test]
+    fn pacing_stops_at_the_deadline_instead_of_waiting_for_a_busy_window() {
+        let control = MutationControl::default();
+        let error = wait_for_answer(
+            &control,
+            Duration::from_mins(1),
+            Some(Instant::now()),
+            || panic!("a run past its deadline must not ask the window"),
+        )
+        .expect_err("the deadline ends the wait");
+        assert_eq!(error.reason_code(), Some("deadline_reached"));
+        // A cancellation still wins over the deadline.
+        control.cancel();
+        let error = wait_for_answer(
+            &control,
+            Duration::from_mins(1),
+            Some(Instant::now()),
+            || panic!("a cancelled run must not ask the window"),
+        )
+        .unwrap_err();
+        assert_eq!(error.reason_code(), Some("cancelled"));
+        // A deadline still ahead leaves the answer to the window.
+        let ahead = Instant::now().checked_add(Duration::from_mins(1));
+        wait_for_answer(&MutationControl::default(), Duration::ZERO, ahead, || {
+            Answer::Answered
+        })
+        .unwrap();
     }
 
     /// A window handle carried to the test thread. Only its value is used there.
@@ -2709,20 +2901,20 @@ mod progress_tests {
         ] {
             let mut remaining = answers.clone().into_iter();
             let mut asked = 0;
-            wait_for_answer(&control, Duration::from_mins(1), || {
+            wait_for_answer(&control, Duration::from_mins(1), None, || {
                 asked += 1;
                 remaining.next().unwrap()
             })
             .unwrap();
             assert_eq!(asked, answers.len());
         }
-        let error = wait_for_answer(&control, Duration::ZERO, || Answer::Busy)
+        let error = wait_for_answer(&control, Duration::ZERO, None, || Answer::Busy)
             .expect_err("a busy window past the limit stops typing");
         assert_eq!(error.reason_code(), Some("target_not_responding"));
         assert!(!error.retryable());
         let cancelled = MutationControl::default();
         cancelled.cancel();
-        let error = wait_for_answer(&cancelled, Duration::from_mins(1), || {
+        let error = wait_for_answer(&cancelled, Duration::from_mins(1), None, || {
             panic!("a cancelled run must not ask the window")
         })
         .expect_err("cancellation ends the wait");
@@ -2940,6 +3132,7 @@ mod progress_tests {
             let result = send_text_checking_held_keys(
                 &utf16(text),
                 &control,
+                &TypingDeadline::after(None, Instant::now),
                 || Ok(()),
                 |inputs| {
                     batches += 1;
@@ -2964,6 +3157,7 @@ mod progress_tests {
                 let error = send_text_checking_held_keys(
                     &utf16(text),
                     &control,
+                    &TypingDeadline::after(None, Instant::now),
                     || Ok(()),
                     |_| panic!("a held modifier must refuse before any keystroke"),
                     |key| key == modifier,
@@ -2986,6 +3180,7 @@ mod progress_tests {
             let error = send_text_checking_held_keys(
                 &utf16(text),
                 &control,
+                &TypingDeadline::after(None, Instant::now),
                 || Ok(()),
                 |inputs| {
                     batches.set(batches.get() + 1);
@@ -3015,6 +3210,7 @@ mod progress_tests {
         let result = send_text_checking_held_keys(
             &utf16("a\nb\n"),
             &control,
+            &TypingDeadline::after(None, Instant::now),
             || Ok(()),
             |inputs| {
                 sent_batches += 1;

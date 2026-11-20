@@ -800,9 +800,11 @@ pub(super) fn prepare_press_keys(arguments: Option<JsonObject>) -> PreparedInput
 
 pub(super) fn prepare_type_text(arguments: Option<JsonObject>) -> PreparedInput {
     let input = parse_input::<TypeTextInput>(arguments)?;
+    controlfreak_core::validate_text_timeout(input.timeout_ms).map_err(|error| refuse(&error))?;
     let text_length = input.text.encode_utf16().count();
     let request = TextInputRequest {
         text: input.text,
+        timeout_ms: input.timeout_ms,
         observation: input.observation.into(),
     };
     let target_ref = input.target_ref;
@@ -1191,10 +1193,11 @@ fn run_step(
                 )
                 .map(|result| result.observation)
         }
-        ActionStep::TypeText { text } => backend
+        ActionStep::TypeText { text, timeout_ms } => backend
             .type_text_controlled(
                 &TextInputRequest {
                     text: text.clone(),
+                    timeout_ms: *timeout_ms,
                     observation,
                 },
                 control,

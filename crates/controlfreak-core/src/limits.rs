@@ -9,6 +9,11 @@ pub const MAX_MOVE_DURATION_MS: u32 = 10_000;
 pub const MAX_SCROLL_DELTA: u32 = 12_000;
 /// Longest text one `type_text` call or step accepts, in UTF-16 code units.
 pub const MAX_TEXT_UTF16_UNITS: usize = 4_000;
+/// Shortest `timeout_ms` a `type_text` call or step accepts. Zero would type nothing.
+pub const MIN_TEXT_TIMEOUT_MS: u32 = 1;
+/// Longest `timeout_ms` a `type_text` call or step accepts, in milliseconds. Above the wait
+/// tools' limit, because the longest text takes about a minute at the paced typing rate.
+pub const MAX_TEXT_TIMEOUT_MS: u32 = 300_000;
 /// Widest image an explicit capture may request.
 pub const MAX_CAPTURE_WIDTH: u32 = 7_680;
 /// Width of a captured image when the caller gives no `max_width`.

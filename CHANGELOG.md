@@ -27,6 +27,7 @@ versioned section and uses that section for the corresponding GitHub Release not
 - `switch_virtual_desktop` reports `before_id`, `after_id` and `transition` (`confirmed_changed`, `confirmed_unchanged` or `unknown`) in `action`. Only two known desktops confirm a result. A missing foreground window, as on an empty desktop, gives `unknown`. `changed` keeps its old meaning for compatibility, so it can read `true` for a switch that was not confirmed: use `transition`. The desktop before the switch is now read while the server holds its input lock.
 - A second `notifications/controlfreak/session_stopped` event, `stop_drained`, when work that was running at a user stop has finished.
 - `input.split_character: true` when `type_text` or a `run_actions` `type_text` step stops between the two halves of an emoji or other non-BMP character. The application then holds half a character, so delete it before typing again. A stop, cancel or refusal still never sends the second half.
+- `type_text` and the `run_actions` `type_text` step take an optional `timeout_ms` (1 to 300000) that limits how long typing may take. At the limit, typing stops between two keystrokes with reason `deadline_reached` (not retryable), `status: "partially_sent"` and the exact `input.sent_events`. Observe the text before typing the rest. Without `timeout_ms` nothing changes.
 
 ### Changed
 

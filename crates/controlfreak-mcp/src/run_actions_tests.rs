@@ -138,8 +138,14 @@ impl KeyboardBackend for Scripted {
         request: &TextInputRequest,
         control: &MutationControl,
     ) -> Result<KeyboardActionResult, PlatformError> {
+        let timeout = request
+            .timeout_ms
+            .map_or_else(String::new, |timeout_ms| format!(" timeout={timeout_ms}"));
         self.step(
-            format!("type {} {:?}", request.text, request.observation.mode),
+            format!(
+                "type {} {:?}{timeout}",
+                request.text, request.observation.mode
+            ),
             control,
         )
         .map(|()| KeyboardActionResult {
@@ -512,4 +518,132 @@ async fn typing_that_stops_inside_a_surrogate_pair_reports_the_split_character()
         content["input"].get("split_character").is_none(),
         "{content}"
     );
+}
+
+fn deadline_reached() -> PlatformError {
+    PlatformError::failed(
+        controlfreak_core::FailureCause::DeadlineReached,
+        "type_text",
+        "typing reached its timeout_ms before the text was finished",
+    )
+}
+
+#[tokio::test]
+async fn timeout_ms_reaches_the_backend_and_is_absent_by_default() {
+    let target = "target-00000000-0000-0000-0000-000000000003";
+    let scripted = || Scripted {
+        fail_at: None,
+        failure: deadline_reached(),
+        observation_fails_at: None,
+        splits_pair: false,
+        calls: Mutex::new(Vec::new()),
+    };
+    let (content, calls) = call(
+        scripted(),
+        TYPE_TEXT,
+        json!({"target_ref": target, "text": "Ada", "timeout_ms": 2_500, "observation": {"mode": "none"}}),
+    )
+    .await;
+    assert_eq!(content["status"], "completed", "{content}");
+    assert_eq!(calls, ["type Ada None timeout=2500"]);
+
+    let mut timed = steps();
+    timed[1]["timeout_ms"] = json!(300_000);
+    let (content, calls) = call(
+        scripted(),
+        RUN_ACTIONS,
+        json!({"target_ref": target, "steps": timed}),
+    )
+    .await;
+    assert_eq!(content["status"], "completed", "{content}");
+    assert_eq!(calls[1], "type Ada None timeout=300000");
+
+    // Without timeout_ms the request carries no limit.
+    let (_, calls) = run(None, json!({"target_ref": target, "steps": steps()})).await;
+    assert_eq!(calls[1], "type Ada None");
+}
+
+#[tokio::test]
+async fn a_typing_deadline_reports_partial_delivery_and_is_not_retryable() {
+    let target = "target-00000000-0000-0000-0000-000000000003";
+    // The deadline fell between the halves of a pair: the high half was sent.
+    let (content, _) = call(
+        Scripted {
+            fail_at: Some(0),
+            failure: deadline_reached(),
+            observation_fails_at: None,
+            splits_pair: true,
+            calls: Mutex::new(Vec::new()),
+        },
+        TYPE_TEXT,
+        json!({"target_ref": target, "text": "a\u{1f980}", "timeout_ms": 20}),
+    )
+    .await;
+    assert_eq!(content["status"], "partially_sent", "{content}");
+    assert_eq!(content["retry_action"], false, "{content}");
+    assert_eq!(content["input"]["sent_events"], 2, "{content}");
+    assert_eq!(content["input"]["split_character"], true, "{content}");
+    let error = &content["error"];
+    assert_eq!(error["code"], "platform_operation_failed", "{content}");
+    assert_eq!(error["reason"], "deadline_reached", "{content}");
+    assert_eq!(error["retryable"], false, "{content}");
+
+    // In a batch the step that ran out of time fails and every later step is skipped.
+    let mut timed = steps();
+    timed[1]["timeout_ms"] = json!(20);
+    let (content, calls) = run_failing(
+        Some(1),
+        deadline_reached(),
+        None,
+        json!({"target_ref": target, "steps": timed}),
+    )
+    .await;
+    assert_eq!(calls, ["click fixture 10 20", "type Ada None timeout=20"]);
+    assert_eq!(content["status"], "partially_sent", "{content}");
+    assert_eq!(content["input"]["sent_events"], 2, "{content}");
+    let error = &content["error"];
+    assert_eq!(error["reason"], "deadline_reached", "{content}");
+    assert_eq!(error["retryable"], false, "{content}");
+    let statuses: Vec<_> = error["details"]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| step["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(statuses, ["completed", "failed", "skipped", "skipped"]);
+}
+
+#[tokio::test]
+async fn an_out_of_range_timeout_is_refused_before_any_input() {
+    let target = "target-00000000-0000-0000-0000-000000000003";
+    for timeout_ms in [0, 300_001] {
+        let scripted = Scripted {
+            fail_at: None,
+            failure: deadline_reached(),
+            observation_fails_at: None,
+            splits_pair: false,
+            calls: Mutex::new(Vec::new()),
+        };
+        let (content, calls) = call(
+            scripted,
+            TYPE_TEXT,
+            json!({"target_ref": target, "text": "Ada", "timeout_ms": timeout_ms}),
+        )
+        .await;
+        assert_eq!(content["status"], "not_started", "{content}");
+        assert_eq!(content["error"]["code"], "invalid_argument", "{content}");
+        assert!(calls.is_empty(), "{calls:?}");
+
+        let mut timed = steps();
+        timed[1]["timeout_ms"] = json!(timeout_ms);
+        let (content, calls) = run(None, json!({"target_ref": target, "steps": timed})).await;
+        assert_eq!(content["status"], "not_started", "{content}");
+        assert!(
+            content
+                .to_string()
+                .contains("timeout_ms must be between 1 and 300000"),
+            "{content}"
+        );
+        assert!(calls.is_empty(), "{calls:?}");
+    }
 }

@@ -122,6 +122,9 @@ pub enum FailureCause {
     /// The window with keyboard focus stopped answering while text was typed, so typing stopped
     /// instead of queueing keystrokes the application could mistranslate.
     TargetNotResponding,
+    /// Typing reached the request's `timeout_ms` before the text was finished, so it stopped
+    /// between two keystrokes. Part of the text may have been sent, so repeating it is unsafe.
+    DeadlineReached,
     /// The server process is not per-monitor DPI aware, so Windows would virtualize window and
     /// pointer coordinates on a scaled display. Process awareness is fixed for its lifetime.
     DpiAwarenessUnsupported,
@@ -141,6 +144,7 @@ impl FailureCause {
             Self::WorkerFailed => "worker_failed",
             Self::InputBlocked => "input_blocked",
             Self::TargetNotResponding => "target_not_responding",
+            Self::DeadlineReached => "deadline_reached",
             Self::DpiAwarenessUnsupported => "dpi_awareness_unsupported",
         }
     }
@@ -230,6 +234,13 @@ mod tests {
         let error = PlatformError::failed(FailureCause::PointerNotPlaced, "click_mouse", "x");
         assert_eq!(error.reason_code(), Some("pointer_not_placed"));
         assert!(!error.retryable(), "the same request is clamped again");
+    }
+
+    #[test]
+    fn a_reached_typing_deadline_is_its_own_non_retryable_reason() {
+        let error = PlatformError::failed(FailureCause::DeadlineReached, "type_text", "x");
+        assert_eq!(error.reason_code(), Some("deadline_reached"));
+        assert!(!error.retryable(), "part of the text may have been sent");
     }
 
     #[test]
