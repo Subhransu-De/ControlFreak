@@ -323,6 +323,21 @@ pub(super) fn find_display(display_id: &str) -> Result<DisplayInfo, PlatformErro
         })
 }
 
+/// ID of the display nearest to `hwnd`, for any window that exists, listed or not. `None` for a
+/// null or destroyed handle, or when Windows cannot describe the display.
+pub(super) fn window_display_id(hwnd: HWND) -> Option<String> {
+    if hwnd.is_invalid() {
+        return None;
+    }
+    // SAFETY: MonitorFromWindow only reads the borrowed handle; for a handle that no longer
+    // names a window it returns a null monitor, which is checked before use.
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if monitor.is_invalid() {
+        return None;
+    }
+    monitor_info(monitor).ok().map(|display| display.id)
+}
+
 pub(super) fn find_display_at_point(point: POINT) -> Option<DisplayInfo> {
     enumerate_displays().ok()?.into_iter().find(|display| {
         let right = i64::from(display.bounds.left) + i64::from(display.bounds.width);
@@ -474,7 +489,15 @@ pub(super) fn window_info(hwnd: HWND) -> Result<WindowInfo, PlatformError> {
 /// another process than `list_windows` does. `None` only when no window holds the foreground or
 /// it closed while it was read.
 pub(super) fn foreground_window(target_process: Option<u32>) -> Option<ForegroundWindow> {
-    let hwnd = foreground_window_handle();
+    describe_foreground(foreground_window_handle(), target_process)
+}
+
+/// [`foreground_window`] for a foreground handle the caller already read, so that a caller can
+/// also locate the same window.
+pub(super) fn describe_foreground(
+    hwnd: HWND,
+    target_process: Option<u32>,
+) -> Option<ForegroundWindow> {
     if hwnd.is_invalid() {
         return None;
     }

@@ -23,6 +23,7 @@ versioned section and uses that section for the corresponding GitHub Release not
 - If Windows reports no display for a moment while no session is owned, the session tab and the lamp now check again at their next poll, and sessions can start once a display is back. Before, input stayed closed until the server restarted. During a session this still closes input with the reason. Not yet observed on Windows: whether hot-plug, monitor sleep or a remote session disconnect gives such a reading.
 - Argument errors no longer repeat the value you sent. Before, a value of the wrong type, such as text where a number goes, or an unknown key name was quoted in `error.message` and `error.details.reason`, so typed text could reach the transcript.
 - An `observation_id` point is refused with `invalid_argument` and nothing is sent once a display was added, removed or moved after the screenshot. Before, the point was mapped onto whatever display now covered the old position. Capture again.
+- The screenshot after `press_keys`, `type_text` or `switch_virtual_desktop` now shows the display of the window in front even when that window has no target reference, such as a popup menu or drop-down on a secondary display. Before, it showed the primary display. With no window in front it shows the session target's display, and the primary display only without a session. Not yet checked on a real multi-display machine.
 
 ### Added
 
