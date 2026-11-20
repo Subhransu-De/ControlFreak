@@ -131,7 +131,7 @@ pub enum BaselineFailure {
 
 impl BaselineFailure {
     #[must_use]
-    pub const fn code(self) -> &'static str {
+    const fn code(self) -> &'static str {
         match self {
             Self::Expired => "expired",
             Self::Evicted => "evicted",
