@@ -117,7 +117,7 @@ Without `language`, OCR uses the first language in the Windows language list tha
 
 | Tool | Matching | Gives input approval |
 | --- | --- | --- |
-| `click_text` | `exact` (default) or substring with `exact_match=false` | Yes, only for one unique match |
+| `click_text` | `match_mode`: `exact` (default) or `substring` | Yes, only for one unique match |
 | `find_text_on_screen` | `match_mode`: `substring` (default), `exact`, `tolerant` | No |
 | `wait_for_text` | Same as `find_text_on_screen`, until `appears` or `disappears` | No |
 
@@ -125,11 +125,13 @@ Without `language`, OCR uses the first language in the Windows language list tha
 
 - Matching works on the words inside each OCR line, so a label in the middle of a line can be
   clicked. `exact` needs the query's words to equal consecutive whole words of a line
-  (`Edit` matches in `File Edit View`, `Edi` does not). `exact_match=false` needs the query to
+  (`Edit` matches in `File Edit View`, `Edi` does not). `substring` needs the query to
   occur in the line's words and selects every word it touches. The click lands on the centre of
   the box that covers the matched words, not on the centre of the line. A line without word
   boxes is matched as a whole line.
 - `find_text_on_screen` returns the same matched-word box for each match, in display-local pixels.
+- `match_mode` `tolerant` is refused with `invalid_argument`, because a click needs a strict match. Use `find_text_on_screen` with `tolerant` to pick the query.
+- `exact_match` is the older name: `true` is `exact` and `false` is `substring`. It can repeat `match_mode`, but a value that contradicts it is refused with `invalid_argument`.
 - Zero matches return `ocr_no_match`. More than one returns `ocr_ambiguous_match`, including two
   matches inside one line. Neither sends input or falls back to coordinates.
 - `error.details` lists up to 20 candidates of up to 256 characters each, with `candidate_count`

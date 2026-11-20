@@ -242,8 +242,9 @@ pub(super) struct ClickTextInput {
     pub(super) query: String,
     #[serde(default)]
     pub(super) case_sensitive: bool,
-    #[serde(default = "default_true")]
-    pub(super) exact_match: bool,
+    match_mode: Option<controlfreak_core::TextMatchMode>,
+    /// The older name for `match_mode`: `true` is `exact`, `false` is `substring`.
+    exact_match: Option<bool>,
     #[serde(default = "default_left_button")]
     pub(super) button: MouseButton,
     #[serde(default = "default_click_count")]
@@ -257,6 +258,31 @@ pub(super) struct ClickTextInput {
 }
 
 impl ClickTextInput {
+    /// Whether the query must equal whole words (`exact`, the default) rather than occur in them
+    /// (`substring`). `tolerant` is refused: its normalizing tiers are for discovery, and a click
+    /// needs an unambiguous match. `exact_match` may repeat `match_mode` but not contradict it.
+    pub(super) fn exact_match(&self) -> Result<bool, PlatformError> {
+        use controlfreak_core::TextMatchMode;
+        let from_mode = match self.match_mode {
+            None => None,
+            Some(TextMatchMode::Exact) => Some(true),
+            Some(TextMatchMode::Substring) => Some(false),
+            Some(TextMatchMode::Tolerant) => {
+                return Err(PlatformError::InvalidArgument {
+                    argument: "match_mode".to_owned(),
+                    reason: "click_text accepts exact or substring: tolerant matches are for discovery, so use find_text_on_screen to pick a strict query".to_owned(),
+                });
+            }
+        };
+        match (from_mode, self.exact_match) {
+            (Some(mode), Some(alias)) if mode != alias => Err(PlatformError::InvalidArgument {
+                argument: "exact_match".to_owned(),
+                reason: "contradicts match_mode; give match_mode only".to_owned(),
+            }),
+            (mode, alias) => Ok(mode.or(alias).unwrap_or(true)),
+        }
+    }
+
     /// The OCR region, with an omitted display left as the primary-display alias.
     pub(super) fn region(&self) -> OcrRegionRequest {
         OcrRegionRequest {

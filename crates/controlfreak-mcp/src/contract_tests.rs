@@ -696,6 +696,74 @@ fn routes_and_published_tools_agree() {
     assert!(is_mutating_tool(CLICK_TEXT));
 }
 
+/// #5: `click_text` names its matching option `match_mode`, like the discovery tools, and keeps
+/// `exact_match` as an alias that may repeat it but not contradict it. `tolerant` is refused.
+#[test]
+fn click_text_and_discovery_share_match_mode() {
+    let click = &tool_named(CLICK_TEXT).input_schema["properties"];
+    for name in [FIND_TEXT_ON_SCREEN, WAIT_FOR_TEXT] {
+        let find = &tool_named(name).input_schema["properties"]["match_mode"]["enum"];
+        for mode in click["match_mode"]["enum"].as_array().unwrap() {
+            assert!(find.as_array().unwrap().contains(mode), "{name}: {mode}");
+        }
+    }
+    assert_eq!(click["match_mode"]["enum"], json!(["exact", "substring"]));
+    assert_eq!(click["match_mode"]["default"], "exact");
+    assert!(click["exact_match"].get("default").is_none());
+
+    let parse = |extra: Value| {
+        let mut arguments = json!({
+            "target_ref": "target-00000000-0000-0000-0000-000000000001",
+            "x": 0, "y": 0, "width": 10, "height": 10, "query": "Save"
+        });
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let Value::Object(arguments) = arguments else {
+            unreachable!()
+        };
+        parse_arguments::<ClickTextInput>(Some(arguments))
+            .unwrap()
+            .exact_match()
+    };
+    for (extra, exact) in [
+        (json!({}), true),
+        (json!({"match_mode": "exact"}), true),
+        (json!({"match_mode": "substring"}), false),
+        (json!({"exact_match": false}), false),
+        (json!({"exact_match": true}), true),
+        (
+            json!({"match_mode": "substring", "exact_match": false}),
+            false,
+        ),
+        (json!({"match_mode": "exact", "exact_match": true}), true),
+    ] {
+        assert_eq!(parse(extra.clone()).unwrap(), exact, "{extra}");
+    }
+    for (extra, argument) in [
+        (json!({"match_mode": "tolerant"}), "match_mode"),
+        (
+            json!({"match_mode": "tolerant", "exact_match": false}),
+            "match_mode",
+        ),
+        (
+            json!({"match_mode": "exact", "exact_match": false}),
+            "exact_match",
+        ),
+        (
+            json!({"match_mode": "substring", "exact_match": true}),
+            "exact_match",
+        ),
+    ] {
+        let error = parse(extra.clone()).unwrap_err();
+        assert!(
+            matches!(&error, PlatformError::InvalidArgument { argument: named, .. } if named == argument),
+            "{extra}: {error:?}"
+        );
+    }
+}
+
 /// F-04: `target_ref` is an alias of `window_id`, and disagreement is refused.
 #[tokio::test]
 async fn target_ref_is_an_alias_of_window_id() {

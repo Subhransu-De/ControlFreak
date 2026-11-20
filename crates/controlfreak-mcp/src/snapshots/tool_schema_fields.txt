@@ -403,9 +403,10 @@ click_text input case_sensitive default=false
 click_text input click_count default=1
 click_text input display_id
 click_text input duration_ms default=0
-click_text input exact_match default=true
+click_text input exact_match
 click_text input height required
 click_text input language
+click_text input match_mode default="exact"
 click_text input modifiers default=[]
 click_text input observation
 click_text input observation.include_cursor default=true

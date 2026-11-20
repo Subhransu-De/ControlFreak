@@ -129,6 +129,18 @@ fn malformed(target: &str) -> Vec<(&'static str, Value, &'static str)> {
             ]}),
             "invalid_argument",
         ),
+        (
+            CLICK_TEXT,
+            json!({"target_ref": target, "x": 0, "y": 0, "width": 10, "height": 10, "query": "Save",
+                   "match_mode": "tolerant"}),
+            "invalid_argument",
+        ),
+        (
+            CLICK_TEXT,
+            json!({"target_ref": target, "x": 0, "y": 0, "width": 10, "height": 10, "query": "Save",
+                   "match_mode": "substring", "exact_match": true}),
+            "invalid_argument",
+        ),
     ]
 }
 

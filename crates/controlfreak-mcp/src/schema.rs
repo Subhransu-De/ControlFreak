@@ -314,14 +314,16 @@ pub(super) fn wait_for_text() -> Contract {
 pub(super) fn click_text() -> Contract {
     let mut properties = text_query_properties();
     properties.remove("max_results");
-    properties.remove("match_mode");
     properties.remove("ocr_confusions");
+    // The same name as in find_text_on_screen. tolerant is left out: a click needs a strict match.
+    properties.insert(
+        "match_mode".into(),
+        json!({"type": "string", "enum": ["exact", "substring"], "default": "exact", "description": "substring accepts a unique substring."}),
+    );
+    // No default here, so a client that fills in defaults does not contradict match_mode.
     properties.insert(
         "exact_match".to_owned(),
-        json!({
-            "type": "boolean", "default": true,
-            "description": "false accepts a unique substring."
-        }),
+        json!({ "type": "boolean", "description": "Alias: true is exact, false substring." }),
     );
     properties.insert("button".to_owned(), button_property(true));
     properties.insert("click_count".to_owned(), click_count_property());
