@@ -19,7 +19,7 @@ env:
 jobs:
   quality:
     name: Formatting, Clippy, and docs
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 25
 
     steps:
@@ -29,7 +29,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
+        run: rustup toolchain install
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -47,7 +47,7 @@ jobs:
 
   tests:
     name: Tests
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 25
 
     steps:
@@ -57,7 +57,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.97.1 --profile minimal
+        run: rustup toolchain install
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -82,7 +82,7 @@ jobs:
 
   live-desktop:
     name: Live desktop tests
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 30
 
     steps:
@@ -92,7 +92,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.97.1 --profile minimal
+        run: rustup toolchain install
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -115,7 +115,7 @@ jobs:
 
   windows-build:
     name: Release build
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 25
 
     steps:
@@ -125,7 +125,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.97.1 --profile minimal
+        run: rustup toolchain install
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -172,11 +172,22 @@ jobs:
         with:
           persist-credentials: false
 
+      # install-action does not ship actionlint, so download the pinned
+      # release binary and check it against its published SHA-256.
       - name: Install actionlint
-        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          archive="${RUNNER_TEMP}/actionlint.tar.gz"
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            --output "$archive"
+          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
 
       - name: Validate workflows
-        run: '"${HOME}/go/bin/actionlint"'
+        run: '"${RUNNER_TEMP}/actionlint"'
 
   hawk:
     name: Hawk unsafe-code audit
@@ -190,15 +201,19 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        run: >-
-          rustup toolchain install 1.97.1 --profile minimal
-          --component llvm-tools-preview --target x86_64-pc-windows-msvc
+        run: |
+          rustup toolchain install
+          rustup component add llvm-tools-preview
+          rustup target add x86_64-pc-windows-msvc
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Install cargo-xwin
-        run: cargo install cargo-xwin --version 0.23.0 --locked
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: cargo-xwin@0.23.0
+          fallback: none
 
       - name: Install Hawk
         run: |
@@ -214,7 +229,7 @@ jobs:
         run: |
           target=x86_64-pc-windows-msvc
           eval "$(cargo xwin env --quiet --target "$target" --manifest-path Cargo.toml)"
-          cargo +1.97.1 hawk check \
+          cargo hawk check \
             --manifest-path Cargo.toml \
             --target "$target" \
             -D warnings

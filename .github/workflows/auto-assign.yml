@@ -1,5 +1,8 @@
 name: Auto-assign pull requests
 
+# pull_request_target runs with a write token in the context of the base
+# branch. It is safe here only because the job never checks out or runs code
+# from the pull request. Do not add a checkout step to this workflow.
 on:
   pull_request_target:
     types: [opened, reopened, ready_for_review]
@@ -12,6 +15,7 @@ permissions:
 jobs:
   assign-owner:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Assign repository owner
         env:

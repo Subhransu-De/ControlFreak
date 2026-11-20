@@ -37,7 +37,7 @@ permissions:
 jobs:
   build:
     name: Build and verify Windows release
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 45
     outputs:
       tag: ${{ steps.version.outputs.tag }}
@@ -66,10 +66,12 @@ jobs:
           if (@($runs | ConvertFrom-Json).Count -eq 0) { throw "CI has not passed on $env:GITHUB_SHA. Wait for it to pass on main, then run the release again." }
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.97.1 --profile minimal
+        run: rustup toolchain install
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: false
 
       - name: Prepare and validate release version and changelog
         id: version
@@ -106,11 +108,11 @@ jobs:
           cargo xtask release-notes --output "$env:RUNNER_TEMP/release-notes.md"
           if ($LASTEXITCODE -ne 0) { throw 'Release changelog is missing or empty.' }
 
-      - name: Install cargo-auditable
-        run: cargo install cargo-auditable --version 0.7.5 --locked
-
-      - name: Install cargo-cyclonedx
-        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+      - name: Install cargo-auditable and cargo-cyclonedx
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: cargo-auditable@0.7.5,cargo-cyclonedx@0.5.9
+          fallback: none
 
       - name: Test release configuration
         run: cargo test --workspace --release --locked
@@ -199,7 +201,7 @@ jobs:
     name: Publish GitHub release
     needs: build
     if: ${{ !inputs.dry_run }}
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 20
     environment:
       name: release
@@ -220,7 +222,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.97.1 --profile minimal
+        run: rustup toolchain install
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -290,7 +292,7 @@ jobs:
     name: Submit stable release to winget
     needs: [build, publish]
     if: ${{ !contains(needs.build.outputs.tag, '-') }}
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 15
     permissions:
       contents: read
