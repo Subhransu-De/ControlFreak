@@ -1330,6 +1330,9 @@ fn run_step(
             .type_text_controlled(
                 &TextInputRequest {
                     text: text.clone(),
+                    // A relative limit: the backend starts it when typing starts, after its input
+                    // lock, target check and settle baseline, so those can run past the batch's
+                    // deadline before the first keystroke.
                     timeout_ms: match (*timeout_ms, budget_ms) {
                         (Some(own), Some(budget)) => Some(own.min(budget)),
                         (own, budget) => own.or(budget),
