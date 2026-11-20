@@ -7,9 +7,9 @@ use controlfreak_core::{
         MAX_RUN_ACTIONS_WAIT_MS, MAX_SCROLL_DELTA, MAX_SETTLE_MS, MAX_TEXT_UTF16_UNITS,
     },
 };
-use rmcp::{ErrorData, model::JsonObject};
 use serde::Deserialize;
-use serde_json::{Value, json};
+
+pub(super) use super::arguments::parse_arguments;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -242,8 +242,11 @@ pub(super) struct ClickTextInput {
     pub(super) query: String,
     #[serde(default)]
     pub(super) case_sensitive: bool,
-    #[serde(default = "default_true")]
-    pub(super) exact_match: bool,
+    #[serde(default, deserialize_with = "not_null")]
+    match_mode: Option<controlfreak_core::TextMatchMode>,
+    /// The older name for `match_mode`: `true` is `exact`, `false` is `substring`.
+    #[serde(default, deserialize_with = "not_null")]
+    exact_match: Option<bool>,
     #[serde(default = "default_left_button")]
     pub(super) button: MouseButton,
     #[serde(default = "default_click_count")]
@@ -257,6 +260,31 @@ pub(super) struct ClickTextInput {
 }
 
 impl ClickTextInput {
+    /// Whether the query must equal whole words (`exact`, the default) rather than occur in them
+    /// (`substring`). `tolerant` is refused: its normalizing tiers are for discovery, and a click
+    /// needs an unambiguous match. `exact_match` may repeat `match_mode` but not contradict it.
+    pub(super) fn exact_match(&self) -> Result<bool, PlatformError> {
+        use controlfreak_core::TextMatchMode;
+        let from_mode = match self.match_mode {
+            None => None,
+            Some(TextMatchMode::Exact) => Some(true),
+            Some(TextMatchMode::Substring) => Some(false),
+            Some(TextMatchMode::Tolerant) => {
+                return Err(PlatformError::InvalidArgument {
+                    argument: "match_mode".to_owned(),
+                    reason: "click_text accepts exact or substring: tolerant matches are for discovery, so use find_text_on_screen to pick a strict query".to_owned(),
+                });
+            }
+        };
+        match (from_mode, self.exact_match) {
+            (Some(mode), Some(alias)) if mode != alias => Err(PlatformError::InvalidArgument {
+                argument: "exact_match".to_owned(),
+                reason: "contradicts match_mode; give match_mode only".to_owned(),
+            }),
+            (mode, alias) => Ok(mode.or(alias).unwrap_or(true)),
+        }
+    }
+
     /// The OCR region, with an omitted display left as the primary-display alias.
     pub(super) fn region(&self) -> OcrRegionRequest {
         OcrRegionRequest {
@@ -703,19 +731,6 @@ const fn default_max_ocr_results() -> u32 {
     20
 }
 
-pub(super) fn parse_arguments<T>(arguments: Option<JsonObject>) -> Result<T, ErrorData>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    serde_json::from_value(Value::Object(arguments.unwrap_or_default())).map_err(|error| {
-        let reason = error.to_string();
-        ErrorData::invalid_params(
-            format!("invalid tool arguments: {reason}"),
-            Some(json!({ "reason": reason })),
-        )
-    })
-}
-
 const fn default_focus_timeout_ms() -> u32 {
     1_000
 }
@@ -784,50 +799,34 @@ pub(super) struct RunActionsInput {
     pub(super) observation: ObservationInput,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+/// One `run_actions` step as it arrives, tagged by `action`. It is parsed through [`StepFields`],
+/// not as an internally tagged enum, because serde buffers such an enum and the argument error
+/// would lose the path of the field inside the step.
+#[derive(Debug)]
 pub(super) enum ActionStepInput {
     Click {
-        #[serde(default)]
         display_id: Option<String>,
-        #[serde(default)]
         x: Option<u32>,
-        #[serde(default)]
         y: Option<u32>,
-        #[serde(default)]
         observation_id: Option<String>,
-        #[serde(default)]
         image_x: Option<u32>,
-        #[serde(default)]
         image_y: Option<u32>,
-        #[serde(default = "default_left_button")]
         button: MouseButton,
-        #[serde(default = "default_click_count")]
         click_count: u8,
-        #[serde(default)]
         modifiers: Vec<Key>,
     },
     Scroll {
-        #[serde(default)]
         display_id: Option<String>,
-        #[serde(default)]
         x: Option<u32>,
-        #[serde(default)]
         y: Option<u32>,
-        #[serde(default)]
         observation_id: Option<String>,
-        #[serde(default)]
         image_x: Option<u32>,
-        #[serde(default)]
         image_y: Option<u32>,
-        #[serde(default)]
         delta_x: i32,
-        #[serde(default)]
         delta_y: i32,
     },
     TypeText {
         text: String,
-        #[serde(default)]
         timeout_ms: Option<u32>,
     },
     PressKeys {
@@ -836,6 +835,201 @@ pub(super) enum ActionStepInput {
     Wait {
         wait_ms: u32,
     },
+}
+
+/// Every field any step takes. The step's `action` decides which of them it may use.
+///
+/// An omitted field and an explicit `null` stay distinct, as they were for the tagged enum: a
+/// nullable field is [`Given::Null`] for `null`, so a `null` field that the action does not take is
+/// still an unknown field, and a field that is not nullable refuses `null` instead of taking its
+/// default.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StepFields {
+    action: StepAction,
+    #[serde(default, deserialize_with = "present")]
+    display_id: Given<String>,
+    #[serde(default, deserialize_with = "present")]
+    x: Given<u32>,
+    #[serde(default, deserialize_with = "present")]
+    y: Given<u32>,
+    #[serde(default, deserialize_with = "present")]
+    observation_id: Given<String>,
+    #[serde(default, deserialize_with = "present")]
+    image_x: Given<u32>,
+    #[serde(default, deserialize_with = "present")]
+    image_y: Given<u32>,
+    #[serde(default, deserialize_with = "not_null")]
+    button: Option<MouseButton>,
+    #[serde(default, deserialize_with = "not_null")]
+    click_count: Option<u8>,
+    #[serde(default, deserialize_with = "not_null")]
+    modifiers: Option<Vec<Key>>,
+    #[serde(default, deserialize_with = "not_null")]
+    delta_x: Option<i32>,
+    #[serde(default, deserialize_with = "not_null")]
+    delta_y: Option<i32>,
+    #[serde(default, deserialize_with = "not_null")]
+    text: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    timeout_ms: Given<u32>,
+    #[serde(default, deserialize_with = "not_null")]
+    keys: Option<Vec<Key>>,
+    #[serde(default, deserialize_with = "not_null")]
+    wait_ms: Option<u32>,
+}
+
+/// A nullable step field: omitted, an explicit `null`, or a value.
+#[derive(Default)]
+enum Given<T> {
+    #[default]
+    Omitted,
+    Null,
+    Value(T),
+}
+
+impl<T> Given<T> {
+    const fn is_given(&self) -> bool {
+        !matches!(self, Self::Omitted)
+    }
+
+    fn value(self) -> Option<T> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Omitted | Self::Null => None,
+        }
+    }
+}
+
+/// A nullable field that was given; with `#[serde(default)]`, an omitted one is [`Given::Omitted`].
+fn present<'de, D, T>(deserializer: D) -> Result<Given<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(|value| value.map_or(Given::Null, Given::Value))
+}
+
+/// A field that may be omitted (with `#[serde(default)]`) but not `null`.
+fn not_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StepAction {
+    Click,
+    Scroll,
+    TypeText,
+    PressKeys,
+    Wait,
+}
+
+impl StepFields {
+    /// The fields `action` takes.
+    const fn allowed(action: StepAction) -> &'static [&'static str] {
+        match action {
+            StepAction::Click => &[
+                "display_id",
+                "x",
+                "y",
+                "observation_id",
+                "image_x",
+                "image_y",
+                "button",
+                "click_count",
+                "modifiers",
+            ],
+            StepAction::Scroll => &[
+                "display_id",
+                "x",
+                "y",
+                "observation_id",
+                "image_x",
+                "image_y",
+                "delta_x",
+                "delta_y",
+            ],
+            StepAction::TypeText => &["text", "timeout_ms"],
+            StepAction::PressKeys => &["keys"],
+            StepAction::Wait => &["wait_ms"],
+        }
+    }
+
+    /// The step, or serde's own unknown-field or missing-field error, so the argument error
+    /// names `steps[i].<field>`.
+    fn into_step<E: serde::de::Error>(self) -> Result<ActionStepInput, E> {
+        let allowed = Self::allowed(self.action);
+        let given = [
+            ("display_id", self.display_id.is_given()),
+            ("x", self.x.is_given()),
+            ("y", self.y.is_given()),
+            ("observation_id", self.observation_id.is_given()),
+            ("image_x", self.image_x.is_given()),
+            ("image_y", self.image_y.is_given()),
+            ("button", self.button.is_some()),
+            ("click_count", self.click_count.is_some()),
+            ("modifiers", self.modifiers.is_some()),
+            ("delta_x", self.delta_x.is_some()),
+            ("delta_y", self.delta_y.is_some()),
+            ("text", self.text.is_some()),
+            ("timeout_ms", self.timeout_ms.is_given()),
+            ("keys", self.keys.is_some()),
+            ("wait_ms", self.wait_ms.is_some()),
+        ];
+        if let Some((name, _)) = given
+            .iter()
+            .find(|(name, present)| *present && !allowed.contains(name))
+        {
+            return Err(E::unknown_field(name, allowed));
+        }
+        Ok(match self.action {
+            StepAction::Click => ActionStepInput::Click {
+                display_id: self.display_id.value(),
+                x: self.x.value(),
+                y: self.y.value(),
+                observation_id: self.observation_id.value(),
+                image_x: self.image_x.value(),
+                image_y: self.image_y.value(),
+                button: self.button.unwrap_or_else(default_left_button),
+                click_count: self.click_count.unwrap_or_else(default_click_count),
+                modifiers: self.modifiers.unwrap_or_default(),
+            },
+            StepAction::Scroll => ActionStepInput::Scroll {
+                display_id: self.display_id.value(),
+                x: self.x.value(),
+                y: self.y.value(),
+                observation_id: self.observation_id.value(),
+                image_x: self.image_x.value(),
+                image_y: self.image_y.value(),
+                delta_x: self.delta_x.unwrap_or_default(),
+                delta_y: self.delta_y.unwrap_or_default(),
+            },
+            StepAction::TypeText => ActionStepInput::TypeText {
+                text: self.text.ok_or_else(|| E::missing_field("text"))?,
+                timeout_ms: self.timeout_ms.value(),
+            },
+            StepAction::PressKeys => ActionStepInput::PressKeys {
+                keys: self.keys.ok_or_else(|| E::missing_field("keys"))?,
+            },
+            StepAction::Wait => ActionStepInput::Wait {
+                wait_ms: self.wait_ms.ok_or_else(|| E::missing_field("wait_ms"))?,
+            },
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ActionStepInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        StepFields::deserialize(deserializer)?.into_step()
+    }
 }
 
 /// A batch step checked before any step runs. Image points are resolved later, on the worker,

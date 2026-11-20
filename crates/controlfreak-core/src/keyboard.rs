@@ -288,8 +288,9 @@ impl<'de> Deserialize<'de> for Key {
                 },
                 |name| format!("did you mean '{name}'?"),
             );
+            // The name is not repeated: the error must not echo what the client sent.
             de::Error::custom(format!(
-                "unknown key '{value}'; key names are case-insensitive; {hint}"
+                "unknown key; key names are case-insensitive; {hint}"
             ))
         })
     }

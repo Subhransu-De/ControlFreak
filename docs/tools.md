@@ -117,7 +117,7 @@ Without `language`, OCR uses the first language in the Windows language list tha
 
 | Tool | Matching | Gives input approval |
 | --- | --- | --- |
-| `click_text` | `exact` (default) or substring with `exact_match=false` | Yes, only for one unique match |
+| `click_text` | `match_mode`: `exact` (default) or `substring` | Yes, only for one unique match |
 | `find_text_on_screen` | `match_mode`: `substring` (default), `exact`, `tolerant` | No |
 | `wait_for_text` | Same as `find_text_on_screen`, until `appears` or `disappears` | No |
 
@@ -125,11 +125,13 @@ Without `language`, OCR uses the first language in the Windows language list tha
 
 - Matching works on the words inside each OCR line, so a label in the middle of a line can be
   clicked. `exact` needs the query's words to equal consecutive whole words of a line
-  (`Edit` matches in `File Edit View`, `Edi` does not). `exact_match=false` needs the query to
+  (`Edit` matches in `File Edit View`, `Edi` does not). `substring` needs the query to
   occur in the line's words and selects every word it touches. The click lands on the centre of
   the box that covers the matched words, not on the centre of the line. A line without word
   boxes is matched as a whole line.
 - `find_text_on_screen` returns the same matched-word box for each match, in display-local pixels.
+- `match_mode` `tolerant` is refused with `invalid_argument`, because a click needs a strict match. Use `find_text_on_screen` with `tolerant` to pick the query.
+- `exact_match` is the older name: `true` is `exact` and `false` is `substring`. It can repeat `match_mode`, but a value that contradicts it is refused with `invalid_argument`.
 - Zero matches return `ocr_no_match`. More than one returns `ocr_ambiguous_match`, including two
   matches inside one line. Neither sends input or falls back to coordinates.
 - `error.details` lists up to 20 candidates of up to 256 characters each, with `candidate_count`
@@ -257,6 +259,23 @@ The reason for `platform_operation_failed` is set by the code that detects the f
 - Accepted input does not prove the application did what was asked. Check the screenshot.
 - After partial or unknown delivery, observe before you act again. Do not replay the whole
   action.
+
+## Argument errors
+
+A request that does not fit the tool's input schema fails with `error.code` `invalid_arguments`: a missing or unknown field, a wrong JSON type, a name that is not in an enum, or a number outside its integer type. A request that parses but breaks a rule, such as a published range or a combination of fields, fails with `invalid_argument`. Both are found before any desktop work, so an input tool reports `status: "not_started"` and takes no session. No argument error repeats a value you sent, so typed text never appears in an error.
+
+`invalid_arguments` explains the field in `error.details`:
+
+| Field | Meaning |
+| --- | --- |
+| `path` | The field, such as `text`, `observation.region.x`, `keys[1]` or `steps[2].text`. |
+| `problem` | `missing_field`, `unknown_field`, `invalid_type`, `invalid_value`, `unknown_variant` or `invalid_length`. |
+| `expected` | What the field takes, when known: `string`, `boolean`, `array`, `object`, a range such as `integer from 0 to 255`, or a list such as `one of: left, right, middle`. |
+| `received_kind` | The JSON kind that was sent: `string`, `number`, `boolean`, `null`, `array` or `object`, or `missing`. |
+| `valid_fields` | `unknown_field` only: the fields that object takes, at most 32. |
+| `reason` | The same explanation as one sentence, also used in `error.message`. |
+
+For example, `type_text` with `{"text": 5}` gives `path: "text"`, `problem: "invalid_type"`, `expected: "string"` and `received_kind: "number"`. An unknown key name in `press_keys` keeps its hint (`did you mean 'ctrl'?`, or the valid names) in `reason`.
 
 ## Session errors
 

@@ -459,10 +459,12 @@ pub(super) async fn call_wait_for_text(
 
 pub(super) fn prepare_click_text(arguments: Option<JsonObject>) -> PreparedInput {
     let input = parse_input::<ClickTextInput>(arguments)?;
+    let exact_match = input.exact_match().map_err(|error| refuse(&error))?;
     let action = json!({
         "kind": "click_text",
         "query": input.query,
-        "exact_match": input.exact_match,
+        "match_mode": if exact_match { "exact" } else { "substring" },
+        "exact_match": exact_match,
         "button": input.button,
         "click_count": input.click_count,
         "modifiers": input.modifiers,
@@ -471,7 +473,7 @@ pub(super) fn prepare_click_text(arguments: Option<JsonObject>) -> PreparedInput
         region: input.region(),
         query: input.query,
         case_sensitive: input.case_sensitive,
-        exact_match: input.exact_match,
+        exact_match,
         button: input.button,
         click_count: input.click_count,
         modifiers: input.modifiers,

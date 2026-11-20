@@ -1,0 +1,1340 @@
+get_server_status output anyOf[0].backend required
+get_server_status output anyOf[0].backend.backend_id required
+get_server_status output anyOf[0].backend.display_server required
+get_server_status output anyOf[0].backend.platform required
+get_server_status output anyOf[0].dpi_awareness required
+get_server_status output anyOf[0].dpi_awareness.oneOf[0].awareness required
+get_server_status output anyOf[0].dpi_awareness.oneOf[0].reason required
+get_server_status output anyOf[0].elevated_operation_allowed required
+get_server_status output anyOf[0].input_admission required
+get_server_status output anyOf[0].instance_id required
+get_server_status output anyOf[0].operations_completed required
+get_server_status output anyOf[0].operations_failed required
+get_server_status output anyOf[0].operations_started required
+get_server_status output anyOf[0].process_id required
+get_server_status output anyOf[0].recent_operations required
+get_server_status output anyOf[0].recent_operations[].elapsed_ms required
+get_server_status output anyOf[0].recent_operations[].gap_ms required
+get_server_status output anyOf[0].recent_operations[].operation_id required
+get_server_status output anyOf[0].recent_operations[].stages_ms required
+get_server_status output anyOf[0].recent_operations[].status required
+get_server_status output anyOf[0].recent_operations[].tool required
+get_server_status output anyOf[0].recovery required
+get_server_status output anyOf[0].safety_indicator required
+get_server_status output anyOf[0].safety_indicator.reason required
+get_server_status output anyOf[0].safety_indicator.status required
+get_server_status output anyOf[0].server_elevated required
+get_server_status output anyOf[0].session required
+get_server_status output anyOf[0].status required
+get_server_status output anyOf[0].stop_reason
+get_server_status output anyOf[0].stop_state required
+get_server_status output anyOf[0].uptime_ms required
+get_server_status output anyOf[0].version required
+get_server_status output anyOf[0].windows_integrity_level required
+get_server_status output anyOf[1].error required
+get_server_status output anyOf[1].error.code required
+get_server_status output anyOf[1].error.details
+get_server_status output anyOf[1].error.message required
+get_server_status output anyOf[1].error.reason
+get_server_status output anyOf[1].error.retryable
+get_server_status output $defs.recovery.action required
+get_server_status output $defs.recovery.actor required
+get_server_status output $defs.recovery.message required
+get_server_status output $defs.session.active_mutations
+get_server_status output $defs.session.approved_target_ref
+get_server_status output $defs.session.call_count
+get_server_status output $defs.session.containment
+get_server_status output $defs.session.containment_reason
+get_server_status output $defs.session.draining required
+get_server_status output $defs.session.hold_ms
+get_server_status output $defs.session.last_cleanup_reason
+get_server_status output $defs.session.owns_arbitration
+get_server_status output $defs.session.restart_count
+get_server_status output $defs.session.state required
+get_server_status output $defs.session.stop_state
+get_server_status output $defs.session.time_until_close_ms
+begin_control_session input expected_seconds
+begin_control_session input target_ref required
+begin_control_session output anyOf[0].session required
+begin_control_session output anyOf[0].status required
+begin_control_session output anyOf[1].error required
+begin_control_session output anyOf[1].error.code required
+begin_control_session output anyOf[1].error.details
+begin_control_session output anyOf[1].error.message required
+begin_control_session output anyOf[1].error.reason
+begin_control_session output anyOf[1].error.retryable
+begin_control_session output $defs.session.active_mutations
+begin_control_session output $defs.session.approved_target_ref
+begin_control_session output $defs.session.call_count
+begin_control_session output $defs.session.containment
+begin_control_session output $defs.session.containment_reason
+begin_control_session output $defs.session.draining required
+begin_control_session output $defs.session.hold_ms
+begin_control_session output $defs.session.last_cleanup_reason
+begin_control_session output $defs.session.owns_arbitration
+begin_control_session output $defs.session.restart_count
+begin_control_session output $defs.session.state required
+begin_control_session output $defs.session.stop_state
+begin_control_session output $defs.session.time_until_close_ms
+end_control_session output anyOf[0].recovery required
+end_control_session output anyOf[0].session required
+end_control_session output anyOf[0].status required
+end_control_session output anyOf[1].error required
+end_control_session output anyOf[1].error.code required
+end_control_session output anyOf[1].error.details
+end_control_session output anyOf[1].error.message required
+end_control_session output anyOf[1].error.reason
+end_control_session output anyOf[1].error.retryable
+end_control_session output $defs.recovery.action required
+end_control_session output $defs.recovery.actor required
+end_control_session output $defs.recovery.message required
+end_control_session output $defs.session.active_mutations
+end_control_session output $defs.session.approved_target_ref
+end_control_session output $defs.session.call_count
+end_control_session output $defs.session.containment
+end_control_session output $defs.session.containment_reason
+end_control_session output $defs.session.draining required
+end_control_session output $defs.session.hold_ms
+end_control_session output $defs.session.last_cleanup_reason
+end_control_session output $defs.session.owns_arbitration
+end_control_session output $defs.session.restart_count
+end_control_session output $defs.session.state required
+end_control_session output $defs.session.stop_state
+end_control_session output $defs.session.time_until_close_ms
+list_displays output anyOf[0].count required
+list_displays output anyOf[0].displays required
+list_displays output anyOf[1].error required
+list_displays output anyOf[1].error.code required
+list_displays output anyOf[1].error.details
+list_displays output anyOf[1].error.message required
+list_displays output anyOf[1].error.reason
+list_displays output anyOf[1].error.retryable
+list_displays output $defs.bounds.height required
+list_displays output $defs.bounds.left required
+list_displays output $defs.bounds.top required
+list_displays output $defs.bounds.width required
+list_displays output $defs.display.bounds required
+list_displays output $defs.display.id required
+list_displays output $defs.display.is_primary required
+list_displays output $defs.display.name required
+capture_display input display_id
+capture_display input include_cursor default=true
+capture_display input max_width default=1280
+capture_display input native default=false
+capture_display output anyOf[1].error required
+capture_display output anyOf[1].error.code required
+capture_display output anyOf[1].error.details
+capture_display output anyOf[1].error.message required
+capture_display output anyOf[1].error.reason
+capture_display output anyOf[1].error.retryable
+capture_display output $defs.bounds.height required
+capture_display output $defs.bounds.left required
+capture_display output $defs.bounds.top required
+capture_display output $defs.bounds.width required
+capture_display output $defs.display.bounds required
+capture_display output $defs.display.id required
+capture_display output $defs.display.is_primary required
+capture_display output $defs.display.name required
+capture_display output $defs.screenshot.byte_length required
+capture_display output $defs.screenshot.capture_method required
+capture_display output $defs.screenshot.cursor_marker required
+capture_display output $defs.screenshot.display required
+capture_display output $defs.screenshot.image_height required
+capture_display output $defs.screenshot.image_width required
+capture_display output $defs.screenshot.mime_type required
+capture_display output $defs.screenshot.observation_id
+capture_display output $defs.screenshot.source_bounds required
+capture_display output $defs.screenshot.target_ref
+capture_region input display_id
+capture_region input height required
+capture_region input include_cursor default=true
+capture_region input max_width default=1280
+capture_region input native default=false
+capture_region input width required
+capture_region input x required
+capture_region input y required
+capture_region output anyOf[1].error required
+capture_region output anyOf[1].error.code required
+capture_region output anyOf[1].error.details
+capture_region output anyOf[1].error.message required
+capture_region output anyOf[1].error.reason
+capture_region output anyOf[1].error.retryable
+capture_region output $defs.bounds.height required
+capture_region output $defs.bounds.left required
+capture_region output $defs.bounds.top required
+capture_region output $defs.bounds.width required
+capture_region output $defs.display.bounds required
+capture_region output $defs.display.id required
+capture_region output $defs.display.is_primary required
+capture_region output $defs.display.name required
+capture_region output $defs.screenshot.byte_length required
+capture_region output $defs.screenshot.capture_method required
+capture_region output $defs.screenshot.cursor_marker required
+capture_region output $defs.screenshot.display required
+capture_region output $defs.screenshot.image_height required
+capture_region output $defs.screenshot.image_width required
+capture_region output $defs.screenshot.mime_type required
+capture_region output $defs.screenshot.observation_id
+capture_region output $defs.screenshot.source_bounds required
+capture_region output $defs.screenshot.target_ref
+wait_for_visual_change input difference_threshold default=0.01
+wait_for_visual_change input display_id
+wait_for_visual_change input height required
+wait_for_visual_change input stable_ms default=250
+wait_for_visual_change input timeout_ms default=5000
+wait_for_visual_change input width required
+wait_for_visual_change input x required
+wait_for_visual_change input y required
+wait_for_visual_change output anyOf[0].changed required
+wait_for_visual_change output anyOf[0].difference required
+wait_for_visual_change output anyOf[0].elapsed_ms required
+wait_for_visual_change output anyOf[0].screenshot required
+wait_for_visual_change output anyOf[0].timed_out required
+wait_for_visual_change output anyOf[1].error required
+wait_for_visual_change output anyOf[1].error.code required
+wait_for_visual_change output anyOf[1].error.details
+wait_for_visual_change output anyOf[1].error.message required
+wait_for_visual_change output anyOf[1].error.reason
+wait_for_visual_change output anyOf[1].error.retryable
+wait_for_visual_change output $defs.bounds.height required
+wait_for_visual_change output $defs.bounds.left required
+wait_for_visual_change output $defs.bounds.top required
+wait_for_visual_change output $defs.bounds.width required
+wait_for_visual_change output $defs.display.bounds required
+wait_for_visual_change output $defs.display.id required
+wait_for_visual_change output $defs.display.is_primary required
+wait_for_visual_change output $defs.display.name required
+wait_for_visual_change output $defs.screenshot.byte_length required
+wait_for_visual_change output $defs.screenshot.capture_method required
+wait_for_visual_change output $defs.screenshot.cursor_marker required
+wait_for_visual_change output $defs.screenshot.display required
+wait_for_visual_change output $defs.screenshot.image_height required
+wait_for_visual_change output $defs.screenshot.image_width required
+wait_for_visual_change output $defs.screenshot.mime_type required
+wait_for_visual_change output $defs.screenshot.observation_id
+wait_for_visual_change output $defs.screenshot.source_bounds required
+wait_for_visual_change output $defs.screenshot.target_ref
+capture_visual_baseline input display_id
+capture_visual_baseline input height required
+capture_visual_baseline input width required
+capture_visual_baseline input x required
+capture_visual_baseline input y required
+capture_visual_baseline output anyOf[0].baseline_id required
+capture_visual_baseline output anyOf[0].display required
+capture_visual_baseline output anyOf[0].expires_in_ms required
+capture_visual_baseline output anyOf[0].fingerprint required
+capture_visual_baseline output anyOf[0].source_bounds required
+capture_visual_baseline output anyOf[1].error required
+capture_visual_baseline output anyOf[1].error.code required
+capture_visual_baseline output anyOf[1].error.details
+capture_visual_baseline output anyOf[1].error.message required
+capture_visual_baseline output anyOf[1].error.reason
+capture_visual_baseline output anyOf[1].error.retryable
+capture_visual_baseline output $defs.bounds.height required
+capture_visual_baseline output $defs.bounds.left required
+capture_visual_baseline output $defs.bounds.top required
+capture_visual_baseline output $defs.bounds.width required
+capture_visual_baseline output $defs.display.bounds required
+capture_visual_baseline output $defs.display.id required
+capture_visual_baseline output $defs.display.is_primary required
+capture_visual_baseline output $defs.display.name required
+wait_for_change_since input baseline_id required
+wait_for_change_since input difference_threshold default=0.01
+wait_for_change_since input stable_ms default=250
+wait_for_change_since input timeout_ms default=5000
+wait_for_change_since output anyOf[0].changed required
+wait_for_change_since output anyOf[0].difference required
+wait_for_change_since output anyOf[0].elapsed_ms required
+wait_for_change_since output anyOf[0].screenshot required
+wait_for_change_since output anyOf[0].timed_out required
+wait_for_change_since output anyOf[1].error required
+wait_for_change_since output anyOf[1].error.code required
+wait_for_change_since output anyOf[1].error.details
+wait_for_change_since output anyOf[1].error.message required
+wait_for_change_since output anyOf[1].error.reason
+wait_for_change_since output anyOf[1].error.retryable
+wait_for_change_since output $defs.bounds.height required
+wait_for_change_since output $defs.bounds.left required
+wait_for_change_since output $defs.bounds.top required
+wait_for_change_since output $defs.bounds.width required
+wait_for_change_since output $defs.display.bounds required
+wait_for_change_since output $defs.display.id required
+wait_for_change_since output $defs.display.is_primary required
+wait_for_change_since output $defs.display.name required
+wait_for_change_since output $defs.screenshot.byte_length required
+wait_for_change_since output $defs.screenshot.capture_method required
+wait_for_change_since output $defs.screenshot.cursor_marker required
+wait_for_change_since output $defs.screenshot.display required
+wait_for_change_since output $defs.screenshot.image_height required
+wait_for_change_since output $defs.screenshot.image_width required
+wait_for_change_since output $defs.screenshot.mime_type required
+wait_for_change_since output $defs.screenshot.observation_id
+wait_for_change_since output $defs.screenshot.source_bounds required
+wait_for_change_since output $defs.screenshot.target_ref
+read_text_in_region input display_id
+read_text_in_region input height required
+read_text_in_region input language
+read_text_in_region input width required
+read_text_in_region input x required
+read_text_in_region input y required
+read_text_in_region output anyOf[0].display required
+read_text_in_region output anyOf[0].language required
+read_text_in_region output anyOf[0].lines required
+read_text_in_region output anyOf[0].lines[].height required
+read_text_in_region output anyOf[0].lines[].text required
+read_text_in_region output anyOf[0].lines[].width required
+read_text_in_region output anyOf[0].lines[].words required
+read_text_in_region output anyOf[0].lines[].words[].height required
+read_text_in_region output anyOf[0].lines[].words[].text required
+read_text_in_region output anyOf[0].lines[].words[].width required
+read_text_in_region output anyOf[0].lines[].words[].x required
+read_text_in_region output anyOf[0].lines[].words[].y required
+read_text_in_region output anyOf[0].lines[].x required
+read_text_in_region output anyOf[0].lines[].y required
+read_text_in_region output anyOf[0].source_bounds required
+read_text_in_region output anyOf[0].target_ref
+read_text_in_region output anyOf[0].text required
+read_text_in_region output anyOf[1].error required
+read_text_in_region output anyOf[1].error.code required
+read_text_in_region output anyOf[1].error.details
+read_text_in_region output anyOf[1].error.message required
+read_text_in_region output anyOf[1].error.reason
+read_text_in_region output anyOf[1].error.retryable
+read_text_in_region output $defs.bounds.height required
+read_text_in_region output $defs.bounds.left required
+read_text_in_region output $defs.bounds.top required
+read_text_in_region output $defs.bounds.width required
+read_text_in_region output $defs.display.bounds required
+read_text_in_region output $defs.display.id required
+read_text_in_region output $defs.display.is_primary required
+read_text_in_region output $defs.display.name required
+find_text_on_screen input case_sensitive default=false
+find_text_on_screen input display_id
+find_text_on_screen input height required
+find_text_on_screen input language
+find_text_on_screen input match_mode default="substring"
+find_text_on_screen input max_results default=20
+find_text_on_screen input ocr_confusions default=false
+find_text_on_screen input query required
+find_text_on_screen input width required
+find_text_on_screen input x required
+find_text_on_screen input y required
+find_text_on_screen output anyOf[0].candidate_count required
+find_text_on_screen output anyOf[0].candidates_truncated required
+find_text_on_screen output anyOf[0].count required
+find_text_on_screen output anyOf[0].display required
+find_text_on_screen output anyOf[0].language required
+find_text_on_screen output anyOf[0].match_tier required
+find_text_on_screen output anyOf[0].matches required
+find_text_on_screen output anyOf[0].matches[].height required
+find_text_on_screen output anyOf[0].matches[].text required
+find_text_on_screen output anyOf[0].matches[].width required
+find_text_on_screen output anyOf[0].matches[].x required
+find_text_on_screen output anyOf[0].matches[].y required
+find_text_on_screen output anyOf[0].query required
+find_text_on_screen output anyOf[0].recovery required
+find_text_on_screen output anyOf[0].source_bounds required
+find_text_on_screen output anyOf[0].target_ref required
+find_text_on_screen output anyOf[0].text_truncated required
+find_text_on_screen output anyOf[1].error required
+find_text_on_screen output anyOf[1].error.code required
+find_text_on_screen output anyOf[1].error.details
+find_text_on_screen output anyOf[1].error.message required
+find_text_on_screen output anyOf[1].error.reason
+find_text_on_screen output anyOf[1].error.retryable
+find_text_on_screen output $defs.bounds.height required
+find_text_on_screen output $defs.bounds.left required
+find_text_on_screen output $defs.bounds.top required
+find_text_on_screen output $defs.bounds.width required
+find_text_on_screen output $defs.display.bounds required
+find_text_on_screen output $defs.display.id required
+find_text_on_screen output $defs.display.is_primary required
+find_text_on_screen output $defs.display.name required
+wait_for_text input case_sensitive default=false
+wait_for_text input condition default="appears"
+wait_for_text input display_id
+wait_for_text input height required
+wait_for_text input language
+wait_for_text input match_mode default="substring"
+wait_for_text input max_results default=20
+wait_for_text input ocr_confusions default=false
+wait_for_text input query required
+wait_for_text input timeout_ms default=5000
+wait_for_text input width required
+wait_for_text input x required
+wait_for_text input y required
+wait_for_text output anyOf[0].attempts required
+wait_for_text output anyOf[0].candidate_count required
+wait_for_text output anyOf[0].candidates_truncated required
+wait_for_text output anyOf[0].condition required
+wait_for_text output anyOf[0].count required
+wait_for_text output anyOf[0].display required
+wait_for_text output anyOf[0].elapsed_ms required
+wait_for_text output anyOf[0].language required
+wait_for_text output anyOf[0].match_tier required
+wait_for_text output anyOf[0].matches required
+wait_for_text output anyOf[0].matches[].height required
+wait_for_text output anyOf[0].matches[].text required
+wait_for_text output anyOf[0].matches[].width required
+wait_for_text output anyOf[0].matches[].x required
+wait_for_text output anyOf[0].matches[].y required
+wait_for_text output anyOf[0].query required
+wait_for_text output anyOf[0].satisfied required
+wait_for_text output anyOf[0].source_bounds required
+wait_for_text output anyOf[0].target_ref required
+wait_for_text output anyOf[0].text_truncated required
+wait_for_text output anyOf[0].timed_out required
+wait_for_text output anyOf[1].error required
+wait_for_text output anyOf[1].error.code required
+wait_for_text output anyOf[1].error.details
+wait_for_text output anyOf[1].error.message required
+wait_for_text output anyOf[1].error.reason
+wait_for_text output anyOf[1].error.retryable
+wait_for_text output $defs.bounds.height required
+wait_for_text output $defs.bounds.left required
+wait_for_text output $defs.bounds.top required
+wait_for_text output $defs.bounds.width required
+wait_for_text output $defs.display.bounds required
+wait_for_text output $defs.display.id required
+wait_for_text output $defs.display.is_primary required
+wait_for_text output $defs.display.name required
+click_text input button default="left"
+click_text input case_sensitive default=false
+click_text input click_count default=1
+click_text input display_id
+click_text input duration_ms default=0
+click_text input exact_match
+click_text input height required
+click_text input language
+click_text input match_mode default="exact"
+click_text input modifiers default=[]
+click_text input observation
+click_text input observation.include_cursor default=true
+click_text input observation.max_width
+click_text input observation.mode default="screenshot"
+click_text input observation.region
+click_text input observation.region.display_id
+click_text input observation.region.height required
+click_text input observation.region.width required
+click_text input observation.region.x required
+click_text input observation.region.y required
+click_text input observation.settle_ms
+click_text input query required
+click_text input target_ref required
+click_text input width required
+click_text input x required
+click_text input y required
+click_text output anyOf[0].action required
+click_text output anyOf[0].input required
+click_text output anyOf[0].input.input_outcome
+click_text output anyOf[0].observation required
+click_text output anyOf[0].observation.foreground_window required
+click_text output anyOf[0].observation.screenshot required
+click_text output anyOf[0].observation.settle
+click_text output anyOf[0].observation.settle.elapsed_ms
+click_text output anyOf[0].observation.settle.outcome
+click_text output anyOf[0].observation_status required
+click_text output anyOf[0].position required
+click_text output anyOf[0].position.display_id required
+click_text output anyOf[0].position.local_x required
+click_text output anyOf[0].position.local_y required
+click_text output anyOf[0].position.virtual_x required
+click_text output anyOf[0].position.virtual_y required
+click_text output anyOf[0].status required
+click_text output anyOf[1].details
+click_text output anyOf[1].error
+click_text output anyOf[1].error.code required
+click_text output anyOf[1].error.details
+click_text output anyOf[1].error.message required
+click_text output anyOf[1].error.reason
+click_text output anyOf[1].error.retryable
+click_text output anyOf[1].input required
+click_text output anyOf[1].observation_status required
+click_text output anyOf[1].operation
+click_text output anyOf[1].retry_action required
+click_text output anyOf[1].status required
+click_text output anyOf[1].warning
+click_text output $defs.bounds.height required
+click_text output $defs.bounds.left required
+click_text output $defs.bounds.top required
+click_text output $defs.bounds.width required
+click_text output $defs.display.bounds required
+click_text output $defs.display.id required
+click_text output $defs.display.is_primary required
+click_text output $defs.display.name required
+click_text output $defs.input.activation_attempts
+click_text output $defs.input.activation_elapsed_ms
+click_text output $defs.input.activation_helper
+click_text output $defs.input.cleanup required
+click_text output $defs.input.input_outcome required
+click_text output $defs.input.sent_events required
+click_text output $defs.input.split_character
+click_text output $defs.input.target_remained_foreground
+click_text output $defs.screenshot.byte_length required
+click_text output $defs.screenshot.capture_method required
+click_text output $defs.screenshot.cursor_marker required
+click_text output $defs.screenshot.display required
+click_text output $defs.screenshot.image_height required
+click_text output $defs.screenshot.image_width required
+click_text output $defs.screenshot.mime_type required
+click_text output $defs.screenshot.observation_id
+click_text output $defs.screenshot.source_bounds required
+click_text output $defs.screenshot.target_ref
+click_text output $defs.window.bounds required
+click_text output $defs.window.class_name required
+click_text output $defs.window.display_id required
+click_text output $defs.window.id required
+click_text output $defs.window.is_foreground required
+click_text output $defs.window.is_minimized required
+click_text output $defs.window.owner
+click_text output $defs.window.process_id required
+click_text output $defs.window.title required
+list_virtual_desktops output anyOf[0].count required
+list_virtual_desktops output anyOf[0].desktops required
+list_virtual_desktops output anyOf[0].desktops[].application_count required
+list_virtual_desktops output anyOf[0].desktops[].id required
+list_virtual_desktops output anyOf[0].desktops[].is_current required
+list_virtual_desktops output anyOf[0].desktops[].windows required
+list_virtual_desktops output anyOf[0].includes_empty_desktops required
+list_virtual_desktops output anyOf[0].names_available required
+list_virtual_desktops output anyOf[0].order_available required
+list_virtual_desktops output anyOf[1].error required
+list_virtual_desktops output anyOf[1].error.code required
+list_virtual_desktops output anyOf[1].error.details
+list_virtual_desktops output anyOf[1].error.message required
+list_virtual_desktops output anyOf[1].error.reason
+list_virtual_desktops output anyOf[1].error.retryable
+list_virtual_desktops output $defs.bounds.height required
+list_virtual_desktops output $defs.bounds.left required
+list_virtual_desktops output $defs.bounds.top required
+list_virtual_desktops output $defs.bounds.width required
+list_virtual_desktops output $defs.window.bounds required
+list_virtual_desktops output $defs.window.class_name required
+list_virtual_desktops output $defs.window.display_id required
+list_virtual_desktops output $defs.window.id required
+list_virtual_desktops output $defs.window.is_foreground required
+list_virtual_desktops output $defs.window.is_minimized required
+list_virtual_desktops output $defs.window.owner
+list_virtual_desktops output $defs.window.process_id required
+list_virtual_desktops output $defs.window.title required
+switch_virtual_desktop input direction required
+switch_virtual_desktop input observation
+switch_virtual_desktop input observation.include_cursor default=true
+switch_virtual_desktop input observation.max_width
+switch_virtual_desktop input observation.mode default="screenshot"
+switch_virtual_desktop input observation.region
+switch_virtual_desktop input observation.region.display_id
+switch_virtual_desktop input observation.region.height required
+switch_virtual_desktop input observation.region.width required
+switch_virtual_desktop input observation.region.x required
+switch_virtual_desktop input observation.region.y required
+switch_virtual_desktop input steps default=1
+switch_virtual_desktop input target_ref
+switch_virtual_desktop output anyOf[0].action required
+switch_virtual_desktop output anyOf[0].action.after_id required
+switch_virtual_desktop output anyOf[0].action.before_id required
+switch_virtual_desktop output anyOf[0].action.changed required
+switch_virtual_desktop output anyOf[0].action.transition required
+switch_virtual_desktop output anyOf[0].input required
+switch_virtual_desktop output anyOf[0].input.input_outcome
+switch_virtual_desktop output anyOf[0].observation required
+switch_virtual_desktop output anyOf[0].observation.foreground_window required
+switch_virtual_desktop output anyOf[0].observation.screenshot required
+switch_virtual_desktop output anyOf[0].observation.settle
+switch_virtual_desktop output anyOf[0].observation.settle.elapsed_ms
+switch_virtual_desktop output anyOf[0].observation.settle.outcome
+switch_virtual_desktop output anyOf[0].observation_status required
+switch_virtual_desktop output anyOf[0].status required
+switch_virtual_desktop output anyOf[1].details
+switch_virtual_desktop output anyOf[1].error
+switch_virtual_desktop output anyOf[1].error.code required
+switch_virtual_desktop output anyOf[1].error.details
+switch_virtual_desktop output anyOf[1].error.message required
+switch_virtual_desktop output anyOf[1].error.reason
+switch_virtual_desktop output anyOf[1].error.retryable
+switch_virtual_desktop output anyOf[1].input required
+switch_virtual_desktop output anyOf[1].observation_status required
+switch_virtual_desktop output anyOf[1].operation
+switch_virtual_desktop output anyOf[1].retry_action required
+switch_virtual_desktop output anyOf[1].status required
+switch_virtual_desktop output anyOf[1].warning
+switch_virtual_desktop output $defs.bounds.height required
+switch_virtual_desktop output $defs.bounds.left required
+switch_virtual_desktop output $defs.bounds.top required
+switch_virtual_desktop output $defs.bounds.width required
+switch_virtual_desktop output $defs.display.bounds required
+switch_virtual_desktop output $defs.display.id required
+switch_virtual_desktop output $defs.display.is_primary required
+switch_virtual_desktop output $defs.display.name required
+switch_virtual_desktop output $defs.input.activation_attempts
+switch_virtual_desktop output $defs.input.activation_elapsed_ms
+switch_virtual_desktop output $defs.input.activation_helper
+switch_virtual_desktop output $defs.input.cleanup required
+switch_virtual_desktop output $defs.input.input_outcome required
+switch_virtual_desktop output $defs.input.sent_events required
+switch_virtual_desktop output $defs.input.split_character
+switch_virtual_desktop output $defs.input.target_remained_foreground
+switch_virtual_desktop output $defs.screenshot.byte_length required
+switch_virtual_desktop output $defs.screenshot.capture_method required
+switch_virtual_desktop output $defs.screenshot.cursor_marker required
+switch_virtual_desktop output $defs.screenshot.display required
+switch_virtual_desktop output $defs.screenshot.image_height required
+switch_virtual_desktop output $defs.screenshot.image_width required
+switch_virtual_desktop output $defs.screenshot.mime_type required
+switch_virtual_desktop output $defs.screenshot.observation_id
+switch_virtual_desktop output $defs.screenshot.source_bounds required
+switch_virtual_desktop output $defs.screenshot.target_ref
+switch_virtual_desktop output $defs.window.bounds required
+switch_virtual_desktop output $defs.window.class_name required
+switch_virtual_desktop output $defs.window.display_id required
+switch_virtual_desktop output $defs.window.id required
+switch_virtual_desktop output $defs.window.is_foreground required
+switch_virtual_desktop output $defs.window.is_minimized required
+switch_virtual_desktop output $defs.window.owner
+switch_virtual_desktop output $defs.window.process_id required
+switch_virtual_desktop output $defs.window.title required
+list_windows output anyOf[0].count required
+list_windows output anyOf[0].truncated required
+list_windows output anyOf[0].windows required
+list_windows output anyOf[1].error required
+list_windows output anyOf[1].error.code required
+list_windows output anyOf[1].error.details
+list_windows output anyOf[1].error.message required
+list_windows output anyOf[1].error.reason
+list_windows output anyOf[1].error.retryable
+list_windows output $defs.bounds.height required
+list_windows output $defs.bounds.left required
+list_windows output $defs.bounds.top required
+list_windows output $defs.bounds.width required
+list_windows output $defs.window.bounds required
+list_windows output $defs.window.class_name required
+list_windows output $defs.window.display_id required
+list_windows output $defs.window.id required
+list_windows output $defs.window.is_foreground required
+list_windows output $defs.window.is_minimized required
+list_windows output $defs.window.owner
+list_windows output $defs.window.process_id required
+list_windows output $defs.window.title required
+focus_window input observation
+focus_window input observation.include_cursor default=true
+focus_window input observation.max_width
+focus_window input observation.mode default="screenshot"
+focus_window input observation.region
+focus_window input observation.region.display_id
+focus_window input observation.region.height required
+focus_window input observation.region.width required
+focus_window input observation.region.x required
+focus_window input observation.region.y required
+focus_window input target_ref
+focus_window input timeout_ms default=1000
+focus_window input window_id
+focus_window output anyOf[0].action required
+focus_window output anyOf[0].input required
+focus_window output anyOf[0].input.input_outcome
+focus_window output anyOf[0].observation required
+focus_window output anyOf[0].observation.foreground_window required
+focus_window output anyOf[0].observation.screenshot required
+focus_window output anyOf[0].observation.settle
+focus_window output anyOf[0].observation.settle.elapsed_ms
+focus_window output anyOf[0].observation.settle.outcome
+focus_window output anyOf[0].observation_status required
+focus_window output anyOf[0].status required
+focus_window output anyOf[1].details
+focus_window output anyOf[1].error
+focus_window output anyOf[1].error.code required
+focus_window output anyOf[1].error.details
+focus_window output anyOf[1].error.message required
+focus_window output anyOf[1].error.reason
+focus_window output anyOf[1].error.retryable
+focus_window output anyOf[1].input required
+focus_window output anyOf[1].observation_status required
+focus_window output anyOf[1].operation
+focus_window output anyOf[1].retry_action required
+focus_window output anyOf[1].status required
+focus_window output anyOf[1].warning
+focus_window output $defs.bounds.height required
+focus_window output $defs.bounds.left required
+focus_window output $defs.bounds.top required
+focus_window output $defs.bounds.width required
+focus_window output $defs.display.bounds required
+focus_window output $defs.display.id required
+focus_window output $defs.display.is_primary required
+focus_window output $defs.display.name required
+focus_window output $defs.input.activation_attempts
+focus_window output $defs.input.activation_elapsed_ms
+focus_window output $defs.input.activation_helper
+focus_window output $defs.input.cleanup required
+focus_window output $defs.input.input_outcome required
+focus_window output $defs.input.sent_events required
+focus_window output $defs.input.split_character
+focus_window output $defs.input.target_remained_foreground
+focus_window output $defs.screenshot.byte_length required
+focus_window output $defs.screenshot.capture_method required
+focus_window output $defs.screenshot.cursor_marker required
+focus_window output $defs.screenshot.display required
+focus_window output $defs.screenshot.image_height required
+focus_window output $defs.screenshot.image_width required
+focus_window output $defs.screenshot.mime_type required
+focus_window output $defs.screenshot.observation_id
+focus_window output $defs.screenshot.source_bounds required
+focus_window output $defs.screenshot.target_ref
+focus_window output $defs.window.bounds required
+focus_window output $defs.window.class_name required
+focus_window output $defs.window.display_id required
+focus_window output $defs.window.id required
+focus_window output $defs.window.is_foreground required
+focus_window output $defs.window.is_minimized required
+focus_window output $defs.window.owner
+focus_window output $defs.window.process_id required
+focus_window output $defs.window.title required
+capture_window input include_cursor default=true
+capture_window input max_width default=1280
+capture_window input native default=false
+capture_window input target_ref
+capture_window input window_id
+capture_window output anyOf[1].error required
+capture_window output anyOf[1].error.code required
+capture_window output anyOf[1].error.details
+capture_window output anyOf[1].error.message required
+capture_window output anyOf[1].error.reason
+capture_window output anyOf[1].error.retryable
+capture_window output $defs.bounds.height required
+capture_window output $defs.bounds.left required
+capture_window output $defs.bounds.top required
+capture_window output $defs.bounds.width required
+capture_window output $defs.window.bounds required
+capture_window output $defs.window.class_name required
+capture_window output $defs.window.display_id required
+capture_window output $defs.window.id required
+capture_window output $defs.window.is_foreground required
+capture_window output $defs.window.is_minimized required
+capture_window output $defs.window.owner
+capture_window output $defs.window.process_id required
+capture_window output $defs.window.title required
+capture_window output $defs.window_screenshot.byte_length required
+capture_window output $defs.window_screenshot.capture_method required
+capture_window output $defs.window_screenshot.cursor_marker required
+capture_window output $defs.window_screenshot.image_height required
+capture_window output $defs.window_screenshot.image_width required
+capture_window output $defs.window_screenshot.mime_type required
+capture_window output $defs.window_screenshot.observation_id
+capture_window output $defs.window_screenshot.source_bounds required
+capture_window output $defs.window_screenshot.window required
+wait_for_window input class_name
+wait_for_window input is_foreground
+wait_for_window input process_id
+wait_for_window input target_ref
+wait_for_window input timeout_ms default=5000
+wait_for_window input title_contains
+wait_for_window input window_id
+wait_for_window output anyOf[0].elapsed_ms required
+wait_for_window output anyOf[0].matched required
+wait_for_window output anyOf[0].timed_out required
+wait_for_window output anyOf[0].window required
+wait_for_window output anyOf[1].error required
+wait_for_window output anyOf[1].error.code required
+wait_for_window output anyOf[1].error.details
+wait_for_window output anyOf[1].error.message required
+wait_for_window output anyOf[1].error.reason
+wait_for_window output anyOf[1].error.retryable
+wait_for_window output $defs.bounds.height required
+wait_for_window output $defs.bounds.left required
+wait_for_window output $defs.bounds.top required
+wait_for_window output $defs.bounds.width required
+wait_for_window output $defs.window.bounds required
+wait_for_window output $defs.window.class_name required
+wait_for_window output $defs.window.display_id required
+wait_for_window output $defs.window.id required
+wait_for_window output $defs.window.is_foreground required
+wait_for_window output $defs.window.is_minimized required
+wait_for_window output $defs.window.owner
+wait_for_window output $defs.window.process_id required
+wait_for_window output $defs.window.title required
+move_mouse input display_id
+move_mouse input duration_ms default=0
+move_mouse input image_x
+move_mouse input image_y
+move_mouse input observation
+move_mouse input observation.include_cursor default=true
+move_mouse input observation.max_width
+move_mouse input observation.mode default="screenshot"
+move_mouse input observation.region
+move_mouse input observation.region.display_id
+move_mouse input observation.region.height required
+move_mouse input observation.region.width required
+move_mouse input observation.region.x required
+move_mouse input observation.region.y required
+move_mouse input observation.settle_ms
+move_mouse input observation_id
+move_mouse input target_ref required
+move_mouse input x
+move_mouse input y
+move_mouse output anyOf[0].action required
+move_mouse output anyOf[0].input required
+move_mouse output anyOf[0].input.input_outcome
+move_mouse output anyOf[0].observation required
+move_mouse output anyOf[0].observation.foreground_window required
+move_mouse output anyOf[0].observation.screenshot required
+move_mouse output anyOf[0].observation.settle
+move_mouse output anyOf[0].observation.settle.elapsed_ms
+move_mouse output anyOf[0].observation.settle.outcome
+move_mouse output anyOf[0].observation_status required
+move_mouse output anyOf[0].position required
+move_mouse output anyOf[0].position.display_id required
+move_mouse output anyOf[0].position.local_x required
+move_mouse output anyOf[0].position.local_y required
+move_mouse output anyOf[0].position.virtual_x required
+move_mouse output anyOf[0].position.virtual_y required
+move_mouse output anyOf[0].status required
+move_mouse output anyOf[1].details
+move_mouse output anyOf[1].error
+move_mouse output anyOf[1].error.code required
+move_mouse output anyOf[1].error.details
+move_mouse output anyOf[1].error.message required
+move_mouse output anyOf[1].error.reason
+move_mouse output anyOf[1].error.retryable
+move_mouse output anyOf[1].input required
+move_mouse output anyOf[1].observation_status required
+move_mouse output anyOf[1].operation
+move_mouse output anyOf[1].retry_action required
+move_mouse output anyOf[1].status required
+move_mouse output anyOf[1].warning
+move_mouse output $defs.bounds.height required
+move_mouse output $defs.bounds.left required
+move_mouse output $defs.bounds.top required
+move_mouse output $defs.bounds.width required
+move_mouse output $defs.display.bounds required
+move_mouse output $defs.display.id required
+move_mouse output $defs.display.is_primary required
+move_mouse output $defs.display.name required
+move_mouse output $defs.input.activation_attempts
+move_mouse output $defs.input.activation_elapsed_ms
+move_mouse output $defs.input.activation_helper
+move_mouse output $defs.input.cleanup required
+move_mouse output $defs.input.input_outcome required
+move_mouse output $defs.input.sent_events required
+move_mouse output $defs.input.split_character
+move_mouse output $defs.input.target_remained_foreground
+move_mouse output $defs.screenshot.byte_length required
+move_mouse output $defs.screenshot.capture_method required
+move_mouse output $defs.screenshot.cursor_marker required
+move_mouse output $defs.screenshot.display required
+move_mouse output $defs.screenshot.image_height required
+move_mouse output $defs.screenshot.image_width required
+move_mouse output $defs.screenshot.mime_type required
+move_mouse output $defs.screenshot.observation_id
+move_mouse output $defs.screenshot.source_bounds required
+move_mouse output $defs.screenshot.target_ref
+move_mouse output $defs.window.bounds required
+move_mouse output $defs.window.class_name required
+move_mouse output $defs.window.display_id required
+move_mouse output $defs.window.id required
+move_mouse output $defs.window.is_foreground required
+move_mouse output $defs.window.is_minimized required
+move_mouse output $defs.window.owner
+move_mouse output $defs.window.process_id required
+move_mouse output $defs.window.title required
+click_mouse input button default="left"
+click_mouse input click_count default=1
+click_mouse input display_id
+click_mouse input duration_ms default=0
+click_mouse input image_x
+click_mouse input image_y
+click_mouse input modifiers default=[]
+click_mouse input observation
+click_mouse input observation.include_cursor default=true
+click_mouse input observation.max_width
+click_mouse input observation.mode default="screenshot"
+click_mouse input observation.region
+click_mouse input observation.region.display_id
+click_mouse input observation.region.height required
+click_mouse input observation.region.width required
+click_mouse input observation.region.x required
+click_mouse input observation.region.y required
+click_mouse input observation.settle_ms
+click_mouse input observation_id
+click_mouse input target_ref required
+click_mouse input x
+click_mouse input y
+click_mouse output anyOf[0].action required
+click_mouse output anyOf[0].input required
+click_mouse output anyOf[0].input.input_outcome
+click_mouse output anyOf[0].observation required
+click_mouse output anyOf[0].observation.foreground_window required
+click_mouse output anyOf[0].observation.screenshot required
+click_mouse output anyOf[0].observation.settle
+click_mouse output anyOf[0].observation.settle.elapsed_ms
+click_mouse output anyOf[0].observation.settle.outcome
+click_mouse output anyOf[0].observation_status required
+click_mouse output anyOf[0].position required
+click_mouse output anyOf[0].position.display_id required
+click_mouse output anyOf[0].position.local_x required
+click_mouse output anyOf[0].position.local_y required
+click_mouse output anyOf[0].position.virtual_x required
+click_mouse output anyOf[0].position.virtual_y required
+click_mouse output anyOf[0].status required
+click_mouse output anyOf[1].details
+click_mouse output anyOf[1].error
+click_mouse output anyOf[1].error.code required
+click_mouse output anyOf[1].error.details
+click_mouse output anyOf[1].error.message required
+click_mouse output anyOf[1].error.reason
+click_mouse output anyOf[1].error.retryable
+click_mouse output anyOf[1].input required
+click_mouse output anyOf[1].observation_status required
+click_mouse output anyOf[1].operation
+click_mouse output anyOf[1].retry_action required
+click_mouse output anyOf[1].status required
+click_mouse output anyOf[1].warning
+click_mouse output $defs.bounds.height required
+click_mouse output $defs.bounds.left required
+click_mouse output $defs.bounds.top required
+click_mouse output $defs.bounds.width required
+click_mouse output $defs.display.bounds required
+click_mouse output $defs.display.id required
+click_mouse output $defs.display.is_primary required
+click_mouse output $defs.display.name required
+click_mouse output $defs.input.activation_attempts
+click_mouse output $defs.input.activation_elapsed_ms
+click_mouse output $defs.input.activation_helper
+click_mouse output $defs.input.cleanup required
+click_mouse output $defs.input.input_outcome required
+click_mouse output $defs.input.sent_events required
+click_mouse output $defs.input.split_character
+click_mouse output $defs.input.target_remained_foreground
+click_mouse output $defs.screenshot.byte_length required
+click_mouse output $defs.screenshot.capture_method required
+click_mouse output $defs.screenshot.cursor_marker required
+click_mouse output $defs.screenshot.display required
+click_mouse output $defs.screenshot.image_height required
+click_mouse output $defs.screenshot.image_width required
+click_mouse output $defs.screenshot.mime_type required
+click_mouse output $defs.screenshot.observation_id
+click_mouse output $defs.screenshot.source_bounds required
+click_mouse output $defs.screenshot.target_ref
+click_mouse output $defs.window.bounds required
+click_mouse output $defs.window.class_name required
+click_mouse output $defs.window.display_id required
+click_mouse output $defs.window.id required
+click_mouse output $defs.window.is_foreground required
+click_mouse output $defs.window.is_minimized required
+click_mouse output $defs.window.owner
+click_mouse output $defs.window.process_id required
+click_mouse output $defs.window.title required
+drag_mouse input button default="left"
+drag_mouse input duration_ms default=0
+drag_mouse input end_display_id
+drag_mouse input end_image_x
+drag_mouse input end_image_y
+drag_mouse input end_x
+drag_mouse input end_y
+drag_mouse input modifiers default=[]
+drag_mouse input observation
+drag_mouse input observation.include_cursor default=true
+drag_mouse input observation.max_width
+drag_mouse input observation.mode default="screenshot"
+drag_mouse input observation.region
+drag_mouse input observation.region.display_id
+drag_mouse input observation.region.height required
+drag_mouse input observation.region.width required
+drag_mouse input observation.region.x required
+drag_mouse input observation.region.y required
+drag_mouse input observation.settle_ms
+drag_mouse input observation_id
+drag_mouse input start_display_id
+drag_mouse input start_image_x
+drag_mouse input start_image_y
+drag_mouse input start_x
+drag_mouse input start_y
+drag_mouse input target_ref required
+drag_mouse output anyOf[0].action required
+drag_mouse output anyOf[0].input required
+drag_mouse output anyOf[0].input.input_outcome
+drag_mouse output anyOf[0].observation required
+drag_mouse output anyOf[0].observation.foreground_window required
+drag_mouse output anyOf[0].observation.screenshot required
+drag_mouse output anyOf[0].observation.settle
+drag_mouse output anyOf[0].observation.settle.elapsed_ms
+drag_mouse output anyOf[0].observation.settle.outcome
+drag_mouse output anyOf[0].observation_status required
+drag_mouse output anyOf[0].position required
+drag_mouse output anyOf[0].position.display_id required
+drag_mouse output anyOf[0].position.local_x required
+drag_mouse output anyOf[0].position.local_y required
+drag_mouse output anyOf[0].position.virtual_x required
+drag_mouse output anyOf[0].position.virtual_y required
+drag_mouse output anyOf[0].status required
+drag_mouse output anyOf[1].details
+drag_mouse output anyOf[1].error
+drag_mouse output anyOf[1].error.code required
+drag_mouse output anyOf[1].error.details
+drag_mouse output anyOf[1].error.message required
+drag_mouse output anyOf[1].error.reason
+drag_mouse output anyOf[1].error.retryable
+drag_mouse output anyOf[1].input required
+drag_mouse output anyOf[1].observation_status required
+drag_mouse output anyOf[1].operation
+drag_mouse output anyOf[1].retry_action required
+drag_mouse output anyOf[1].status required
+drag_mouse output anyOf[1].warning
+drag_mouse output $defs.bounds.height required
+drag_mouse output $defs.bounds.left required
+drag_mouse output $defs.bounds.top required
+drag_mouse output $defs.bounds.width required
+drag_mouse output $defs.display.bounds required
+drag_mouse output $defs.display.id required
+drag_mouse output $defs.display.is_primary required
+drag_mouse output $defs.display.name required
+drag_mouse output $defs.input.activation_attempts
+drag_mouse output $defs.input.activation_elapsed_ms
+drag_mouse output $defs.input.activation_helper
+drag_mouse output $defs.input.cleanup required
+drag_mouse output $defs.input.input_outcome required
+drag_mouse output $defs.input.sent_events required
+drag_mouse output $defs.input.split_character
+drag_mouse output $defs.input.target_remained_foreground
+drag_mouse output $defs.screenshot.byte_length required
+drag_mouse output $defs.screenshot.capture_method required
+drag_mouse output $defs.screenshot.cursor_marker required
+drag_mouse output $defs.screenshot.display required
+drag_mouse output $defs.screenshot.image_height required
+drag_mouse output $defs.screenshot.image_width required
+drag_mouse output $defs.screenshot.mime_type required
+drag_mouse output $defs.screenshot.observation_id
+drag_mouse output $defs.screenshot.source_bounds required
+drag_mouse output $defs.screenshot.target_ref
+drag_mouse output $defs.window.bounds required
+drag_mouse output $defs.window.class_name required
+drag_mouse output $defs.window.display_id required
+drag_mouse output $defs.window.id required
+drag_mouse output $defs.window.is_foreground required
+drag_mouse output $defs.window.is_minimized required
+drag_mouse output $defs.window.owner
+drag_mouse output $defs.window.process_id required
+drag_mouse output $defs.window.title required
+scroll_mouse input delta_x default=0
+scroll_mouse input delta_y required
+scroll_mouse input display_id
+scroll_mouse input duration_ms default=0
+scroll_mouse input image_x
+scroll_mouse input image_y
+scroll_mouse input observation
+scroll_mouse input observation.include_cursor default=true
+scroll_mouse input observation.max_width
+scroll_mouse input observation.mode default="screenshot"
+scroll_mouse input observation.region
+scroll_mouse input observation.region.display_id
+scroll_mouse input observation.region.height required
+scroll_mouse input observation.region.width required
+scroll_mouse input observation.region.x required
+scroll_mouse input observation.region.y required
+scroll_mouse input observation.settle_ms
+scroll_mouse input observation_id
+scroll_mouse input target_ref required
+scroll_mouse input x
+scroll_mouse input y
+scroll_mouse output anyOf[0].action required
+scroll_mouse output anyOf[0].input required
+scroll_mouse output anyOf[0].input.input_outcome
+scroll_mouse output anyOf[0].observation required
+scroll_mouse output anyOf[0].observation.foreground_window required
+scroll_mouse output anyOf[0].observation.screenshot required
+scroll_mouse output anyOf[0].observation.settle
+scroll_mouse output anyOf[0].observation.settle.elapsed_ms
+scroll_mouse output anyOf[0].observation.settle.outcome
+scroll_mouse output anyOf[0].observation_status required
+scroll_mouse output anyOf[0].position required
+scroll_mouse output anyOf[0].position.display_id required
+scroll_mouse output anyOf[0].position.local_x required
+scroll_mouse output anyOf[0].position.local_y required
+scroll_mouse output anyOf[0].position.virtual_x required
+scroll_mouse output anyOf[0].position.virtual_y required
+scroll_mouse output anyOf[0].status required
+scroll_mouse output anyOf[1].details
+scroll_mouse output anyOf[1].error
+scroll_mouse output anyOf[1].error.code required
+scroll_mouse output anyOf[1].error.details
+scroll_mouse output anyOf[1].error.message required
+scroll_mouse output anyOf[1].error.reason
+scroll_mouse output anyOf[1].error.retryable
+scroll_mouse output anyOf[1].input required
+scroll_mouse output anyOf[1].observation_status required
+scroll_mouse output anyOf[1].operation
+scroll_mouse output anyOf[1].retry_action required
+scroll_mouse output anyOf[1].status required
+scroll_mouse output anyOf[1].warning
+scroll_mouse output $defs.bounds.height required
+scroll_mouse output $defs.bounds.left required
+scroll_mouse output $defs.bounds.top required
+scroll_mouse output $defs.bounds.width required
+scroll_mouse output $defs.display.bounds required
+scroll_mouse output $defs.display.id required
+scroll_mouse output $defs.display.is_primary required
+scroll_mouse output $defs.display.name required
+scroll_mouse output $defs.input.activation_attempts
+scroll_mouse output $defs.input.activation_elapsed_ms
+scroll_mouse output $defs.input.activation_helper
+scroll_mouse output $defs.input.cleanup required
+scroll_mouse output $defs.input.input_outcome required
+scroll_mouse output $defs.input.sent_events required
+scroll_mouse output $defs.input.split_character
+scroll_mouse output $defs.input.target_remained_foreground
+scroll_mouse output $defs.screenshot.byte_length required
+scroll_mouse output $defs.screenshot.capture_method required
+scroll_mouse output $defs.screenshot.cursor_marker required
+scroll_mouse output $defs.screenshot.display required
+scroll_mouse output $defs.screenshot.image_height required
+scroll_mouse output $defs.screenshot.image_width required
+scroll_mouse output $defs.screenshot.mime_type required
+scroll_mouse output $defs.screenshot.observation_id
+scroll_mouse output $defs.screenshot.source_bounds required
+scroll_mouse output $defs.screenshot.target_ref
+scroll_mouse output $defs.window.bounds required
+scroll_mouse output $defs.window.class_name required
+scroll_mouse output $defs.window.display_id required
+scroll_mouse output $defs.window.id required
+scroll_mouse output $defs.window.is_foreground required
+scroll_mouse output $defs.window.is_minimized required
+scroll_mouse output $defs.window.owner
+scroll_mouse output $defs.window.process_id required
+scroll_mouse output $defs.window.title required
+press_keys input keys required
+press_keys input observation
+press_keys input observation.include_cursor default=true
+press_keys input observation.max_width
+press_keys input observation.mode default="screenshot"
+press_keys input observation.region
+press_keys input observation.region.display_id
+press_keys input observation.region.height required
+press_keys input observation.region.width required
+press_keys input observation.region.x required
+press_keys input observation.region.y required
+press_keys input observation.settle_ms
+press_keys input target_ref required
+press_keys output anyOf[0].action required
+press_keys output anyOf[0].input required
+press_keys output anyOf[0].input.input_outcome
+press_keys output anyOf[0].observation required
+press_keys output anyOf[0].observation.foreground_window required
+press_keys output anyOf[0].observation.screenshot required
+press_keys output anyOf[0].observation.settle
+press_keys output anyOf[0].observation.settle.elapsed_ms
+press_keys output anyOf[0].observation.settle.outcome
+press_keys output anyOf[0].observation_status required
+press_keys output anyOf[0].status required
+press_keys output anyOf[1].details
+press_keys output anyOf[1].error
+press_keys output anyOf[1].error.code required
+press_keys output anyOf[1].error.details
+press_keys output anyOf[1].error.message required
+press_keys output anyOf[1].error.reason
+press_keys output anyOf[1].error.retryable
+press_keys output anyOf[1].input required
+press_keys output anyOf[1].observation_status required
+press_keys output anyOf[1].operation
+press_keys output anyOf[1].retry_action required
+press_keys output anyOf[1].status required
+press_keys output anyOf[1].warning
+press_keys output $defs.bounds.height required
+press_keys output $defs.bounds.left required
+press_keys output $defs.bounds.top required
+press_keys output $defs.bounds.width required
+press_keys output $defs.display.bounds required
+press_keys output $defs.display.id required
+press_keys output $defs.display.is_primary required
+press_keys output $defs.display.name required
+press_keys output $defs.input.activation_attempts
+press_keys output $defs.input.activation_elapsed_ms
+press_keys output $defs.input.activation_helper
+press_keys output $defs.input.cleanup required
+press_keys output $defs.input.input_outcome required
+press_keys output $defs.input.sent_events required
+press_keys output $defs.input.split_character
+press_keys output $defs.input.target_remained_foreground
+press_keys output $defs.screenshot.byte_length required
+press_keys output $defs.screenshot.capture_method required
+press_keys output $defs.screenshot.cursor_marker required
+press_keys output $defs.screenshot.display required
+press_keys output $defs.screenshot.image_height required
+press_keys output $defs.screenshot.image_width required
+press_keys output $defs.screenshot.mime_type required
+press_keys output $defs.screenshot.observation_id
+press_keys output $defs.screenshot.source_bounds required
+press_keys output $defs.screenshot.target_ref
+press_keys output $defs.window.bounds required
+press_keys output $defs.window.class_name required
+press_keys output $defs.window.display_id required
+press_keys output $defs.window.id required
+press_keys output $defs.window.is_foreground required
+press_keys output $defs.window.is_minimized required
+press_keys output $defs.window.owner
+press_keys output $defs.window.process_id required
+press_keys output $defs.window.title required
+type_text input observation
+type_text input observation.include_cursor default=true
+type_text input observation.max_width
+type_text input observation.mode default="screenshot"
+type_text input observation.region
+type_text input observation.region.display_id
+type_text input observation.region.height required
+type_text input observation.region.width required
+type_text input observation.region.x required
+type_text input observation.region.y required
+type_text input observation.settle_ms
+type_text input target_ref required
+type_text input text required
+type_text input timeout_ms
+type_text output anyOf[0].action required
+type_text output anyOf[0].input required
+type_text output anyOf[0].input.input_outcome
+type_text output anyOf[0].observation required
+type_text output anyOf[0].observation.foreground_window required
+type_text output anyOf[0].observation.screenshot required
+type_text output anyOf[0].observation.settle
+type_text output anyOf[0].observation.settle.elapsed_ms
+type_text output anyOf[0].observation.settle.outcome
+type_text output anyOf[0].observation_status required
+type_text output anyOf[0].status required
+type_text output anyOf[1].details
+type_text output anyOf[1].error
+type_text output anyOf[1].error.code required
+type_text output anyOf[1].error.details
+type_text output anyOf[1].error.message required
+type_text output anyOf[1].error.reason
+type_text output anyOf[1].error.retryable
+type_text output anyOf[1].input required
+type_text output anyOf[1].observation_status required
+type_text output anyOf[1].operation
+type_text output anyOf[1].retry_action required
+type_text output anyOf[1].status required
+type_text output anyOf[1].warning
+type_text output $defs.bounds.height required
+type_text output $defs.bounds.left required
+type_text output $defs.bounds.top required
+type_text output $defs.bounds.width required
+type_text output $defs.display.bounds required
+type_text output $defs.display.id required
+type_text output $defs.display.is_primary required
+type_text output $defs.display.name required
+type_text output $defs.input.activation_attempts
+type_text output $defs.input.activation_elapsed_ms
+type_text output $defs.input.activation_helper
+type_text output $defs.input.cleanup required
+type_text output $defs.input.input_outcome required
+type_text output $defs.input.sent_events required
+type_text output $defs.input.split_character
+type_text output $defs.input.target_remained_foreground
+type_text output $defs.screenshot.byte_length required
+type_text output $defs.screenshot.capture_method required
+type_text output $defs.screenshot.cursor_marker required
+type_text output $defs.screenshot.display required
+type_text output $defs.screenshot.image_height required
+type_text output $defs.screenshot.image_width required
+type_text output $defs.screenshot.mime_type required
+type_text output $defs.screenshot.observation_id
+type_text output $defs.screenshot.source_bounds required
+type_text output $defs.screenshot.target_ref
+type_text output $defs.window.bounds required
+type_text output $defs.window.class_name required
+type_text output $defs.window.display_id required
+type_text output $defs.window.id required
+type_text output $defs.window.is_foreground required
+type_text output $defs.window.is_minimized required
+type_text output $defs.window.owner
+type_text output $defs.window.process_id required
+type_text output $defs.window.title required
+run_actions input observation
+run_actions input observation.include_cursor default=true
+run_actions input observation.max_width
+run_actions input observation.mode default="screenshot"
+run_actions input observation.region
+run_actions input observation.region.display_id
+run_actions input observation.region.height required
+run_actions input observation.region.width required
+run_actions input observation.region.x required
+run_actions input observation.region.y required
+run_actions input observation.settle_ms
+run_actions input steps required
+run_actions input steps[].action required
+run_actions input steps[].button default="left"
+run_actions input steps[].click_count default=1
+run_actions input steps[].delta_x default=0
+run_actions input steps[].delta_y default=0
+run_actions input steps[].display_id
+run_actions input steps[].image_x
+run_actions input steps[].image_y
+run_actions input steps[].keys
+run_actions input steps[].modifiers default=[]
+run_actions input steps[].observation_id
+run_actions input steps[].text
+run_actions input steps[].timeout_ms
+run_actions input steps[].wait_ms
+run_actions input steps[].x
+run_actions input steps[].y
+run_actions input target_ref required
+run_actions output anyOf[0].action required
+run_actions output anyOf[0].input required
+run_actions output anyOf[0].input.input_outcome
+run_actions output anyOf[0].observation required
+run_actions output anyOf[0].observation.foreground_window required
+run_actions output anyOf[0].observation.screenshot required
+run_actions output anyOf[0].observation.settle
+run_actions output anyOf[0].observation.settle.elapsed_ms
+run_actions output anyOf[0].observation.settle.outcome
+run_actions output anyOf[0].observation_status required
+run_actions output anyOf[0].status required
+run_actions output anyOf[1].details
+run_actions output anyOf[1].error
+run_actions output anyOf[1].error.code required
+run_actions output anyOf[1].error.details
+run_actions output anyOf[1].error.message required
+run_actions output anyOf[1].error.reason
+run_actions output anyOf[1].error.retryable
+run_actions output anyOf[1].input required
+run_actions output anyOf[1].observation_status required
+run_actions output anyOf[1].operation
+run_actions output anyOf[1].retry_action required
+run_actions output anyOf[1].status required
+run_actions output anyOf[1].warning
+run_actions output $defs.bounds.height required
+run_actions output $defs.bounds.left required
+run_actions output $defs.bounds.top required
+run_actions output $defs.bounds.width required
+run_actions output $defs.display.bounds required
+run_actions output $defs.display.id required
+run_actions output $defs.display.is_primary required
+run_actions output $defs.display.name required
+run_actions output $defs.input.activation_attempts
+run_actions output $defs.input.activation_elapsed_ms
+run_actions output $defs.input.activation_helper
+run_actions output $defs.input.cleanup required
+run_actions output $defs.input.input_outcome required
+run_actions output $defs.input.sent_events required
+run_actions output $defs.input.split_character
+run_actions output $defs.input.target_remained_foreground
+run_actions output $defs.screenshot.byte_length required
+run_actions output $defs.screenshot.capture_method required
+run_actions output $defs.screenshot.cursor_marker required
+run_actions output $defs.screenshot.display required
+run_actions output $defs.screenshot.image_height required
+run_actions output $defs.screenshot.image_width required
+run_actions output $defs.screenshot.mime_type required
+run_actions output $defs.screenshot.observation_id
+run_actions output $defs.screenshot.source_bounds required
+run_actions output $defs.screenshot.target_ref
+run_actions output $defs.window.bounds required
+run_actions output $defs.window.class_name required
+run_actions output $defs.window.display_id required
+run_actions output $defs.window.id required
+run_actions output $defs.window.is_foreground required
+run_actions output $defs.window.is_minimized required
+run_actions output $defs.window.owner
+run_actions output $defs.window.process_id required
+run_actions output $defs.window.title required
+stop_desktop_work output anyOf[0].status required
+stop_desktop_work output anyOf[1].error required
+stop_desktop_work output anyOf[1].error.code required
+stop_desktop_work output anyOf[1].error.details
+stop_desktop_work output anyOf[1].error.message required
+stop_desktop_work output anyOf[1].error.reason
+stop_desktop_work output anyOf[1].error.retryable

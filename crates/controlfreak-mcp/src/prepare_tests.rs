@@ -129,6 +129,18 @@ fn malformed(target: &str) -> Vec<(&'static str, Value, &'static str)> {
             ]}),
             "invalid_argument",
         ),
+        (
+            CLICK_TEXT,
+            json!({"target_ref": target, "x": 0, "y": 0, "width": 10, "height": 10, "query": "Save",
+                   "match_mode": "tolerant"}),
+            "invalid_argument",
+        ),
+        (
+            CLICK_TEXT,
+            json!({"target_ref": target, "x": 0, "y": 0, "width": 10, "height": 10, "query": "Save",
+                   "match_mode": "substring", "exact_match": true}),
+            "invalid_argument",
+        ),
     ]
 }
 
@@ -163,10 +175,11 @@ async fn a_malformed_input_request_is_refused_before_it_takes_the_desktop() {
     }
     // Every input tool called with no arguments fails parsing, or a static check when it has no
     // required field.
-    for (name, route) in ROUTES {
-        if !matches!(route, Route::Input(_)) {
+    for spec in catalog::CATALOG {
+        if !spec.is_mutating() {
             continue;
         }
+        let name = spec.name;
         let result = server.call(name, json!({})).await;
         let code = result["structuredContent"]["error"]["code"]
             .as_str()
@@ -256,5 +269,74 @@ async fn each_valid_input_request_takes_exactly_one_lease() {
     assert_eq!(server.session().await["call_count"], 2);
     assert_eq!(server.acquisitions.load(Ordering::SeqCst), 1);
     assert_eq!(server.indicator_starts.load(Ordering::SeqCst), 1);
+    server.harness.finish().await;
+}
+
+/// #5: an argument error names the field's path, what it expects and the JSON kind it got,
+/// never the value, and like any malformed request it leaves the desktop alone.
+#[tokio::test]
+async fn an_argument_error_explains_the_field_without_the_value() {
+    let desktop = FakeDesktop::new();
+    let target = desktop.id(desktop.open("Editor", 10));
+    let owned = Arc::new(AtomicBool::new(false));
+    let mut server = Server::start(&desktop, &owned).await;
+
+    let typed = server
+        .call(TYPE_TEXT, json!({"target_ref": target, "text": 5}))
+        .await;
+    assert_refused(TYPE_TEXT, &typed, "invalid_arguments");
+    let details = &typed["structuredContent"]["error"]["details"];
+    assert_eq!(details["path"], "text", "{typed}");
+    assert_eq!(details["expected"], "string", "{typed}");
+    assert_eq!(details["received_kind"], "number", "{typed}");
+
+    let typo = server
+        .call(
+            TYPE_TEXT,
+            json!({"target_ref": target, "text": "private words", "txt": "more private words"}),
+        )
+        .await;
+    assert_refused(TYPE_TEXT, &typo, "invalid_arguments");
+    let details = &typo["structuredContent"]["error"]["details"];
+    assert_eq!(details["problem"], "unknown_field", "{typo}");
+    assert_eq!(details["path"], "txt", "{typo}");
+    let valid = details["valid_fields"].as_array().unwrap();
+    assert!(
+        valid.contains(&json!("text")) && valid.len() <= 32,
+        "{typo}"
+    );
+
+    let batch = server
+        .call(
+            RUN_ACTIONS,
+            json!({"target_ref": target, "steps": [
+                {"action": "type_text", "text": "private words"},
+                {"action": "type_text", "text": ["private words"]},
+            ]}),
+        )
+        .await;
+    assert_refused(RUN_ACTIONS, &batch, "invalid_arguments");
+    let details = &batch["structuredContent"]["error"]["details"];
+    assert_eq!(details["path"], "steps[1].text", "{batch}");
+    assert_eq!(details["received_kind"], "array", "{batch}");
+
+    let capture = server
+        .call(
+            CAPTURE_REGION,
+            json!({"x": "private words", "y": 0, "width": 1, "height": 1}),
+        )
+        .await;
+    assert_eq!(capture["isError"], true, "{capture}");
+    let error = &capture["structuredContent"]["error"];
+    assert_eq!(error["code"], "invalid_arguments", "{capture}");
+    assert_eq!(error["details"]["path"], "x", "{capture}");
+    assert_eq!(error["details"]["received_kind"], "string", "{capture}");
+
+    for result in [&typed, &typo, &batch, &capture] {
+        assert!(!result.to_string().contains("private"), "{result}");
+    }
+    assert_untouched(&server.session().await);
+    assert_eq!(server.acquisitions.load(Ordering::SeqCst), 0);
+    assert!(desktop.received().is_empty());
     server.harness.finish().await;
 }
