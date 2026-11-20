@@ -16,6 +16,7 @@ versioned section and uses that section for the corresponding GitHub Release not
 - `end_control_session` reports what happened (`closed`, `closing` or `not_owned`) instead of always `closing`.
 - `approved_target_ref` is `null` once a session closes, after an end, an expired hold or a stop.
 - While you hold Shift, Ctrl, Alt or Win, key presses, typing, clicks, drags, scrolls and desktop switches are now refused with `key_held` before anything is sent. Before, Windows combined your key with the agent's input, so Delete could arrive as Shift+Delete or a click as a Ctrl-click. Release the key and the agent can retry.
+- A visual baseline, which holds screen pixels, is now removed from memory 5 minutes after `capture_visual_baseline`, as PRIVACY.md says. Before, an idle server kept the last baseline until the next baseline call. Expired IDs are refused as before.
 
 ### Added
 
