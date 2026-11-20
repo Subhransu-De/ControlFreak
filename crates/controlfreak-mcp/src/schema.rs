@@ -1,10 +1,7 @@
 use super::{
-    Arc, BEGIN_CONTROL_SESSION, CAPTURE_DISPLAY, CAPTURE_REGION, CAPTURE_VISUAL_BASELINE,
-    CAPTURE_WINDOW, CLICK_MOUSE, CLICK_TEXT, DRAG_MOUSE, END_CONTROL_SESSION, FIND_TEXT_ON_SCREEN,
-    FOCUS_WINDOW, GET_SERVER_STATUS, JsonObject, LIST_DISPLAYS, LIST_VIRTUAL_DESKTOPS,
-    LIST_WINDOWS, MOVE_MOUSE, PRESS_KEYS, READ_TEXT_IN_REGION, RUN_ACTIONS, SCROLL_MOUSE,
-    STOP_DESKTOP_WORK, SWITCH_VIRTUAL_DESKTOP, TYPE_TEXT, Tool, ToolAnnotations, Value,
-    WAIT_FOR_CHANGE_SINCE, WAIT_FOR_TEXT, WAIT_FOR_VISUAL_CHANGE, WAIT_FOR_WINDOW, json,
+    Arc, JsonObject, Tool, ToolAnnotations, Value,
+    catalog::{CATALOG, Route, TargetRef, ToolSpec},
+    json,
     requests::MAX_RUN_ACTION_STEPS,
 };
 use controlfreak_core::limits::{
@@ -13,47 +10,69 @@ use controlfreak_core::limits::{
     MAX_TEXT_TIMEOUT_MS, MAX_TEXT_UTF16_UNITS, MAX_WAIT_MS, MIN_TEXT_TIMEOUT_MS, MIN_WAIT_MS,
 };
 
-/// How a tool touches the desktop. It decides the annotations, which every client reads.
-#[derive(Clone, Copy)]
-enum Kind {
-    /// Reads desktop or server state only.
-    Observe { idempotent: bool },
-    /// Sends keyboard, mouse or focus input to the desktop.
-    Input { idempotent: bool },
-    /// Changes the control session without sending input.
-    Session,
-    /// Permanently closes input until the server restarts.
-    Stop,
+/// What a tool's schema builder writes: the parts of a tool that the catalog row does not hold.
+pub(super) struct Contract {
+    description: &'static str,
+    input: JsonObject,
+    output: Arc<JsonObject>,
 }
 
-impl Kind {
-    fn annotations(self, title: &str) -> ToolAnnotations {
-        let (read_only, destructive, idempotent, open_world) = match self {
-            Self::Observe { idempotent } => (true, false, idempotent, false),
-            Self::Input { idempotent } => (false, true, idempotent, true),
-            Self::Session => (false, false, true, false),
-            Self::Stop => (false, true, true, false),
-        };
-        ToolAnnotations::with_title(title)
-            .read_only(read_only)
-            .destructive(destructive)
-            .idempotent(idempotent)
-            .open_world(open_world)
+fn contract(description: &'static str, input: JsonObject, output: Arc<JsonObject>) -> Contract {
+    Contract {
+        description,
+        input,
+        output,
     }
 }
 
-fn tool(
-    name: &'static str,
-    title: &str,
-    kind: Kind,
-    description: &str,
-    input: JsonObject,
-    output: Arc<JsonObject>,
-) -> Tool {
-    Tool::new(name, description.to_owned(), input)
-        .with_title(title)
+/// The annotations every client reads, from how the tool runs.
+fn annotations(spec: &ToolSpec) -> ToolAnnotations {
+    let (read_only, destructive, open_world) = match spec.route {
+        // Reads desktop or server state only.
+        Route::Status | Route::Observe(_) | Route::Watch(_) => (true, false, false),
+        // Sends keyboard, mouse or focus input to the desktop.
+        Route::Input(_) => (false, true, true),
+        // Changes the control session without sending input.
+        Route::BeginSession | Route::EndSession => (false, false, false),
+        // Permanently closes input until the server restarts.
+        Route::Stop => (false, true, false),
+    };
+    ToolAnnotations::with_title(spec.title)
+        .read_only(read_only)
+        .destructive(destructive)
+        .idempotent(spec.idempotent)
+        .open_world(open_world)
+}
+
+/// Builds one tool from its catalog row.
+fn build_tool(spec: &ToolSpec) -> Tool {
+    let Contract {
+        description,
+        mut input,
+        output,
+    } = (spec.schema)();
+    if spec.target_ref != TargetRef::None {
+        input
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+            .expect("targeted tool schemas define a properties object")
+            .insert(
+                "target_ref".into(),
+                json!({"type": "string", "minLength": 1,
+                "description": "Approved window, from list_windows or a screenshot."}),
+            );
+        if spec.target_ref == TargetRef::Required {
+            input
+                .get_mut("required")
+                .and_then(Value::as_array_mut)
+                .expect("targeted tool schemas define a required array")
+                .push(json!("target_ref"));
+        }
+    }
+    Tool::new(spec.name, description.to_owned(), input)
+        .with_title(spec.title)
         .with_raw_output_schema(output)
-        .with_annotations(kind.annotations(title))
+        .with_annotations(annotations(spec))
 }
 
 /// Tool descriptions and schemas that `tools/list` publishes.
@@ -73,71 +92,14 @@ pub fn tools() -> Vec<Tool> {
 }
 
 /// Every tool with its full result contract, closed against extra fields, for `--print-tools`.
-/// Names, descriptions, input schemas and annotations are the same as in `tools/list`.
-///
-/// The list starts with the tools an agent needs first and ends with the emergency stop.
+/// Names, descriptions, input schemas and annotations are the same as in `tools/list`, and the
+/// order is the catalog's.
 pub fn full_tools() -> Vec<Tool> {
-    let mut tools = vec![
-        get_server_status_tool(),
-        begin_control_session_tool(),
-        end_control_session_tool(),
-        list_displays_tool(),
-        capture_display_tool(),
-        capture_region_tool(),
-        wait_for_visual_change_tool(),
-        capture_visual_baseline_tool(),
-        wait_for_change_since_tool(),
-        read_text_in_region_tool(),
-        find_text_on_screen_tool(),
-        wait_for_text_tool(),
-        click_text_tool(),
-        list_virtual_desktops_tool(),
-        switch_virtual_desktop_tool(),
-        list_windows_tool(),
-        focus_window_tool(),
-        capture_window_tool(),
-        wait_for_window_tool(),
-        move_mouse_tool(),
-        click_mouse_tool(),
-        drag_mouse_tool(),
-        scroll_mouse_tool(),
-        press_keys_tool(),
-        type_text_tool(),
-        run_actions_tool(),
-        stop_desktop_work_tool(),
-    ];
-    for tool in &mut tools {
-        if super::is_mutating_tool(&tool.name) && tool.name != FOCUS_WINDOW
-            || tool.name == BEGIN_CONTROL_SESSION
-        {
-            let schema = Arc::make_mut(&mut tool.input_schema);
-            schema
-                .get_mut("properties")
-                .and_then(Value::as_object_mut)
-                .expect("targeted tool schemas define a properties object")
-                .insert(
-                    "target_ref".into(),
-                    json!({"type": "string", "minLength": 1,
-                    "description": "Approved window, from list_windows or a screenshot."}),
-                );
-            // Switching desktops may omit the target: it defaults to the session's window.
-            if tool.name != SWITCH_VIRTUAL_DESKTOP {
-                schema
-                    .get_mut("required")
-                    .and_then(Value::as_array_mut)
-                    .expect("targeted tool schemas define a required array")
-                    .push(json!("target_ref"));
-            }
-        }
-    }
-    tools
+    CATALOG.iter().map(build_tool).collect()
 }
 
-fn stop_desktop_work_tool() -> Tool {
-    tool(
-        STOP_DESKTOP_WORK,
-        "Emergency stop",
-        Kind::Stop,
+pub(super) fn stop_desktop_work() -> Contract {
+    contract(
         "To finish normally, call end_control_session instead. This emergency stop cancels all desktop work and closes input permanently until the user restarts the server. Do not call it to clean up. It cannot undo input that was already sent.",
         object_schema(JsonObject::new(), &[]),
         output_schema(
@@ -152,7 +114,7 @@ fn stop_desktop_work_tool() -> Tool {
     )
 }
 
-fn begin_control_session_tool() -> Tool {
+pub(super) fn begin_control_session() -> Contract {
     let mut properties = JsonObject::new();
     properties.insert(
         "expected_seconds".to_owned(),
@@ -162,43 +124,31 @@ fn begin_control_session_tool() -> Tool {
             "description": "Idle hold in seconds. Default 45. The server caps it, at 120 unless the operator changed the cap."
         }),
     );
-    tool(
-        BEGIN_CONTROL_SESSION,
-        "Begin control session",
-        Kind::Session,
+    contract(
         "Start here before any input. Reserves desktop control for ONE window (target_ref from list_windows or a screenshot) and shows the user the control indicator. Input tools work only while that window is in the foreground, so call focus_window next if it is not. Dialogs and menus of the same application are accepted (for File Explorer, only its own dialogs and menus, not the taskbar or other folder windows). A window from another process needs end_control_session and a new session. Error desktop_in_use is retryable: another ControlFreak server owns the desktop.",
         object_schema(properties, &[]),
         session_change_output_schema("armed"),
     )
 }
 
-fn end_control_session_tool() -> Tool {
-    tool(
-        END_CONTROL_SESSION,
-        "End control session",
-        Kind::Session,
+pub(super) fn end_control_session() -> Contract {
+    contract(
         "The normal way to finish. Stops accepting input and releases desktop control after pending actions finish. Call it when the task is done, or before approving another window. Safe to call twice: status is closed, closing while pending actions finish, or not_owned when no session was held. After a stop, recovery says what allows input again.",
         object_schema(JsonObject::new(), &[]),
         end_session_output_schema(),
     )
 }
 
-fn get_server_status_tool() -> Tool {
-    tool(
-        GET_SERVER_STATUS,
-        "Server status",
-        Kind::Observe { idempotent: true },
+pub(super) fn get_server_status() -> Contract {
+    contract(
         "Return version, uptime, privileges, DPI awareness, indicator health, input_admission, session state, stop_state and recent operations. status describes the server and indicator; input_admission says whether input is accepted. When it is closed, recovery gives the next step: no tool reopens input, only the user restarting the server from the MCP client. stop_reason=user_stop means the user ended control.",
         object_schema(JsonObject::new(), &[]),
         server_status_output_schema(),
     )
 }
 
-fn list_displays_tool() -> Tool {
-    tool(
-        LIST_DISPLAYS,
-        "List displays",
-        Kind::Observe { idempotent: true },
+pub(super) fn list_displays() -> Contract {
+    contract(
         "List active displays: ID, name, primary flag and bounds in physical pixels (left and top can be negative). Every display_id parameter defaults to the primary display, so call this only on multi-display setups.",
         object_schema(JsonObject::new(), &[]),
         output_schema(
@@ -216,27 +166,21 @@ fn list_displays_tool() -> Tool {
     )
 }
 
-fn capture_display_tool() -> Tool {
+pub(super) fn capture_display() -> Contract {
     let mut properties = JsonObject::new();
     properties.insert("display_id".to_owned(), display_id_property());
     add_capture_options(&mut properties);
-    tool(
-        CAPTURE_DISPLAY,
-        "Capture display",
-        Kind::Observe { idempotent: false },
+    contract(
         "Capture a whole display as PNG, 1280 px wide by default (max_width changes it, native=true keeps full resolution). The result's observation_id maps image points to screen pixels for pointer tools. Protected or HDR content may render incorrectly.",
         object_schema(properties, &[]),
         output_schema(vec![screenshot_schema()], false),
     )
 }
 
-fn capture_region_tool() -> Tool {
+pub(super) fn capture_region() -> Contract {
     let mut properties = region_properties();
     add_capture_options(&mut properties);
-    tool(
-        CAPTURE_REGION,
-        "Capture region",
-        Kind::Observe { idempotent: false },
+    contract(
         "Capture a rectangle as PNG, cheaper than a full capture when one area matters. x, y, width, height are display-local physical pixels. Width defaults to 1280 (max_width changes it, native=true keeps full resolution).",
         object_schema(properties, &["x", "y", "width", "height"]),
         output_schema(vec![screenshot_schema()], false),
@@ -261,24 +205,18 @@ fn timeout_property() -> Value {
     json!({ "type": "integer", "minimum": MIN_WAIT_MS, "maximum": MAX_WAIT_MS, "default": 5000 })
 }
 
-fn wait_for_visual_change_tool() -> Tool {
+pub(super) fn wait_for_visual_change() -> Contract {
     let mut properties = region_properties();
     properties.extend(wait_properties());
-    tool(
-        WAIT_FOR_VISUAL_CHANGE,
-        "Wait for visual change",
-        Kind::Observe { idempotent: false },
+    contract(
         "Wait until a region differs from how it looks at call time and then stays stable for stable_ms, and return its screenshot. A timeout (default 5000 ms, at most 30000; 0 checks once) is a normal result with timed_out=true, not an error. To compare against a moment before an action, use capture_visual_baseline and wait_for_change_since.",
         object_schema(properties, &["x", "y", "width", "height"]),
         visual_change_output_schema(),
     )
 }
 
-fn capture_visual_baseline_tool() -> Tool {
-    tool(
-        CAPTURE_VISUAL_BASELINE,
-        "Save visual baseline",
-        Kind::Observe { idempotent: false },
+pub(super) fn capture_visual_baseline() -> Contract {
+    contract(
         "Save a region's appearance without returning an image. Call it BEFORE an action, then call wait_for_change_since afterwards. Baselines last 5 minutes and at most 16 are kept.",
         object_schema(region_properties(), &["x", "y", "width", "height"]),
         output_schema(
@@ -299,7 +237,7 @@ fn capture_visual_baseline_tool() -> Tool {
     )
 }
 
-fn wait_for_change_since_tool() -> Tool {
+pub(super) fn wait_for_change_since() -> Contract {
     let mut properties = wait_properties();
     properties.insert(
         "baseline_id".to_owned(),
@@ -308,23 +246,17 @@ fn wait_for_change_since_tool() -> Tool {
             "description": "From capture_visual_baseline."
         }),
     );
-    tool(
-        WAIT_FOR_CHANGE_SINCE,
-        "Wait for change since baseline",
-        Kind::Observe { idempotent: false },
+    contract(
         "Wait until a region differs from its saved baseline and is stable, then return a screenshot. A timeout (default 5000 ms, at most 30000) is a normal result. The baseline can be reused until it expires after 5 minutes.",
         object_schema(properties, &["baseline_id"]),
         visual_change_output_schema(),
     )
 }
 
-fn read_text_in_region_tool() -> Tool {
+pub(super) fn read_text_in_region() -> Contract {
     let mut properties = region_properties();
     add_ocr_language(&mut properties);
-    tool(
-        READ_TEXT_IN_REGION,
-        "Read text (OCR)",
-        Kind::Observe { idempotent: false },
+    contract(
         "Read the text in a region with OCR. Returns lines and words with display-local pixel bounds, no image and no confidence scores. Needs a Windows OCR language pack.",
         object_schema(properties, &["x", "y", "width", "height"]),
         read_text_output_schema(),
@@ -354,11 +286,8 @@ fn text_query_properties() -> JsonObject {
     properties
 }
 
-fn find_text_on_screen_tool() -> Tool {
-    tool(
-        FIND_TEXT_ON_SCREEN,
-        "Find text (OCR)",
-        Kind::Observe { idempotent: false },
+pub(super) fn find_text_on_screen() -> Contract {
+    contract(
         "Find text in a region with OCR. Discovery only: it never sends input. Returns display-local bounds, match_tier, the full candidate_count and truncation flags. Use it to pick a query and region before click_text.",
         object_schema(
             text_query_properties(),
@@ -368,24 +297,21 @@ fn find_text_on_screen_tool() -> Tool {
     )
 }
 
-fn wait_for_text_tool() -> Tool {
+pub(super) fn wait_for_text() -> Contract {
     let mut properties = text_query_properties();
     properties.insert(
         "condition".to_owned(),
         json!({ "type": "string", "enum": ["appears", "disappears"], "default": "appears" }),
     );
     properties.insert("timeout_ms".to_owned(), timeout_property());
-    tool(
-        WAIT_FOR_TEXT,
-        "Wait for text (OCR)",
-        Kind::Observe { idempotent: false },
+    contract(
         "Repeat OCR over a region until query appears or disappears, or timeout_ms (default 5000, at most 30000) elapses. Returns satisfied, timed_out, attempts and the last matches. Each pass is a full recognition, so keep the region small. Never sends input.",
         object_schema(properties, &["x", "y", "width", "height", "query"]),
         wait_for_text_output_schema(),
     )
 }
 
-fn click_text_tool() -> Tool {
+pub(super) fn click_text() -> Contract {
     let mut properties = text_query_properties();
     properties.remove("max_results");
     properties.remove("match_mode");
@@ -402,21 +328,15 @@ fn click_text_tool() -> Tool {
     properties.insert("modifiers".to_owned(), modifier_schema());
     properties.insert("duration_ms".to_owned(), duration_property());
     add_action_observation(&mut properties);
-    tool(
-        CLICK_TEXT,
-        "Click text (OCR)",
-        Kind::Input { idempotent: false },
+    contract(
         "Click the unique visible text match inside a region. Needs a session whose window is in the foreground. Zero or several matches return ocr_no_match or ocr_ambiguous_match with candidates and send no input: narrow the region or look with find_text_on_screen. Success reports matched_text and match_tier.",
         object_schema(properties, &["x", "y", "width", "height", "query"]),
         action_output_schema(true),
     )
 }
 
-fn list_virtual_desktops_tool() -> Tool {
-    tool(
-        LIST_VIRTUAL_DESKTOPS,
-        "List virtual desktops",
-        Kind::Observe { idempotent: true },
+pub(super) fn list_virtual_desktops() -> Contract {
+    contract(
         "Group the discoverable titled windows by virtual desktop and mark the current one. Empty desktops, names and desktop order are not available.",
         object_schema(JsonObject::new(), &[]),
         output_schema(
@@ -450,7 +370,7 @@ fn list_virtual_desktops_tool() -> Tool {
     )
 }
 
-fn switch_virtual_desktop_tool() -> Tool {
+pub(super) fn switch_virtual_desktop() -> Contract {
     let mut properties = JsonObject::new();
     properties.insert(
         "direction".to_owned(),
@@ -461,10 +381,7 @@ fn switch_virtual_desktop_tool() -> Tool {
         json!({ "type": "integer", "minimum": 1, "maximum": 10, "default": 1, "description": "Windows stops at the last desktop." }),
     );
     add_observation(&mut properties);
-    tool(
-        SWITCH_VIRTUAL_DESKTOP,
-        "Switch virtual desktop",
-        Kind::Input { idempotent: false },
+    contract(
         "Switch left or right across existing virtual desktops. Needs the session's window in the foreground. The switch ends the control session, because that window is no longer on screen: begin a new session on a window of the new desktop. target_ref is optional and defaults to the session's window, or to the foreground window when no session is active. Trust action.transition, not the legacy changed: unknown means the foreground desktop was unreadable before or after, as an empty desktop may be.",
         object_schema(properties, &["direction"]),
         action_output_schema_with(
@@ -483,11 +400,8 @@ fn switch_virtual_desktop_tool() -> Tool {
     )
 }
 
-fn list_windows_tool() -> Tool {
-    tool(
-        LIST_WINDOWS,
-        "List windows",
-        Kind::Observe { idempotent: true },
+pub(super) fn list_windows() -> Contract {
+    contract(
         "List visible titled top-level windows, foreground first, then by title. Dialogs and other owned windows are listed too, with an owner field naming the window they belong to. Each id is a target_ref for begin_control_session, focus_window and capture_window. Returns at most 200; truncated=true means more exist, so use wait_for_window with title_contains, class_name or process_id to reach them. Refresh ids after windows open, close or change owner.",
         object_schema(JsonObject::new(), &[]),
         output_schema(
@@ -506,7 +420,7 @@ fn list_windows_tool() -> Tool {
     )
 }
 
-fn focus_window_tool() -> Tool {
+pub(super) fn focus_window() -> Contract {
     let mut properties = JsonObject::new();
     properties.insert(
         "timeout_ms".into(),
@@ -514,31 +428,25 @@ fn focus_window_tool() -> Tool {
     );
     add_window_id(&mut properties);
     add_observation(&mut properties);
-    tool(
-        FOCUS_WINDOW,
-        "Focus window",
-        Kind::Input { idempotent: true },
+    contract(
         "Bring the session's approved window to the foreground, restoring it if minimized, and verify it. Call it right after begin_control_session, and again whenever a window from another process took the foreground. It never sends keys or clicks to get focus: if Windows refuses, ask the user to click the window. window_id (or its alias target_ref) is the approved window or, inside a session, a dialog of the same application.",
         object_schema(properties, &[]),
         action_output_schema(false),
     )
 }
 
-fn capture_window_tool() -> Tool {
+pub(super) fn capture_window() -> Contract {
     let mut properties = JsonObject::new();
     add_window_id(&mut properties);
     add_capture_options(&mut properties);
-    tool(
-        CAPTURE_WINDOW,
-        "Capture window",
-        Kind::Observe { idempotent: false },
+    contract(
         "Capture one window as PNG without focusing it. window_id (or its alias target_ref) comes from list_windows, and must be fresh. Restore minimized windows first. Width defaults to 1280 (max_width changes it, native=true keeps full resolution). Menus and popups are separate windows and do not appear: use an action's screenshot or capture_display.",
         object_schema(properties, &[]),
         output_schema(vec![window_screenshot_schema()], false),
     )
 }
 
-fn wait_for_window_tool() -> Tool {
+pub(super) fn wait_for_window() -> Contract {
     let mut properties = JsonObject::new();
     add_window_id(&mut properties);
     properties.insert(
@@ -555,10 +463,7 @@ fn wait_for_window_tool() -> Tool {
     );
     properties.insert("is_foreground".to_owned(), json!({ "type": "boolean" }));
     properties.insert("timeout_ms".to_owned(), timeout_property());
-    tool(
-        WAIT_FOR_WINDOW,
-        "Wait for window",
-        Kind::Observe { idempotent: false },
+    contract(
         "Wait for a visible top-level window that matches every criterion given: window_id (or target_ref), title_contains, class_name, process_id, is_foreground. At least one is required. A timeout (default 5000 ms, at most 30000) returns matched=false and timed_out=true.",
         object_schema(properties, &[]),
         output_schema(
@@ -578,33 +483,27 @@ fn wait_for_window_tool() -> Tool {
     )
 }
 
-fn move_mouse_tool() -> Tool {
-    tool(
-        MOVE_MOUSE,
-        "Move mouse",
-        Kind::Input { idempotent: true },
+pub(super) fn move_mouse() -> Contract {
+    contract(
         "Move the pointer onto the approved window. Needs the window in the foreground. Give x and y (display-local physical pixels; display_id defaults to primary), or observation_id with image_x and image_y from a screenshot.",
         object_schema(pointer_properties(), &[]),
         action_output_schema(true),
     )
 }
 
-fn click_mouse_tool() -> Tool {
+pub(super) fn click_mouse() -> Contract {
     let mut properties = pointer_properties();
     properties.insert("button".to_owned(), button_property(true));
     properties.insert("click_count".to_owned(), click_count_property());
     properties.insert("modifiers".to_owned(), modifier_schema());
-    tool(
-        CLICK_MOUSE,
-        "Click mouse",
-        Kind::Input { idempotent: false },
+    contract(
         "Click on the approved window. Needs the window in the foreground. Give x and y (display-local physical pixels; display_id defaults to primary), or observation_id with image_x and image_y from a screenshot. Modifiers are held for the click and always released. button defaults to left.",
         object_schema(properties, &[]),
         action_output_schema(true),
     )
 }
 
-fn drag_mouse_tool() -> Tool {
+pub(super) fn drag_mouse() -> Contract {
     let mut properties = JsonObject::new();
     for prefix in ["start", "end"] {
         properties.insert(
@@ -636,17 +535,14 @@ fn drag_mouse_tool() -> Tool {
     properties.insert("modifiers".to_owned(), modifier_schema());
     properties.insert("duration_ms".to_owned(), duration_property());
     add_action_observation(&mut properties);
-    tool(
-        DRAG_MOUSE,
-        "Drag mouse",
-        Kind::Input { idempotent: false },
+    contract(
         "Press, move and release in one call. Needs the approved window in the foreground. Give each end as start_x/start_y or end_x/end_y (start_display_id and end_display_id default to primary), or as start_image_x/start_image_y and end_image_x/end_image_y in one screenshot's observation_id. The button and modifiers are always released.",
         object_schema(properties, &[]),
         action_output_schema(true),
     )
 }
 
-fn scroll_mouse_tool() -> Tool {
+pub(super) fn scroll_mouse() -> Contract {
     let mut properties = pointer_properties();
     properties.insert(
         "delta_x".to_owned(),
@@ -666,10 +562,7 @@ fn scroll_mouse_tool() -> Tool {
             "description": "Positive scrolls up, negative down. 120 is one wheel detent."
         }),
     );
-    tool(
-        SCROLL_MOUSE,
-        "Scroll mouse",
-        Kind::Input { idempotent: false },
+    contract(
         "Move to a point on the approved window, then scroll. Needs the window in the foreground. Give x and y (display_id defaults to primary) or observation_id with image_x and image_y. delta_x scrolls right when positive.",
         object_schema(properties, &["delta_y"]),
         action_output_schema(true),
@@ -698,7 +591,7 @@ fn key_names_description() -> String {
     )
 }
 
-fn press_keys_tool() -> Tool {
+pub(super) fn press_keys() -> Contract {
     let mut properties = JsonObject::new();
     properties.insert(
         "keys".to_owned(),
@@ -712,17 +605,14 @@ fn press_keys_tool() -> Tool {
         }),
     );
     add_action_observation(&mut properties);
-    tool(
-        PRESS_KEYS,
-        "Press keys",
-        Kind::Input { idempotent: false },
+    contract(
         "Send a key or chord to the approved window. Needs the window in the foreground; if it is not, call focus_window first. Refused if another process took the foreground.",
         object_schema(properties, &["keys"]),
         action_output_schema(false),
     )
 }
 
-fn run_actions_tool() -> Tool {
+pub(super) fn run_actions() -> Contract {
     let mut step = pointer_properties();
     step.remove("duration_ms");
     step.remove("observation");
@@ -771,17 +661,14 @@ fn run_actions_tool() -> Tool {
         }),
     );
     add_action_observation(&mut properties);
-    tool(
-        RUN_ACTIONS,
-        "Run action batch",
-        Kind::Input { idempotent: false },
+    contract(
         "Run up to 16 click, scroll, type_text, press_keys and wait steps in order on the approved window, with one final screenshot. Needs the window in the foreground. Every step is checked before the first runs. The batch stops at the first failure and reports each step as completed, failed or skipped. Each step waits up to 0.5 s for the window to settle and reports how that ended; a wait step pauses up to 5 s for slower loads and cannot be the last step. Use it for a known sequence such as filling a form, and observe between steps when the next one depends on the result.",
         object_schema(properties, &["steps"]),
         action_output_schema(false),
     )
 }
 
-fn type_text_tool() -> Tool {
+pub(super) fn type_text() -> Contract {
     let mut properties = JsonObject::new();
     properties.insert(
         "text".to_owned(),
@@ -793,10 +680,7 @@ fn type_text_tool() -> Tool {
     );
     properties.insert("timeout_ms".to_owned(), text_timeout_property());
     add_action_observation(&mut properties);
-    tool(
-        TYPE_TEXT,
-        "Type text",
-        Kind::Input { idempotent: false },
+    contract(
         "Type Unicode text into the approved window without the clipboard. Needs the window in the foreground and revalidates it before every character. Characters go one at a time, each after the application answers, so long text takes a while and a busy application slows it further. Use press_keys for shortcuts and special keys.",
         object_schema(properties, &["text"]),
         action_output_schema(false),

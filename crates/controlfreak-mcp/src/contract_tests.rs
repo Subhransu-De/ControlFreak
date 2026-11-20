@@ -678,15 +678,20 @@ fn every_tool_has_a_title_and_honest_annotations() {
     assert!(description.contains("permanently") || description.contains("closes input"));
 }
 
-/// F-54: the route table and the published tool list name exactly the same tools.
+/// F-54: the published tool list is the catalog, in its order, and every name is unique.
 #[test]
 fn routes_and_published_tools_agree() {
-    let mut published: Vec<String> = tools().iter().map(|tool| tool.name.to_string()).collect();
-    let mut routed: Vec<String> = ROUTES.iter().map(|(name, _)| (*name).to_owned()).collect();
-    published.sort();
-    routed.sort();
-    assert_eq!(published, routed);
-    assert!(route("not_a_tool").is_none());
+    let published: Vec<String> = tools().iter().map(|tool| tool.name.to_string()).collect();
+    let cataloged: Vec<String> = catalog::CATALOG
+        .iter()
+        .map(|spec| spec.name.to_owned())
+        .collect();
+    assert_eq!(published, cataloged);
+    let mut unique = cataloged.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), cataloged.len(), "duplicate tool names");
+    assert!(catalog::spec("not_a_tool").is_none());
     assert!(!is_mutating_tool(CAPTURE_DISPLAY));
     assert!(is_mutating_tool(CLICK_TEXT));
 }

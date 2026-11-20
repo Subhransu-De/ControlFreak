@@ -163,10 +163,11 @@ async fn a_malformed_input_request_is_refused_before_it_takes_the_desktop() {
     }
     // Every input tool called with no arguments fails parsing, or a static check when it has no
     // required field.
-    for (name, route) in ROUTES {
-        if !matches!(route, Route::Input(_)) {
+    for spec in catalog::CATALOG {
+        if !spec.is_mutating() {
             continue;
         }
+        let name = spec.name;
         let result = server.call(name, json!({})).await;
         let code = result["structuredContent"]["error"]["code"]
             .as_str()

@@ -2,6 +2,9 @@
 
 #[cfg(test)]
 mod begin_cancel_tests;
+mod catalog;
+#[cfg(test)]
+mod catalog_tests;
 #[cfg(test)]
 mod cleanup_tests;
 #[cfg(test)]
@@ -58,17 +61,10 @@ mod schema;
 #[cfg(test)]
 mod session_error_tests;
 
+use catalog::{Route, ToolSpec};
 #[cfg(test)]
 use controlfreak_core::{CaptureWindowRequest, WaitForChangeSinceRequest, WaitForWindowRequest};
-use handlers::{
-    call_capture_display, call_capture_region, call_capture_visual_baseline, call_capture_window,
-    call_find_text_on_screen, call_get_server_status, call_list_displays,
-    call_list_virtual_desktops, call_list_windows, call_read_text_in_region,
-    call_wait_for_change_since, call_wait_for_text, call_wait_for_visual_change,
-    call_wait_for_window, prepare_click_mouse, prepare_click_text, prepare_drag_mouse,
-    prepare_focus_window, prepare_move_mouse, prepare_press_keys, prepare_run_actions,
-    prepare_scroll_mouse, prepare_switch_virtual_desktop, prepare_type_text,
-};
+use handlers::call_get_server_status;
 use results::{
     CarriesPng, Encoded, click_text_result, keyboard_result, pointer_result, screenshot_result,
     tool_error, tool_execution_error, virtual_desktop_list_result, virtual_desktop_switch_result,
@@ -170,107 +166,8 @@ type InputRun =
 type PreparedInput = Result<InputRun, Box<CallToolResponse>>;
 type InputPrepare = fn(Option<JsonObject>) -> PreparedInput;
 
-/// Wraps a tool function as a [`ToolHandler`].
-macro_rules! handler {
-    ($function:path) => {
-        |backend, arguments, lease| Box::pin($function(backend, arguments, lease))
-    };
-}
-
-/// How a request for a tool is admitted and run.
-#[derive(Clone, Copy)]
-enum Route {
-    /// Cancels all desktop work and closes admission.
-    Stop,
-    /// Reports server state, even after a stop.
-    Status,
-    /// Releases desktop control.
-    EndSession,
-    /// Reserves desktop control for one approved window.
-    BeginSession,
-    /// A short read of the desktop. Stays available after a stop, with request cancellation only.
-    Observe(ToolHandler),
-    /// A read that can wait for seconds. A stop cancels it while it runs, but a new one is still
-    /// admitted after a stop, because reading the screen is safe.
-    Watch(ToolHandler),
-    /// Changes the desktop. Needs admission and runs under an operation lease, which is taken only
-    /// after the request is prepared, so a malformed request never reserves the desktop.
-    Input(InputPrepare),
-}
-
-/// Every tool by name and how it runs. A tool missing here does not exist, and `tools()` must
-/// publish exactly these names.
-static ROUTES: &[(&str, Route)] = &[
-    (STOP_DESKTOP_WORK, Route::Stop),
-    (GET_SERVER_STATUS, Route::Status),
-    (END_CONTROL_SESSION, Route::EndSession),
-    (BEGIN_CONTROL_SESSION, Route::BeginSession),
-    (LIST_DISPLAYS, Route::Observe(handler!(call_list_displays))),
-    (
-        CAPTURE_DISPLAY,
-        Route::Observe(handler!(call_capture_display)),
-    ),
-    (
-        CAPTURE_REGION,
-        Route::Observe(handler!(call_capture_region)),
-    ),
-    (
-        CAPTURE_WINDOW,
-        Route::Observe(handler!(call_capture_window)),
-    ),
-    (
-        CAPTURE_VISUAL_BASELINE,
-        Route::Observe(handler!(call_capture_visual_baseline)),
-    ),
-    (
-        WAIT_FOR_VISUAL_CHANGE,
-        Route::Watch(handler!(call_wait_for_visual_change)),
-    ),
-    (
-        WAIT_FOR_CHANGE_SINCE,
-        Route::Watch(handler!(call_wait_for_change_since)),
-    ),
-    (
-        READ_TEXT_IN_REGION,
-        Route::Watch(handler!(call_read_text_in_region)),
-    ),
-    (
-        FIND_TEXT_ON_SCREEN,
-        Route::Watch(handler!(call_find_text_on_screen)),
-    ),
-    (WAIT_FOR_TEXT, Route::Watch(handler!(call_wait_for_text))),
-    (LIST_WINDOWS, Route::Observe(handler!(call_list_windows))),
-    (
-        WAIT_FOR_WINDOW,
-        Route::Watch(handler!(call_wait_for_window)),
-    ),
-    (
-        LIST_VIRTUAL_DESKTOPS,
-        Route::Observe(handler!(call_list_virtual_desktops)),
-    ),
-    (CLICK_TEXT, Route::Input(prepare_click_text)),
-    (MOVE_MOUSE, Route::Input(prepare_move_mouse)),
-    (CLICK_MOUSE, Route::Input(prepare_click_mouse)),
-    (DRAG_MOUSE, Route::Input(prepare_drag_mouse)),
-    (SCROLL_MOUSE, Route::Input(prepare_scroll_mouse)),
-    (
-        SWITCH_VIRTUAL_DESKTOP,
-        Route::Input(prepare_switch_virtual_desktop),
-    ),
-    (FOCUS_WINDOW, Route::Input(prepare_focus_window)),
-    (PRESS_KEYS, Route::Input(prepare_press_keys)),
-    (TYPE_TEXT, Route::Input(prepare_type_text)),
-    (RUN_ACTIONS, Route::Input(prepare_run_actions)),
-];
-
-fn route(tool: &str) -> Option<Route> {
-    ROUTES
-        .iter()
-        .find_map(|(name, route)| (*name == tool).then_some(*route))
-}
-
 fn is_mutating_tool(tool: &str) -> bool {
-    matches!(route(tool), Some(Route::Input(_)))
+    catalog::spec(tool).is_some_and(ToolSpec::is_mutating)
 }
 
 #[derive(Clone)]
@@ -310,13 +207,13 @@ impl ControlFreakServer {
         stages: Arc<Mutex<Vec<controlfreak_core::timing::StageTiming>>>,
     ) -> Result<CallToolResponse, ErrorData> {
         let tool_name = request.name.to_string();
-        let Some(route) = route(&tool_name) else {
+        let Some(spec) = catalog::spec(&tool_name) else {
             return Err(ErrorData::invalid_params(
                 format!("unknown ControlFreak tool '{tool_name}'"),
                 Some(json!({ "tool": tool_name })),
             ));
         };
-        match route {
+        match spec.route {
             Route::Stop => {
                 parse_arguments::<NoArguments>(request.arguments)?;
                 self.stop.stop();
@@ -325,7 +222,7 @@ impl ControlFreakServer {
             Route::Status => self.server_status(request.arguments),
             Route::EndSession => self.end_session(request.arguments).await,
             Route::BeginSession | Route::Observe(_) | Route::Watch(_) | Route::Input(_) => {
-                self.admitted_request(route, request, context, stages).await
+                self.admitted_request(spec, request, context, stages).await
             }
         }
     }
@@ -388,13 +285,14 @@ impl ControlFreakServer {
     /// Admits a request that acts on the desktop or reads it, and runs it to completion.
     async fn admitted_request(
         &self,
-        route: Route,
+        spec: &'static ToolSpec,
         request: CallToolRequestParams,
         context: &RequestContext<RoleServer>,
         stages: Arc<Mutex<Vec<controlfreak_core::timing::StageTiming>>>,
     ) -> Result<CallToolResponse, ErrorData> {
         let tool_name = request.name.to_string();
-        if session::reads_the_screen(&tool_name) {
+        let route = spec.route;
+        if spec.reads_screen {
             // Lets the indicator show a brief "reading" state; it claims no session.
             self.stop.note_observation();
         }

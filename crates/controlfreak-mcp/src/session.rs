@@ -1205,28 +1205,6 @@ fn worker_wait(deadline: Option<Instant>, owned: bool, now: Instant) -> Option<D
     }
 }
 
-/// Tools that read pixels from the screen. They claim no session; the indicator only shows a
-/// brief "reading the screen" state for them.
-pub(super) fn reads_the_screen(tool: &str) -> bool {
-    use super::{
-        CAPTURE_DISPLAY, CAPTURE_REGION, CAPTURE_VISUAL_BASELINE, CAPTURE_WINDOW,
-        FIND_TEXT_ON_SCREEN, READ_TEXT_IN_REGION, WAIT_FOR_CHANGE_SINCE, WAIT_FOR_TEXT,
-        WAIT_FOR_VISUAL_CHANGE,
-    };
-    matches!(
-        tool,
-        CAPTURE_DISPLAY
-            | CAPTURE_REGION
-            | CAPTURE_WINDOW
-            | CAPTURE_VISUAL_BASELINE
-            | WAIT_FOR_VISUAL_CHANGE
-            | WAIT_FOR_CHANGE_SINCE
-            | READ_TEXT_IN_REGION
-            | FIND_TEXT_ON_SCREEN
-            | WAIT_FOR_TEXT
-    )
-}
-
 fn idle_worker_loop(
     runtime: &std::sync::Weak<SessionRuntime>,
     receiver: &mpsc::Receiver<IdleCommand>,
@@ -1391,34 +1369,5 @@ mod worker_tests {
             worker_wait(Some(now), true, now + Duration::from_secs(1)),
             Some(Duration::ZERO)
         );
-    }
-
-    #[test]
-    fn only_tools_that_read_pixels_show_the_reading_state() {
-        for tool in [
-            "capture_display",
-            "capture_region",
-            "capture_window",
-            "capture_visual_baseline",
-            "wait_for_visual_change",
-            "wait_for_change_since",
-            "read_text_in_region",
-            "find_text_on_screen",
-            "wait_for_text",
-        ] {
-            assert!(reads_the_screen(tool), "{tool}");
-        }
-        for tool in [
-            "list_displays",
-            "list_windows",
-            "get_server_status",
-            "begin_control_session",
-            "click_mouse",
-            "type_text",
-            "stop_desktop_work",
-            "wait_for_window",
-        ] {
-            assert!(!reads_the_screen(tool), "{tool}");
-        }
     }
 }
