@@ -666,6 +666,8 @@ pub(super) struct TypeTextInput {
     pub(super) target_ref: String,
     pub(super) text: String,
     #[serde(default)]
+    pub(super) timeout_ms: Option<u32>,
+    #[serde(default)]
     pub(super) observation: ObservationInput,
 }
 
@@ -825,6 +827,8 @@ pub(super) enum ActionStepInput {
     },
     TypeText {
         text: String,
+        #[serde(default)]
+        timeout_ms: Option<u32>,
     },
     PressKeys {
         keys: Vec<Key>,
@@ -851,6 +855,7 @@ pub(super) enum ActionStep {
     },
     TypeText {
         text: String,
+        timeout_ms: Option<u32>,
     },
     PressKeys {
         keys: Vec<Key>,
@@ -952,14 +957,25 @@ impl ActionStepInput {
                     delta_y: *delta_y,
                 })
             }
-            Self::TypeText { text } => {
+            Self::TypeText { text, timeout_ms } => {
                 let units = text.encode_utf16().count();
                 if units == 0 || units > MAX_TEXT_UTF16_UNITS {
                     return Err(format!(
                         "text must contain 1 to {MAX_TEXT_UTF16_UNITS} UTF-16 code units"
                     ));
                 }
-                Ok(ActionStep::TypeText { text: text.clone() })
+                controlfreak_core::validate_text_timeout(*timeout_ms).map_err(
+                    |error| match error {
+                        PlatformError::InvalidArgument { argument, reason } => {
+                            format!("{argument} {reason}")
+                        }
+                        other => other.to_string(),
+                    },
+                )?;
+                Ok(ActionStep::TypeText {
+                    text: text.clone(),
+                    timeout_ms: *timeout_ms,
+                })
             }
             Self::PressKeys { keys } => {
                 let unique: std::collections::HashSet<_> = keys.iter().collect();

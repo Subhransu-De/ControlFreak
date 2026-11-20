@@ -1994,6 +1994,7 @@ mod tests {
                 .type_text_controlled(
                     &TextInputRequest {
                         text: "synthetic".into(),
+                        timeout_ms: None,
                         observation,
                     },
                     &controlfreak_core::MutationControl::default(),

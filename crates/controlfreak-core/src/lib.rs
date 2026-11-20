@@ -33,7 +33,9 @@ pub use display::{
 };
 pub use dpi::{DpiAwareness, DpiAwarenessStatus};
 pub use error::{FailureCause, PlatformError, RefusalCause};
-pub use keyboard::{Key, KeyChordRequest, KeyboardActionResult, TextInputRequest};
+pub use keyboard::{
+    Key, KeyChordRequest, KeyboardActionResult, TextInputRequest, validate_text_timeout,
+};
 pub use mutation::MutationControl;
 pub use ocr::{
     ClickTextRequest, ClickTextResult, FindTextRequest, FindTextResult, OcrLine, OcrMatchDetails,

@@ -10,7 +10,7 @@ use super::{
 use controlfreak_core::limits::{
     DEFAULT_CAPTURE_WIDTH, DEFAULT_QUIET_SETTLE_MS, DEFAULT_SETTLE_MS, MAX_CAPTURE_WIDTH,
     MAX_MOVE_DURATION_MS, MAX_RUN_ACTIONS_WAIT_MS, MAX_SCROLL_DELTA, MAX_SETTLE_MS,
-    MAX_TEXT_UTF16_UNITS, MAX_WAIT_MS, MIN_WAIT_MS,
+    MAX_TEXT_TIMEOUT_MS, MAX_TEXT_UTF16_UNITS, MAX_WAIT_MS, MIN_TEXT_TIMEOUT_MS, MIN_WAIT_MS,
 };
 
 /// How a tool touches the desktop. It decides the annotations, which every client reads.
@@ -745,6 +745,7 @@ fn run_actions_tool() -> Tool {
         "text".to_owned(),
         json!({ "type": "string", "minLength": 1, "maxLength": MAX_TEXT_UTF16_UNITS }),
     );
+    step.insert("timeout_ms".to_owned(), text_timeout_property());
     step.insert(
         "keys".to_owned(),
         json!({ "type": "array", "minItems": 1, "maxItems": 8, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } }),
@@ -760,7 +761,7 @@ fn run_actions_tool() -> Tool {
             "type": "array",
             "minItems": 1,
             "maxItems": MAX_RUN_ACTION_STEPS,
-            "description": "click and scroll take x/y or observation_id/image_x/image_y; type_text takes text; press_keys takes keys as in press_keys; wait takes wait_ms.",
+            "description": "click and scroll take x/y or observation_id/image_x/image_y; type_text takes text and optional timeout_ms; press_keys takes keys as in press_keys; wait takes wait_ms.",
             "items": {
                 "type": "object",
                 "properties": step,
@@ -790,6 +791,7 @@ fn type_text_tool() -> Tool {
             "maxLength": MAX_TEXT_UTF16_UNITS,
         }),
     );
+    properties.insert("timeout_ms".to_owned(), text_timeout_property());
     add_action_observation(&mut properties);
     tool(
         TYPE_TEXT,
@@ -799,6 +801,16 @@ fn type_text_tool() -> Tool {
         object_schema(properties, &["text"]),
         action_output_schema(false),
     )
+}
+
+/// The optional overall limit of a `type_text` call or step.
+fn text_timeout_property() -> Value {
+    json!({
+        "type": "integer",
+        "minimum": MIN_TEXT_TIMEOUT_MS,
+        "maximum": MAX_TEXT_TIMEOUT_MS,
+        "description": "Stop typing after this many ms, between characters, with reason deadline_reached. No limit if omitted."
+    })
 }
 
 fn display_id_property() -> Value {
