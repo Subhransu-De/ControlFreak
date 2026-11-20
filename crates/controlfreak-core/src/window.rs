@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ActionObservation, ObservationOptions};
+use crate::{ActionObservation, DisplayLayout, ObservationOptions};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowBounds {
@@ -52,6 +52,8 @@ pub struct CaptureWindowRequest {
 pub struct WindowScreenshot {
     pub window: WindowInfo,
     pub source_bounds: WindowBounds,
+    /// The display layout the window was captured on, read after the pixels were.
+    pub display_layout: DisplayLayout,
     pub png: Vec<u8>,
     pub image_width: u32,
     pub image_height: u32,

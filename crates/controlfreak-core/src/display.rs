@@ -62,11 +62,31 @@ pub struct DisplayInfo {
     pub is_primary: bool,
 }
 
+/// The active displays by ID and bounds, and nothing else: enough to tell that a display was
+/// added, removed or moved since a capture. The order a backend lists displays in does not
+/// matter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayLayout(Vec<(String, DisplayBounds)>);
+
+impl DisplayLayout {
+    #[must_use]
+    pub fn from_displays(displays: &[DisplayInfo]) -> Self {
+        let mut layout: Vec<_> = displays
+            .iter()
+            .map(|display| (display.id.clone(), display.bounds))
+            .collect();
+        layout.sort_by(|left, right| left.0.cmp(&right.0));
+        Self(layout)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisplayScreenshot {
     pub target_ref: Option<String>,
     pub display: DisplayInfo,
     pub source_bounds: DisplayBounds,
+    /// The display layout the source bounds belong to, read after the pixels were.
+    pub display_layout: DisplayLayout,
     pub png: Vec<u8>,
     pub image_width: u32,
     pub image_height: u32,

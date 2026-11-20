@@ -5,7 +5,7 @@ use super::output_schema_tests::ObservationBackend;
 use super::session_error_tests::{call, harness_with_backend};
 use super::*;
 use controlfreak_core::{
-    BackendMetadata, DisplayBackend, DisplayBounds, DisplayInfo, DisplayScreenshot,
+    BackendMetadata, DisplayBackend, DisplayBounds, DisplayInfo, DisplayLayout, DisplayScreenshot,
     KeyboardBackend, MouseButton, MutationProgress, OcrBackend, PointerBackend, WindowBackend,
     WindowBounds, WindowInfo,
 };
@@ -59,9 +59,11 @@ struct Recorded {
     switches: usize,
 }
 
-/// Two displays, the primary one listed second, and a window list the test can change.
+/// Two displays, the primary one listed second, and a display layout and window list the test
+/// can change.
 struct ContractBackend {
     recorded: Mutex<Recorded>,
+    displays: Mutex<Vec<DisplayInfo>>,
     windows: Mutex<Vec<WindowInfo>>,
     click_error: Mutex<Option<PlatformError>>,
     /// Truncates `list_windows` like the real backend's cap, without hiding windows from
@@ -78,6 +80,7 @@ impl ContractBackend {
                 window("target-00000000-0000-0000-0000-000000000001"),
                 window("target-00000000-0000-0000-0000-000000000002"),
             ]),
+            displays: Mutex::new(displays()),
             click_error: Mutex::new(None),
             list_cap: Mutex::new(None),
             dpi_awareness: Mutex::new(None),
@@ -86,6 +89,18 @@ impl ContractBackend {
 
     fn recorded<T>(&self, read: impl FnOnce(&Recorded) -> T) -> T {
         read(&self.recorded.lock().unwrap())
+    }
+
+    /// A capture of the main display on the current layout.
+    fn screenshot(&self, request_width: Option<u32>) -> DisplayScreenshot {
+        DisplayScreenshot {
+            display_layout: self.layout(),
+            ..screenshot(request_width)
+        }
+    }
+
+    fn layout(&self) -> DisplayLayout {
+        DisplayLayout::from_displays(&self.displays.lock().unwrap())
     }
 
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)] // mirrors the other fixture backends
@@ -105,12 +120,18 @@ fn observation() -> ActionObservation {
     }
 }
 
+/// The fixture's displays until a test moves one.
+fn displays() -> Vec<DisplayInfo> {
+    vec![display("second", false, -800), display("main", true, 0)]
+}
+
 fn screenshot(request_width: Option<u32>) -> DisplayScreenshot {
     let width = request_width.unwrap_or(800).min(800);
     DisplayScreenshot {
         target_ref: None,
         display: display("main", true, 0),
         source_bounds: bounds(0, 800),
+        display_layout: DisplayLayout::from_displays(&displays()),
         png: vec![1, 2, 3],
         image_width: width,
         image_height: 600,
@@ -153,24 +174,21 @@ impl BackendMetadata for ContractBackend {
 
 impl DisplayBackend for ContractBackend {
     fn list_displays(&self) -> Result<Vec<DisplayInfo>, PlatformError> {
-        Ok(vec![
-            display("second", false, -800),
-            display("main", true, 0),
-        ])
+        Ok(self.displays.lock().unwrap().clone())
     }
     fn capture_display(
         &self,
         request: &CaptureDisplayRequest,
     ) -> Result<DisplayScreenshot, PlatformError> {
         self.recorded.lock().unwrap().captures.push(request.clone());
-        Ok(screenshot(request.max_width))
+        Ok(self.screenshot(request.max_width))
     }
     fn capture_region(
         &self,
         request: &CaptureRegionRequest,
     ) -> Result<DisplayScreenshot, PlatformError> {
         self.recorded.lock().unwrap().regions.push(request.clone());
-        Ok(screenshot(request.max_width))
+        Ok(self.screenshot(request.max_width))
     }
     fn wait_for_visual_change(
         &self,
@@ -186,7 +204,7 @@ impl DisplayBackend for ContractBackend {
             timed_out: true,
             difference: 0.0,
             elapsed_ms: 1,
-            screenshot: screenshot(None),
+            screenshot: self.screenshot(None),
         })
     }
 }
@@ -291,6 +309,7 @@ impl WindowBackend for ContractBackend {
             })?;
         Ok(controlfreak_core::WindowScreenshot {
             source_bounds: window.bounds,
+            display_layout: self.layout(),
             window,
             png: vec![1, 2, 3],
             image_width: request.max_width.map_or(400, |width| width.min(400)),
@@ -1208,6 +1227,71 @@ async fn a_window_image_stops_mapping_points_once_its_window_changed() {
     harness.finish().await;
 }
 
+/// #21: an image point maps only on the display layout the image was captured on. After a
+/// display moved, the old virtual rectangle may lie on another display, so the point is refused
+/// and nothing is sent; a new capture maps again.
+#[tokio::test]
+async fn an_image_stops_mapping_points_once_the_display_layout_changed() {
+    let backend = ContractBackend::new();
+    let mut harness = harness(backend.clone()).await;
+    let target = "target-00000000-0000-0000-0000-000000000001";
+    call(
+        &mut harness,
+        BEGIN_CONTROL_SESSION,
+        json!({"target_ref": target}),
+    )
+    .await;
+    let display_image = call(&mut harness, CAPTURE_DISPLAY, json!({})).await;
+    // The fixture keeps the window's reference across the layout change, so only the layout
+    // check can refuse its image.
+    let window_image = call(&mut harness, CAPTURE_WINDOW, json!({"window_id": target})).await;
+    let click = |capture: &Value| json!({"target_ref": target, "observation_id": capture["structuredContent"]["observation_id"], "image_x": 10, "image_y": 10});
+    for capture in [&display_image, &window_image] {
+        let same_layout = call(&mut harness, CLICK_MOUSE, click(capture)).await;
+        assert_ne!(same_layout["isError"], true, "{same_layout}");
+    }
+    assert_eq!(backend.recorded(|r| r.clicks.len()), 2);
+
+    // The secondary display moves from the left of the primary one to its right.
+    backend.displays.lock().unwrap()[0] = display("second", false, 800);
+    for capture in [&display_image, &window_image] {
+        let stale = call(&mut harness, CLICK_MOUSE, click(capture)).await;
+        assert_eq!(stale["isError"], true, "{stale}");
+        assert_eq!(
+            stale["structuredContent"]["error"]["code"],
+            "invalid_argument"
+        );
+        assert!(
+            stale.to_string().contains("display layout changed"),
+            "{stale}"
+        );
+        assert_eq!(stale["structuredContent"]["status"], "not_started");
+    }
+    let batch = call(
+        &mut harness,
+        RUN_ACTIONS,
+        json!({"target_ref": target, "steps": [{"action": "click", "observation_id": display_image["structuredContent"]["observation_id"], "image_x": 10, "image_y": 10}]}),
+    )
+    .await;
+    assert_eq!(batch["isError"], true, "{batch}");
+    assert!(
+        batch.to_string().contains("display layout changed"),
+        "{batch}"
+    );
+    assert_eq!(backend.recorded(|r| r.clicks.len()), 2);
+
+    let fresh = call(&mut harness, CAPTURE_DISPLAY, json!({})).await;
+    let mapped = call(&mut harness, CLICK_MOUSE, click(&fresh)).await;
+    assert_ne!(mapped["isError"], true, "{mapped}");
+    let clicks = backend.recorded(|r| r.clicks.clone());
+    assert_eq!(clicks.len(), 3);
+    assert_eq!(
+        (clicks[2].display_id.as_str(), clicks[2].x, clicks[2].y),
+        ("main", 10, 10)
+    );
+    harness.finish().await;
+}
+
 /// The window check does not depend on the capped `list_windows`.
 #[tokio::test]
 async fn a_window_image_is_checked_without_the_capped_window_list() {
@@ -1448,6 +1532,7 @@ fn a_completed_click_result_stays_small() {
             screenshot: Some(DisplayScreenshot {
                 target_ref: Some("target-00000000-0000-0000-0000-000000000001".into()),
                 source_bounds: display.bounds,
+                display_layout: DisplayLayout::from_displays(std::slice::from_ref(&display)),
                 display,
                 png: vec![1, 2, 3],
                 image_width: 1280,

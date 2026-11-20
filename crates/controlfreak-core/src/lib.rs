@@ -26,10 +26,11 @@ pub use desktop::{
 };
 pub use display::{
     ActionObservation, CaptureDisplayRequest, CaptureRegionRequest, DisplayBounds, DisplayInfo,
-    DisplayScreenshot, MouseButton, MouseClickRequest, MouseDragRequest, MouseMoveRequest,
-    MousePosition, MouseScrollRequest, ObservationMode, ObservationOptions, ObservationRegion,
-    PointerActionResult, SettleOutcome, SettleReport, VisualBaseline, VisualBaselineRequest,
-    VisualChangeResult, WaitForChangeSinceRequest, WaitForVisualChangeRequest,
+    DisplayLayout, DisplayScreenshot, MouseButton, MouseClickRequest, MouseDragRequest,
+    MouseMoveRequest, MousePosition, MouseScrollRequest, ObservationMode, ObservationOptions,
+    ObservationRegion, PointerActionResult, SettleOutcome, SettleReport, VisualBaseline,
+    VisualBaselineRequest, VisualChangeResult, WaitForChangeSinceRequest,
+    WaitForVisualChangeRequest,
 };
 pub use dpi::{DpiAwareness, DpiAwarenessStatus};
 pub use error::{FailureCause, PlatformError, RefusalCause};

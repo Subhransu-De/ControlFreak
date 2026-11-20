@@ -78,6 +78,7 @@ fn screenshot_metadata(screenshot: &DisplayScreenshot) -> Value {
             screenshot.source_bounds,
             screenshot.image_width,
             screenshot.image_height,
+            screenshot.display_layout.clone(),
             None,
         ),
     })
@@ -135,6 +136,7 @@ pub(super) fn window_screenshot_result(screenshot: Encoded<WindowScreenshot>) ->
                 },
                 screenshot.image_width,
                 screenshot.image_height,
+                screenshot.display_layout.clone(),
                 Some(super::observations::ShownWindow {
                     id: screenshot.window.id.clone(),
                     bounds: screenshot.window.bounds,

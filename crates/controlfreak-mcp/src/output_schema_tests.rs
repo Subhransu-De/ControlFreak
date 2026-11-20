@@ -30,6 +30,7 @@ fn screenshot() -> DisplayScreenshot {
         target_ref: Some("target-synthetic".into()),
         display: display(),
         source_bounds: bounds(),
+        display_layout: controlfreak_core::DisplayLayout::from_displays(&[display()]),
         png: vec![1, 2, 3],
         image_width: 5,
         image_height: 5,
@@ -220,6 +221,7 @@ impl WindowBackend for ObservationBackend {
         Ok(controlfreak_core::WindowScreenshot {
             window: window(),
             source_bounds: window().bounds,
+            display_layout: controlfreak_core::DisplayLayout::from_displays(&[display()]),
             png: vec![1, 2, 3],
             image_width: 5,
             image_height: 5,

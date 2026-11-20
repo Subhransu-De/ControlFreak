@@ -46,18 +46,20 @@ virtual-desktop coordinates. For an image point `image_x, image_y`, map each axi
 
 ```text
 local_x = source_bounds.left - display.bounds.left
-          + floor(image_x * source_bounds.width / image_width)
+          + floor((2 * image_x + 1) * source_bounds.width / (2 * image_width))
 local_y = source_bounds.top - display.bounds.top
-          + floor(image_y * source_bounds.height / image_height)
+          + floor((2 * image_y + 1) * source_bounds.height / (2 * image_height))
 ```
+
+This is the source pixel under the centre of the image pixel. An unresized image maps one to one.
 
 Use actual image dimensions because resizing can round either axis. Validate that the image
 point lies inside the image and the mapped point lies inside the display. Do not multiply
 by Windows DPI scaling or use the resized image coordinates directly as input coordinates.
 
 The fixture crop starts at display-local `100, 60` and covers 400 by 200 physical pixels.
-Its returned image is 200 by 100 pixels. Image point `50, 25` maps to display-local `200, 110`,
-or virtual point `-1720, -90`. The first recipe asserts both capture metadata and input position.
+Its returned image is 200 by 100 pixels. Image point `50, 25` maps to display-local `201, 111`,
+or virtual point `-1719, -89`. The first recipe asserts both capture metadata and input position.
 
 ## Bounded waits
 
