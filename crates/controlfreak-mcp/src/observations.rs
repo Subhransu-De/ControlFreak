@@ -5,12 +5,14 @@
 //! and the server maps it back, so clients never redo crop and scale arithmetic. Only geometry is
 //! kept, never pixels, in a small bounded map with a short lifetime.
 //!
-//! An image of one window maps points only while that window is unchanged: its reference changes
-//! when the window moves, resizes or closes, so a stale image is refused instead of mapped onto
+//! An image of one window maps points only while that window is unchanged: the same reference
+//! with the same bounds. A window keeps its reference when it only moves or is resized, so the
+//! bounds are compared too, and a stale image is refused instead of mapped onto
 //! whatever now lies under the old rectangle.
 
 use controlfreak_core::{
     DisplayBounds, ObservationOptions, PlatformBackend, PlatformError, WaitForWindowRequest,
+    WindowBounds,
 };
 use std::{
     collections::VecDeque,
@@ -41,7 +43,14 @@ struct Observation {
     created: Instant,
     mapping: ImageMapping,
     /// The window this image shows, when it is an image of one window.
-    window_id: Option<String>,
+    window: Option<ShownWindow>,
+}
+
+/// The window an image shows, as it was when the image was captured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ShownWindow {
+    pub(super) id: String,
+    pub(super) bounds: WindowBounds,
 }
 
 static OBSERVATIONS: Mutex<VecDeque<Observation>> = Mutex::new(VecDeque::new());
@@ -58,12 +67,12 @@ fn process_nonce() -> u64 {
 }
 
 /// Records a returned image's geometry and returns the id clients pass back with image points.
-/// `window_id` is set when the image shows one window.
+/// `window` is set when the image shows one window.
 pub(super) fn register(
     source: DisplayBounds,
     image_width: u32,
     image_height: u32,
-    window_id: Option<String>,
+    window: Option<ShownWindow>,
 ) -> String {
     let id = format!(
         "obs-{:016x}-{:x}",
@@ -83,7 +92,7 @@ pub(super) fn register(
                 image_width,
                 image_height,
             },
-            window_id,
+            window,
         },
     );
     id
@@ -105,13 +114,13 @@ fn invalid(argument: &str, reason: impl Into<String>) -> PlatformError {
     }
 }
 
-fn lookup(id: &str) -> Result<(ImageMapping, Option<String>), PlatformError> {
+fn lookup(id: &str) -> Result<(ImageMapping, Option<ShownWindow>), PlatformError> {
     OBSERVATIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
         .find(|observation| observation.id == id && observation.created.elapsed() < OBSERVATION_TTL)
-        .map(|observation| (observation.mapping, observation.window_id.clone()))
+        .map(|observation| (observation.mapping, observation.window.clone()))
         .ok_or_else(|| {
             invalid(
                 "observation_id",
@@ -265,13 +274,13 @@ impl PointerTarget {
                 image_y,
             } => (observation_id, *image_x, *image_y),
         };
-        let (mapping, window_id) = lookup(observation_id)?;
+        let (mapping, shown) = lookup(observation_id)?;
         // Ask for this one window's reference directly: `list_windows` is capped, so a window
         // missing from that list would otherwise look closed.
-        if let Some(window_id) = window_id {
+        if let Some(shown) = shown {
             let unchanged = backend
                 .wait_for_window(&WaitForWindowRequest {
-                    window_id: Some(window_id.clone()),
+                    window_id: Some(shown.id.clone()),
                     title_contains: None,
                     class_name: None,
                     process_id: None,
@@ -279,7 +288,7 @@ impl PointerTarget {
                     timeout_ms: 0,
                 })?
                 .window
-                .is_some_and(|window| window.id == window_id);
+                .is_some_and(|window| window.id == shown.id && window.bounds == shown.bounds);
             if !unchanged {
                 return Err(invalid(
                     "observation_id",
@@ -363,7 +372,7 @@ mod tests {
                 image_width: 10,
                 image_height: 10,
             },
-            window_id: None,
+            window: None,
         };
         remember(&mut store, entry("first".to_owned()));
         for number in 0..MAX_OBSERVATIONS {

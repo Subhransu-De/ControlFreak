@@ -1109,7 +1109,12 @@ impl WindowBackend for Backend {
         // window that cannot is copied from the screen, and `capture_method` says which.
         let capture =
             capture_window_bounds(hwnd, bounds, request.max_width, request.include_cursor)?;
-        if target::issue(hwnd)? != window.id {
+        // The image is the window only if it is still the same window on the same display layout
+        // (the same reference) and at the same place. A reference survives a move, so the
+        // bounds are compared as well.
+        if target::issue(hwnd)? != window.id
+            || find_window(&request.window_id)?.bounds != window.bounds
+        {
             return Err(target::invalid(
                 "window geometry changed during capture; observe again",
             ));

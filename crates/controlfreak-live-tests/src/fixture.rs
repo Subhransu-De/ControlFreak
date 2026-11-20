@@ -15,6 +15,7 @@
 //! controlfreak-fixture --inject-click X,Y     # SendInput a left click at a screen point
 //! controlfreak-fixture --release-clip         # free the pointer from any ClipCursor rectangle
 //! controlfreak-fixture --clip-rect            # print the rectangle the pointer is confined to
+//! controlfreak-fixture --move-window TITLE DX,DY  # move the top-level window titled TITLE
 //! ```
 //!
 //! With `--clip-cursor` the window confines the pointer to the left part of its client area with
@@ -82,13 +83,14 @@ mod win {
                     DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, FindWindowW,
                     GetClassNameW, GetClipCursor, GetForegroundWindow, GetMessageW, GetWindowRect,
                     GetWindowTextW, HMENU, IDC_ARROW, IsWindowVisible, LoadCursorW, MSG, PM_REMOVE,
-                    PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SetCursorPos,
-                    SetForegroundWindow, SetTimer, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
-                    WINDOW_STYLE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE,
-                    WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT,
-                    WM_PRINTCLIENT, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR,
-                    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD,
-                    WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_VISIBLE, WaitMessage,
+                    PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SWP_NOACTIVATE,
+                    SWP_NOSIZE, SWP_NOZORDER, SetCursorPos, SetForegroundWindow, SetTimer,
+                    SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
+                    WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN,
+                    WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT, WM_PRINTCLIENT, WM_QUIT,
+                    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+                    WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP,
+                    WS_SYSMENU, WS_VISIBLE, WaitMessage,
                 },
             },
         },
@@ -193,6 +195,10 @@ mod win {
                 "--inject-unicode" => return inject_unicode(&args.next().unwrap_or_default()),
                 "--release-clip" => return release_clip(),
                 "--clip-rect" => return print_clip_rect(),
+                "--move-window" => {
+                    let title = args.next().unwrap_or_default();
+                    return move_window(&title, &args.next().unwrap_or_default());
+                }
                 "--title" => options.title = args.next().unwrap_or_default(),
                 "--log" => options.log = args.next().map(PathBuf::from),
                 "--color" => {
@@ -582,6 +588,43 @@ mod win {
         }
         println!("{} {} {} {}", clip.left, clip.top, clip.right, clip.bottom);
         0
+    }
+
+    /// Moves the top-level window with exactly this title by DX,DY physical pixels, from
+    /// another process, as a user dragging its title bar would. Its size, Z order and the
+    /// foreground stay as they are. Exit code 0 only if the window was found and moved.
+    fn move_window(title: &str, offset: &str) -> i32 {
+        let Some((dx, dy)) = offset
+            .split_once(',')
+            .and_then(|(x, y)| Some((x.parse::<i32>().ok()?, y.parse::<i32>().ok()?)))
+        else {
+            eprintln!("--move-window needs a title and DX,DY");
+            return 2;
+        };
+        let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+        let mut rect = RECT::default();
+        // SAFETY: `title` is NUL-terminated and outlives the synchronous lookup, `rect` is
+        // writable for its call, and the found handle is only passed by value.
+        unsafe {
+            let Ok(window) = FindWindowW(None, PCWSTR(title.as_ptr())) else {
+                return 1;
+            };
+            if GetWindowRect(window, &raw mut rect).is_err() {
+                return 1;
+            }
+            i32::from(
+                SetWindowPos(
+                    window,
+                    None,
+                    rect.left + dx,
+                    rect.top + dy,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+                .is_err(),
+            )
+        }
     }
 
     fn destroy(hwnd: HWND) -> LRESULT {

@@ -48,6 +48,7 @@ This is the plain "one application" desk. Every task here starts a control sessi
 | `smoke/click-text-by-ocr` | Needs OCR. Clicks the word `Banana` by OCR and checks the click landed inside the label. |
 | `smoke/injected-stop-click-ignored` | Finds the session's Stop button. Checks the server refuses a click on it with `own_indicator`. Then sends a real injected click straight to the button through the fixture and checks control did not stop. |
 | `smoke/held-modifier-refused` | Holds Shift through the fixture with a real key-down, as a person would. Checks `press_keys`, `type_text`, `click_mouse` and `scroll_mouse` are refused with `key_held`, `not_started` and no events, and the window received no input. Releases Shift, checks Delete then arrives, and records in a note how a Unicode character typed under a held Alt reached the window. |
+| `smoke/moved-window-keeps-session` | Captures the window, then moves it 60 by 40 pixels from another process through the fixture, as a user dragging it would. Checks a click through the old capture's `observation_id` is refused as stale. Captures the window again and checks it kept its `target_ref`. Checks a click at the button through the new capture is refused with `target_moved`, `retryable` and `not_started`, then that the same click succeeds in the same session and the button was pressed once. |
 
 ## busy-app
 

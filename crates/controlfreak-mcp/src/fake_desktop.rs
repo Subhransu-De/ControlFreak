@@ -5,8 +5,9 @@
 //! covered by the platform tests; this model only keeps the two in step at the tool boundary.
 //!
 //! Rules modelled:
-//! - A reference names one window revision. Resizing or closing makes it unknown, which is fatal
-//!   for the session that approved it.
+//! - A reference names one window. Closing it makes the reference unknown, which is fatal for the
+//!   session that approved it. Resizing keeps the reference: the next input action is refused
+//!   once with `target_moved`, and the session's reference takes the new bounds.
 //! - Input is accepted while the foreground window belongs to the approved window's process. Any
 //!   other foreground is refused for that action only; the session survives.
 //! - Pointer input lands on the foreground window.
@@ -39,8 +40,9 @@ struct FakeWindow {
     process_id: u32,
     owner: Option<u32>,
     bounds: WindowBounds,
-    /// Bumped by every resize; part of the reference, as bounds are in the real one.
-    revision: u32,
+    /// The bounds the window's reference last checked input against. A resize changes `bounds`
+    /// only, as the real reference keeps the bounds it was issued or last validated with.
+    checked: WindowBounds,
     open: bool,
 }
 
@@ -59,10 +61,7 @@ struct State {
 pub(super) struct FakeDesktop(Mutex<State>);
 
 fn reference(window: &FakeWindow) -> String {
-    format!(
-        "target-{:08X}-0000-0000-0000-{:012X}",
-        window.key, window.revision
-    )
+    format!("target-{:08X}-0000-0000-0000-000000000000", window.key)
 }
 
 fn info(window: &FakeWindow, state: &State) -> WindowInfo {
@@ -153,7 +152,12 @@ impl FakeDesktop {
                 width: 800,
                 height: 600,
             },
-            revision: 0,
+            checked: WindowBounds {
+                left: 100,
+                top: 100,
+                width: 800,
+                height: 600,
+            },
             open: true,
         })
     }
@@ -174,12 +178,17 @@ impl FakeDesktop {
                 width: 300,
                 height: 150,
             },
-            revision: 0,
+            checked: WindowBounds {
+                left: 300,
+                top: 250,
+                width: 300,
+                height: 150,
+            },
             open: true,
         })
     }
 
-    /// Changes the window's size; its old reference stops existing.
+    /// Changes the window's size. Its reference stays, as for the same window on Windows.
     pub(super) fn resize(&self, key: u32) {
         let mut state = self.state();
         let window = state
@@ -188,7 +197,6 @@ impl FakeDesktop {
             .find(|window| window.key == key)
             .expect("window exists");
         window.bounds.width += 40;
-        window.revision += 1;
     }
 
     /// Closes the window; the foreground falls to its owner when it has one.
@@ -223,8 +231,9 @@ impl FakeDesktop {
         self.state().received.clone()
     }
 
-    /// Admission for one input action: the approved window must still exist, and the foreground
-    /// window must belong to its process. Returns the key of the window that receives input.
+    /// Admission for one input action: the approved window must still exist with the bounds its
+    /// reference checked last, and the foreground window must belong to its process. Returns the
+    /// key of the window that receives input.
     fn admit(&self, control: &MutationControl, operation: &str) -> Result<u32, PlatformError> {
         control.check(operation)?;
         control.check_target()?;
@@ -234,13 +243,25 @@ impl FakeDesktop {
                 .ok_or_else(|| PlatformError::TargetInvalidated {
                     reason: "an approved target reference is required".into(),
                 })?;
-        let state = self.state();
-        let Some(target) = state.resolve(&approved) else {
+        let mut state = self.state();
+        let Some(target) = state
+            .windows
+            .iter_mut()
+            .find(|window| window.open && reference(window) == approved)
+        else {
             control.invalidate_target();
             return Err(PlatformError::TargetInvalidated {
                 reason: "window, process lifetime, owner, or desktop changed".into(),
             });
         };
+        if target.bounds != target.checked {
+            target.checked = target.bounds;
+            return Err(PlatformError::refused(
+                controlfreak_core::RefusalCause::TargetMoved,
+                "the approved window moved or was resized",
+            ));
+        }
+        let target = target.clone();
         state
             .foreground
             .and_then(|key| state.window(key))

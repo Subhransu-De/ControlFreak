@@ -135,7 +135,10 @@ pub(super) fn window_screenshot_result(screenshot: Encoded<WindowScreenshot>) ->
                 },
                 screenshot.image_width,
                 screenshot.image_height,
-                Some(screenshot.window.id.clone()),
+                Some(super::observations::ShownWindow {
+                    id: screenshot.window.id.clone(),
+                    bounds: screenshot.window.bounds,
+                }),
             ),
         }),
     )
