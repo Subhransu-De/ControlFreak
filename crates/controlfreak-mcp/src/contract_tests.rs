@@ -326,12 +326,15 @@ impl WindowBackend for ContractBackend {
         self.act(
             control,
             // A known desktop, then none: what an empty destination desktop may look like.
-            VirtualDesktopSwitchResult::from_readings(
-                request,
-                Some("desktop-a".to_owned()),
-                None,
-                observation(),
-            ),
+            VirtualDesktopSwitchResult {
+                direction: request.direction,
+                requested_steps: request.steps,
+                changed: true,
+                before_id: Some("desktop-a".to_owned()),
+                after_id: None,
+                transition: controlfreak_core::VirtualDesktopTransition::Unknown,
+                observation: observation(),
+            },
         )
     }
 }

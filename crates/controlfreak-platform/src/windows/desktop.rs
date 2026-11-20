@@ -153,13 +153,45 @@ pub(super) fn with_virtual_desktop_manager<T>(
 }
 
 pub(super) fn current_virtual_desktop_id(manager: &IVirtualDesktopManager) -> Option<String> {
+    foreground_desktop(manager).map(|desktop_id| format!("{desktop_id:?}"))
+}
+
+/// The foreground window's desktop as the shell reports it, including the all-zero ID.
+pub(super) fn foreground_desktop(manager: &IVirtualDesktopManager) -> Option<windows::core::GUID> {
     let foreground = foreground_window_handle();
     if foreground.is_invalid() {
         return None;
     }
-    window_desktop_id(manager, foreground)
-        .ok()
-        .map(|desktop_id| format!("{desktop_id:?}"))
+    window_desktop_id(manager, foreground).ok()
+}
+
+/// Builds a switch result from the raw readings before and after the shortcuts. The shell gives
+/// an all-zero ID for a window it does not track, which names no desktop, so it is unknown for
+/// `transition` and reported as `None`. `changed` keeps comparing the raw readings, as before.
+pub(super) fn desktop_switch_result(
+    request: &controlfreak_core::VirtualDesktopSwitchRequest,
+    before: Option<windows::core::GUID>,
+    after: Option<windows::core::GUID>,
+    observation: controlfreak_core::ActionObservation,
+) -> controlfreak_core::VirtualDesktopSwitchResult {
+    let known = |desktop: Option<windows::core::GUID>| {
+        desktop
+            .filter(|desktop| *desktop != windows::core::GUID::zeroed())
+            .map(|desktop| format!("{desktop:?}"))
+    };
+    let (before_id, after_id) = (known(before), known(after));
+    controlfreak_core::VirtualDesktopSwitchResult {
+        direction: request.direction,
+        requested_steps: request.steps,
+        changed: before != after,
+        transition: controlfreak_core::VirtualDesktopTransition::classify(
+            before_id.as_deref(),
+            after_id.as_deref(),
+        ),
+        before_id,
+        after_id,
+        observation,
+    }
 }
 
 /// Sets per-monitor awareness once and caches the outcome, refusals included: a process's
@@ -667,6 +699,63 @@ fn window_not_available(reason: &str) -> PlatformError {
     PlatformError::InvalidArgument {
         argument: "window".to_owned(),
         reason: reason.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod switch_result_tests {
+    use super::*;
+    use controlfreak_core::{
+        ActionObservation, ObservationOptions, VirtualDesktopDirection,
+        VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult, VirtualDesktopTransition,
+    };
+    use windows::core::GUID;
+
+    fn switch(before: Option<GUID>, after: Option<GUID>) -> VirtualDesktopSwitchResult {
+        let request = VirtualDesktopSwitchRequest {
+            direction: VirtualDesktopDirection::Left,
+            steps: 2,
+            observation: ObservationOptions::default(),
+        };
+        let observation = ActionObservation {
+            foreground_window: None,
+            screenshot: None,
+            settle: None,
+        };
+        desktop_switch_result(&request, before, after, observation)
+    }
+
+    #[test]
+    fn a_missing_or_untracked_reading_confirms_nothing_and_changed_stays_raw() {
+        let a = Some(GUID::from_u128(0xa));
+        let b = Some(GUID::from_u128(0xb));
+        let zero = Some(GUID::zeroed());
+        for (before, after, expected) in [
+            (a, None, (true, VirtualDesktopTransition::Unknown)),
+            (None, None, (false, VirtualDesktopTransition::Unknown)),
+            (a, zero, (true, VirtualDesktopTransition::Unknown)),
+            (zero, zero, (false, VirtualDesktopTransition::Unknown)),
+            (None, zero, (true, VirtualDesktopTransition::Unknown)),
+            (a, a, (false, VirtualDesktopTransition::ConfirmedUnchanged)),
+            (a, b, (true, VirtualDesktopTransition::ConfirmedChanged)),
+        ] {
+            let result = switch(before, after);
+            assert_eq!(
+                (result.changed, result.transition),
+                expected,
+                "{before:?} -> {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_untracked_reading_is_reported_as_an_unknown_id() {
+        let a = GUID::from_u128(0xa);
+        let result = switch(Some(a), Some(GUID::zeroed()));
+        assert_eq!(result.before_id, Some(format!("{a:?}")));
+        assert_eq!(result.after_id, None);
+        assert_eq!(result.direction, VirtualDesktopDirection::Left);
+        assert_eq!(result.requested_steps, 2);
     }
 }
 

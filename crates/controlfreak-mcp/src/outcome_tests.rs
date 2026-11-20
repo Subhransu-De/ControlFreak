@@ -199,10 +199,17 @@ impl WindowBackend for SyntheticBackend {
         request: &VirtualDesktopSwitchRequest,
         control: &MutationControl,
     ) -> Result<VirtualDesktopSwitchResult, PlatformError> {
-        let desktop = || Some("desktop-a".to_owned());
         self.act(
             control,
-            VirtualDesktopSwitchResult::from_readings(request, desktop(), desktop(), observation()),
+            VirtualDesktopSwitchResult {
+                direction: request.direction,
+                requested_steps: request.steps,
+                changed: false,
+                before_id: Some("desktop-a".to_owned()),
+                after_id: Some("desktop-a".to_owned()),
+                transition: controlfreak_core::VirtualDesktopTransition::ConfirmedUnchanged,
+                observation: observation(),
+            },
         )
     }
 }
