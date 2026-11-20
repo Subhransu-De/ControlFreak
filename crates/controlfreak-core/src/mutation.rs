@@ -171,6 +171,12 @@ impl MutationControl {
         });
     }
 
+    /// Records that typing stopped between the two halves of a surrogate pair: the high half
+    /// was sent and the low half will not be.
+    pub fn split_character(&self) {
+        self.update_progress(|progress| progress.split_character = true);
+    }
+
     pub fn cleanup_status(&self, status: CleanupStatus) {
         self.update_progress(|progress| progress.cleanup = status);
     }

@@ -1097,6 +1097,7 @@ fn input_progress_schema() -> Value {
             "activation_attempts": { "type": "integer", "minimum": 0 },
             "activation_elapsed_ms": { "type": "integer", "minimum": 0 },
             "activation_helper": {"enum": ["accepted", "refused", "failed"]},
+            "split_character": {"const": true},
             "cleanup": {"enum": ["not_needed", "succeeded", "unknown"]}
         },
         "required": ["input_outcome", "sent_events", "cleanup"],

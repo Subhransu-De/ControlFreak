@@ -1063,11 +1063,15 @@ fn run_steps(
         } else {
             quiet.clone()
         };
-        let sent_before = control.progress().sent_events;
+        let before = control.progress();
         let outcome = control
             .check("run_actions")
             .and_then(|()| run_step(backend, step, point, options, control));
-        let sent_events = control.progress().sent_events.saturating_sub(sent_before);
+        let after = control.progress();
+        let sent_events = after.sent_events.saturating_sub(before.sent_events);
+        // Typing that stopped between the halves of a surrogate pair says so on its own step,
+        // as it does in the batch's `input`.
+        let split_character = after.split_character && !before.split_character;
         match outcome {
             Ok(step_observation) => {
                 report(
@@ -1085,9 +1089,11 @@ fn run_steps(
                     );
                     return Err(error);
                 }
-                report(
-                    json!({ "index": index, "action": step.kind(), "status": "failed", "sent_events": sent_events, "error": error.to_string() }),
-                );
+                let mut failed = json!({ "index": index, "action": step.kind(), "status": "failed", "sent_events": sent_events, "error": error.to_string() });
+                if split_character {
+                    failed["split_character"] = json!(true);
+                }
+                report(failed);
                 for (skipped, step) in steps.iter().enumerate().skip(index + 1) {
                     report(
                         json!({ "index": skipped, "action": step.kind(), "status": "skipped", "sent_events": 0 }),

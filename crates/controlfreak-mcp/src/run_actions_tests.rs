@@ -13,6 +13,9 @@ struct Scripted {
     failure: PlatformError,
     /// Step whose input is delivered but whose post-action observation then fails.
     observation_fails_at: Option<usize>,
+    /// The failing step first sends the high half of a surrogate pair, as typing that stops
+    /// between the halves does.
+    splits_pair: bool,
     calls: Mutex<Vec<String>>,
 }
 
@@ -23,6 +26,11 @@ impl Scripted {
         calls.push(label);
         drop(calls);
         if self.fail_at == Some(index) {
+            if self.splits_pair {
+                control.dispatch_started();
+                control.dispatch_accepted(2);
+                control.split_character();
+            }
             return Err(self.failure.clone());
         }
         control.dispatch_started();
@@ -177,12 +185,19 @@ async fn run_failing(
     observation_fails_at: Option<usize>,
     arguments: Value,
 ) -> (Value, Vec<String>) {
-    let backend = Arc::new(Scripted {
+    let backend = Scripted {
         fail_at,
         failure,
         observation_fails_at,
+        splits_pair: false,
         calls: Mutex::new(Vec::new()),
-    });
+    };
+    call(backend, RUN_ACTIONS, arguments).await
+}
+
+/// Calls `tool` once on `backend` and checks the result against the tool's output schema.
+async fn call(backend: Scripted, tool: &str, arguments: Value) -> (Value, Vec<String>) {
+    let backend = Arc::new(backend);
     let server =
         ControlFreakServer::with_indicator(backend.clone(), SafetyIndicator::dormant(), None);
     let (client_io, server_io) = tokio::io::duplex(256 * 1024);
@@ -208,21 +223,21 @@ async fn run_failing(
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
     )
     .await;
-    let tool = listed["result"]["tools"]
+    let listed_tool = listed["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|tool| tool["name"] == RUN_ACTIONS)
+        .find(|listed| listed["name"] == tool)
         .unwrap()
         .clone();
     let response = exchange(
         &mut client,
-        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":RUN_ACTIONS,"arguments":arguments}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":tool,"arguments":arguments}}),
     )
     .await;
     let content = response["result"]["structuredContent"].clone();
     assert!(
-        jsonschema::validator_for(&tool["outputSchema"])
+        jsonschema::validator_for(&listed_tool["outputSchema"])
             .unwrap()
             .is_valid(&content),
         "{content}"
@@ -435,5 +450,66 @@ async fn observation_failures_report_steps_and_true_delivery() {
     assert_eq!(
         statuses(&content["details"]["steps"]),
         ["completed", "completed", "completed", "completed"]
+    );
+}
+
+#[tokio::test]
+async fn typing_that_stops_inside_a_surrogate_pair_reports_the_split_character() {
+    let stopped = || {
+        PlatformError::failed(
+            controlfreak_core::FailureCause::Cancelled,
+            "type_text",
+            "the desktop operation was cancelled",
+        )
+    };
+    let scripted = |fail_at| Scripted {
+        fail_at: Some(fail_at),
+        failure: stopped(),
+        observation_fails_at: None,
+        splits_pair: true,
+        calls: Mutex::new(Vec::new()),
+    };
+    let target = "target-00000000-0000-0000-0000-000000000003";
+    let (content, _) = call(
+        scripted(0),
+        TYPE_TEXT,
+        json!({"target_ref": target, "text": "\u{1f980}"}),
+    )
+    .await;
+    assert_eq!(content["status"], "partially_sent", "{content}");
+    assert_eq!(content["input"]["split_character"], true, "{content}");
+    assert_eq!(content["error"]["reason"], "cancelled", "{content}");
+
+    let (content, calls) = call(
+        scripted(1),
+        RUN_ACTIONS,
+        json!({"target_ref": target, "steps": steps()}),
+    )
+    .await;
+    assert_eq!(calls.len(), 2, "{content}");
+    assert_eq!(content["status"], "partially_sent", "{content}");
+    assert_eq!(content["input"]["split_character"], true, "{content}");
+    let reported = content["error"]["details"]["steps"].as_array().unwrap();
+    assert_eq!(reported[1]["status"], "failed", "{content}");
+    assert_eq!(reported[1]["split_character"], true, "{content}");
+    // Only the step that split the pair says so.
+    for index in [0, 2, 3] {
+        assert!(
+            reported[index].get("split_character").is_none(),
+            "{content}"
+        );
+    }
+
+    // Typing that stops elsewhere carries no split flag.
+    let (content, _) = run_failing(
+        Some(1),
+        stopped(),
+        None,
+        json!({"target_ref": target, "steps": steps()}),
+    )
+    .await;
+    assert!(
+        content["input"].get("split_character").is_none(),
+        "{content}"
     );
 }

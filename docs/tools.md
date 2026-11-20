@@ -176,6 +176,8 @@ Windows adds a modifier the user is holding to every key, click and wheel turn t
 
 `type_text` sends one keystroke at a time and checks the target before every keystroke. Before each keystroke it waits until the window with keyboard focus answers a message, pauses 10 ms, and waits for a second answer. A Unicode keystroke does not carry its character in its window message: Windows keeps the character of the keystroke the application took last, so an application that takes several queued keystrokes before translating them, as a busy one can, would turn them all into the last character. Pacing keeps keystrokes from piling up while the application is busy. It cannot prove the application took or translated a keystroke, so an application that answers messages without taking keyboard input, or handles one keystroke for longer than the pause, can still receive wrong characters, and so can any application when a keyboard hook delays keystrokes for longer than the pause; check the result before relying on it. Typing runs at roughly 70 characters a second, slower while the application is busy, and the 4,000-unit maximum can take about a minute. If the window does not answer for 5 seconds, typing stops with `target_not_responding`, and `input.sent_events` shows how much was sent. Each wait is bounded, but a whole run has no overall limit: a window that answers just under 5 seconds every time keeps typing slowly until it is finished, stopped or cancelled.
 
+A character outside the Basic Multilingual Plane, such as an emoji, is two UTF-16 units, a surrogate pair, and each half is checked and sent as its own keystroke. If typing stops between the halves, the second half is never sent: a target refusal because it could reach another window, and a held modifier, user stop or cancellation because a stop means no more input. The application then holds half a character, and the result says so with `input.split_character: true`; in `run_actions` the failed `type_text` step carries `split_character: true` too. Observe the text and delete the stray half before typing again. The field is absent when no pair was split. If Windows did not confirm whether the second half was sent, `input.input_outcome` is `unknown` and `split_character` is absent.
+
 ## Waiting for changes
 
 - `capture_visual_baseline` then `wait_for_change_since`: save a region before an action and wait
@@ -207,6 +209,7 @@ depends on what an earlier step shows.
 | `input.cleanup` | `not_needed`, `succeeded`, `unknown` |
 | `input.target_remained_foreground` | `true`, `false` or `null` after the action |
 | `input.activation_helper` | `focus_window` only, when Windows refused the server: `accepted`, `refused` or `failed` |
+| `input.split_character` | `type_text` and `run_actions` only: `true` when typing stopped between the two halves of a surrogate pair, otherwise absent |
 | `observation_status` | `succeeded`, `failed`, `not_attempted` |
 | `effect_verification` | Always `unverified` |
 | `retry_action` | Always `false` |
