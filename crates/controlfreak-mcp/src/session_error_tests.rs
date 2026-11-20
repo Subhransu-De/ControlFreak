@@ -351,7 +351,7 @@ fn a_session_is_admitted_only_after_the_esc_hook_is_confirmed() {
     fake_escape_monitor(runtime.stop.clone(), Ok(()));
     let started = Instant::now();
     runtime
-        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
         .unwrap();
     assert!(
         started.elapsed() >= Duration::from_millis(50),
@@ -367,7 +367,7 @@ fn a_session_is_refused_with_the_reason_when_the_esc_hook_cannot_be_installed() 
     let runtime = escape_runtime(Arc::clone(&owned));
     fake_escape_monitor(runtime.stop.clone(), Err("hook refused"));
     let error = runtime
-        .begin_session(None, "target-00000000-0000-0000-0000-000000000003")
+        .begin_session(None, "target-00000000-0000-0000-0000-000000000003", None)
         .unwrap_err();
     let message = format!("{error:?}");
     assert!(message.contains("hook refused"), "{message}");

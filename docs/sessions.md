@@ -113,8 +113,7 @@ The refusal (`error.details.recovery`), `get_server_status.recovery`, the `end_c
 | `stopped` | `restart_client` | `user` | Stopped. Nothing is running. The user restarts the server from the client. |
 | `cleanup_failed` | `resolve_held_input` | `user` | Held keys or buttons could not be released for certain. The desktop stays reserved. The user releases any stuck key or button, then restarts the server from the client. |
 
-To cancel a single request without stopping the server, send the MCP `notifications/cancelled`
-notification.
+To cancel a single request without stopping the server, send the MCP `notifications/cancelled` notification. Cancelling a `begin_control_session` that renews a live session leaves that session as it was, with its hold and deadline; cancelling a first begin releases the desktop.
 
 ## Elevated mode
 
