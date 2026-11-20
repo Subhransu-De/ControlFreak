@@ -9,10 +9,14 @@
 //! with the same bounds. A window keeps its reference when it only moves or is resized, so the
 //! bounds are compared too, and a stale image is refused instead of mapped onto
 //! whatever now lies under the old rectangle.
+//!
+//! Every image also records the display layout it was captured on (display IDs and bounds). A
+//! point maps only while that layout is unchanged: after a display was added, removed or moved,
+//! the old virtual rectangle may lie on another display, so the point is refused instead.
 
 use controlfreak_core::{
-    DisplayBounds, ObservationOptions, PlatformBackend, PlatformError, WaitForWindowRequest,
-    WindowBounds,
+    DisplayBounds, DisplayLayout, ObservationOptions, PlatformBackend, PlatformError,
+    WaitForWindowRequest, WindowBounds,
 };
 use std::{
     collections::VecDeque,
@@ -31,11 +35,13 @@ pub(super) const PRIMARY_DISPLAY: &str = "primary";
 const MAX_OBSERVATIONS: usize = if cfg!(test) { 4096 } else { 64 };
 const OBSERVATION_TTL: Duration = Duration::from_mins(5);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ImageMapping {
     source: DisplayBounds,
     image_width: u32,
     image_height: u32,
+    /// The display layout `source` belongs to.
+    layout: DisplayLayout,
 }
 
 struct Observation {
@@ -67,11 +73,13 @@ fn process_nonce() -> u64 {
 }
 
 /// Records a returned image's geometry and returns the id clients pass back with image points.
-/// `window` is set when the image shows one window.
+/// `layout` is the display layout the image was captured on; `window` is set when the image shows
+/// one window.
 pub(super) fn register(
     source: DisplayBounds,
     image_width: u32,
     image_height: u32,
+    layout: DisplayLayout,
     window: Option<ShownWindow>,
 ) -> String {
     let id = format!(
@@ -91,6 +99,7 @@ pub(super) fn register(
                 source,
                 image_width,
                 image_height,
+                layout,
             },
             window,
         },
@@ -120,7 +129,7 @@ fn lookup(id: &str) -> Result<(ImageMapping, Option<ShownWindow>), PlatformError
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
         .find(|observation| observation.id == id && observation.created.elapsed() < OBSERVATION_TTL)
-        .map(|observation| (observation.mapping, observation.window.clone()))
+        .map(|observation| (observation.mapping.clone(), observation.window.clone()))
         .ok_or_else(|| {
             invalid(
                 "observation_id",
@@ -167,10 +176,13 @@ pub(super) fn resolve_observation(
     Ok(())
 }
 
-/// Maps an image pixel to the first virtual-desktop pixel it covers, the same
-/// `image_x * source_width / image_width` arithmetic as the published crop-mapping recipe.
+/// Maps an image pixel to the virtual-desktop pixel under its centre, the same
+/// `(2 * image_x + 1) * source_width / (2 * image_width)` arithmetic as the published
+/// crop-mapping recipe. A resized image pixel covers several source pixels; its centre is the
+/// point it shows best, and it brings a source pixel taken to the image pixel that covers it and
+/// back within one source pixel of where it started. An unresized image maps one to one.
 fn to_virtual(
-    mapping: ImageMapping,
+    mapping: &ImageMapping,
     image_x: u32,
     image_y: u32,
 ) -> Result<(i64, i64), PlatformError> {
@@ -184,7 +196,7 @@ fn to_virtual(
         ));
     }
     let scale = |image: u32, image_size: u32, source_size: u32| {
-        u64::from(image) * u64::from(source_size) / u64::from(image_size)
+        (2 * u64::from(image) + 1) * u64::from(source_size) / (2 * u64::from(image_size))
     };
     let offset_x = scale(image_x, mapping.image_width, mapping.source.width);
     let offset_y = scale(image_y, mapping.image_height, mapping.source.height);
@@ -259,7 +271,7 @@ impl PointerTarget {
     }
 
     /// Resolves to a display ID and display-local physical pixels. Image points are mapped
-    /// through their observation and located on the current display layout.
+    /// through their observation only while the display layout is the one it was captured on.
     pub(super) fn resolve(
         &self,
         backend: &dyn PlatformBackend,
@@ -275,6 +287,14 @@ impl PointerTarget {
             } => (observation_id, *image_x, *image_y),
         };
         let (mapping, shown) = lookup(observation_id)?;
+        // The same list locates the point below, so the layout check costs no extra call.
+        let displays = backend.list_displays()?;
+        if DisplayLayout::from_displays(&displays) != mapping.layout {
+            return Err(invalid(
+                "observation_id",
+                "the display layout changed since this screenshot; capture again",
+            ));
+        }
         // Ask for this one window's reference directly: `list_windows` is capped, so a window
         // missing from that list would otherwise look closed.
         if let Some(shown) = shown {
@@ -296,9 +316,8 @@ impl PointerTarget {
                 ));
             }
         }
-        let (x, y) = to_virtual(mapping, image_x, image_y)?;
-        let display = backend
-            .list_displays()?
+        let (x, y) = to_virtual(&mapping, image_x, image_y)?;
+        let display = displays
             .into_iter()
             .find(|display| {
                 let bounds = display.bounds;
@@ -335,28 +354,121 @@ mod tests {
         }
     }
 
+    fn image(source: DisplayBounds, image_width: u32, image_height: u32) -> ImageMapping {
+        ImageMapping {
+            source,
+            image_width,
+            image_height,
+            layout: DisplayLayout::from_displays(&[]),
+        }
+    }
+
     #[test]
     fn image_points_map_through_crop_and_fractional_scale() {
         // A 1920x1080 crop at a negative origin, returned as a 1280x720 image.
-        let mapping = ImageMapping {
-            source: bounds(-1920, -200, 1920, 1080),
-            image_width: 1280,
-            image_height: 720,
-        };
-        assert_eq!(to_virtual(mapping, 0, 0).unwrap(), (-1920, -200));
+        let mapping = image(bounds(-1920, -200, 1920, 1080), 1280, 720);
+        assert_eq!(to_virtual(&mapping, 0, 0).unwrap(), (-1920, -200));
         assert_eq!(
-            to_virtual(mapping, 640, 360).unwrap(),
+            to_virtual(&mapping, 640, 360).unwrap(),
             (-1920 + 960, -200 + 540)
         );
-        assert_eq!(to_virtual(mapping, 1279, 719).unwrap(), (-2, 878));
-        assert!(to_virtual(mapping, 1280, 0).is_err());
-        assert!(to_virtual(mapping, 0, 720).is_err());
-        let native = ImageMapping {
-            source: bounds(100, 60, 400, 200),
-            image_width: 400,
-            image_height: 200,
+        // The centre of the last image pixel, which covers 1.5 source pixels on each axis.
+        assert_eq!(to_virtual(&mapping, 1279, 719).unwrap(), (-1, 879));
+        assert!(to_virtual(&mapping, 1280, 0).is_err());
+        assert!(to_virtual(&mapping, 0, 720).is_err());
+        let native = image(bounds(100, 60, 400, 200), 400, 200);
+        assert_eq!(to_virtual(&native, 17, 23).unwrap(), (117, 83));
+    }
+
+    #[test]
+    fn an_odd_image_size_round_trips_within_one_source_pixel_on_each_axis() {
+        // 1920x1080 at a negative origin returned as 1279x719: neither axis has a whole scale.
+        let (left, top) = (-1920, -1080);
+        let mapping = image(bounds(left, top, 1920, 1080), 1279, 719);
+        // The image pixel that covers a source pixel: how the image was made, and how the cursor
+        // marker is placed.
+        let to_image = |offset: u32, source: u32, image: u32| {
+            u32::try_from(u64::from(offset) * u64::from(image) / u64::from(source)).unwrap()
         };
-        assert_eq!(to_virtual(native, 17, 23).unwrap(), (117, 83));
+        let offset = |mapped: i64, origin: i32| u32::try_from(mapped - i64::from(origin)).unwrap();
+        // Each axis on its own, with the other axis held at the image's last pixel.
+        for x in 0..1920 {
+            let (virtual_x, virtual_y) =
+                to_virtual(&mapping, to_image(x, 1920, 1279), 718).unwrap();
+            let error = i64::from(left) + i64::from(x) - virtual_x;
+            assert!(
+                error.abs() <= 1,
+                "source x {x} comes back {error} pixels away"
+            );
+            assert_eq!(virtual_y, i64::from(top) + 1079);
+        }
+        for y in 0..1080 {
+            let (virtual_x, virtual_y) =
+                to_virtual(&mapping, 1278, to_image(y, 1080, 719)).unwrap();
+            let error = i64::from(top) + i64::from(y) - virtual_y;
+            assert!(
+                error.abs() <= 1,
+                "source y {y} comes back {error} pixels away"
+            );
+            assert_eq!(virtual_x, i64::from(left) + 1919);
+        }
+        // Every image pixel maps inside the source, onto a source pixel that overlaps the source
+        // span `[image * source / size, (image + 1) * source / size)` it shows. With a scale that
+        // is not whole, that source pixel can straddle two image pixels.
+        let overlaps = |image: u32, mapped: u32, source: u32, size: u32| {
+            let (image, mapped, source, size) = (
+                u64::from(image),
+                u64::from(mapped),
+                u64::from(source),
+                u64::from(size),
+            );
+            mapped < source
+                && (mapped + 1) * size > image * source
+                && mapped * size < (image + 1) * source
+        };
+        for image_x in 0..1279 {
+            let (virtual_x, _) = to_virtual(&mapping, image_x, 0).unwrap();
+            assert!(
+                overlaps(image_x, offset(virtual_x, left), 1920, 1279),
+                "x {image_x}"
+            );
+        }
+        for image_y in 0..719 {
+            let (_, virtual_y) = to_virtual(&mapping, 0, image_y).unwrap();
+            assert!(
+                overlaps(image_y, offset(virtual_y, top), 1080, 719),
+                "y {image_y}"
+            );
+        }
+        assert!(to_virtual(&mapping, 1279, 0).is_err());
+        assert!(to_virtual(&mapping, 0, 719).is_err());
+    }
+
+    #[test]
+    fn a_layout_is_compared_by_display_ids_and_bounds_in_any_order() {
+        let display = |id: &str, left: i32, is_primary: bool| controlfreak_core::DisplayInfo {
+            id: id.to_owned(),
+            name: format!("name of {id}"),
+            bounds: bounds(left, 0, 1920, 1080),
+            is_primary,
+        };
+        let layout =
+            DisplayLayout::from_displays(&[display("a", 0, true), display("b", 1920, false)]);
+        let mut renamed = display("b", 1920, false);
+        renamed.name = "another name".to_owned();
+        assert_eq!(
+            DisplayLayout::from_displays(&[renamed, display("a", 0, true)]),
+            layout
+        );
+        // One display moved to the other side.
+        assert_ne!(
+            DisplayLayout::from_displays(&[display("a", 0, true), display("b", -1920, false)]),
+            layout
+        );
+        assert_ne!(
+            DisplayLayout::from_displays(&[display("a", 0, true)]),
+            layout
+        );
     }
 
     #[test]
@@ -367,11 +479,7 @@ mod tests {
         let entry = |id: String| Observation {
             id,
             created: Instant::now(),
-            mapping: ImageMapping {
-                source: bounds(0, 0, 10, 10),
-                image_width: 10,
-                image_height: 10,
-            },
+            mapping: image(bounds(0, 0, 10, 10), 10, 10),
             window: None,
         };
         remember(&mut store, entry("first".to_owned()));

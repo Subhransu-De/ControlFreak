@@ -17,10 +17,11 @@
 use controlfreak_core::{
     ActionObservation, ActivationHelperOutcome, BackendIdentity, BackendMetadata,
     CapabilityDescriptor, CaptureWindowRequest, DisplayBackend, DisplayBounds, DisplayInfo,
-    FocusWindowRequest, KeyChordRequest, KeyboardActionResult, KeyboardBackend, MouseClickRequest,
-    MousePosition, MutationControl, OcrBackend, PermissionDescriptor, Platform, PlatformError,
-    PointerActionResult, PointerBackend, TextInputRequest, WaitForWindowRequest, WindowBackend,
-    WindowBounds, WindowFocusResult, WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
+    DisplayLayout, FocusWindowRequest, KeyChordRequest, KeyboardActionResult, KeyboardBackend,
+    MouseClickRequest, MousePosition, MutationControl, OcrBackend, PermissionDescriptor, Platform,
+    PlatformError, PointerActionResult, PointerBackend, TextInputRequest, WaitForWindowRequest,
+    WindowBackend, WindowBounds, WindowFocusResult, WindowInfo, WindowList, WindowScreenshot,
+    WindowWaitResult,
 };
 use std::sync::Mutex;
 
@@ -364,6 +365,7 @@ impl WindowBackend for FakeDesktop {
         Ok(WindowScreenshot {
             window: info(window, &state),
             source_bounds: window.bounds,
+            display_layout: DisplayLayout::from_displays(&[display()]),
             png: vec![1, 2, 3],
             image_width: window.bounds.width,
             image_height: window.bounds.height,

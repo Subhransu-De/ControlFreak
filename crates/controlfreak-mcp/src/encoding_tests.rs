@@ -105,6 +105,7 @@ fn encoded_image_content_decodes_to_the_capture_png() {
             width: 1,
             height: 1,
         },
+        display_layout: controlfreak_core::DisplayLayout::from_displays(&[]),
         png: png.clone(),
         image_width: 1,
         image_height: 1,

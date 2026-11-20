@@ -946,6 +946,9 @@ fn pointer_result_contains_post_action_png() {
             screenshot: Some(DisplayScreenshot {
                 target_ref: None,
                 source_bounds: display.bounds,
+                display_layout: controlfreak_core::DisplayLayout::from_displays(
+                    std::slice::from_ref(&display),
+                ),
                 display,
                 png: b"\x89PNG\r\n\x1a\n".to_vec(),
                 image_width: 1,

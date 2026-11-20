@@ -44,6 +44,7 @@ fn screenshot() -> DisplayScreenshot {
         target_ref: Some("target-00000000-0000-0000-0000-000000000003".into()),
         display: display(),
         source_bounds: bounds(),
+        display_layout: controlfreak_core::DisplayLayout::from_displays(&[display()]),
         png: include_bytes!("../../../examples/fixture.png").to_vec(),
         image_width: 200,
         image_height: 100,
@@ -220,12 +221,13 @@ impl PointerBackend for Fixture {
         request: &MouseClickRequest,
         control: &MutationControl,
     ) -> Result<PointerActionResult, PlatformError> {
-        // The target is image pixel (50, 25), scaled into the cropped source and then display-local pixels.
+        // The target is the centre of image pixel (50, 25), scaled into the cropped source and
+        // then display-local pixels.
         let shot = screenshot();
         let x = u32::try_from(shot.source_bounds.left - shot.display.bounds.left).unwrap()
-            + 50 * shot.source_bounds.width / shot.image_width;
+            + (2 * 50 + 1) * shot.source_bounds.width / (2 * shot.image_width);
         let y = u32::try_from(shot.source_bounds.top - shot.display.bounds.top).unwrap()
-            + 25 * shot.source_bounds.height / shot.image_height;
+            + (2 * 25 + 1) * shot.source_bounds.height / (2 * shot.image_height);
         assert_eq!((request.x, request.y), (x, y));
         assert_eq!(request.display_id, "fixture");
         Ok(self.pointer(request.x, request.y, "Saved", control))
@@ -424,7 +426,7 @@ async fn image_points_from_a_cropped_screenshot_reach_the_same_display_pixel() {
         .as_str()
         .unwrap()
         .to_owned();
-    // The fixture asserts that image pixel (50, 25) arrives as display-local (200, 110).
+    // The fixture asserts that image pixel (50, 25) arrives as display-local (201, 111).
     let clicked = exchange(
         &mut client,
         call(
@@ -438,7 +440,7 @@ async fn image_points_from_a_cropped_screenshot_reach_the_same_display_pixel() {
     assert_ne!(clicked["result"]["isError"], true, "{clicked}");
     assert_eq!(
         clicked["result"]["structuredContent"]["position"]["local_x"],
-        200
+        201
     );
     for (id, arguments, reason) in [
         (

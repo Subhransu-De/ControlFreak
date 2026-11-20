@@ -1,6 +1,6 @@
 #![allow(unsafe_code)]
 
-use controlfreak_core::{MutationControl, SettleOutcome, timing};
+use controlfreak_core::{DisplayLayout, MutationControl, SettleOutcome, timing};
 use windows::System::UserProfile::GlobalizationPreferences;
 use windows::Win32::{
     Foundation::{HWND, RECT},
@@ -134,17 +134,50 @@ pub(super) fn capture_display_bounds(
     include_cursor_marker: bool,
 ) -> Result<DisplayScreenshot, PlatformError> {
     let target_before = super::target::observe();
-    let (png, image_width, image_height, cursor_marker) =
-        capture_bounds(source_bounds, max_width, include_cursor_marker)?;
+    let ((png, image_width, image_height, cursor_marker), display_layout) =
+        on_one_layout(Some(&display), || {
+            capture_bounds(source_bounds, max_width, include_cursor_marker)
+        })?;
     Ok(DisplayScreenshot {
         target_ref: super::target::finish_observation(target_before),
         display,
         source_bounds,
+        display_layout,
         png,
         image_width,
         image_height,
         cursor_marker,
     })
+}
+
+/// Runs `capture` and returns the display layout it ran on, which an image's points map onto. The
+/// layout is read before and after, and a capture during which any display was added, removed or
+/// moved is refused rather than recorded against either layout. `display`, when given, is the
+/// display the source bounds came from, so it must still be in the layout as it was found.
+pub(super) fn on_one_layout<T>(
+    display: Option<&DisplayInfo>,
+    capture: impl FnOnce() -> Result<T, PlatformError>,
+) -> Result<(T, DisplayLayout), PlatformError> {
+    let changed = || PlatformError::InvalidArgument {
+        argument: "display_id".to_owned(),
+        reason:
+            "the display layout changed during the capture; call list_displays and capture again"
+                .to_owned(),
+    };
+    let before = enumerate_displays()?;
+    if display.is_some_and(|display| {
+        !before
+            .iter()
+            .any(|current| current.id == display.id && current.bounds == display.bounds)
+    }) {
+        return Err(changed());
+    }
+    let captured = capture()?;
+    let layout = DisplayLayout::from_displays(&before);
+    if DisplayLayout::from_displays(&enumerate_displays()?) != layout {
+        return Err(changed());
+    }
+    Ok((captured, layout))
 }
 
 pub(super) fn display_region_bounds(

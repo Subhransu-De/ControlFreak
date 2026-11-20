@@ -69,8 +69,8 @@
           "name": "click_mouse",
           "arguments": {
             "display_id": "fixture",
-            "x": 200,
-            "y": 110,
+            "x": 201,
+            "y": 111,
             "button": "left",
             "observation": {
               "mode": "metadata"
@@ -80,8 +80,8 @@
         },
         "expect": {
           "/status": "completed",
-          "/position/virtual_x": -1720,
-          "/position/virtual_y": -90
+          "/position/virtual_x": -1719,
+          "/position/virtual_y": -89
         }
       },
       {

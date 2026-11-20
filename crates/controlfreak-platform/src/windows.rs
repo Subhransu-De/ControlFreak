@@ -117,7 +117,7 @@ pub(crate) fn server_security_context(
 use capture::{
     ComparisonCapture, baseline_process_nonce, capture_comparison_frame, capture_display_bounds,
     capture_display_image, capture_window_bounds, display_bounds_from_window,
-    display_region_bounds, frame_fingerprint, observe_display, observe_foreground,
+    display_region_bounds, frame_fingerprint, observe_display, observe_foreground, on_one_layout,
     recognize_text_fingerprinted, validate_max_width, validate_visual_wait, validate_wait_values,
     wait_for_change,
 };
@@ -1107,8 +1107,9 @@ impl WindowBackend for Backend {
         let (hwnd, _) = resolve_window_reference(&request.window_id)?;
         // The window renders itself, so a window covered by others is captured as itself; a
         // window that cannot is copied from the screen, and `capture_method` says which.
-        let capture =
-            capture_window_bounds(hwnd, bounds, request.max_width, request.include_cursor)?;
+        let (capture, display_layout) = on_one_layout(None, || {
+            capture_window_bounds(hwnd, bounds, request.max_width, request.include_cursor)
+        })?;
         // The image is the window only if it is still the same window on the same display layout
         // (the same reference) and at the same place. A reference survives a move, so the
         // bounds are compared as well.
@@ -1121,6 +1122,7 @@ impl WindowBackend for Backend {
         }
         Ok(WindowScreenshot {
             source_bounds: window.bounds,
+            display_layout,
             window,
             png: capture.png,
             image_width: capture.image_width,
