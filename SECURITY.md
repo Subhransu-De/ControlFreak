@@ -123,8 +123,8 @@ the re-arming procedure, after draining and resolving any cleanup failure.
 Cancellation is cooperative. An in-flight native call may finish after stop.
 Cleanup bypasses ordinary mutation admission but releases only acknowledged,
 unmatched owned inputs. It does not release every key named by a failed request.
-An existing held key or button is refused before new input dispatch. Unknown
-cleanup closes admission and retains the ownership lease and indicator. Status
+An existing held key or button is refused before new input dispatch. A held Shift, Ctrl, Alt or Win key that the request does not name is refused the same way (`key_held`), for every key press, typed character, click, drag and scroll, because Windows would combine it with the injected input (Shift+Delete, Alt+Tab, a Ctrl-click). Releases and cleanup are never refused, and the server's own held modifiers do not trigger the check.
+Unknown cleanup closes admission and retains the ownership lease and indicator. Status
 reports draining or cleanup failure without claiming to undo application effects.
 Stopping does not kill applications, lock Windows, or shut it down. The private
 OCR helper retains its pre-existing timeout and owned-process cleanup policy.

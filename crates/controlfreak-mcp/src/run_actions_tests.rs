@@ -6,9 +6,11 @@ use controlfreak_core::{
 };
 use tokio::io::{AsyncWriteExt, BufReader};
 
-/// Records each dispatched step and fails the step whose zero-based number is `fail_at`.
+/// Records each dispatched step and fails the step whose zero-based number is `fail_at` with
+/// `failure`, before it dispatches anything.
 struct Scripted {
     fail_at: Option<usize>,
+    failure: PlatformError,
     /// Step whose input is delivered but whose post-action observation then fails.
     observation_fails_at: Option<usize>,
     calls: Mutex<Vec<String>>,
@@ -21,9 +23,7 @@ impl Scripted {
         calls.push(label);
         drop(calls);
         if self.fail_at == Some(index) {
-            return Err(PlatformError::TargetInvalidated {
-                reason: "synthetic focus theft before dispatch".into(),
-            });
+            return Err(self.failure.clone());
         }
         control.dispatch_started();
         control.dispatch_accepted(2);
@@ -165,8 +165,21 @@ async fn run_scripted(
     observation_fails_at: Option<usize>,
     arguments: Value,
 ) -> (Value, Vec<String>) {
+    let failure = PlatformError::TargetInvalidated {
+        reason: "synthetic focus theft before dispatch".into(),
+    };
+    run_failing(fail_at, failure, observation_fails_at, arguments).await
+}
+
+async fn run_failing(
+    fail_at: Option<usize>,
+    failure: PlatformError,
+    observation_fails_at: Option<usize>,
+    arguments: Value,
+) -> (Value, Vec<String>) {
     let backend = Arc::new(Scripted {
         fail_at,
+        failure,
         observation_fails_at,
         calls: Mutex::new(Vec::new()),
     });
@@ -302,6 +315,50 @@ async fn a_failed_step_stops_the_batch_and_reports_partial_delivery() {
         .collect();
     assert_eq!(statuses, ["completed", "completed", "failed", "skipped"]);
     assert_eq!(content["error"]["code"], "target_invalidated");
+}
+
+#[tokio::test]
+async fn a_held_modifier_refusal_stops_the_batch_at_its_step() {
+    let held = PlatformError::failed(
+        controlfreak_core::FailureCause::KeyHeld,
+        "press_keys",
+        "a modifier key (Shift, Ctrl, Alt or Win) is held and would change this input; \
+         release it before retrying",
+    );
+    for (fail_at, expected) in [
+        (0, ["failed", "skipped", "skipped", "skipped"]),
+        (2, ["completed", "completed", "failed", "skipped"]),
+    ] {
+        let (content, calls) = run_failing(
+            Some(fail_at),
+            held.clone(),
+            None,
+            json!({"target_ref": "target-00000000-0000-0000-0000-000000000003", "steps": steps()}),
+        )
+        .await;
+        assert_eq!(calls.len(), fail_at + 1, "{content}");
+        let error = &content["error"];
+        assert_eq!(error["code"], "platform_operation_failed", "{content}");
+        assert_eq!(error["reason"], "key_held");
+        let steps = error["details"]["steps"].as_array().unwrap();
+        let statuses: Vec<_> = steps
+            .iter()
+            .map(|step| step["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(statuses, expected);
+        // The refused step and every skipped step sent nothing.
+        assert!(
+            steps[fail_at..].iter().all(|step| step["sent_events"] == 0),
+            "{content}"
+        );
+        let (status, sent) = if fail_at == 0 {
+            ("not_started", 0)
+        } else {
+            ("partially_sent", 4)
+        };
+        assert_eq!(content["status"], status, "{content}");
+        assert_eq!(content["input"]["sent_events"], sent);
+    }
 }
 
 #[tokio::test]

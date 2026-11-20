@@ -292,7 +292,6 @@ pub(super) fn send_desktop_switch_hops(
     validate: impl FnMut(u8) -> Result<(), PlatformError>,
     settle: impl FnMut(),
 ) -> Result<(), PlatformError> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     let arrow = match direction {
         VirtualDesktopDirection::Left => Key::ArrowLeft,
         VirtualDesktopDirection::Right => Key::ArrowRight,
@@ -303,10 +302,7 @@ pub(super) fn send_desktop_switch_hops(
         steps,
         control,
         validate,
-        |key| {
-            // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
-            unsafe { GetAsyncKeyState(key) < 0 }
-        },
+        key_is_down,
         native_send_inputs,
         settle,
     )
@@ -352,16 +348,12 @@ pub(super) fn send_unicode_text<F>(
 where
     F: FnMut() -> Result<(), PlatformError>,
 {
-    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     send_text_checking_held_keys(
         utf16,
         control,
         validate_target,
         native_send_inputs,
-        |key| {
-            // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
-            unsafe { GetAsyncKeyState(key) < 0 }
-        },
+        key_is_down,
         wait_for_previous_keystroke,
     )
 }
@@ -506,6 +498,63 @@ fn wait_for_answer(
 /// Virtual keys of the four modifiers: Shift, Ctrl, Alt, and the left and right Win keys.
 const HELD_MODIFIER_KEYS: [i32; 5] = [0x10, 0x11, 0x12, 0x5B, 0x5C];
 
+/// Refuses input while the person holds a modifier. Windows combines a held modifier with every
+/// injected key, click and wheel turn: Delete arrives as Shift+Delete, Tab as Alt+Tab, a click as
+/// a Ctrl-click, and a held Alt can turn typed characters into menu mnemonics. A modifier that the
+/// request names itself is refused by the requested-key check, so any held modifier refuses.
+///
+/// Call it only before input that presses something, never before a release or cleanup. The
+/// server's own modifiers never trigger it: a chord and a typed keystroke release what they
+/// pressed before the next check, a multi-click recheck ignores the modifiers the click holds,
+/// and a drag is checked before its press but not between the press and the release.
+pub(super) fn ensure_no_modifier_held(operation: &str) -> Result<(), PlatformError> {
+    ensure_no_modifier_held_with(operation, key_is_down)
+}
+
+fn ensure_no_modifier_held_with(
+    operation: &str,
+    is_down: impl FnMut(i32) -> bool,
+) -> Result<(), PlatformError> {
+    ensure_no_other_modifier_held(operation, &[], is_down)
+}
+
+/// The modifier check for an action that already holds the modifiers `owned` itself.
+fn ensure_no_other_modifier_held(
+    operation: &str,
+    owned: &[i32],
+    mut is_down: impl FnMut(i32) -> bool,
+) -> Result<(), PlatformError> {
+    if HELD_MODIFIER_KEYS
+        .iter()
+        .any(|key| !owned.contains(key) && is_down(*key))
+    {
+        return Err(PlatformError::failed(
+            controlfreak_core::FailureCause::KeyHeld,
+            operation,
+            "a modifier key (Shift, Ctrl, Alt or Win) is held and would change this input; \
+             release it before retrying",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses input that presses a key or button the person already holds, or that a held modifier
+/// would change. Nothing is sent when it refuses.
+fn ensure_input_idle(
+    operation: &str,
+    inputs: &[INPUT],
+    mut is_down: impl FnMut(i32) -> bool,
+) -> Result<(), PlatformError> {
+    if any_requested_input_held(inputs, &mut is_down) {
+        return Err(PlatformError::failed(
+            controlfreak_core::FailureCause::KeyHeld,
+            operation,
+            "a requested key or mouse button is already held; release it before retrying",
+        ));
+    }
+    ensure_no_modifier_held_with(operation, is_down)
+}
+
 /// Types one keystroke per `SendInput` call, each paced behind whatever the application was
 /// handling before it, including input from an earlier call such as a previous `run_actions` step.
 ///
@@ -523,9 +572,11 @@ const HELD_MODIFIER_KEYS: [i32; 5] = [0x10, 0x11, 0x12, 0x5B, 0x5C];
 /// so an application that took both before translating could not get two low surrogates. A
 /// refusal or cancellation between the halves stops before the second half.
 ///
-/// Unicode packets carry no virtual key, so only the Enter and Tab segments can repeat a key the
-/// person already holds. Those go through the same held-key refusal as `press_keys`, before
-/// any input of that segment is sent.
+/// Every unit is refused while the person holds a modifier, like `press_keys`: a held Alt can
+/// turn typed characters into menu mnemonics, and a held modifier turns Enter and Tab into
+/// shortcuts (Alt+Tab, Ctrl+Enter). Unicode packets carry no virtual key, so only the Enter and
+/// Tab segments can also repeat a key the person already holds. Each refusal comes before any
+/// input of that unit is sent.
 fn send_text_checking_held_keys<F, S, P>(
     utf16: &[u16],
     control: &MutationControl,
@@ -546,6 +597,9 @@ where
                     pace_or_refuse(control, &mut pace, &mut validate_target)?;
                     control.check("type_text")?;
                     validate_target()?;
+                    // After validation, which queries windows, so the check is the last before
+                    // dispatch.
+                    ensure_no_modifier_held_with("type_text", &mut is_down)?;
                     let inputs = [unicode_input(*unit, false), unicode_input(*unit, true)];
                     send_releasing("type_text", &inputs, control, &mut send)?;
                 }
@@ -554,18 +608,8 @@ where
                 pace_or_refuse(control, &mut pace, &mut validate_target)?;
                 control.check("type_text")?;
                 let inputs = [keyboard_input(key, false), keyboard_input(key, true)];
-                // A held modifier would turn the key into a shortcut (Alt+Tab, Ctrl+Enter), which
-                // the Unicode text before it never could be, so it is refused like the key itself.
-                if any_requested_input_held(&inputs, &mut is_down)
-                    || HELD_MODIFIER_KEYS.iter().any(|key| is_down(*key))
-                {
-                    return Err(PlatformError::failed(
-                        controlfreak_core::FailureCause::KeyHeld,
-                        "type_text",
-                        "a requested key or mouse button is already held; release it before retrying",
-                    ));
-                }
                 validate_target()?;
+                ensure_input_idle("type_text", &inputs, &mut is_down)?;
                 send_releasing("type_text", &inputs, control, &mut send)?;
             }
         }
@@ -997,15 +1041,11 @@ fn send_with_button_dwell_native(
     control: &MutationControl,
     validate: impl FnMut() -> Result<(), PlatformError>,
 ) -> Result<(), PlatformError> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     send_with_button_dwell_if_idle(
         operation,
         inputs,
         control,
-        |key| {
-            // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
-            unsafe { GetAsyncKeyState(key) < 0 }
-        },
+        key_is_down,
         validate,
         native_send_inputs,
         || control.wait(operation, BUTTON_DWELL),
@@ -1016,20 +1056,36 @@ fn send_with_button_dwell_if_idle(
     operation: &str,
     inputs: &[INPUT],
     control: &MutationControl,
-    is_down: impl FnMut(i32) -> bool,
-    validate: impl FnMut() -> Result<(), PlatformError>,
+    mut is_down: impl FnMut(i32) -> bool,
+    mut validate: impl FnMut() -> Result<(), PlatformError>,
     send: impl FnMut(&[INPUT]) -> Result<usize, PlatformError>,
     dwell: impl FnMut() -> Result<(), PlatformError>,
 ) -> Result<(), PlatformError> {
     control.check(operation)?;
-    if any_requested_input_held(inputs, is_down) {
-        return Err(PlatformError::failed(
-            controlfreak_core::FailureCause::KeyHeld,
-            operation,
-            "a requested key or mouse button is already held; release it before retrying",
-        ));
-    }
-    send_with_button_dwell(operation, inputs, control, validate, send, dwell)
+    ensure_input_idle(operation, inputs, &mut is_down)?;
+    // A modifier pressed during a dwell would change the next press of a double or triple click.
+    // The click's own modifiers are down by then, so only the others refuse it.
+    let owned = pressed_virtual_keys(inputs);
+    let validate_next_press = || {
+        validate()?;
+        ensure_no_other_modifier_held(operation, &owned, &mut is_down)
+    };
+    send_with_button_dwell(operation, inputs, control, validate_next_press, send, dwell)
+}
+
+/// Virtual keys that `inputs` press.
+fn pressed_virtual_keys(inputs: &[INPUT]) -> Vec<i32> {
+    inputs
+        .iter()
+        .filter_map(|input| {
+            if input.r#type != INPUT_KEYBOARD {
+                return None;
+            }
+            // SAFETY: The tag says this locally built INPUT holds its keyboard member.
+            let key = unsafe { input.Anonymous.ki };
+            (!key.dwFlags.contains(KEYEVENTF_KEYUP)).then_some(i32::from(key.wVk.0))
+        })
+        .collect()
 }
 
 /// Sends `inputs` in steps with a pause after each button press. The caller validated the
@@ -1107,6 +1163,12 @@ pub(super) fn send_drag_press<F>(
 where
     F: FnMut() -> Result<(), PlatformError>,
 {
+    let inputs = drag_press_inputs(button, modifiers);
+    validate_target()?;
+    send_releasing_native("drag_mouse", &inputs, control)
+}
+
+fn drag_press_inputs(button: MouseButton, modifiers: &[Key]) -> Vec<INPUT> {
     let (down, _) = mouse_button_flags(button);
     let mut inputs = Vec::with_capacity(modifiers.len() + 1);
     inputs.extend(
@@ -1116,8 +1178,7 @@ where
             .map(|key| keyboard_input(key, false)),
     );
     inputs.push(mouse_input(down, 0));
-    validate_target()?;
-    send_releasing_native("drag_mouse", &inputs, control)
+    inputs
 }
 
 pub(super) fn send_drag_release<F>(
@@ -1147,15 +1208,32 @@ pub(super) fn send_scroll<F>(
     delta_x: i32,
     delta_y: i32,
     control: &MutationControl,
-    mut validate_target: F,
+    validate_target: F,
 ) -> Result<(), PlatformError>
 where
     F: FnMut() -> Result<(), PlatformError>,
 {
-    let inputs = scroll_inputs(delta_x, delta_y);
+    send_scroll_with(
+        &scroll_inputs(delta_x, delta_y),
+        control,
+        validate_target,
+        key_is_down,
+        native_send_inputs,
+    )
+}
+
+fn send_scroll_with(
+    inputs: &[INPUT],
+    control: &MutationControl,
+    mut validate_target: impl FnMut() -> Result<(), PlatformError>,
+    is_down: impl FnMut(i32) -> bool,
+    send: impl FnOnce(&[INPUT]) -> Result<usize, PlatformError>,
+) -> Result<(), PlatformError> {
     validate_target()?;
     control.check("scroll_mouse")?;
-    let inserted = dispatch_inputs(&inputs, control, native_send_inputs)?;
+    // A held Ctrl zooms and a held Shift scrolls sideways in many applications.
+    ensure_no_modifier_held_with("scroll_mouse", is_down)?;
+    let inserted = dispatch_inputs(inputs, control, send)?;
     if inserted == inputs.len() {
         Ok(())
     } else {
@@ -1197,12 +1275,15 @@ fn any_requested_input_held(inputs: &[INPUT], mut is_down: impl FnMut(i32) -> bo
     false
 }
 
+/// Whether a key or mouse button is down now, by virtual-key code.
+fn key_is_down(key: i32) -> bool {
+    // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
+    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(key) < 0 }
+}
+
 // Use only before ControlFreak presses a drag button. Recheck on every approach frame.
 pub(super) fn ensure_pointer_idle(operation: &str) -> Result<(), PlatformError> {
-    ensure_pointer_idle_with(operation, |key| {
-        // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
-        unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(key) < 0 }
-    })
+    ensure_pointer_idle_with(operation, key_is_down)
 }
 
 fn ensure_pointer_idle_with(
@@ -1224,17 +1305,7 @@ fn send_releasing_native(
     inputs: &[INPUT],
     control: &MutationControl,
 ) -> Result<(), PlatformError> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-    send_releasing_if_idle(
-        operation,
-        inputs,
-        control,
-        |key| {
-            // SAFETY: GetAsyncKeyState takes a virtual-key code and retains no references.
-            unsafe { GetAsyncKeyState(key) < 0 }
-        },
-        native_send_inputs,
-    )
+    send_releasing_if_idle(operation, inputs, control, key_is_down, native_send_inputs)
 }
 
 fn send_releasing_if_idle(
@@ -1245,13 +1316,7 @@ fn send_releasing_if_idle(
     send: impl FnMut(&[INPUT]) -> Result<usize, PlatformError>,
 ) -> Result<(), PlatformError> {
     control.check(operation)?;
-    if any_requested_input_held(inputs, is_down) {
-        return Err(PlatformError::failed(
-            controlfreak_core::FailureCause::KeyHeld,
-            operation,
-            "a requested key or mouse button is already held; release it before retrying",
-        ));
-    }
+    ensure_input_idle(operation, inputs, is_down)?;
     send_releasing(operation, inputs, control, send)
 }
 
@@ -1820,6 +1885,293 @@ mod progress_tests {
             &owned_releases(&click[..1]),
             |_| true
         ));
+    }
+
+    fn refuses_untouched(result: Result<(), PlatformError>, control: &MutationControl) -> String {
+        let error = result.expect_err("held input must be refused");
+        assert_eq!(error.reason_code(), Some("key_held"), "{error}");
+        assert_eq!(control.progress(), MutationControl::default().progress());
+        error.to_string()
+    }
+
+    #[test]
+    fn a_held_modifier_the_request_does_not_name_refuses_a_key_press_before_dispatch() {
+        let shortcuts: [(&[Key], i32); 6] = [
+            (&[Key::Delete], 0x10),       // Shift+Delete deletes permanently
+            (&[Key::Tab], 0x12),          // Alt+Tab
+            (&[Key::L], 0x5B),            // Win+L locks the PC
+            (&[Key::L], 0x5C),            // the right Win key
+            (&[Key::Win, Key::L], 0x5C),  // the request's Win is the left key
+            (&[Key::Ctrl, Key::C], 0x10), // Ctrl+Shift+C
+        ];
+        for (keys, held) in shortcuts {
+            let control = MutationControl::default();
+            let reason = refuses_untouched(
+                send_releasing_if_idle(
+                    "press_keys",
+                    &key_chord_inputs(keys),
+                    &control,
+                    |key| key == held,
+                    |_| panic!("a held modifier must refuse before dispatch"),
+                ),
+                &control,
+            );
+            assert!(
+                reason.contains("modifier key"),
+                "{keys:?} {held:#x}: {reason}"
+            );
+        }
+        // A held key that the request names keeps the requested-key refusal.
+        let control = MutationControl::default();
+        let reason = refuses_untouched(
+            send_releasing_if_idle(
+                "press_keys",
+                &key_chord_inputs(&[Key::Ctrl, Key::C]),
+                &control,
+                |key| key == 0x11,
+                |_| panic!("a held requested key must refuse before dispatch"),
+            ),
+            &control,
+        );
+        assert!(reason.contains("requested key"), "{reason}");
+        // A key that is not a modifier, held by the person, does not refuse an unrelated chord.
+        let control = MutationControl::default();
+        send_releasing_if_idle(
+            "press_keys",
+            &key_chord_inputs(&[Key::Delete]),
+            &control,
+            |key| key == 0x41,
+            |inputs| Ok(inputs.len()),
+        )
+        .unwrap();
+        assert_eq!(control.progress().sent_events, 2);
+    }
+
+    #[test]
+    fn a_held_modifier_refuses_a_click_or_drag_press_unless_the_request_names_it() {
+        for modifier in HELD_MODIFIER_KEYS {
+            for inputs in [
+                click_inputs(MouseButton::Left, 1, &[]),
+                click_inputs(MouseButton::Right, 2, &[]),
+            ] {
+                let control = MutationControl::default();
+                let reason = refuses_untouched(
+                    send_with_button_dwell_if_idle(
+                        "click_mouse",
+                        &inputs,
+                        &control,
+                        |key| key == modifier,
+                        || Ok(()),
+                        |_| panic!("a held modifier must refuse the click before dispatch"),
+                        || Ok(()),
+                    ),
+                    &control,
+                );
+                assert!(reason.contains("modifier key"), "{modifier:#x}: {reason}");
+            }
+            let control = MutationControl::default();
+            refuses_untouched(
+                send_releasing_if_idle(
+                    "drag_mouse",
+                    &drag_press_inputs(MouseButton::Left, &[]),
+                    &control,
+                    |key| key == modifier,
+                    |_| panic!("a held modifier must refuse the drag press"),
+                ),
+                &control,
+            );
+        }
+        // `modifiers: ["ctrl"]` with Ctrl held follows the requested-key rule.
+        let control = MutationControl::default();
+        let reason = refuses_untouched(
+            send_with_button_dwell_if_idle(
+                "click_mouse",
+                &click_inputs(MouseButton::Left, 1, &[Key::Ctrl]),
+                &control,
+                |key| key == 0x11,
+                || Ok(()),
+                |_| panic!("a held requested modifier must refuse the click"),
+                || Ok(()),
+            ),
+            &control,
+        );
+        assert!(reason.contains("requested key"), "{reason}");
+    }
+
+    #[test]
+    fn a_modifier_pressed_during_a_double_click_stops_the_second_press() {
+        // Shift goes down during the first dwell. The click's own Ctrl is held then too.
+        for modifiers in [&[][..], &[Key::Ctrl][..]] {
+            let inputs = click_inputs(MouseButton::Left, 2, modifiers);
+            let control = MutationControl::default();
+            let keys = FakeKeyState::default();
+            let shift = std::cell::Cell::new(false);
+            let batches = std::cell::RefCell::new(Vec::new());
+            let error = send_with_button_dwell_if_idle(
+                "click_mouse",
+                &inputs,
+                &control,
+                |key| keys.is_down(key) || (key == 0x10 && shift.get()),
+                || Ok(()),
+                |batch| {
+                    batches.borrow_mut().push(batch.len());
+                    Ok(keys.accept(batch))
+                },
+                || {
+                    shift.set(true);
+                    Ok(())
+                },
+            )
+            .expect_err("a modifier pressed during the dwell must stop the next press");
+            assert_eq!(error.reason_code(), Some("key_held"), "{modifiers:?}");
+            // The first press went out, then only its release: no second press.
+            let pressed = modifiers.len() + 1;
+            assert_eq!(*batches.borrow(), [pressed, pressed], "{modifiers:?}");
+            assert!(keys.0.borrow().is_empty(), "{modifiers:?}");
+            assert_eq!(
+                control.progress().input_outcome,
+                InputOutcome::PartiallySent
+            );
+            assert_eq!(control.progress().cleanup, CleanupStatus::Succeeded);
+        }
+    }
+
+    #[test]
+    fn a_held_modifier_refuses_a_scroll_before_dispatch() {
+        for modifier in HELD_MODIFIER_KEYS {
+            let control = MutationControl::default();
+            refuses_untouched(
+                send_scroll_with(
+                    &scroll_inputs(0, -120),
+                    &control,
+                    || Ok(()),
+                    |key| key == modifier,
+                    |_| panic!("a held modifier must refuse the wheel event"),
+                ),
+                &control,
+            );
+        }
+        let control = MutationControl::default();
+        send_scroll_with(
+            &scroll_inputs(120, -120),
+            &control,
+            || Ok(()),
+            |_| false,
+            |inputs| Ok(inputs.len()),
+        )
+        .unwrap();
+        assert_eq!(control.progress().sent_events, 2);
+    }
+
+    #[test]
+    fn a_held_modifier_refuses_the_approach_before_the_pointer_moves() {
+        for modifier in HELD_MODIFIER_KEYS {
+            for duration in [0, 20] {
+                let control = MutationControl::default();
+                let mut moved = false;
+                let result = move_cursor_with(
+                    "click_mouse",
+                    POINT::default(),
+                    POINT { x: 100, y: 100 },
+                    duration,
+                    &control,
+                    |_| ensure_no_modifier_held_with("click_mouse", |key| key == modifier),
+                    |_| {
+                        moved = true;
+                        Ok(None)
+                    },
+                );
+                refuses_untouched(result, &control);
+                assert!(!moved);
+            }
+        }
+        assert!(ensure_no_modifier_held_with("click_mouse", |key| key == 1).is_ok());
+    }
+
+    /// Key and button state that follows the events a fake `send` accepted, as Windows' does.
+    #[derive(Default)]
+    struct FakeKeyState(std::cell::RefCell<Vec<i32>>);
+
+    impl FakeKeyState {
+        fn accept(&self, inputs: &[INPUT]) -> usize {
+            let mut held = self.0.borrow_mut();
+            for input in inputs {
+                // SAFETY: the INPUT values under test are built locally with a matching union tag.
+                let event = unsafe {
+                    if input.r#type == INPUT_KEYBOARD {
+                        let key = input.Anonymous.ki;
+                        Some((i32::from(key.wVk.0), !key.dwFlags.contains(KEYEVENTF_KEYUP)))
+                    } else {
+                        let flags = input.Anonymous.mi.dwFlags;
+                        if flags.contains(MOUSEEVENTF_LEFTDOWN) {
+                            Some((1, true))
+                        } else if flags.contains(MOUSEEVENTF_LEFTUP) {
+                            Some((1, false))
+                        } else {
+                            None
+                        }
+                    }
+                };
+                match event {
+                    Some((code, true)) => held.push(code),
+                    Some((code, false)) => held.retain(|key| *key != code),
+                    None => {}
+                }
+            }
+            inputs.len()
+        }
+
+        fn is_down(&self, key: i32) -> bool {
+            self.0.borrow().contains(&key)
+        }
+    }
+
+    #[test]
+    fn the_servers_own_keys_never_refuse_its_next_event() {
+        let keys = FakeKeyState::default();
+        // A Ctrl-double-click holds Ctrl through both presses and the dwells between them.
+        let click = click_inputs(MouseButton::Left, 2, &[Key::Ctrl]);
+        let control = MutationControl::default();
+        send_with_button_dwell_if_idle(
+            "click_mouse",
+            &click,
+            &control,
+            |key| keys.is_down(key),
+            || Ok(()),
+            |inputs| Ok(keys.accept(inputs)),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            control.progress().sent_events,
+            u64::try_from(click.len()).unwrap()
+        );
+        // Each desktop-switch hop and each typed unit follows the release of the one before.
+        let control = MutationControl::default();
+        send_desktop_switch_hops_with(
+            "switch_virtual_desktop",
+            &key_chord_inputs(&[Key::Ctrl, Key::Win, Key::ArrowRight]),
+            3,
+            &control,
+            |_| Ok(()),
+            |key| keys.is_down(key),
+            |inputs| Ok(keys.accept(inputs)),
+            || {},
+        )
+        .unwrap();
+        assert_eq!(control.progress().sent_events, 18);
+        let control = MutationControl::default();
+        send_text_checking_held_keys(
+            &utf16("a\tb\n"),
+            &control,
+            || Ok(()),
+            |inputs| Ok(keys.accept(inputs)),
+            |key| keys.is_down(key),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(control.progress().sent_events, 8);
+        assert!(keys.0.borrow().is_empty());
     }
 
     #[test]
@@ -2469,36 +2821,54 @@ mod progress_tests {
     }
 
     #[test]
-    fn a_held_modifier_refuses_enter_and_tab_but_not_plain_text() {
+    fn a_held_modifier_refuses_text_before_the_first_unit() {
         for modifier in HELD_MODIFIER_KEYS {
+            for text in ["abc", "\tc", "\n", "\u{1f980}"] {
+                let control = MutationControl::default();
+                let error = send_text_checking_held_keys(
+                    &utf16(text),
+                    &control,
+                    || Ok(()),
+                    |_| panic!("a held modifier must refuse before any keystroke"),
+                    |key| key == modifier,
+                    |_| Ok(()),
+                )
+                .expect_err("a held modifier must refuse the text");
+                assert_eq!(error.reason_code(), Some("key_held"), "{modifier:#x}");
+                assert!(error.to_string().contains("modifier key"), "{error}");
+                assert_eq!(control.progress(), MutationControl::default().progress());
+            }
+        }
+    }
+
+    #[test]
+    fn a_modifier_pressed_while_typing_stops_before_the_next_unit() {
+        // Alt goes down after two characters, as a person reaching for a shortcut would.
+        for text in ["abcd", "ab\tc"] {
             let control = MutationControl::default();
-            let mut batches = 0;
+            let batches = std::cell::Cell::new(0);
             let error = send_text_checking_held_keys(
-                &utf16("ab\tc"),
+                &utf16(text),
                 &control,
                 || Ok(()),
                 |inputs| {
-                    batches += 1;
+                    batches.set(batches.get() + 1);
                     Ok(inputs.len())
                 },
-                |key| key == modifier,
+                |key| key == 0x12 && batches.get() >= 2,
                 |_| Ok(()),
             )
-            .expect_err("a held modifier must refuse the key segment");
-            assert_eq!(error.reason_code(), Some("key_held"), "{modifier:#x}");
-            // The text before the key went out; the key itself did not.
-            assert_eq!((batches, control.progress().sent_events), (2, 4));
+            .expect_err("a modifier pressed mid-text must stop typing");
+            assert_eq!(error.reason_code(), Some("key_held"), "{text:?}");
+            assert_eq!(batches.get(), 2, "{text:?}");
+            assert_eq!(control.progress().sent_events, 4, "{text:?}");
+            assert_eq!(
+                control.progress().input_outcome,
+                InputOutcome::PartiallySent
+            );
+            // Each sent unit was released in its own batch, so nothing is left to clean up.
+            assert_eq!(control.progress().cleanup, CleanupStatus::NotNeeded);
         }
-        let control = MutationControl::default();
-        send_text_checking_held_keys(
-            &utf16("abc"),
-            &control,
-            || Ok(()),
-            |inputs| Ok(inputs.len()),
-            |_| true,
-            |_| Ok(()),
-        )
-        .expect("Unicode text carries no virtual key and is not affected by a held modifier");
     }
 
     #[test]
