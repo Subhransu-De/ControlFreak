@@ -1,6 +1,7 @@
 #![allow(unsafe_code)]
 
 use controlfreak_core::{MutationControl, SettleOutcome, timing};
+use windows::System::UserProfile::GlobalizationPreferences;
 use windows::Win32::{
     Foundation::{HWND, RECT},
     Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow},
@@ -1087,6 +1088,16 @@ pub(super) fn recognize_text_fingerprinted(
     request: &OcrRegionRequest,
     control: &controlfreak_core::MutationControl,
 ) -> Result<(OcrResult, u64), PlatformError> {
+    recognize_text_with_engine(request, control, timed_ocr_engine)
+}
+
+/// Like `recognize_text_fingerprinted`, but takes the engine for the requested language from
+/// `engine`, so the OCR helper can reuse engines between requests.
+pub(super) fn recognize_text_with_engine(
+    request: &OcrRegionRequest,
+    control: &controlfreak_core::MutationControl,
+    engine: impl FnOnce(Option<&str>) -> Result<OcrEngine, PlatformError>,
+) -> Result<(OcrResult, u64), PlatformError> {
     control.check("windows_ocr")?;
     let _timer = timing::start("ocr_recognize");
     ensure_dpi_awareness()?;
@@ -1110,41 +1121,14 @@ pub(super) fn recognize_text_fingerprinted(
     }
     let rgba = timing::time("capture_gdi", || capture_rgba(source_bounds))?;
     let fingerprint = pixel_fingerprint(&rgba, true);
-    let writer = DataWriter::new().map_err(ocr_error)?;
-    writer.WriteBytes(&rgba).map_err(ocr_error)?;
-    let buffer = writer.DetachBuffer().map_err(ocr_error)?;
-    let width = i32::try_from(request.width).map_err(|_| PlatformError::InvalidArgument {
-        argument: "width".to_owned(),
-        reason: "exceeds the Windows OCR bitmap limit".to_owned(),
-    })?;
-    let height = i32::try_from(request.height).map_err(|_| PlatformError::InvalidArgument {
-        argument: "height".to_owned(),
-        reason: "exceeds the Windows OCR bitmap limit".to_owned(),
-    })?;
-    let bitmap =
-        SoftwareBitmap::CreateCopyFromBuffer(&buffer, BitmapPixelFormat::Rgba8, width, height)
-            .map_err(ocr_error)?;
-    let engine = timing::time("ocr_engine_create", || {
-        ocr_engine(request.language.as_deref())
-    })?;
+    let bitmap = ocr_bitmap(&rgba, request.width, request.height)?;
+    let engine = engine(request.language.as_deref())?;
     let language = engine
         .RecognizerLanguage()
         .and_then(|language| language.LanguageTag())
         .map(|tag| tag.to_string())
         .map_err(ocr_error)?;
-    control.check("windows_ocr")?;
-    let operation = engine.RecognizeAsync(&bitmap).map_err(ocr_error)?;
-    // WinRT AsyncStatus::Started is zero. Request cancellation once, then drain
-    // the operation; a provider that ignores cancellation remains visibly draining.
-    while operation.Status().map_err(ocr_error)?.0 == 0 {
-        if control.is_cancelled() {
-            let _ = operation.Cancel();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    let recognized = operation.join().map_err(ocr_error)?;
-    control.check("windows_ocr")?;
+    let recognized = recognize_bitmap(&engine, &bitmap, control)?;
     let recognized_lines = recognized.Lines().map_err(ocr_error)?;
     let mut lines = Vec::with_capacity(recognized_lines.Size().map_err(ocr_error)? as usize);
     for index in 0..recognized_lines.Size().map_err(ocr_error)? {
@@ -1184,6 +1168,65 @@ pub(super) fn recognize_text_fingerprinted(
         },
         fingerprint,
     ))
+}
+
+/// Copies RGBA pixels into the bitmap type Windows OCR reads.
+pub(super) fn ocr_bitmap(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<SoftwareBitmap, PlatformError> {
+    let writer = DataWriter::new().map_err(ocr_error)?;
+    writer.WriteBytes(rgba).map_err(ocr_error)?;
+    let buffer = writer.DetachBuffer().map_err(ocr_error)?;
+    let width = i32::try_from(width).map_err(|_| PlatformError::InvalidArgument {
+        argument: "width".to_owned(),
+        reason: "exceeds the Windows OCR bitmap limit".to_owned(),
+    })?;
+    let height = i32::try_from(height).map_err(|_| PlatformError::InvalidArgument {
+        argument: "height".to_owned(),
+        reason: "exceeds the Windows OCR bitmap limit".to_owned(),
+    })?;
+    SoftwareBitmap::CreateCopyFromBuffer(&buffer, BitmapPixelFormat::Rgba8, width, height)
+        .map_err(ocr_error)
+}
+
+/// Runs one recognition, cancelling it promptly when `control` is cancelled.
+pub(super) fn recognize_bitmap(
+    engine: &OcrEngine,
+    bitmap: &SoftwareBitmap,
+    control: &controlfreak_core::MutationControl,
+) -> Result<windows::Media::Ocr::OcrResult, PlatformError> {
+    control.check("windows_ocr")?;
+    let operation = engine.RecognizeAsync(bitmap).map_err(ocr_error)?;
+    // WinRT AsyncStatus::Started is zero. Request cancellation once, then drain
+    // the operation; a provider that ignores cancellation remains visibly draining.
+    while operation.Status().map_err(ocr_error)?.0 == 0 {
+        if control.is_cancelled() {
+            let _ = operation.Cancel();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let recognized = operation.join().map_err(ocr_error)?;
+    control.check("windows_ocr")?;
+    Ok(recognized)
+}
+
+/// Creates an engine and records the time as the `ocr_engine_create` stage.
+pub(super) fn timed_ocr_engine(language: Option<&str>) -> Result<OcrEngine, PlatformError> {
+    timing::time("ocr_engine_create", || ocr_engine(language))
+}
+
+/// The user-profile language list that `TryCreateFromUserProfileLanguages` chooses from, joined
+/// into one key. The default-language engine is valid only while this key is unchanged.
+pub(super) fn user_profile_language_key() -> Result<String, PlatformError> {
+    let languages = GlobalizationPreferences::Languages().map_err(ocr_error)?;
+    let tags = languages
+        .into_iter()
+        .map(|tag| tag.to_string())
+        .collect::<Vec<_>>();
+    Ok(tags.join(","))
 }
 
 fn ocr_engine(language: Option<&str>) -> Result<OcrEngine, PlatformError> {

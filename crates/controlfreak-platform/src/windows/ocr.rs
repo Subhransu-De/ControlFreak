@@ -5,8 +5,12 @@
 //! warm between requests. A helper serves one request at a time; closing its stdin cancels the
 //! request in progress and ends it. A helper is retired after an error, timeout, cancellation, or
 //! `MAX_REQUESTS_PER_HELPER` requests, and exits by itself when idle for `HELPER_IDLE_EXIT`.
+//!
+//! Inside a helper, `EngineCache` keeps the `OcrEngine` for each language between requests; see
+//! there for when an engine is replaced.
 
-use super::recognize_text_fingerprinted;
+use super::capture::{recognize_text_with_engine, timed_ocr_engine, user_profile_language_key};
+use super::initialize_com;
 use crate::OcrHelperCommand;
 use controlfreak_core::{MutationControl, OcrRegionRequest, OcrResult, PlatformError};
 use serde::{Deserialize, Serialize};
@@ -496,16 +500,90 @@ fn read_bounded_line(input: &mut impl BufRead, limit: u64) -> std::io::Result<Op
     }
 }
 
+/// The default-language engine plus up to three explicitly requested languages.
+const MAX_CACHED_ENGINES: usize = 4;
+
+#[derive(Debug, PartialEq, Eq)]
+enum EngineKey {
+    /// The default engine, for the user-profile language list it was created from.
+    Default(String),
+    /// An explicitly requested BCP-47 tag, compared case-insensitively.
+    Explicit(String),
+}
+
+/// The engines one helper keeps between requests, most recently used last.
+///
+/// A default-language engine is keyed on the user-profile language list, which is read again for
+/// every request, so a change in Settings takes effect on the next request that sees the new
+/// list. Windows can also change what an engine would choose without changing that list, for
+/// example when an OCR language pack is installed; such changes, and any profile list Windows
+/// serves stale inside a running process, take effect when the helper retires, after at most
+/// `MAX_REQUESTS_PER_HELPER` requests or `HELPER_IDLE_EXIT` idle.
+struct EngineCache<E> {
+    engines: Vec<(EngineKey, E)>,
+}
+
+impl<E> Default for EngineCache<E> {
+    fn default() -> Self {
+        Self {
+            engines: Vec::new(),
+        }
+    }
+}
+
+impl<E: Clone> EngineCache<E> {
+    /// Returns the cached engine for `language`, creating it with `create` when there is none.
+    /// `profile_languages` reads the current user-profile language list for a default request.
+    fn engine(
+        &mut self,
+        language: Option<&str>,
+        profile_languages: impl FnOnce() -> Result<String, PlatformError>,
+        create: impl FnOnce(Option<&str>) -> Result<E, PlatformError>,
+    ) -> Result<E, PlatformError> {
+        let key = match language {
+            Some(tag) => EngineKey::Explicit(tag.to_ascii_lowercase()),
+            // Without the list there is nothing to validate a cached engine against.
+            None => match profile_languages() {
+                Ok(list) => EngineKey::Default(list),
+                Err(_) => return create(None),
+            },
+        };
+        if let Some(index) = self.engines.iter().position(|(cached, _)| *cached == key) {
+            let entry = self.engines.remove(index);
+            let engine = entry.1.clone();
+            self.engines.push(entry);
+            return Ok(engine);
+        }
+        let engine = create(language)?;
+        if matches!(key, EngineKey::Default(_)) {
+            // A default engine for an earlier language list is never asked for again.
+            self.engines
+                .retain(|(cached, _)| !matches!(cached, EngineKey::Default(_)));
+        }
+        if self.engines.len() >= MAX_CACHED_ENGINES {
+            self.engines.remove(0);
+        }
+        self.engines.push((key, engine.clone()));
+        Ok(engine)
+    }
+}
+
 pub(crate) fn serve_ocr_helper(
     input: impl Read + Send + 'static,
     output: impl Write,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // The helper stays in the multithreaded apartment for its whole life, so cached engines never
+    // outlive the COM initialization they were created under. `engines` is dropped first.
+    let _apartment = initialize_com()?;
+    let mut engines = EngineCache::default();
     serve_ocr_helper_with(
         input,
         output,
         |request, control| {
-            recognize_text_fingerprinted(request, control)
-                .map(|(result, fingerprint)| (result, Some(fingerprint)))
+            recognize_text_with_engine(request, control, |language| {
+                engines.engine(language, user_profile_language_key, timed_ocr_engine)
+            })
+            .map(|(result, fingerprint)| (result, Some(fingerprint)))
         },
         HELPER_IDLE_EXIT,
     )
@@ -516,7 +594,7 @@ pub(crate) fn serve_ocr_helper(
 fn serve_ocr_helper_with(
     input: impl Read + Send + 'static,
     mut output: impl Write,
-    recognize: impl Fn(
+    mut recognize: impl FnMut(
         &OcrRegionRequest,
         &MutationControl,
     ) -> Result<(OcrResult, Option<u64>), PlatformError>,
@@ -594,15 +672,19 @@ mod tests {
     use super::*;
 
     fn request_line(id: u64) -> Vec<u8> {
+        request_line_in(id, None)
+    }
+
+    fn request_line_in(id: u64, language: Option<&str>) -> Vec<u8> {
         let mut line = serde_json::to_vec(&OcrHelperRequest {
             id,
             request: OcrRegionRequest {
                 display_id: "fixture".into(),
-                x: 0,
+                x: u32::try_from(id).unwrap_or(0),
                 y: 0,
                 width: 1,
                 height: 1,
-                language: None,
+                language: language.map(str::to_owned),
             },
         })
         .unwrap();
@@ -671,6 +753,105 @@ mod tests {
         drop(requests);
         helper.join().unwrap();
         assert!(read_bounded_line(&mut replies, 1 << 20).unwrap().is_none());
+    }
+
+    #[test]
+    fn one_helper_creates_each_language_engine_once_until_the_profile_languages_change() {
+        let (input, mut requests) = std::io::pipe().unwrap();
+        let (replies, output) = std::io::pipe().unwrap();
+        let helper = thread::spawn(move || {
+            let mut engines = EngineCache::default();
+            let mut created = Vec::new();
+            serve_ocr_helper_with(
+                input,
+                output,
+                |request, _| {
+                    // From request 10 on (`x` carries the ID) the profile language list differs.
+                    let profile = if request.x >= 10 {
+                        "de-DE,en-US"
+                    } else {
+                        "en-US"
+                    };
+                    let engine = engines.engine(
+                        request.language.as_deref(),
+                        || Ok(profile.to_owned()),
+                        |language| {
+                            created.push(language.map(str::to_owned));
+                            Ok(created.len())
+                        },
+                    )?;
+                    Ok((synthetic_result(&format!("engine-{engine}")), None))
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            created
+        });
+        let mut replies = BufReader::new(replies);
+        let mut served_by = Vec::new();
+        for (id, tag) in [
+            (1, None),
+            (2, None),
+            (3, Some("fr-FR")),
+            (4, Some("FR-fr")),
+            (5, None),
+            (10, None),
+            (11, None),
+        ] {
+            requests.write_all(&request_line_in(id, tag)).unwrap();
+            let line = read_bounded_line(&mut replies, 1 << 20).unwrap().unwrap();
+            let reply = serde_json::from_slice::<OcrHelperReply>(&line).unwrap();
+            assert_eq!(reply.id, id);
+            let OcrHelperResponse::Success { result, .. } = reply.response else {
+                panic!("the fake recognizer failed");
+            };
+            served_by.push(language(&result));
+        }
+        drop(requests);
+        let created = helper.join().unwrap();
+        assert_eq!(
+            served_by,
+            [
+                "engine-1", "engine-1", "engine-2", "engine-2", "engine-1", "engine-3", "engine-3"
+            ]
+        );
+        assert_eq!(created, [None, Some("fr-FR".to_owned()), None]);
+    }
+
+    #[test]
+    fn the_engine_cache_stays_bounded_and_never_keeps_a_failure() {
+        let mut engines = EngineCache::default();
+        let mut created = 0;
+        let mut create = |_: Option<&str>| -> Result<u32, PlatformError> {
+            created += 1;
+            Ok(created)
+        };
+        let profile = || Ok("en-US".to_owned());
+        let failing = |_: Option<&str>| -> Result<u32, PlatformError> {
+            Err(PlatformError::Unavailable {
+                reason: "OCR language 'xx' is not installed".into(),
+            })
+        };
+        assert!(engines.engine(Some("xx"), profile, failing).is_err());
+        assert!(engines.engines.is_empty());
+        let default = engines.engine(None, profile, &mut create).unwrap();
+        for tag in ["a", "b", "c", "d"] {
+            engines.engine(Some(tag), profile, &mut create).unwrap();
+        }
+        assert_eq!(engines.engines.len(), MAX_CACHED_ENGINES);
+        // The least recently used entry, the default engine, made room for "d".
+        assert_ne!(engines.engine(None, profile, &mut create).unwrap(), default);
+        assert_eq!(engines.engines.len(), MAX_CACHED_ENGINES);
+        // Without a profile language list the default engine is created and not kept.
+        let unreadable = || {
+            Err(PlatformError::Unavailable {
+                reason: "no profile".into(),
+            })
+        };
+        let first = engines.engine(None, unreadable, &mut create).unwrap();
+        let second = engines.engine(None, unreadable, &mut create).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(engines.engines.len(), MAX_CACHED_ENGINES);
     }
 
     #[test]
@@ -894,5 +1075,217 @@ mod tests {
             .unwrap();
         assert!(failure.error.to_string().contains("exceeded"));
         assert!(!helper.is_running());
+    }
+}
+
+#[cfg(test)]
+mod synthetic_benchmarks {
+    #![allow(unsafe_code)]
+
+    use super::super::capture::{ocr_bitmap, recognize_bitmap};
+    use super::*;
+    use windows::Win32::Graphics::Gdi::{
+        ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CLIP_DEFAULT_PRECIS,
+        CreateCompatibleDC, CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH,
+        DIB_RGB_COLORS, DeleteDC, DeleteObject, FF_SWISS, FW_NORMAL, GdiFlush, OUT_DEFAULT_PRECIS,
+        PatBlt, SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW, WHITENESS,
+    };
+
+    /// Renders lines of black text on white into a memory bitmap and returns RGBA pixels. Nothing
+    /// is read from or drawn on the screen.
+    #[allow(clippy::cast_possible_wrap)]
+    fn synthetic_text_rgba(width: u32, height: u32) -> Vec<u8> {
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: u32::try_from(std::mem::size_of::<BITMAPINFOHEADER>()).unwrap(),
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        // SAFETY: Every GDI object created here is selected out and deleted before return. `bits`
+        // points to `width * height * 4` bytes owned by the DIB section, which is read only after
+        // GdiFlush and before the section is deleted.
+        let mut pixels = unsafe {
+            let dc = CreateCompatibleDC(None);
+            assert!(!dc.is_invalid());
+            let bitmap = CreateDIBSection(
+                Some(dc),
+                &raw const info,
+                DIB_RGB_COLORS,
+                &raw mut bits,
+                None,
+                0,
+            )
+            .unwrap();
+            let previous_bitmap = SelectObject(dc, bitmap.into());
+            PatBlt(dc, 0, 0, width as i32, height as i32, WHITENESS).unwrap();
+            let font = CreateFontW(
+                -20,
+                0,
+                0,
+                0,
+                FW_NORMAL.0.cast_signed(),
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                ANTIALIASED_QUALITY,
+                u32::from(DEFAULT_PITCH.0 | FF_SWISS.0),
+                windows::core::w!("Segoe UI"),
+            );
+            let previous_font = SelectObject(dc, font.into());
+            SetTextColor(dc, windows::Win32::Foundation::COLORREF(0));
+            SetBkMode(dc, TRANSPARENT);
+            for (row, top) in (10..height.saturating_sub(30)).step_by(32).enumerate() {
+                let text: Vec<u16> =
+                    format!("Synthetic line {row} the quick brown fox jumps over 42 lazy dogs")
+                        .encode_utf16()
+                        .collect();
+                let _ = TextOutW(dc, 12, top as i32, &text);
+            }
+            let _ = GdiFlush();
+            let pixels =
+                std::slice::from_raw_parts(bits.cast::<u8>(), width as usize * height as usize * 4)
+                    .to_vec();
+            SelectObject(dc, previous_font);
+            let _ = DeleteObject(font.into());
+            SelectObject(dc, previous_bitmap);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(dc);
+            pixels
+        };
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+            pixel[3] = 255;
+        }
+        pixels
+    }
+
+    fn median_ms(mut samples: Vec<Duration>) -> f64 {
+        samples.sort();
+        samples[samples.len() / 2].as_secs_f64() * 1_000.0
+    }
+
+    fn time<T>(run: impl FnOnce() -> T) -> (T, Duration) {
+        let started = Instant::now();
+        let value = run();
+        (value, started.elapsed())
+    }
+
+    fn fixture_request() -> OcrRegionRequest {
+        OcrRegionRequest {
+            display_id: "fixture".into(),
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            language: None,
+        }
+    }
+
+    fn echo_helper() -> OcrHelperCommand {
+        OcrHelperCommand::new(std::env::current_exe().unwrap())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("windows::ocr::tests::warm_echo_test_helper")
+            .arg("--nocapture")
+            .arg("--quiet")
+    }
+
+    /// Times each OCR stage on synthetic text: helper spawn, engine creation, the profile
+    /// language read that validates a cached default engine, and recognition, then compares a
+    /// call that creates its engine (before) with one that reuses it (after).
+    #[test]
+    #[ignore = "runs Windows OCR on synthetic images; needs an installed OCR language"]
+    fn synthetic_ocr_stage_latency() {
+        const SAMPLES: usize = 25;
+        let spawn: Vec<Duration> = (0..10)
+            .map(|id| {
+                let line = serde_json::to_vec(&OcrHelperRequest {
+                    id,
+                    request: fixture_request(),
+                })
+                .unwrap();
+                let (helper, elapsed) = time(|| {
+                    let mut helper =
+                        WarmOcrHelper::spawn(&echo_helper(), MAX_OCR_REPLY_BYTES).unwrap();
+                    helper
+                        .request(id, &line, &MutationControl::default(), OCR_HELPER_TIMEOUT)
+                        .map_err(|failure| failure.error)
+                        .unwrap();
+                    helper
+                });
+                drop(helper);
+                elapsed
+            })
+            .collect();
+        eprintln!(
+            "helper spawn to first reply (test binary, no OCR): median={:.1}ms",
+            median_ms(spawn)
+        );
+
+        let _apartment = initialize_com().unwrap();
+        let (first, first_create) = time(|| timed_ocr_engine(None).unwrap());
+        drop(first);
+        let creates: Vec<Duration> = (0..SAMPLES)
+            .map(|_| time(|| timed_ocr_engine(None).unwrap()).1)
+            .collect();
+        let explicit: Vec<Duration> = (0..SAMPLES)
+            .map(|_| time(|| timed_ocr_engine(Some("en-US")).unwrap()).1)
+            .collect();
+        let lookups: Vec<Duration> = (0..SAMPLES)
+            .map(|_| time(|| user_profile_language_key().unwrap()).1)
+            .collect();
+        eprintln!(
+            "engine create: first={:.1}ms later default={:.2}ms later en-US={:.2}ms; \
+             profile language read={:.3}ms",
+            first_create.as_secs_f64() * 1_000.0,
+            median_ms(creates),
+            median_ms(explicit),
+            median_ms(lookups)
+        );
+
+        let control = MutationControl::default();
+        for (width, height) in [(400_u32, 120_u32), (760, 560), (1920, 1080)] {
+            let rgba = synthetic_text_rgba(width, height);
+            let bitmap = ocr_bitmap(&rgba, width, height).unwrap();
+            let mut engines = EngineCache::default();
+            let mut cached = || {
+                engines
+                    .engine(None, user_profile_language_key, timed_ocr_engine)
+                    .unwrap()
+            };
+            let recognized = recognize_bitmap(&cached(), &bitmap, &control).unwrap();
+            assert!(
+                recognized.Text().unwrap().to_string().contains("quick"),
+                "the synthetic text was not recognized"
+            );
+            // Interleaved, so drift in machine load affects both variants alike.
+            let mut before = Vec::with_capacity(SAMPLES);
+            let mut after = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                before.push(
+                    time(|| {
+                        let engine = timed_ocr_engine(None).unwrap();
+                        recognize_bitmap(&engine, &bitmap, &control).unwrap();
+                    })
+                    .1,
+                );
+                after.push(time(|| recognize_bitmap(&cached(), &bitmap, &control).unwrap()).1);
+            }
+            eprintln!(
+                "{width}x{height}: per call before={:.1}ms after={:.1}ms",
+                median_ms(before),
+                median_ms(after)
+            );
+        }
     }
 }

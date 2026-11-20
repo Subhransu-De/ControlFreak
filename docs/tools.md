@@ -113,6 +113,8 @@ Every input action (`move_mouse`, `click_mouse`, `click_text`, `scroll_mouse`, `
 OCR uses the Windows OCR engine on the computer. It needs a Windows OCR language pack. It gives
 no confidence scores.
 
+Without `language`, OCR uses the first language in the Windows language list that has an OCR pack. A change to that list applies from the next OCR call. A newly installed or removed OCR language pack can take up to 100 calls, or one minute without OCR, to apply.
+
 | Tool | Matching | Gives input approval |
 | --- | --- | --- |
 | `click_text` | `exact` (default) or substring with `exact_match=false` | Yes, only for one unique match |
