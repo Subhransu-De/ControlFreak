@@ -196,19 +196,63 @@ impl Monitor {
 /// Space kept clear on each side of a tab, in DIPs.
 const TAB_CLEARANCE_DIP: f32 = 16.0;
 
+/// Windows reported no display the indicator can be drawn on. Unplugging or waking a display, or
+/// a remote session reconnecting, may cause this for a moment, so a hidden indicator reads again
+/// at its next poll; a shown one must fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TopologyGap {
+    NoMonitors,
+    InvalidBounds,
+}
+
+impl std::fmt::Display for TopologyGap {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::NoMonitors => "Windows reported no active monitors for the indicator",
+            Self::InvalidBounds => "Windows reported invalid monitor bounds for the indicator",
+        })
+    }
+}
+
+impl std::error::Error for TopologyGap {}
+
+impl From<TopologyGap> for io::Error {
+    fn from(gap: TopologyGap) -> Self {
+        let kind = match gap {
+            TopologyGap::NoMonitors => io::ErrorKind::NotFound,
+            TopologyGap::InvalidBounds => io::ErrorKind::InvalidData,
+        };
+        Self::new(kind, gap)
+    }
+}
+
 /// Active monitors sorted by position, so an unchanged layout compares equal between polls.
 pub(crate) fn enumerate_monitors() -> io::Result<Vec<Monitor>> {
+    Ok(usable_monitors(read_monitors()?)?)
+}
+
+/// Every active monitor as Windows reports it, possibly none. Only a failing Windows call is an
+/// error here; [`usable_monitors`] judges the reading.
+pub(crate) fn read_monitors() -> io::Result<Vec<Monitor>> {
     let mut monitors = Vec::new();
     visit_monitors(|monitor| {
         monitors.push(monitor_info(monitor).map_err(|error| error.to_string())?);
         Ok(())
     })
     .map_err(io::Error::other)?;
+    Ok(monitors)
+}
+
+/// The monitors sorted by position, or the gap when the indicator has nowhere to draw.
+pub(crate) fn usable_monitors(mut monitors: Vec<Monitor>) -> Result<Vec<Monitor>, TopologyGap> {
     if monitors.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "Windows reported no active monitors for the indicator",
-        ));
+        return Err(TopologyGap::NoMonitors);
+    }
+    if monitors
+        .iter()
+        .any(|monitor| monitor.width() <= 0 || monitor.height() <= 0)
+    {
+        return Err(TopologyGap::InvalidBounds);
     }
     monitors.sort_by_key(|monitor| (monitor.left, monitor.top, monitor.right, monitor.bottom));
     Ok(monitors)
@@ -230,20 +274,13 @@ fn monitor_info(monitor: HMONITOR) -> io::Result<Monitor> {
     // SAFETY: Both outputs are writable locals that outlive this synchronous call. A failure keeps
     // the 96 DPI default, which changes only the indicator's size, never its position.
     let _ = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &raw mut dpi_x, &raw mut dpi_y) };
-    let rect = Monitor {
+    Ok(Monitor {
         left: info.rcMonitor.left,
         top: info.rcMonitor.top,
         right: info.rcMonitor.right,
         bottom: info.rcMonitor.bottom,
         dpi: dpi_x.max(96),
-    };
-    if rect.width() <= 0 || rect.height() <= 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Windows reported invalid monitor bounds for the indicator",
-        ));
-    }
-    Ok(rect)
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
