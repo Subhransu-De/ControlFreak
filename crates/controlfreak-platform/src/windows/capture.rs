@@ -923,13 +923,80 @@ fn pixel_fingerprint(frame: &[u8], red_first: bool) -> u64 {
     hash ^ (frame.len() as u64)
 }
 
+/// Reads one screen region repeatedly as visual-change comparison frames. The grabber is created
+/// once, so after the first read a poll is one screen copy and one downscale into the caller's
+/// comparison buffer, with no full-resolution allocation or RGBA copy. Baselines and wait polls
+/// both read through `read`, so their frames stay comparable.
+pub(super) struct ComparisonCapture {
+    grabber: FrameGrabber,
+}
+
+impl ComparisonCapture {
+    pub(super) fn new(bounds: DisplayBounds) -> Result<Self, PlatformError> {
+        Ok(Self {
+            grabber: FrameGrabber::new(bounds)?,
+        })
+    }
+
+    const fn bounds(&self) -> DisplayBounds {
+        self.grabber.bounds
+    }
+
+    /// Replaces `frame` with the region's current comparison frame, reusing its allocation.
+    pub(super) fn read(&mut self, frame: &mut Vec<u8>) -> Result<(), PlatformError> {
+        if timing::time("capture_gdi", || self.grabber.grab()).is_err() {
+            // A held screen DC or bitmap can stop working where a fresh one would read, for
+            // example after a display change. Rebuild once; a second failure is reported.
+            self.grabber = FrameGrabber::new(self.grabber.bounds)?;
+            timing::time("capture_gdi", || self.grabber.grab())?;
+        }
+        let bounds = self.grabber.bounds;
+        downscale_comparison_frame(&self.grabber.buffer, bounds.width, bounds.height, frame);
+        Ok(())
+    }
+}
+
 pub(super) fn capture_comparison_frame(bounds: DisplayBounds) -> Result<Vec<u8>, PlatformError> {
-    let rgba = timing::time("capture_gdi", || capture_rgba(bounds))?;
-    let factor = bounds.width.div_ceil(VISUAL_COMPARE_WIDTH).max(1);
-    if factor == 1 {
-        Ok(rgba)
-    } else {
-        Ok(resize_rgba_box(&rgba, bounds.width, bounds.height, factor))
+    let mut frame = Vec::new();
+    ComparisonCapture::new(bounds)?.read(&mut frame)?;
+    Ok(frame)
+}
+
+/// Box-averages a top-down BGRA frame into the opaque RGBA comparison frame, at most
+/// `VISUAL_COMPARE_WIDTH` pixels wide, replacing `target` and reusing its allocation. Each output
+/// pixel is the truncated integer mean of the `factor` x `factor` block under it (clipped at the
+/// right and bottom edges). The fourth source byte is ignored, as a screen read leaves it
+/// unspecified. These are the bytes that `fnv1a64-rgba320` fingerprints: keep them unchanged.
+fn downscale_comparison_frame(source: &[u8], width: u32, height: u32, target: &mut Vec<u8>) {
+    let factor = width.div_ceil(VISUAL_COMPARE_WIDTH).max(1) as usize;
+    let (width, height) = (width as usize, height as usize);
+    let stride = width * 4;
+    let target_width = width.div_ceil(factor);
+    target.clear();
+    target.resize(target_width * height.div_ceil(factor) * 4, 0);
+    if stride == 0 || source.len() != stride * height {
+        return;
+    }
+    for (target_row, band) in target
+        .chunks_exact_mut(target_width * 4)
+        .zip(source.chunks(stride * factor))
+    {
+        let rows = band.len() / stride;
+        for (column, pixel) in target_row.chunks_exact_mut(4).enumerate() {
+            let left = column * factor * 4;
+            let right = (left + factor * 4).min(stride);
+            let mut totals = [0_u64; 3];
+            for row in band.chunks_exact(stride) {
+                for source_pixel in row[left..right].chunks_exact(4) {
+                    totals[0] += u64::from(source_pixel[0]);
+                    totals[1] += u64::from(source_pixel[1]);
+                    totals[2] += u64::from(source_pixel[2]);
+                }
+            }
+            let count = (rows * (right - left) / 4) as u64;
+            let mean = |total: u64| u8::try_from(total / count).unwrap_or(u8::MAX);
+            pixel.copy_from_slice(&[mean(totals[2]), mean(totals[1]), mean(totals[0]), u8::MAX]);
+        }
     }
 }
 
@@ -950,9 +1017,12 @@ pub(super) fn baseline_process_nonce() -> u128 {
     })
 }
 
+/// Polls `capture` until its region changed from `baseline` and then held still. The capture is
+/// reused for every poll and the two comparison buffers are swapped between polls, so the loop
+/// allocates nothing after the first poll.
 pub(super) fn wait_for_change(
     display: DisplayInfo,
-    bounds: DisplayBounds,
+    mut capture: ComparisonCapture,
     baseline: &[u8],
     timeout_ms: u32,
     stable_ms: u32,
@@ -960,8 +1030,10 @@ pub(super) fn wait_for_change(
     control: &controlfreak_core::MutationControl,
 ) -> Result<VisualChangeResult, PlatformError> {
     validate_wait_values(timeout_ms, stable_ms, difference_threshold)?;
+    let bounds = capture.bounds();
     let started = Instant::now();
     let mut previous = baseline.to_owned();
+    let mut frame = Vec::with_capacity(baseline.len());
     let mut difference = 0.0_f64;
     let mut changed = false;
     let mut settled = false;
@@ -974,7 +1046,7 @@ pub(super) fn wait_for_change(
             "wait_for_change",
             remaining.min(Duration::from_millis(VISUAL_POLL_MS)),
         )?;
-        let frame = capture_comparison_frame(bounds)?;
+        capture.read(&mut frame)?;
         difference = image_difference(baseline, &frame)?;
         if difference >= difference_threshold {
             changed = true;
@@ -994,9 +1066,11 @@ pub(super) fn wait_for_change(
                 stable_since = None;
             }
         }
-        previous = frame;
+        std::mem::swap(&mut previous, &mut frame);
     }
 
+    // Free the screen DC, bitmap and full-size buffer before the final screenshot allocates its own.
+    drop(capture);
     control.check("wait_for_change")?;
     let screenshot = capture_display_bounds(display, bounds, Some(MAX_ACTION_IMAGE_WIDTH), true)?;
     Ok(VisualChangeResult {
@@ -1225,56 +1299,6 @@ pub(super) fn validate_wait_values(
         });
     }
     Ok(())
-}
-
-pub(super) fn resize_rgba_box(
-    source: &[u8],
-    source_width: u32,
-    source_height: u32,
-    factor: u32,
-) -> Vec<u8> {
-    let target_width = source_width.div_ceil(factor);
-    let target_height = source_height.div_ceil(factor);
-    let target_length = usize::try_from(target_width)
-        .ok()
-        .and_then(|width| {
-            usize::try_from(target_height)
-                .ok()
-                .and_then(|height| width.checked_mul(height))
-        })
-        .and_then(|pixels| pixels.checked_mul(4))
-        .unwrap_or(0);
-    let mut target = vec![0_u8; target_length];
-    for target_y in 0..target_height {
-        for target_x in 0..target_width {
-            let source_left = target_x * factor;
-            let source_top = target_y * factor;
-            let source_right = source_left.saturating_add(factor).min(source_width);
-            let source_bottom = source_top.saturating_add(factor).min(source_height);
-            let mut totals = [0_u64; 4];
-            let mut count = 0_u64;
-            for source_y in source_top..source_bottom {
-                for source_x in source_left..source_right {
-                    let source_index = usize::try_from(
-                        (u64::from(source_y) * u64::from(source_width) + u64::from(source_x)) * 4,
-                    )
-                    .unwrap_or(0);
-                    for channel in 0..4 {
-                        totals[channel] += u64::from(source[source_index + channel]);
-                    }
-                    count += 1;
-                }
-            }
-            let target_index = usize::try_from(
-                (u64::from(target_y) * u64::from(target_width) + u64::from(target_x)) * 4,
-            )
-            .unwrap_or(0);
-            for channel in 0..4 {
-                target[target_index + channel] = u8::try_from(totals[channel] / count).unwrap_or(0);
-            }
-        }
-    }
-    target
 }
 
 /// Fixed-point scale for resampling weights; one source pixel's full coverage.
@@ -1544,16 +1568,52 @@ mod benchmarks {
             let encode_action = measure(9, || {
                 encode_png(image_width, image_height, &resized).unwrap();
             });
-            let factor = width.div_ceil(VISUAL_COMPARE_WIDTH).max(1);
             let mut compare = Vec::new();
             let downscale_compare = measure(9, || {
-                compare = resize_rgba_box(&frame, width, height, factor);
+                downscale_comparison_frame(&frame, width, height, &mut compare);
             });
             let difference = measure(9, || {
                 image_difference(&compare, &compare).unwrap();
             });
             eprintln!(
                 "{width}x{height}: resize_to_1280={resize:.1}ms encode_png_full={encode_full:.1}ms ({png_bytes} bytes, RGB) encode_png_full_rgba_reference={encode_full_rgba:.1}ms ({png_bytes_rgba} bytes) encode_png_1280={encode_action:.1}ms compare_downscale={downscale_compare:.1}ms compare_difference={difference:.2}ms"
+            );
+        }
+    }
+
+    /// The CPU cost of one visual-wait poll after the screen read, on a synthetic frame standing
+    /// in for the grabber's BGRA buffer. The previous path received a new full-size buffer per
+    /// poll (simulated by a copy), swapped it to RGBA and box-averaged it into a new comparison
+    /// frame; the current one downscales the grabber's buffer into a reused frame. Real screen
+    /// copies, and the GDI objects the previous path also recreated per poll, are not measured.
+    /// Run with `cargo test -p controlfreak-platform --release --lib visual_poll -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "synthetic latency benchmark; run explicitly"]
+    fn synthetic_visual_poll_latency() {
+        for (width, height) in [(1_920_u32, 1_080_u32), (3_840, 2_160)] {
+            let grabbed = synthetic_frame(width, height);
+            let mut reused = Vec::new();
+            downscale_comparison_frame(&grabbed, width, height, &mut reused);
+            let previous = measure(21, || {
+                std::hint::black_box(super::comparison_tests::reference_comparison_frame(
+                    std::hint::black_box(&grabbed),
+                    width,
+                    height,
+                ));
+            });
+            let current = measure(21, || {
+                downscale_comparison_frame(
+                    std::hint::black_box(&grabbed),
+                    width,
+                    height,
+                    &mut reused,
+                );
+                std::hint::black_box(&reused);
+            });
+            eprintln!(
+                "{width}x{height}: previous_poll={previous:.2}ms current_poll={current:.2}ms speedup={:.1}x full_size_bytes_per_previous_poll={}",
+                previous / current,
+                grabbed.len()
             );
         }
     }
@@ -1681,6 +1741,205 @@ mod live_capture_benchmarks {
                 samples[0]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod comparison_tests {
+    use super::*;
+
+    /// The comparison path before #66: a fresh full-size buffer per poll, swapped to RGBA and
+    /// then box-averaged. Kept to prove the in-place downscale produces the same bytes.
+    pub(super) fn reference_comparison_frame(bgra: &[u8], width: u32, height: u32) -> Vec<u8> {
+        let mut rgba = bgra.to_vec();
+        bgra_to_rgba(&mut rgba);
+        let factor = width.div_ceil(VISUAL_COMPARE_WIDTH).max(1);
+        if factor == 1 {
+            rgba
+        } else {
+            resize_rgba_box(&rgba, width, height, factor)
+        }
+    }
+
+    fn resize_rgba_box(
+        source: &[u8],
+        source_width: u32,
+        source_height: u32,
+        factor: u32,
+    ) -> Vec<u8> {
+        let target_width = source_width.div_ceil(factor);
+        let target_height = source_height.div_ceil(factor);
+        let mut target = vec![0_u8; target_width as usize * target_height as usize * 4];
+        for target_y in 0..target_height {
+            for target_x in 0..target_width {
+                let source_right = (target_x * factor + factor).min(source_width);
+                let source_bottom = (target_y * factor + factor).min(source_height);
+                let mut totals = [0_u64; 4];
+                let mut count = 0_u64;
+                for source_y in target_y * factor..source_bottom {
+                    for source_x in target_x * factor..source_right {
+                        let index =
+                            (source_y as usize * source_width as usize + source_x as usize) * 4;
+                        for channel in 0..4 {
+                            totals[channel] += u64::from(source[index + channel]);
+                        }
+                        count += 1;
+                    }
+                }
+                let index = (target_y as usize * target_width as usize + target_x as usize) * 4;
+                for channel in 0..4 {
+                    target[index + channel] = u8::try_from(totals[channel] / count).unwrap();
+                }
+            }
+        }
+        target
+    }
+
+    /// A BGRA desktop-like frame: a dark sidebar, a light panel with rows of text-like strokes
+    /// starting `scroll` rows down, and a fourth byte that varies as a screen read leaves it.
+    fn screen(width: u32, height: u32, scroll: u32) -> Vec<u8> {
+        let mut bgra = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let line = y + scroll;
+                let text = line % 24 < 12 && x % 9 < 5 && !(x / 9 + line / 24).is_multiple_of(7);
+                let value: u8 = match (x < width / 5, text) {
+                    (true, _) => 32,
+                    (false, true) => 24,
+                    (false, false) => 245,
+                };
+                bgra.extend_from_slice(&[
+                    value.saturating_add(8),
+                    value,
+                    value,
+                    (x ^ y).to_le_bytes()[0],
+                ]);
+            }
+        }
+        bgra
+    }
+
+    fn flat(width: u32, height: u32) -> Vec<u8> {
+        [200_u8, 210, 220, 0].repeat(width as usize * height as usize)
+    }
+
+    /// `frame` with one dark 9 x 16 glyph drawn at (`left`, `top`), clipped to the frame.
+    fn with_glyph(mut frame: Vec<u8>, width: u32, left: u32, top: u32) -> Vec<u8> {
+        let height = u32::try_from(frame.len() / 4).unwrap() / width;
+        for y in top..(top + 16).min(height) {
+            for x in left..(left + 9).min(width) {
+                if (x - left) % 4 != 3 {
+                    let index = (y as usize * width as usize + x as usize) * 4;
+                    frame[index..index + 3].copy_from_slice(&[20, 20, 20]);
+                }
+            }
+        }
+        frame
+    }
+
+    fn comparison(bgra: &[u8], width: u32, height: u32) -> Vec<u8> {
+        let mut frame = Vec::new();
+        downscale_comparison_frame(bgra, width, height, &mut frame);
+        frame
+    }
+
+    #[test]
+    fn box_downscale_averages_source_pixels_into_opaque_rgba() {
+        // Two by two BGRA pixels whose fourth bytes are unspecified, reduced by a factor of two.
+        let source = [0, 0, 0, 9, 0, 0, 100, 0, 0, 100, 0, 7, 0, 100, 100, 1];
+        let mut frame = Vec::new();
+        // Up to 320 columns every pixel is kept, only reordered to RGBA.
+        downscale_comparison_frame(&source, 2, 2, &mut frame);
+        assert_eq!(
+            frame,
+            [
+                0, 0, 0, 255, 100, 0, 0, 255, 0, 100, 0, 255, 100, 100, 0, 255
+            ]
+        );
+        // 640 columns is the narrowest region that is reduced by two.
+        let wide = [0_u8, 0, 0, 0, 0, 0, 100, 0].repeat(320);
+        let mut stacked = wide.clone();
+        stacked.extend([0_u8, 100, 0, 0, 0, 100, 100, 0].repeat(320));
+        downscale_comparison_frame(&stacked, 640, 2, &mut frame);
+        assert_eq!(frame, [50_u8, 50, 0, 255].repeat(320));
+    }
+
+    #[test]
+    fn comparison_frames_match_the_previous_path_byte_for_byte() {
+        // 1920 and 1366 columns reduce by 6 and 5 with clipped right and bottom blocks, 641 x 7
+        // by 3 with a clipped last row band, and 300 columns keep full size.
+        for (width, height) in [(1_920, 1_080), (1_366, 768), (641, 7), (300, 200)] {
+            let frames = [
+                flat(width, height),
+                with_glyph(flat(width, height), width, width / 2, height / 3),
+                screen(width, height, 0),
+                screen(width, height, 12),
+                // A glyph cut by the bottom-right corner lands in the clipped edge blocks.
+                with_glyph(screen(width, height, 0), width, width - 4, height - 5),
+            ];
+            for bgra in &frames {
+                let new = comparison(bgra, width, height);
+                let old = reference_comparison_frame(bgra, width, height);
+                assert_eq!(new, old, "{width}x{height}");
+                assert_eq!(frame_fingerprint(&new), frame_fingerprint(&old));
+            }
+        }
+    }
+
+    #[test]
+    fn change_and_settle_decisions_are_unchanged_for_flat_glyph_and_scrolling_frames() {
+        let (width, height) = (1_920, 1_080);
+        let threshold = 0.01;
+        let stable = threshold / 4.0;
+        let cases = [
+            ("flat", flat(width, height), flat(width, height)),
+            (
+                "glyph",
+                flat(width, height),
+                with_glyph(flat(width, height), width, 700, 400),
+            ),
+            (
+                "scroll",
+                screen(width, height, 0),
+                screen(width, height, 12),
+            ),
+        ];
+        let mut differences = Vec::new();
+        for (name, before, after) in &cases {
+            let new = image_difference(
+                &comparison(before, width, height),
+                &comparison(after, width, height),
+            )
+            .unwrap();
+            let old = image_difference(
+                &reference_comparison_frame(before, width, height),
+                &reference_comparison_frame(after, width, height),
+            )
+            .unwrap();
+            assert_eq!(new.to_bits(), old.to_bits(), "{name}");
+            differences.push(new);
+        }
+        // A still region never counts as changed and settles at once.
+        assert!(differences[0].abs() < f64::EPSILON);
+        // One glyph is visible to the comparison but below the default change and stable
+        // thresholds, as before.
+        assert!(differences[1] > 0.0 && differences[1] < stable);
+        // Scrolling by half a text line is a change and is not mistaken for a settled frame.
+        assert!(differences[2] >= threshold);
+    }
+
+    #[test]
+    fn repeated_reads_reuse_the_comparison_buffer() {
+        let (width, height) = (3_840, 2_160);
+        let first = screen(width, height, 0);
+        let second = screen(width, height, 12);
+        let mut frame = Vec::new();
+        downscale_comparison_frame(&first, width, height, &mut frame);
+        let (pointer, capacity) = (frame.as_ptr(), frame.capacity());
+        assert_eq!(frame.len(), 320 * 180 * 4);
+        downscale_comparison_frame(&second, width, height, &mut frame);
+        assert_eq!((frame.as_ptr(), frame.capacity()), (pointer, capacity));
+        assert_eq!(frame, reference_comparison_frame(&second, width, height));
     }
 }
 
