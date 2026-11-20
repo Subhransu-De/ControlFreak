@@ -1234,8 +1234,11 @@ fn run_budgeted_step(
         .cloned()
         .unwrap_or_else(|| ObservationOptions {
             mode: ObservationMode::None,
-            // An earlier step's settle wait also fits in the budget. The last step's settle wait
-            // and screenshot keep their own limits, as they do after a `type_text` deadline.
+            // An earlier step's settle wait is cut to the time left when the step starts. The
+            // backend starts the wait after the input, so a step that ends just before the
+            // deadline can settle past it by up to this cap; the next step then fails. The last
+            // step's settle wait and screenshot keep their own limits, as after a `type_text`
+            // deadline.
             settle_ms: remaining_ms.map(|remaining_ms| remaining_ms.min(DEFAULT_QUIET_SETTLE_MS)),
             ..ObservationOptions::default()
         });
