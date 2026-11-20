@@ -36,6 +36,7 @@ pub(crate) fn suite() -> Suite {
             task("injected-stop-click-ignored", injected_stop_click)
                 .scene("single")
                 .budget_secs(40),
+            task("held-modifier-refused", held_modifier_refused).scene("single"),
         ],
     }
 }
@@ -511,4 +512,117 @@ fn injected_stop_click(cx: &mut Ctx<'_>) -> Result<(), Failure> {
         accepted.structured
     );
     cx.end()
+}
+
+/// Windows adds a modifier the user holds to injected input, so Delete would arrive as
+/// Shift+Delete and a click as a Shift-click. The fixture holds Shift the way a person does, with
+/// a real key-down that stays down. Every input tool must be refused with `key_held` before
+/// anything reaches the window, and work again once Shift is up. Shift is released whatever the
+/// refusals did, so a failure never leaves it down for later tasks.
+fn held_modifier_refused(cx: &mut Ctx<'_>) -> Result<(), Failure> {
+    let id = control(cx, "app")?;
+    let refusals = refused_while_shift_is_held(cx, &id);
+    let released = release_key(cx, "0x10");
+    if let (Err(refused), Err(stuck)) = (&refusals, &released) {
+        return Err(Failure::new(stuck.kind, format!("{refused}; then {stuck}")));
+    }
+    refusals?;
+    released?;
+    // The release is queued input: wait until it arrived before expecting plain Delete.
+    cx.expect("app", "Shift going up", |e| {
+        e.iter()
+            .any(|event| matches!(event, Event::KeyUp { vk: 0x10, .. }))
+    })?;
+    cx.press(&id, &["delete"])?;
+    cx.expect("app", "Delete once Shift was released", |e| {
+        e.iter()
+            .any(|event| matches!(event, Event::KeyDown { role, vk: 0x2E } if role == "main"))
+    })?;
+    note_unicode_under_alt(cx)?;
+    cx.end()
+}
+
+fn refused_while_shift_is_held(cx: &mut Ctx<'_>, id: &str) -> Result<(), Failure> {
+    let held = cx.helper(&["--hold-key", "0x10"])?;
+    ensure!(held.status.success(), "the fixture could not hold Shift");
+    let events = cx.expect("app", "Shift going down", |e| {
+        e.iter()
+            .any(|event| matches!(event, Event::KeyDown { vk: 0x10, .. }))
+    })?;
+    let before = events.len();
+    let edit = cx.center("app", "edit")?;
+    let none = json!({"mode": "none"});
+    for (tool, arguments) in [
+        (
+            "press_keys",
+            json!({"target_ref": id, "keys": ["delete"], "observation": none}),
+        ),
+        (
+            "type_text",
+            json!({"target_ref": id, "text": "a", "observation": none}),
+        ),
+        (
+            "click_mouse",
+            json!({"target_ref": id, "x": edit.0, "y": edit.1, "observation": none}),
+        ),
+        (
+            "scroll_mouse",
+            json!({"target_ref": id, "x": edit.0, "y": edit.1, "delta_y": -120, "observation": none}),
+        ),
+    ] {
+        let refused = cx.refused(tool, arguments)?;
+        ensure!(
+            refused.error_reason() == Some("key_held")
+                && refused.structured["status"] == "not_started"
+                && refused.structured["input"]["sent_events"] == 0,
+            "{tool} was not refused before sending anything: {}",
+            refused.structured
+        );
+    }
+    thread::sleep(Duration::from_millis(300));
+    let leaked: Vec<Event> = cx.window("app")?.events()[before..]
+        .iter()
+        .filter(|event| event.is_input())
+        .cloned()
+        .collect();
+    ensure!(
+        leaked.is_empty(),
+        "input reached the window while Shift was held: {leaked:?}"
+    );
+    Ok(())
+}
+
+/// Records, without judging, how a Unicode packet typed under a held Alt reaches a window: as a
+/// character, or as a menu mnemonic (`syschar`). The server refuses typing under Alt either way,
+/// so this documents why rather than testing the server. Alt is released whatever happens.
+fn note_unicode_under_alt(cx: &mut Ctx<'_>) -> Result<(), Failure> {
+    let before = cx.window("app")?.events().len();
+    let held = cx.helper(&["--hold-key", "0x12"]);
+    let typed = match &held {
+        Ok(output) if output.status.success() => cx.helper(&["--inject-unicode", "U+0061"]),
+        _ => Err(Failure::host("Alt was not held, so nothing was typed")),
+    };
+    // Released even if holding or typing failed, before any of their errors is reported.
+    release_key(cx, "0x12")?;
+    ensure!(
+        held?.status.success() && typed?.status.success(),
+        "the fixture could not type under Alt"
+    );
+    thread::sleep(Duration::from_millis(300));
+    let arrived: Vec<Event> = cx.window("app")?.events()[before..].to_vec();
+    cx.note(format!(
+        "a Unicode packet under a held Alt arrived as {arrived:?}"
+    ));
+    Ok(())
+}
+
+/// Releases a key the fixture held with `--hold-key`. Windows keeps an injected key down until
+/// its key-up, across processes and later tasks, so a failure here is reported, never ignored.
+fn release_key(cx: &mut Ctx<'_>, key: &str) -> Result<(), Failure> {
+    let output = cx.helper(&["--release-key", key])?;
+    ensure!(
+        output.status.success(),
+        "the fixture could not release key {key}; it may still be held"
+    );
+    Ok(())
 }

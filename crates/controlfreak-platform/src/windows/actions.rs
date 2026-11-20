@@ -80,7 +80,9 @@ impl PointerBackend for Backend {
             control,
             |point| {
                 super::target::validate(control, "drag_mouse", Some(point))?;
-                super::input::ensure_pointer_idle("drag_mouse")
+                super::input::ensure_pointer_idle("drag_mouse")?;
+                // Only before the press: the travel below holds the drag's own modifiers.
+                super::input::ensure_no_modifier_held("drag_mouse")
             },
         )?;
         control.check("drag_mouse")?;
@@ -380,9 +382,10 @@ impl Backend {
             x: target_x,
             y: target_y,
         };
+        let presses = action.is_some();
         // A plain move reports wherever the pointer ended up. A click or scroll fires at the
         // live pointer, so its approach must end exactly on the requested point.
-        let placement = if action.is_some() {
+        let placement = if presses {
             Placement::Verified
         } else {
             Placement::Unchecked
@@ -396,7 +399,14 @@ impl Backend {
             control,
             |point| {
                 super::target::validate(control, operation, Some(point))?;
-                super::input::ensure_pointer_idle(operation)
+                super::input::ensure_pointer_idle(operation)?;
+                // A click or scroll under a held modifier is refused before the pointer moves;
+                // the check before its dispatch covers a modifier pressed during the approach.
+                if presses {
+                    super::input::ensure_no_modifier_held(operation)
+                } else {
+                    Ok(())
+                }
             },
         )?;
         let settled = if let Some(action) = action {

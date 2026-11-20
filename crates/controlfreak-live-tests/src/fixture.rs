@@ -69,8 +69,9 @@ mod win {
                     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
                 },
                 Input::KeyboardAndMouse::{
-                    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-                    MOUSEINPUT, SendInput, SetFocus,
+                    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+                    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+                    MOUSEINPUT, SendInput, SetFocus, VIRTUAL_KEY,
                 },
                 WindowsAndMessaging::{
                     AdjustWindowRectEx, BN_CLICKED, BS_PUSHBUTTON, ClipCursor, CreateWindowExW,
@@ -81,9 +82,9 @@ mod win {
                     SetForegroundWindow, SetTimer, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
                     WINDOW_STYLE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE,
                     WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT,
-                    WM_PRINTCLIENT, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
-                    WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_TOPMOST,
-                    WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_VISIBLE, WaitMessage,
+                    WM_PRINTCLIENT, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR,
+                    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD,
+                    WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_VISIBLE, WaitMessage,
                 },
             },
         },
@@ -181,6 +182,9 @@ mod win {
                 "--stop-button-rect" => return print_stop_button_rect(),
                 "--activate-taskbar" => return activate_taskbar(),
                 "--inject-click" => return inject_click(&args.next().unwrap_or_default()),
+                "--hold-key" => return inject_key(&args.next().unwrap_or_default(), false),
+                "--release-key" => return inject_key(&args.next().unwrap_or_default(), true),
+                "--inject-unicode" => return inject_unicode(&args.next().unwrap_or_default()),
                 "--release-clip" => return release_clip(),
                 "--clip-rect" => return print_clip_rect(),
                 "--title" => options.title = args.next().unwrap_or_default(),
@@ -500,6 +504,12 @@ mod win {
                 // SAFETY: `hwnd` is live and owned by this thread.
                 let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
             }
+            WM_SYSCHAR => {
+                // A character typed under Alt: a menu mnemonic, left to the default handling.
+                let unit = u32::try_from(wparam.0).unwrap_or(0);
+                log(&format!("{role} syschar U+{unit:04X}"));
+                return None;
+            }
             WM_ACTIVATE => {
                 let state = wparam.0 & 0xFFFF;
                 log(&format!("{role} activate {state}"));
@@ -774,6 +784,63 @@ mod win {
             thread::sleep(Duration::from_millis(40));
             i32::from(SendInput(&[event(MOUSEEVENTF_LEFTUP)], size) != 1)
         }
+    }
+
+    /// Sends one real `SendInput` key-down or key-up for a virtual key written as `0x10`. Windows
+    /// keeps the key in that state after this process exits, as it would for a person holding
+    /// it, so the live held-modifier test holds Shift with `--hold-key 0x10` and lets go with
+    /// `--release-key 0x10`. Exit code 0 only if Windows accepted the event.
+    fn inject_key(key: &str, key_up: bool) -> i32 {
+        let Some(key) = key
+            .strip_prefix("0x")
+            .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+        else {
+            eprintln!("--hold-key and --release-key need a virtual key such as 0x10");
+            return 2;
+        };
+        let flags = if key_up {
+            KEYEVENTF_KEYUP
+        } else {
+            KEYBD_EVENT_FLAGS::default()
+        };
+        send_keys(&[key_event(VIRTUAL_KEY(key), 0, flags)])
+    }
+
+    /// Types one UTF-16 unit written as `U+0061` as a Unicode packet, as `type_text` does.
+    fn inject_unicode(unit: &str) -> i32 {
+        let Some(unit) = unit
+            .strip_prefix("U+")
+            .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+        else {
+            eprintln!("--inject-unicode needs a UTF-16 unit such as U+0061");
+            return 2;
+        };
+        send_keys(&[
+            key_event(VIRTUAL_KEY(0), unit, KEYEVENTF_UNICODE),
+            key_event(VIRTUAL_KEY(0), unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+        ])
+    }
+
+    fn key_event(key: VIRTUAL_KEY, unit: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: key,
+                    wScan: unit,
+                    dwFlags: flags,
+                    ..Default::default()
+                },
+            },
+        }
+    }
+
+    fn send_keys(events: &[INPUT]) -> i32 {
+        let size = i32::try_from(size_of::<INPUT>()).unwrap_or(0);
+        // SAFETY: `events` holds locally built INPUT values and is valid for the synchronous
+        // call, which keeps no reference; `size` is the size of INPUT.
+        let sent = unsafe { SendInput(events, size) };
+        i32::from(usize::try_from(sent).ok() != Some(events.len()))
     }
 
     /// Asks Windows to put the taskbar in the foreground. Exit code 0 only if it got there.
