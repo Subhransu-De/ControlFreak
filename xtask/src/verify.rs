@@ -53,6 +53,13 @@ fn invoke(executable: &Path, arguments: &[&str], input: &str) -> Result<process:
 
 pub fn server(executable: &Path, version: &str) -> Result<()> {
     let executable = std::path::absolute(executable)?;
+    let manifest = controlfreak_platform::packaging_tests::embedded_manifest(&executable)?
+        .ok_or("Packaged executable has no application manifest")?;
+    if !declares_per_monitor_v2(&manifest) {
+        return Err(
+            "Packaged executable manifest does not declare PerMonitorV2 DPI awareness".into(),
+        );
+    }
     let result = invoke(&executable, &["--version"], "")?;
     if !result.status.success() || result.stdout.trim() != format!("controlfreak {version}") {
         return Err("Packaged executable version mismatch".into());
@@ -92,9 +99,13 @@ pub fn server(executable: &Path, version: &str) -> Result<()> {
     }
     validate_responses(&result.stdout, version)?;
     println!(
-        "Packaged executable: version, capabilities, MCP discovery/status and disconnect passed."
+        "Packaged executable: DPI manifest, version, capabilities, MCP discovery/status and disconnect passed."
     );
     Ok(())
+}
+
+fn declares_per_monitor_v2(manifest: &str) -> bool {
+    manifest.contains(">PerMonitorV2</dpiAwareness>") && manifest.contains(">true/pm</dpiAware>")
 }
 
 fn validate_responses(output: &str, version: &str) -> Result<()> {
@@ -132,6 +143,9 @@ fn validate_responses(output: &str, version: &str) -> Result<()> {
     {
         return Err("Packaged server did not report ready".into());
     }
+    if status["result"]["structuredContent"]["dpi_awareness"]["awareness"] != "per_monitor_v2" {
+        return Err("Packaged server is not per-monitor v2 DPI aware".into());
+    }
     Ok(())
 }
 
@@ -141,6 +155,19 @@ mod tests {
     #[test]
     fn protocol_noise_and_missing_responses_fail() {
         assert!(validate_responses("debug output\n", "1.0.0").is_err());
+    }
+
+    #[test]
+    fn only_a_per_monitor_v2_manifest_passes() {
+        let manifest =
+            include_str!("../../crates/controlfreak-server/windows/controlfreak.exe.manifest");
+        assert!(declares_per_monitor_v2(manifest));
+        assert!(!declares_per_monitor_v2(
+            &manifest.replace("PerMonitorV2", "PerMonitor")
+        ));
+        assert!(!declares_per_monitor_v2(
+            &manifest.replace("true/pm", "true")
+        ));
         assert!(validate_responses("{\"jsonrpc\":\"2.0\",\"id\":1}\n", "1.0.0").is_err());
     }
 }

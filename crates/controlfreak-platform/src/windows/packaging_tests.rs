@@ -222,3 +222,60 @@ fn checked_resource_slice(data: &[u32], pointer: *const u8, length: usize) -> io
     // The returned slice cannot outlive data and u8 has no alignment requirement.
     Ok(unsafe { std::slice::from_raw_parts(pointer, length) })
 }
+
+/// Unloads a module that was mapped only to read its resources.
+struct ResourceModule(windows::Win32::Foundation::HMODULE);
+impl Drop for ResourceModule {
+    fn drop(&mut self) {
+        // SAFETY: The handle came from a successful LoadLibraryExW, is owned by this guard and
+        // is released exactly once after every borrowed resource pointer is gone.
+        let _ = unsafe { windows::Win32::Foundation::FreeLibrary(self.0) };
+    }
+}
+
+/// The application manifest Windows reads from `path` (resource `RT_MANIFEST` #1), or `None`
+/// when the executable has none. The file is mapped as data only and never executed.
+pub fn embedded_manifest(path: &Path) -> io::Result<Option<String>> {
+    use windows::Win32::{
+        System::LibraryLoader::{
+            FindResourceW, LOAD_LIBRARY_AS_DATAFILE, LOAD_LIBRARY_AS_IMAGE_RESOURCE,
+            LoadLibraryExW, LoadResource, LockResource, SizeofResource,
+        },
+        UI::WindowsAndMessaging::RT_MANIFEST,
+    };
+    // `MAKEINTRESOURCE(1)`: the manifest Windows applies to a process.
+    const PROCESS_MANIFEST: PCWSTR = PCWSTR(std::ptr::without_provenance(1));
+    let path = wide(path)?;
+    // SAFETY: The path is NUL-terminated and outlives the call. The data-file flags map the
+    // image for resource reads only, so none of its code runs.
+    let module = unsafe {
+        LoadLibraryExW(
+            PCWSTR(path.as_ptr()),
+            None,
+            LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE,
+        )
+    }
+    .map(ResourceModule)?;
+    // SAFETY: `module` is loaded until the guard drops; the name and type are integer resource
+    // identifiers, not pointers.
+    let resource = unsafe { FindResourceW(Some(module.0), PROCESS_MANIFEST, RT_MANIFEST) };
+    if resource.is_invalid() {
+        return Ok(None);
+    }
+    // SAFETY: `resource` was found in the still-loaded `module`.
+    let size = unsafe { SizeofResource(Some(module.0), resource) } as usize;
+    // SAFETY: As above; the returned handle refers to memory owned by `module`.
+    let data = unsafe { LoadResource(Some(module.0), resource) }?;
+    // SAFETY: `data` is a loaded resource of `module`; locking it only returns its address.
+    let pointer = unsafe { LockResource(data) };
+    if pointer.is_null() || size == 0 {
+        return Err(io::Error::other("Unreadable manifest resource"));
+    }
+    // SAFETY: Windows reports `size` readable bytes at `pointer`, which stay mapped while
+    // `module` is alive; the bytes are copied before the guard unloads it.
+    let bytes = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), size) }.to_vec();
+    drop(module);
+    String::from_utf8(bytes)
+        .map(|text| Some(text.trim_start_matches('\u{feff}').to_owned()))
+        .map_err(io::Error::other)
+}

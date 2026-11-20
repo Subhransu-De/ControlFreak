@@ -889,9 +889,12 @@ impl Drop for LampWindow {
     }
 }
 
+/// The lamp draws at physical-pixel monitor bounds, so it refuses to start without per-monitor
+/// awareness rather than draw in the wrong place.
 fn ensure_dpi_awareness() -> io::Result<()> {
     set_per_monitor_dpi_awareness()
-        .map_err(|error| windows_error("SetProcessDpiAwarenessContext", &error))
+        .map(drop)
+        .map_err(|error| io::Error::other(error.to_string()))
 }
 
 fn register_window_class() -> io::Result<()> {

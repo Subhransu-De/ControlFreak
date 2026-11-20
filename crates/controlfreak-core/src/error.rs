@@ -122,6 +122,9 @@ pub enum FailureCause {
     /// The window with keyboard focus stopped answering while text was typed, so typing stopped
     /// instead of queueing keystrokes the application could mistranslate.
     TargetNotResponding,
+    /// The server process is not per-monitor DPI aware, so Windows would virtualize window and
+    /// pointer coordinates on a scaled display. Process awareness is fixed for its lifetime.
+    DpiAwarenessUnsupported,
 }
 
 impl FailureCause {
@@ -138,6 +141,7 @@ impl FailureCause {
             Self::WorkerFailed => "worker_failed",
             Self::InputBlocked => "input_blocked",
             Self::TargetNotResponding => "target_not_responding",
+            Self::DpiAwarenessUnsupported => "dpi_awareness_unsupported",
         }
     }
 
@@ -226,6 +230,13 @@ mod tests {
         let error = PlatformError::failed(FailureCause::PointerNotPlaced, "click_mouse", "x");
         assert_eq!(error.reason_code(), Some("pointer_not_placed"));
         assert!(!error.retryable(), "the same request is clamped again");
+    }
+
+    #[test]
+    fn a_server_without_per_monitor_dpi_awareness_has_its_own_non_retryable_reason() {
+        let error = PlatformError::failed(FailureCause::DpiAwarenessUnsupported, "op", "x");
+        assert_eq!(error.reason_code(), Some("dpi_awareness_unsupported"));
+        assert!(!error.retryable(), "process awareness cannot change");
     }
 
     #[test]

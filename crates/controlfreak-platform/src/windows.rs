@@ -122,11 +122,12 @@ use capture::{
     wait_for_change,
 };
 use desktop::{
-    activate_window, current_cursor_position, current_virtual_desktop_id, ensure_dpi_awareness,
-    enumerate_displays, enumerate_window_candidates, enumerate_windows, find_display,
-    find_display_at_point, find_window, foreground_window_handle, initialize_com, issue_candidate,
-    resolve_window_reference, restore_window, validate_window_wait, virtual_desktop_manager,
-    window_desktop_id, window_info, window_is_on_current_desktop, window_matches,
+    activate_window, current_cursor_position, current_virtual_desktop_id, dpi_awareness_status,
+    ensure_dpi_awareness, enumerate_displays, enumerate_window_candidates, enumerate_windows,
+    find_display, find_display_at_point, find_window, foreground_window_handle, initialize_com,
+    issue_candidate, resolve_window_reference, restore_window, validate_window_wait,
+    virtual_desktop_manager, window_desktop_id, window_info, window_is_on_current_desktop,
+    window_matches,
 };
 use environment::ensure_interactive_input_desktop;
 use input::{
@@ -539,6 +540,10 @@ impl BackendMetadata for Backend {
 
     fn security_context(&self) -> SecurityContext {
         self.security_context
+    }
+
+    fn dpi_awareness(&self) -> Option<controlfreak_core::DpiAwarenessStatus> {
+        Some(dpi_awareness_status())
     }
 }
 

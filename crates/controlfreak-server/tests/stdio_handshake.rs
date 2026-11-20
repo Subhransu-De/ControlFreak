@@ -139,6 +139,14 @@ fn assert_server_status(status: &Value) {
     assert!(content["server_elevated"].is_boolean());
     assert!(content["windows_integrity_level"].is_string());
     assert!(content["elevated_operation_allowed"].is_boolean());
+    // The manifest sets per-monitor v2 before the server runs, so its own request is refused
+    // with access denied and the awareness read back must still be v2.
+    let expected_dpi = if cfg!(target_os = "windows") {
+        serde_json::json!({"awareness": "per_monitor_v2", "reason": null})
+    } else {
+        Value::Null
+    };
+    assert_eq!(content["dpi_awareness"], expected_dpi);
 }
 
 #[test]
