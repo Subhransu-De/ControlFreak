@@ -87,12 +87,15 @@ fn click_pixel_and_button(cx: &mut Ctx<'_>) -> Result<(), Failure> {
     cx.end()
 }
 
-/// A window moved by someone else is still the approved window. The next action is refused once
-/// with `target_moved` and sends nothing; the action after it, at the button's new position,
-/// reaches the window in the same session.
+/// A window moved by someone else is still the approved window, and keeps its `target_ref`. An
+/// image of it from before the move no longer maps points. A capture after the move does, but the
+/// first action is refused once with `target_moved` and sends nothing; the same click again then
+/// reaches the button at its new position in the same session.
 fn moved_window_keeps_session(cx: &mut Ctx<'_>) -> Result<(), Failure> {
     const OFFSET: (i32, i32) = (60, 40);
     let id = control(cx, "app")?;
+    let (x, y) = cx.center("app", "button")?;
+    let before = cx.ok("capture_window", json!({"window_id": id}))?;
     let title = cx.window("app")?.title.clone();
     let offset = format!("{},{}", OFFSET.0, OFFSET.1);
     let moved = cx.helper(&["--move-window", &title, &offset])?;
@@ -101,12 +104,20 @@ fn moved_window_keeps_session(cx: &mut Ctx<'_>) -> Result<(), Failure> {
         "the fixture could not move the window: {}",
         String::from_utf8_lossy(&moved.stderr)
     );
-    let (x, y) = cx.center("app", "button")?;
     let button = (x + OFFSET.0, y + OFFSET.1);
-    let refused = cx.refused(
-        "click_mouse",
-        json!({"target_ref": id, "x": button.0, "y": button.1, "observation": {"mode": "none"}}),
-    )?;
+    let stale = cx.refused("click_mouse", image_click(&id, &before, button)?)?;
+    ensure!(
+        stale.error_code() == Some("invalid_argument"),
+        "an image from before the move was not refused as stale: {}",
+        stale.structured
+    );
+    let after = cx.ok("capture_window", json!({"window_id": id}))?;
+    ensure!(
+        after["window"]["id"] == id.as_str(),
+        "the moved window got another reference: {after}"
+    );
+    let click = image_click(&id, &after, button)?;
+    let refused = cx.refused("click_mouse", click.clone())?;
     ensure!(
         refused.error_code() == Some("target_invalidated")
             && refused.error_reason() == Some("target_moved")
@@ -115,7 +126,7 @@ fn moved_window_keeps_session(cx: &mut Ctx<'_>) -> Result<(), Failure> {
         "wrong refusal: {}",
         refused.structured
     );
-    let result = cx.click(&id, button)?;
+    let result = cx.call("click_mouse", click)?;
     ensure!(
         !result.is_error && result.structured["status"] == "completed",
         "the click after the refusal failed: {}",
@@ -130,6 +141,34 @@ fn moved_window_keeps_session(cx: &mut Ctx<'_>) -> Result<(), Failure> {
         .count();
     ensure!(presses == 1, "the button was pressed {presses} times");
     cx.end()
+}
+
+/// A `click_mouse` request at screen point `point`, given as a point in a `capture_window` image.
+fn image_click(
+    id: &str,
+    capture: &serde_json::Value,
+    point: (i32, i32),
+) -> Result<serde_json::Value, Failure> {
+    let field = |value: &serde_json::Value| {
+        value
+            .as_i64()
+            .ok_or_else(|| Failure::assertion(format!("capture without geometry: {capture}")))
+    };
+    let source = &capture["source_bounds"];
+    let (left, top) = (field(&source["left"])?, field(&source["top"])?);
+    let (width, height) = (field(&source["width"])?, field(&source["height"])?);
+    let (image_width, image_height) = (
+        field(&capture["image_width"])?,
+        field(&capture["image_height"])?,
+    );
+    ensure!(width > 0 && height > 0, "empty capture: {capture}");
+    Ok(json!({
+        "target_ref": id,
+        "observation_id": capture["observation_id"],
+        "image_x": (i64::from(point.0) - left) * image_width / width,
+        "image_y": (i64::from(point.1) - top) * image_height / height,
+        "observation": {"mode": "none"},
+    }))
 }
 
 /// A program that confines the pointer with `ClipCursor` makes `SetCursorPos` succeed but leave

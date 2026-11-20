@@ -1122,7 +1122,7 @@ async fn a_window_image_stops_mapping_points_once_its_window_changed() {
     let click = json!({"target_ref": "target-00000000-0000-0000-0000-000000000001", "observation_id": observation_id, "image_x": 10, "image_y": 10});
     let first = call(&mut harness, CLICK_MOUSE, click.clone()).await;
     assert_ne!(first["isError"], true, "{first}");
-    // The window moves: its reference changes, so the old one is no longer listed.
+    // The display layout changed: the window has another reference, and the old one is gone.
     backend.windows.lock().unwrap()[0].id = "w1-moved".into();
     let stale = call(&mut harness, CLICK_MOUSE, click).await;
     assert_eq!(stale["isError"], true, "{stale}");

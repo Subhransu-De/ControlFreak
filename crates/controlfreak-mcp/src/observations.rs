@@ -6,8 +6,8 @@
 //! kept, never pixels, in a small bounded map with a short lifetime.
 //!
 //! An image of one window maps points only while that window is unchanged: the same reference
-//! with the same bounds. A session's approved window keeps its reference when it moves or is
-//! resized, so the bounds are compared too, and a stale image is refused instead of mapped onto
+//! with the same bounds. A window keeps its reference when it only moves or is resized, so the
+//! bounds are compared too, and a stale image is refused instead of mapped onto
 //! whatever now lies under the old rectangle.
 
 use controlfreak_core::{

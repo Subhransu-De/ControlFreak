@@ -4,22 +4,47 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 use crate::{CleanupStatus, InputOutcome, MutationProgress, PlatformError};
 
 /// Cooperative cancellation shared by one admitted desktop mutation and the
 /// safety-indicator health monitor.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MutationControl {
     cancelled: Arc<AtomicBool>,
     parents: Vec<Arc<Self>>,
     progress: Arc<Mutex<MutationProgress>>,
     target: Arc<Mutex<Option<String>>>,
     target_invalidated: Arc<AtomicBool>,
+    /// When the request or operation this control belongs to began.
+    started: Instant,
+}
+
+impl Default for MutationControl {
+    fn default() -> Self {
+        Self {
+            cancelled: Arc::default(),
+            parents: Vec::new(),
+            progress: Arc::default(),
+            target: Arc::default(),
+            target_invalidated: Arc::default(),
+            started: Instant::now(),
+        }
+    }
 }
 
 impl MutationControl {
+    /// When the request or operation began, before it read any coordinates. A backend that
+    /// accepts a change of the target during a session (a moved window) refuses every operation
+    /// that began before it accepted the change, since that operation may hold coordinates
+    /// chosen for the old state.
+    #[must_use]
+    pub const fn started(&self) -> Instant {
+        self.started
+    }
+
     /// Bounded cooperative wait, also used by providers between native calls.
     pub fn wait(
         &self,
@@ -50,6 +75,7 @@ impl MutationControl {
             cancelled: Arc::clone(&self.cancelled),
             parents,
             progress: Arc::clone(&self.progress),
+            started: self.started,
         }
     }
 
@@ -115,11 +141,12 @@ impl MutationControl {
         }
     }
 
-    /// Keep cancellation links but start an independent operation's progress.
+    /// Keep cancellation links but start an independent operation's progress and start time.
     #[must_use]
     pub fn for_operation(&self) -> Self {
         Self {
             progress: Arc::default(),
+            started: Instant::now(),
             ..self.clone()
         }
     }
