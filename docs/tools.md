@@ -258,6 +258,23 @@ The reason for `platform_operation_failed` is set by the code that detects the f
 - After partial or unknown delivery, observe before you act again. Do not replay the whole
   action.
 
+## Argument errors
+
+A request that does not fit the tool's input schema fails with `error.code` `invalid_arguments`: a missing or unknown field, a wrong JSON type, a name that is not in an enum, or a number outside its integer type. A request that parses but breaks a rule, such as a published range or a combination of fields, fails with `invalid_argument`. Both are found before any desktop work, so an input tool reports `status: "not_started"` and takes no session. No argument error repeats a value you sent, so typed text never appears in an error.
+
+`invalid_arguments` explains the field in `error.details`:
+
+| Field | Meaning |
+| --- | --- |
+| `path` | The field, such as `text`, `observation.region.x`, `keys[1]` or `steps[2].text`. |
+| `problem` | `missing_field`, `unknown_field`, `invalid_type`, `invalid_value`, `unknown_variant` or `invalid_length`. |
+| `expected` | What the field takes, when known: `string`, `boolean`, `array`, `object`, a range such as `integer from 0 to 255`, or a list such as `one of: left, right, middle`. |
+| `received_kind` | The JSON kind that was sent: `string`, `number`, `boolean`, `null`, `array` or `object`, or `missing`. |
+| `valid_fields` | `unknown_field` only: the fields that object takes, at most 32. |
+| `reason` | The same explanation as one sentence, also used in `error.message`. |
+
+For example, `type_text` with `{"text": 5}` gives `path: "text"`, `problem: "invalid_type"`, `expected: "string"` and `received_kind: "number"`. An unknown key name in `press_keys` keeps its hint (`did you mean 'ctrl'?`, or the valid names) in `reason`.
+
 ## Session errors
 
 When an input tool cannot start a session, `error.code` says why:

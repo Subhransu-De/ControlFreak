@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod arguments;
 #[cfg(test)]
 mod begin_cancel_tests;
 mod catalog;

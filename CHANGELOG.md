@@ -21,6 +21,7 @@ versioned section and uses that section for the corresponding GitHub Release not
 - ControlFreak no longer treats a server that Windows keeps DPI unaware or system aware as per-monitor aware. On a scaled display that made Windows scale coordinates, and since 0.2.3 every click failed with `pointer_not_placed`. `controlfreak.exe` now declares per-monitor v2 awareness in its manifest. If a compatibility override still changes it, captures and input fail with `dpi_awareness_unsupported`, and `get_server_status` reports `degraded` with the awareness in effect. Checked on Windows with a DPI-unaware compatibility layer, but not on a scaled display.
 - An input tool called with invalid arguments no longer reserves the desktop. It is refused with `invalid_arguments` or `invalid_argument` and `status: "not_started"` before it starts a session, so it arms no hold, shows no indicator and no longer blocks another server with `desktop_in_use` for 8 seconds. `run_actions` checks every step first.
 - If Windows reports no display for a moment while no session is owned, the session tab and the lamp now check again at their next poll, and sessions can start once a display is back. Before, input stayed closed until the server restarted. During a session this still closes input with the reason. Not yet observed on Windows: whether hot-plug, monitor sleep or a remote session disconnect gives such a reading.
+- Argument errors no longer repeat the value you sent. Before, a value of the wrong type, such as text where a number goes, or an unknown key name was quoted in `error.message` and `error.details.reason`, so typed text could reach the transcript.
 
 ### Added
 
@@ -28,6 +29,7 @@ versioned section and uses that section for the corresponding GitHub Release not
 - A second `notifications/controlfreak/session_stopped` event, `stop_drained`, when work that was running at a user stop has finished.
 - `input.split_character: true` when `type_text` or a `run_actions` `type_text` step stops between the two halves of an emoji or other non-BMP character. The application then holds half a character, so delete it before typing again. A stop, cancel or refusal still never sends the second half.
 - `type_text` and the `run_actions` `type_text` step take an optional `timeout_ms` (1 to 300000) that limits how long typing may take. At the limit, typing stops between two keystrokes with reason `deadline_reached` (not retryable), `status: "partially_sent"` and the exact `input.sent_events`. Observe the text before typing the rest. Without `timeout_ms` nothing changes.
+- `invalid_arguments` errors say which field is wrong: `error.details` has `path` (such as `steps[2].text`), `problem`, `expected`, `received_kind` and, for an unknown field, up to 32 `valid_fields`. `error.code` is unchanged.
 
 ### Changed
 
