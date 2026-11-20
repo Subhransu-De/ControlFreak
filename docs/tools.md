@@ -235,12 +235,12 @@ A character outside the Basic Multilingual Plane, such as an emoji, is two UTF-1
 
 - All step arguments are checked before the first step. One bad step refuses the whole batch. So does a step whose tool the [tool profile](#tool-profiles) hides.
 - Each step gets the same target checks as the single tool.
-- The batch stops at the first failure. `action.steps` reports each step as `completed`,
-  `failed` or `skipped`.
+- The batch stops at the first failure. `action.steps` reports each step as `completed`, `failed` or `skipped`, with the `sent_events` of that step and its `cleanup`: what `input.cleanup` says for the single tool, so `not_needed` or `succeeded` on a failed step means it left no key or button held. A `wait` or `skipped` step sent nothing and reports `not_needed`.
 - Each completed `click`, `scroll`, `type_text` and `press_keys` step reports `foreground_window`, the window in front after that step (see [Foreground window](#foreground-window)). A `wait` step sends no input and reads nothing, and it is never the last step, so the step after it reports the window in front.
 - Only the last step returns a screenshot. Each earlier step waits up to 500 ms for the window to settle (see [Waiting for the window to settle](#waiting-for-the-window-to-settle)). Add a `wait` step before a step that depends on a slower load.
 - A `wait` step (`wait_ms` from 1 to 5000, at most 15000 in total) pauses between steps. It sends no input and cannot be the last step.
-- A `type_text` step takes an optional `timeout_ms` with the same range and meaning as the single tool (see [Keys](#keys)). It limits that step only. A step that runs out of time fails with `deadline_reached`, and the later steps are skipped. The batch as a whole has no overall limit.
+- A `type_text` step takes an optional `timeout_ms` with the same range and meaning as the single tool (see [Keys](#keys)). It limits that step only. A step that runs out of time fails with `deadline_reached`, and the later steps are skipped.
+- The batch takes an optional `timeout_ms` (1 to 300000) for all its steps, counted from when the batch starts on the desktop. Each step gets at most the time left: a `type_text` step's own `timeout_ms` is cut to it, and a step that starts with no time left, or a `wait` step that would end at or after the limit, fails at once without input. The step that runs out fails with reason `deadline_reached` (not retryable) and a message that names the batch's limit, later steps are `skipped`, and the batch is `partially_sent` with the exact `input.sent_events` once an earlier step sent input. The settle wait of an earlier step is cut to the time left too; the last step's settle wait and screenshot keep their own limits, so the call can end up to their length after the limit. Without `timeout_ms`, the batch has no overall limit. The 15000 ms total of `wait` steps applies either way.
 
 Use it for a known sequence, such as filling a form. Observe between calls when a later step
 depends on what an earlier step shows.
@@ -272,7 +272,7 @@ Every error also has `error.retryable`. It says whether repeating the same reque
 | `ocr_unavailable` | The OCR helper failed. | No |
 | `input_blocked` | Windows accepted only part of the input, for example for a higher-integrity window. | No |
 | `target_not_responding` | The window with keyboard focus stopped answering while text was typed, so typing stopped. Observe it before typing the rest. | No |
-| `deadline_reached` | `type_text` or a `run_actions` `type_text` step reached its `timeout_ms` and stopped between two keystrokes. `input.sent_events` shows how much was sent. Observe the text before typing the rest. | No |
+| `deadline_reached` | `type_text` or a `run_actions` `type_text` step reached its `timeout_ms` and stopped between two keystrokes, or a `run_actions` step could not finish within the batch's `timeout_ms`. `input.sent_events` shows how much was sent. Observe the text before typing the rest. | No |
 | `desktop_work_stopped` | Admission is closed. | No |
 | `worker_failed` | A worker failed. Observe before recovery. | No |
 | `dpi_awareness_unsupported` | Windows runs the server DPI unaware or system aware, so it would scale coordinates. The message names the awareness. Remove the high DPI compatibility override from `controlfreak.exe` and restart the server (see [Coordinates](#coordinates)). | No |

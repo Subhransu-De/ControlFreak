@@ -1,8 +1,8 @@
 use super::*;
 use controlfreak_core::{
-    BackendIdentity, BackendMetadata, CapabilityDescriptor, DisplayBackend, DisplayBounds,
-    DisplayInfo, DisplayServer, KeyboardBackend, MousePosition, OcrBackend, PermissionDescriptor,
-    Platform, PointerBackend, WindowBackend,
+    BackendIdentity, BackendMetadata, CapabilityDescriptor, CleanupStatus, DisplayBackend,
+    DisplayBounds, DisplayInfo, DisplayServer, KeyboardBackend, MousePosition, ObservationMode,
+    ObservationOptions, OcrBackend, PermissionDescriptor, Platform, PointerBackend, WindowBackend,
 };
 use tokio::io::{AsyncWriteExt, BufReader};
 
@@ -16,21 +16,50 @@ struct Scripted {
     /// The failing step first sends the high half of a surrogate pair, as typing that stops
     /// between the halves does.
     splits_pair: bool,
+    pace: Pace,
     calls: Mutex<Vec<String>>,
 }
 
+/// How long the scripted steps take, what a failing step leaves held, and how large the
+/// screenshot is. The default is instant, clean and screenshot-free.
+#[derive(Clone, Copy, Default)]
+struct Pace {
+    /// Every step takes this long before it reports.
+    step_ms: u64,
+    /// A `type_text` step types for this long. Like the platform, it stops at its `timeout_ms`
+    /// after one sent event and fails with `deadline_reached`.
+    type_ms: Option<u64>,
+    /// The cleanup the failing step reports, as a backend does after releasing held input.
+    failed_cleanup: CleanupStatus,
+    /// Size of the synthetic PNG returned when a screenshot is asked for. Zero returns none.
+    screenshot_bytes: usize,
+}
+
 impl Scripted {
+    fn new(failure: PlatformError) -> Self {
+        Self {
+            fail_at: None,
+            failure,
+            observation_fails_at: None,
+            splits_pair: false,
+            pace: Pace::default(),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
     fn step(&self, label: String, control: &MutationControl) -> Result<(), PlatformError> {
         let mut calls = self.calls.lock().unwrap();
         let index = calls.len();
         calls.push(label);
         drop(calls);
+        std::thread::sleep(Duration::from_millis(self.pace.step_ms));
         if self.fail_at == Some(index) {
             if self.splits_pair {
                 control.dispatch_started();
                 control.dispatch_accepted(2);
                 control.split_character();
             }
+            control.cleanup_status(self.pace.failed_cleanup);
             return Err(self.failure.clone());
         }
         control.dispatch_started();
@@ -44,29 +73,85 @@ impl Scripted {
         }
         Ok(())
     }
-}
 
-fn observation() -> ActionObservation {
-    ActionObservation {
-        foreground_window: None,
-        screenshot: None,
-        settle: Some(controlfreak_core::SettleReport {
-            outcome: controlfreak_core::SettleOutcome::Settled,
-            elapsed_ms: 180,
-        }),
+    /// Types for `pace.type_ms`, or until the request's `timeout_ms` if that comes first.
+    fn type_for(
+        &self,
+        request: &TextInputRequest,
+        control: &MutationControl,
+    ) -> Result<(), PlatformError> {
+        let Some(type_ms) = self.pace.type_ms else {
+            return Ok(());
+        };
+        match request.timeout_ms.map(u64::from) {
+            Some(timeout_ms) if timeout_ms < type_ms => {
+                std::thread::sleep(Duration::from_millis(timeout_ms));
+                control.dispatch_started();
+                control.dispatch_accepted(1);
+                Err(deadline_reached())
+            }
+            _ => {
+                std::thread::sleep(Duration::from_millis(type_ms));
+                Ok(())
+            }
+        }
+    }
+
+    fn observation(&self, options: &ObservationOptions) -> ActionObservation {
+        let screenshot = (self.pace.screenshot_bytes > 0
+            && options.mode == ObservationMode::Screenshot)
+            .then(|| {
+                let display = fixture_display();
+                controlfreak_core::DisplayScreenshot {
+                    target_ref: Some(TARGET.into()),
+                    source_bounds: display.bounds,
+                    display_layout: controlfreak_core::DisplayLayout::from_displays(
+                        std::slice::from_ref(&display),
+                    ),
+                    display,
+                    png: vec![7; self.pace.screenshot_bytes],
+                    image_width: 1280,
+                    image_height: 720,
+                    cursor_marker: true,
+                }
+            });
+        ActionObservation {
+            foreground_window: None,
+            screenshot,
+            settle: Some(controlfreak_core::SettleReport {
+                outcome: controlfreak_core::SettleOutcome::Settled,
+                elapsed_ms: 180,
+            }),
+        }
+    }
+
+    fn pointer(&self, options: &ObservationOptions) -> PointerActionResult {
+        PointerActionResult {
+            position: MousePosition {
+                display_id: "fixture".into(),
+                local_x: 0,
+                local_y: 0,
+                virtual_x: 0,
+                virtual_y: 0,
+            },
+            observation: self.observation(options),
+        }
     }
 }
 
-fn pointer() -> PointerActionResult {
-    PointerActionResult {
-        position: MousePosition {
-            display_id: "fixture".into(),
-            local_x: 0,
-            local_y: 0,
-            virtual_x: 0,
-            virtual_y: 0,
+const TARGET: &str = "target-00000000-0000-0000-0000-000000000003";
+
+fn fixture_display() -> DisplayInfo {
+    DisplayInfo {
+        id: "fixture".into(),
+        name: "fixture".into(),
+        bounds: DisplayBounds {
+            left: -1920,
+            top: 0,
+            width: 1920,
+            height: 1080,
         },
-        observation: observation(),
+        is_primary: true,
     }
 }
 
@@ -91,17 +176,7 @@ impl BackendMetadata for Scripted {
 
 impl DisplayBackend for Scripted {
     fn list_displays(&self) -> Result<Vec<DisplayInfo>, PlatformError> {
-        Ok(vec![DisplayInfo {
-            id: "fixture".into(),
-            name: "fixture".into(),
-            bounds: DisplayBounds {
-                left: -1920,
-                top: 0,
-                width: 1920,
-                height: 1080,
-            },
-            is_primary: true,
-        }])
+        Ok(vec![fixture_display()])
     }
 }
 
@@ -115,7 +190,7 @@ impl PointerBackend for Scripted {
             format!("click {} {} {}", request.display_id, request.x, request.y),
             control,
         )
-        .map(|()| pointer())
+        .map(|()| self.pointer(&request.observation))
     }
     fn scroll_mouse_controlled(
         &self,
@@ -128,7 +203,7 @@ impl PointerBackend for Scripted {
             .settle_ms
             .map_or_else(String::new, |settle_ms| format!(" settle={settle_ms}"));
         self.step(format!("scroll {}{settle}", request.delta_y), control)
-            .map(|()| pointer())
+            .map(|()| self.pointer(&request.observation))
     }
 }
 
@@ -148,8 +223,9 @@ impl KeyboardBackend for Scripted {
             ),
             control,
         )
+        .and_then(|()| self.type_for(request, control))
         .map(|()| KeyboardActionResult {
-            observation: observation(),
+            observation: self.observation(&request.observation),
         })
     }
     fn press_keys_controlled(
@@ -162,7 +238,7 @@ impl KeyboardBackend for Scripted {
             control,
         )
         .map(|()| KeyboardActionResult {
-            observation: observation(),
+            observation: self.observation(&request.observation),
         })
     }
 }
@@ -196,6 +272,7 @@ async fn run_failing(
         failure,
         observation_fails_at,
         splits_pair: false,
+        pace: Pace::default(),
         calls: Mutex::new(Vec::new()),
     };
     call(backend, RUN_ACTIONS, arguments).await
@@ -203,10 +280,25 @@ async fn run_failing(
 
 /// Calls `tool` once on `backend` and checks the result against the tool's output schema.
 async fn call(backend: Scripted, tool: &str, arguments: Value) -> (Value, Vec<String>) {
+    let (mut answered, calls) = call_all(backend, &[(tool, arguments)]).await;
+    (answered.remove(0).content, calls)
+}
+
+/// One answered tool call.
+struct Answered {
+    content: Value,
+    /// Length of the whole JSON-RPC response, as the client reads it.
+    bytes: usize,
+    elapsed: Duration,
+}
+
+/// Calls each tool in order on one server, as one client would, and checks every result
+/// against its tool's output schema.
+async fn call_all(backend: Scripted, requests: &[(&str, Value)]) -> (Vec<Answered>, Vec<String>) {
     let backend = Arc::new(backend);
     let server =
         ControlFreakServer::with_indicator(backend.clone(), SafetyIndicator::dormant(), None);
-    let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+    let (client_io, server_io) = tokio::io::duplex(4 * 1024 * 1024);
     let serving = tokio::spawn(async move {
         server
             .serve(server_io)
@@ -229,32 +321,42 @@ async fn call(backend: Scripted, tool: &str, arguments: Value) -> (Value, Vec<St
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
     )
     .await;
-    let listed_tool = listed["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|listed| listed["name"] == tool)
-        .unwrap()
-        .clone();
-    let response = exchange(
-        &mut client,
-        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":tool,"arguments":arguments}}),
-    )
-    .await;
-    let content = response["result"]["structuredContent"].clone();
-    assert!(
-        jsonschema::validator_for(&listed_tool["outputSchema"])
+    let mut answered = Vec::new();
+    for (id, (tool, arguments)) in (3..).zip(requests) {
+        let listed_tool = listed["result"]["tools"]
+            .as_array()
             .unwrap()
-            .is_valid(&content),
-        "{content}"
-    );
+            .iter()
+            .find(|listed| listed["name"] == *tool)
+            .unwrap()
+            .clone();
+        let started = std::time::Instant::now();
+        let response = exchange(
+            &mut client,
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":tool,"arguments":arguments}}),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let content = response["result"]["structuredContent"].clone();
+        assert!(
+            jsonschema::validator_for(&listed_tool["outputSchema"])
+                .unwrap()
+                .is_valid(&content),
+            "{content}"
+        );
+        answered.push(Answered {
+            content,
+            bytes: response.to_string().len(),
+            elapsed,
+        });
+    }
     drop(client);
     tokio::time::timeout(Duration::from_secs(10), serving)
         .await
         .unwrap()
         .unwrap();
     let calls = backend.calls.lock().unwrap().clone();
-    (content, calls)
+    (answered, calls)
 }
 
 fn steps() -> Value {
@@ -473,6 +575,7 @@ async fn typing_that_stops_inside_a_surrogate_pair_reports_the_split_character()
         failure: stopped(),
         observation_fails_at: None,
         splits_pair: true,
+        pace: Pace::default(),
         calls: Mutex::new(Vec::new()),
     };
     let target = "target-00000000-0000-0000-0000-000000000003";
@@ -536,6 +639,7 @@ async fn timeout_ms_reaches_the_backend_and_is_absent_by_default() {
         failure: deadline_reached(),
         observation_fails_at: None,
         splits_pair: false,
+        pace: Pace::default(),
         calls: Mutex::new(Vec::new()),
     };
     let (content, calls) = call(
@@ -573,6 +677,7 @@ async fn a_typing_deadline_reports_partial_delivery_and_is_not_retryable() {
             failure: deadline_reached(),
             observation_fails_at: None,
             splits_pair: true,
+            pace: Pace::default(),
             calls: Mutex::new(Vec::new()),
         },
         TYPE_TEXT,
@@ -622,6 +727,7 @@ async fn an_out_of_range_timeout_is_refused_before_any_input() {
             failure: deadline_reached(),
             observation_fails_at: None,
             splits_pair: false,
+            pace: Pace::default(),
             calls: Mutex::new(Vec::new()),
         };
         let (content, calls) = call(
@@ -645,5 +751,348 @@ async fn an_out_of_range_timeout_is_refused_before_any_input() {
             "{content}"
         );
         assert!(calls.is_empty(), "{calls:?}");
+    }
+}
+
+fn paced(pace: Pace) -> Scripted {
+    Scripted {
+        pace,
+        ..Scripted::new(deadline_reached())
+    }
+}
+
+/// The `timeout_ms` the scripted backend saw on the type step, if any.
+fn type_timeout(calls: &[String]) -> Option<u32> {
+    calls
+        .iter()
+        .find(|call| call.starts_with("type "))
+        .and_then(|call| call.split(" timeout=").nth(1))
+        .map(|timeout| timeout.parse().unwrap())
+}
+
+fn step_field<'a>(steps: &'a Value, field: &str) -> Vec<&'a Value> {
+    steps
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| &step[field])
+        .collect()
+}
+
+#[tokio::test]
+async fn the_batch_budget_caps_a_type_step_timeout() {
+    // Without its own limit the type step gets what is left of the batch.
+    let (content, calls) = call(
+        paced(Pace::default()),
+        RUN_ACTIONS,
+        json!({"target_ref": TARGET, "steps": steps(), "timeout_ms": 60_000}),
+    )
+    .await;
+    assert_eq!(content["status"], "completed", "{content}");
+    let timeout = type_timeout(&calls).unwrap();
+    assert!((50_000..=60_000).contains(&timeout), "{calls:?}");
+
+    // A shorter limit of its own is kept; a longer one is cut to the batch's.
+    for (own, capped) in [(2_500, false), (300_000, true)] {
+        let mut timed = steps();
+        timed[1]["timeout_ms"] = json!(own);
+        let (_, calls) = call(
+            paced(Pace::default()),
+            RUN_ACTIONS,
+            json!({"target_ref": TARGET, "steps": timed, "timeout_ms": 60_000}),
+        )
+        .await;
+        let timeout = type_timeout(&calls).unwrap();
+        if capped {
+            assert!((50_000..=60_000).contains(&timeout), "{calls:?}");
+        } else {
+            assert_eq!(timeout, own, "{calls:?}");
+        }
+    }
+
+    // An earlier step's settle wait is cut to the time left, and is unchanged without a budget.
+    for (budget, expected) in [(Some(200), true), (None, false)] {
+        let mut arguments = json!({"target_ref": TARGET, "steps": [
+            {"action": "scroll", "display_id": "fixture", "x": 10, "y": 20, "delta_y": -120},
+            {"action": "press_keys", "keys": ["tab"]},
+        ]});
+        if let Some(budget) = budget {
+            arguments["timeout_ms"] = json!(budget);
+        }
+        let (_, calls) = call(paced(Pace::default()), RUN_ACTIONS, arguments).await;
+        let settle: Option<u32> = calls[0]
+            .split(" settle=")
+            .nth(1)
+            .map(|settle| settle.parse().unwrap());
+        assert_eq!(settle.is_some(), expected, "{calls:?}");
+        assert!(settle.is_none_or(|settle| settle <= 200), "{calls:?}");
+    }
+}
+
+#[tokio::test]
+async fn typing_past_the_batch_budget_fails_its_step_and_skips_the_rest() {
+    // The type step would take 5 s; the batch allows 300 ms.
+    let started = std::time::Instant::now();
+    let (content, calls) = call(
+        paced(Pace {
+            type_ms: Some(5_000),
+            ..Pace::default()
+        }),
+        RUN_ACTIONS,
+        json!({"target_ref": TARGET, "steps": steps(), "timeout_ms": 300}),
+    )
+    .await;
+    assert!(started.elapsed() < Duration::from_secs(4), "{content}");
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(content["status"], "partially_sent", "{content}");
+    assert_eq!(content["retry_action"], false, "{content}");
+    // The click sent 2 events and the type step 3 before its deadline.
+    assert_eq!(content["input"]["sent_events"], 5, "{content}");
+    let error = &content["error"];
+    assert_eq!(error["code"], "platform_operation_failed", "{content}");
+    assert_eq!(error["reason"], "deadline_reached", "{content}");
+    assert_eq!(error["retryable"], false, "{content}");
+    // The deadline was the batch's, not the step's own, and the message says so.
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("batch's timeout_ms"),
+        "{content}"
+    );
+    let reported = &error["details"]["steps"];
+    assert_eq!(
+        step_field(reported, "status"),
+        ["completed", "failed", "skipped", "skipped"]
+    );
+    assert_eq!(step_field(reported, "sent_events"), [2, 3, 0, 0]);
+    assert!(
+        step_field(reported, "cleanup")
+            .iter()
+            .all(|cleanup| *cleanup == "not_needed"),
+        "{content}"
+    );
+}
+
+#[tokio::test]
+async fn a_type_step_that_reaches_its_own_timeout_keeps_its_own_message() {
+    let mut timed = steps();
+    timed[1]["timeout_ms"] = json!(50);
+    let (content, _) = call(
+        paced(Pace {
+            type_ms: Some(5_000),
+            ..Pace::default()
+        }),
+        RUN_ACTIONS,
+        json!({"target_ref": TARGET, "steps": timed, "timeout_ms": 60_000}),
+    )
+    .await;
+    let error = &content["error"];
+    assert_eq!(error["reason"], "deadline_reached", "{content}");
+    assert!(
+        !error["message"].as_str().unwrap().contains("batch"),
+        "{content}"
+    );
+}
+
+#[tokio::test]
+async fn a_step_that_starts_after_the_budget_ran_out_sends_nothing() {
+    // Each step takes 300 ms and the batch allows 450: the click and the type step run, and
+    // the batch has run out before press_keys.
+    let (content, calls) = call(
+        paced(Pace {
+            step_ms: 300,
+            ..Pace::default()
+        }),
+        RUN_ACTIONS,
+        json!({"target_ref": TARGET, "steps": steps(), "timeout_ms": 450}),
+    )
+    .await;
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(content["status"], "partially_sent", "{content}");
+    assert_eq!(content["input"]["sent_events"], 4, "{content}");
+    assert_eq!(content["error"]["reason"], "deadline_reached", "{content}");
+    let reported = &content["error"]["details"]["steps"];
+    assert_eq!(
+        step_field(reported, "status"),
+        ["completed", "completed", "failed", "skipped"]
+    );
+    assert_eq!(step_field(reported, "sent_events"), [2, 2, 0, 0]);
+}
+
+#[tokio::test]
+async fn a_wait_that_would_outlast_the_budget_stops_the_batch_at_once() {
+    let started = std::time::Instant::now();
+    let (content, calls) = call(
+        paced(Pace::default()),
+        RUN_ACTIONS,
+        json!({"target_ref": TARGET, "timeout_ms": 1_000, "steps": [
+            {"action": "click", "display_id": "fixture", "x": 10, "y": 20},
+            {"action": "wait", "wait_ms": 5_000},
+            {"action": "press_keys", "keys": ["tab"]},
+        ]}),
+    )
+    .await;
+    // The wait did not hold the desktop until the deadline.
+    assert!(started.elapsed() < Duration::from_millis(900), "{content}");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(content["status"], "partially_sent", "{content}");
+    assert_eq!(content["error"]["reason"], "deadline_reached", "{content}");
+    assert_eq!(
+        step_field(&content["error"]["details"]["steps"], "status"),
+        ["completed", "failed", "skipped"]
+    );
+}
+
+#[tokio::test]
+async fn an_out_of_range_batch_timeout_is_refused_before_any_input() {
+    for timeout_ms in [0, 300_001] {
+        let (content, calls) = call(
+            paced(Pace::default()),
+            RUN_ACTIONS,
+            json!({"target_ref": TARGET, "steps": steps(), "timeout_ms": timeout_ms}),
+        )
+        .await;
+        assert_eq!(content["status"], "not_started", "{content}");
+        assert_eq!(content["error"]["code"], "invalid_argument", "{content}");
+        assert_eq!(
+            content["error"]["message"],
+            "invalid argument 'timeout_ms': must be between 1 and 300000",
+            "{content}"
+        );
+        assert!(calls.is_empty(), "{calls:?}");
+    }
+}
+
+#[tokio::test]
+async fn each_step_reports_its_cleanup() {
+    // Every step of a completed batch released what it pressed.
+    let (content, _) = run(None, json!({"target_ref": TARGET, "steps": steps()})).await;
+    assert_eq!(
+        step_field(&content["action"]["steps"], "cleanup"),
+        ["not_needed"; 4]
+    );
+
+    // A step that fails after pressing something says whether it was released. The batch's
+    // `input.cleanup` is the failed step's.
+    for (left, expected) in [
+        (CleanupStatus::Succeeded, "succeeded"),
+        (CleanupStatus::Unknown, "unknown"),
+    ] {
+        let (content, _) = call(
+            Scripted {
+                fail_at: Some(2),
+                failure: PlatformError::failed(
+                    controlfreak_core::FailureCause::InputBlocked,
+                    "press_keys",
+                    "Windows accepted only part of the input",
+                ),
+                ..paced(Pace {
+                    failed_cleanup: left,
+                    ..Pace::default()
+                })
+            },
+            RUN_ACTIONS,
+            json!({"target_ref": TARGET, "steps": steps()}),
+        )
+        .await;
+        assert_eq!(
+            step_field(&content["error"]["details"]["steps"], "cleanup"),
+            ["not_needed", "not_needed", expected, "not_needed"],
+            "{content}"
+        );
+        assert_eq!(content["input"]["cleanup"], expected, "{content}");
+    }
+
+    // A wait sends nothing.
+    let (content, _) = run(
+        None,
+        json!({"target_ref": TARGET, "steps": [
+            {"action": "wait", "wait_ms": 1},
+            {"action": "press_keys", "keys": ["tab"]},
+        ]}),
+    )
+    .await;
+    assert_eq!(
+        step_field(&content["action"]["steps"], "cleanup"),
+        ["not_needed"; 2]
+    );
+}
+
+/// Fills a two-field form (click the first field, type, Tab, type) once as one `run_actions`
+/// call and once as four single calls on the same scripted desktop, and compares what the
+/// client pays. Run with `--nocapture` to see the numbers.
+#[tokio::test]
+async fn a_form_fill_batch_costs_less_than_separate_calls() {
+    // A 1280-pixel desktop screenshot is commonly 100 to 300 KB as PNG.
+    const SCREENSHOT_BYTES: usize = 150_000;
+    let form = |mode: &str| -> (Value, Vec<(&'static str, Value)>) {
+        let observation = json!({ "mode": mode });
+        let batch = json!({"target_ref": TARGET, "observation": observation, "steps": [
+            {"action": "click", "display_id": "fixture", "x": 400, "y": 300},
+            {"action": "type_text", "text": "Ada Lovelace"},
+            {"action": "press_keys", "keys": ["tab"]},
+            {"action": "type_text", "text": "ada@example.com"},
+        ]});
+        let separate = vec![
+            (
+                CLICK_MOUSE,
+                json!({"target_ref": TARGET, "display_id": "fixture", "x": 400, "y": 300, "observation": observation}),
+            ),
+            (
+                TYPE_TEXT,
+                json!({"target_ref": TARGET, "text": "Ada Lovelace", "observation": observation}),
+            ),
+            (
+                PRESS_KEYS,
+                json!({"target_ref": TARGET, "keys": ["tab"], "observation": observation}),
+            ),
+            (
+                TYPE_TEXT,
+                json!({"target_ref": TARGET, "text": "ada@example.com", "observation": observation}),
+            ),
+        ];
+        (batch, separate)
+    };
+    let desktop = || {
+        paced(Pace {
+            screenshot_bytes: SCREENSHOT_BYTES,
+            ..Pace::default()
+        })
+    };
+    // The same input reaches the desktop either way; only the evidence differs.
+    let inputs = |calls: &[String]| -> Vec<String> {
+        calls
+            .iter()
+            .map(|call| call.replace(" Screenshot", "").replace(" None", ""))
+            .collect()
+    };
+    for mode in ["screenshot", "none"] {
+        let (batch, separate) = form(mode);
+        let (batched, batch_calls) = call_all(desktop(), &[(RUN_ACTIONS, batch)]).await;
+        let (singles, single_calls) = call_all(desktop(), &separate).await;
+        assert_eq!(inputs(&batch_calls), inputs(&single_calls));
+        for answered in batched.iter().chain(&singles) {
+            assert_eq!(
+                answered.content["status"], "completed",
+                "{}",
+                answered.content
+            );
+        }
+        let batch_bytes: usize = batched.iter().map(|answered| answered.bytes).sum();
+        let single_bytes: usize = singles.iter().map(|answered| answered.bytes).sum();
+        let batch_time: Duration = batched.iter().map(|answered| answered.elapsed).sum();
+        let single_time: Duration = singles.iter().map(|answered| answered.elapsed).sum();
+        eprintln!(
+            "form fill, observation {mode}: run_actions 1 call, {batch_bytes} bytes, \
+             {batch_time:?}; separate {} calls, {single_bytes} bytes, {single_time:?}",
+            singles.len()
+        );
+        assert_eq!(batched.len(), 1);
+        assert_eq!(singles.len(), 4);
+        assert!(
+            batch_bytes < single_bytes,
+            "{batch_bytes} >= {single_bytes}"
+        );
     }
 }

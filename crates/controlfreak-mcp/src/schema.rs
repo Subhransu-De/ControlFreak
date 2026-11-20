@@ -675,6 +675,15 @@ pub(super) fn run_actions() -> Contract {
             }
         }),
     );
+    properties.insert(
+        "timeout_ms".to_owned(),
+        json!({
+            "type": "integer",
+            "minimum": MIN_TEXT_TIMEOUT_MS,
+            "maximum": MAX_TEXT_TIMEOUT_MS,
+            "description": "Limit for the whole batch; caps each type_text step's timeout_ms. The step that runs out fails with reason deadline_reached and later steps are skipped. No limit if omitted."
+        }),
+    );
     add_action_observation(&mut properties);
     contract(
         "Run up to 16 click, scroll, type_text, press_keys and wait steps in order on the approved window, with one final screenshot. Needs the window in the foreground. Every step is checked before the first runs. The batch stops at the first failure and reports each step as completed, failed or skipped. Each step waits up to 0.5 s for the window to settle and reports how that ended; a wait step pauses up to 5 s for slower loads and cannot be the last step. Use it for a known sequence such as filling a form, and observe between steps when the next one depends on the result.",
