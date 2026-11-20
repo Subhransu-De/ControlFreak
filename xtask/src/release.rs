@@ -179,13 +179,9 @@ fn unwrap_list_items(body: &str) -> String {
         let table_header = source
             .get(index + 1)
             .is_some_and(|next| is_table_delimiter(next));
+        let continues_item = in_item && !table_header && is_item_prose(line);
         match lines.last_mut() {
-            Some(previous)
-                if in_item
-                    && !table_header
-                    && !ends_with_hard_break(previous)
-                    && is_item_prose(line) =>
-            {
+            Some(previous) if continues_item && !ends_with_hard_break(previous) => {
                 let text = line.trim_start();
                 previous.push(' ');
                 previous.push_str(if ends_with_hard_break(text) {
@@ -195,7 +191,8 @@ fn unwrap_list_items(body: &str) -> String {
                 });
             }
             _ => {
-                in_item = line.starts_with("- ") || line.starts_with("* ");
+                // Prose after a hard break starts its own line but still belongs to the item.
+                in_item = continues_item || line.starts_with("- ") || line.starts_with("* ");
                 lines.push(line.to_owned());
             }
         }
@@ -219,11 +216,28 @@ fn is_item_prose(line: &str) -> bool {
     let emphasis = (text.starts_with('*') || text.starts_with('_'))
         && text[1..].chars().next().is_some_and(|c| !c.is_whitespace());
     !ordered
+        && !is_thematic_break(text)
         && (emphasis
             || text
                 .chars()
                 .next()
                 .is_some_and(|c| c.is_alphanumeric() || "`'\"([".contains(c)))
+}
+
+/// Three or more of the same `*`, `_` or `-`, optionally separated by spaces or tabs.
+fn is_thematic_break(text: &str) -> bool {
+    let mut marks = text.chars().filter(|c| *c != ' ' && *c != '\t');
+    let Some(marker) = marks.next().filter(|c| "*_-".contains(*c)) else {
+        return false;
+    };
+    let mut count = 1;
+    for c in marks {
+        if c != marker {
+            return false;
+        }
+        count += 1;
+    }
+    count >= 3
 }
 
 /// Markdown's explicit line break: two trailing spaces or a trailing backslash.
@@ -368,6 +382,24 @@ mod tests {
         assert_eq!(
             notes(source, "1.2.3").unwrap(),
             "- Support for 2.0 is new and **Windows 11** works, as does _this_ line.\n- A line with a hard break  \n  stays on its own line.\n- Entry with a table:\n  Name | Value\n  --- | ---\n  a | b\n"
+        );
+    }
+
+    #[test]
+    fn wrapped_prose_after_a_hard_break_is_joined() {
+        let source = "## [1.2.3] - 2026-01-02\n\n- First.\\\n  Second wraps\n  onto third.\n- Next  \n  line one\n  wraps.  \n  line two\n  wraps.\n";
+        assert_eq!(
+            notes(source, "1.2.3").unwrap(),
+            "- First.\\\n  Second wraps onto third.\n- Next  \n  line one wraps.  \n  line two wraps.\n"
+        );
+    }
+
+    #[test]
+    fn indented_thematic_breaks_are_kept() {
+        let source = "## [1.2.3] - 2026-01-02\n\n- An entry.\n  ***\n- Another entry.\n  _ _ _\n- A third entry.\n  ***bold italic***\n";
+        assert_eq!(
+            notes(source, "1.2.3").unwrap(),
+            "- An entry.\n  ***\n- Another entry.\n  _ _ _\n- A third entry. ***bold italic***\n"
         );
     }
 
