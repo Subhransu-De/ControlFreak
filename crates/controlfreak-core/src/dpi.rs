@@ -25,7 +25,7 @@ impl DpiAwareness {
     }
 
     #[must_use]
-    pub const fn code(self) -> &'static str {
+    const fn code(self) -> &'static str {
         match self {
             Self::PerMonitorV2 => "per_monitor_v2",
             Self::PerMonitor => "per_monitor",
