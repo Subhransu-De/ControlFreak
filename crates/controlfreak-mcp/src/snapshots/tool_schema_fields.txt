@@ -443,6 +443,10 @@ click_text output anyOf[0].input required
 click_text output anyOf[0].input.input_outcome
 click_text output anyOf[0].observation required
 click_text output anyOf[0].observation.foreground_window required
+click_text output anyOf[0].observation.foreground_window.oneOf[1].class_name required
+click_text output anyOf[0].observation.foreground_window.oneOf[1].id required
+click_text output anyOf[0].observation.foreground_window.oneOf[1].process_id required
+click_text output anyOf[0].observation.foreground_window.oneOf[1].same_process_as_target required
 click_text output anyOf[0].observation.screenshot required
 click_text output anyOf[0].observation.settle
 click_text output anyOf[0].observation.settle.elapsed_ms
@@ -554,6 +558,10 @@ switch_virtual_desktop output anyOf[0].input required
 switch_virtual_desktop output anyOf[0].input.input_outcome
 switch_virtual_desktop output anyOf[0].observation required
 switch_virtual_desktop output anyOf[0].observation.foreground_window required
+switch_virtual_desktop output anyOf[0].observation.foreground_window.oneOf[1].class_name required
+switch_virtual_desktop output anyOf[0].observation.foreground_window.oneOf[1].id required
+switch_virtual_desktop output anyOf[0].observation.foreground_window.oneOf[1].process_id required
+switch_virtual_desktop output anyOf[0].observation.foreground_window.oneOf[1].same_process_as_target required
 switch_virtual_desktop output anyOf[0].observation.screenshot required
 switch_virtual_desktop output anyOf[0].observation.settle
 switch_virtual_desktop output anyOf[0].observation.settle.elapsed_ms
@@ -648,6 +656,10 @@ focus_window output anyOf[0].input required
 focus_window output anyOf[0].input.input_outcome
 focus_window output anyOf[0].observation required
 focus_window output anyOf[0].observation.foreground_window required
+focus_window output anyOf[0].observation.foreground_window.oneOf[1].class_name required
+focus_window output anyOf[0].observation.foreground_window.oneOf[1].id required
+focus_window output anyOf[0].observation.foreground_window.oneOf[1].process_id required
+focus_window output anyOf[0].observation.foreground_window.oneOf[1].same_process_as_target required
 focus_window output anyOf[0].observation.screenshot required
 focus_window output anyOf[0].observation.settle
 focus_window output anyOf[0].observation.settle.elapsed_ms
@@ -789,6 +801,10 @@ move_mouse output anyOf[0].input required
 move_mouse output anyOf[0].input.input_outcome
 move_mouse output anyOf[0].observation required
 move_mouse output anyOf[0].observation.foreground_window required
+move_mouse output anyOf[0].observation.foreground_window.oneOf[1].class_name required
+move_mouse output anyOf[0].observation.foreground_window.oneOf[1].id required
+move_mouse output anyOf[0].observation.foreground_window.oneOf[1].process_id required
+move_mouse output anyOf[0].observation.foreground_window.oneOf[1].same_process_as_target required
 move_mouse output anyOf[0].observation.screenshot required
 move_mouse output anyOf[0].observation.settle
 move_mouse output anyOf[0].observation.settle.elapsed_ms
@@ -876,6 +892,10 @@ click_mouse output anyOf[0].input required
 click_mouse output anyOf[0].input.input_outcome
 click_mouse output anyOf[0].observation required
 click_mouse output anyOf[0].observation.foreground_window required
+click_mouse output anyOf[0].observation.foreground_window.oneOf[1].class_name required
+click_mouse output anyOf[0].observation.foreground_window.oneOf[1].id required
+click_mouse output anyOf[0].observation.foreground_window.oneOf[1].process_id required
+click_mouse output anyOf[0].observation.foreground_window.oneOf[1].same_process_as_target required
 click_mouse output anyOf[0].observation.screenshot required
 click_mouse output anyOf[0].observation.settle
 click_mouse output anyOf[0].observation.settle.elapsed_ms
@@ -967,6 +987,10 @@ drag_mouse output anyOf[0].input required
 drag_mouse output anyOf[0].input.input_outcome
 drag_mouse output anyOf[0].observation required
 drag_mouse output anyOf[0].observation.foreground_window required
+drag_mouse output anyOf[0].observation.foreground_window.oneOf[1].class_name required
+drag_mouse output anyOf[0].observation.foreground_window.oneOf[1].id required
+drag_mouse output anyOf[0].observation.foreground_window.oneOf[1].process_id required
+drag_mouse output anyOf[0].observation.foreground_window.oneOf[1].same_process_as_target required
 drag_mouse output anyOf[0].observation.screenshot required
 drag_mouse output anyOf[0].observation.settle
 drag_mouse output anyOf[0].observation.settle.elapsed_ms
@@ -1053,6 +1077,10 @@ scroll_mouse output anyOf[0].input required
 scroll_mouse output anyOf[0].input.input_outcome
 scroll_mouse output anyOf[0].observation required
 scroll_mouse output anyOf[0].observation.foreground_window required
+scroll_mouse output anyOf[0].observation.foreground_window.oneOf[1].class_name required
+scroll_mouse output anyOf[0].observation.foreground_window.oneOf[1].id required
+scroll_mouse output anyOf[0].observation.foreground_window.oneOf[1].process_id required
+scroll_mouse output anyOf[0].observation.foreground_window.oneOf[1].same_process_as_target required
 scroll_mouse output anyOf[0].observation.screenshot required
 scroll_mouse output anyOf[0].observation.settle
 scroll_mouse output anyOf[0].observation.settle.elapsed_ms
@@ -1131,6 +1159,10 @@ press_keys output anyOf[0].input required
 press_keys output anyOf[0].input.input_outcome
 press_keys output anyOf[0].observation required
 press_keys output anyOf[0].observation.foreground_window required
+press_keys output anyOf[0].observation.foreground_window.oneOf[1].class_name required
+press_keys output anyOf[0].observation.foreground_window.oneOf[1].id required
+press_keys output anyOf[0].observation.foreground_window.oneOf[1].process_id required
+press_keys output anyOf[0].observation.foreground_window.oneOf[1].same_process_as_target required
 press_keys output anyOf[0].observation.screenshot required
 press_keys output anyOf[0].observation.settle
 press_keys output anyOf[0].observation.settle.elapsed_ms
@@ -1204,6 +1236,10 @@ type_text output anyOf[0].input required
 type_text output anyOf[0].input.input_outcome
 type_text output anyOf[0].observation required
 type_text output anyOf[0].observation.foreground_window required
+type_text output anyOf[0].observation.foreground_window.oneOf[1].class_name required
+type_text output anyOf[0].observation.foreground_window.oneOf[1].id required
+type_text output anyOf[0].observation.foreground_window.oneOf[1].process_id required
+type_text output anyOf[0].observation.foreground_window.oneOf[1].same_process_as_target required
 type_text output anyOf[0].observation.screenshot required
 type_text output anyOf[0].observation.settle
 type_text output anyOf[0].observation.settle.elapsed_ms
@@ -1292,6 +1328,10 @@ run_actions output anyOf[0].input required
 run_actions output anyOf[0].input.input_outcome
 run_actions output anyOf[0].observation required
 run_actions output anyOf[0].observation.foreground_window required
+run_actions output anyOf[0].observation.foreground_window.oneOf[1].class_name required
+run_actions output anyOf[0].observation.foreground_window.oneOf[1].id required
+run_actions output anyOf[0].observation.foreground_window.oneOf[1].process_id required
+run_actions output anyOf[0].observation.foreground_window.oneOf[1].same_process_as_target required
 run_actions output anyOf[0].observation.screenshot required
 run_actions output anyOf[0].observation.settle
 run_actions output anyOf[0].observation.settle.elapsed_ms

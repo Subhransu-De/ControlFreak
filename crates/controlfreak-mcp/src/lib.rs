@@ -93,12 +93,13 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use controlfreak_core::{
     ActionObservation, BuildInfo, CaptureDisplayRequest, CaptureRegionRequest, ClickTextRequest,
-    ClickTextResult, DisplayScreenshot, FocusWindowRequest, KeyChordRequest, KeyboardActionResult,
-    MouseClickRequest, MouseDragRequest, MouseMoveRequest, MouseScrollRequest, MutationControl,
-    OcrRegionRequest, PlatformBackend, PlatformError, PointerActionResult, TextInputRequest,
-    UNKNOWN_REVISION, VirtualDesktopList, VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult,
-    VisualBaseline, VisualBaselineRequest, VisualChangeResult, WaitForVisualChangeRequest,
-    WindowFocusResult, WindowScreenshot, WindowWaitResult,
+    ClickTextResult, DisplayScreenshot, FocusWindowRequest, ForegroundWindow, KeyChordRequest,
+    KeyboardActionResult, MouseClickRequest, MouseDragRequest, MouseMoveRequest,
+    MouseScrollRequest, MutationControl, OcrRegionRequest, PlatformBackend, PlatformError,
+    PointerActionResult, TextInputRequest, UNKNOWN_REVISION, VirtualDesktopList,
+    VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest,
+    VisualChangeResult, WaitForVisualChangeRequest, WindowFocusResult, WindowScreenshot,
+    WindowWaitResult,
 };
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,

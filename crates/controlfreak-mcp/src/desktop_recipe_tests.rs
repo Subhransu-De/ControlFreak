@@ -404,3 +404,104 @@ async fn a_closed_window_ends_the_approval() {
     );
     harness.finish().await;
 }
+
+/// The result's `observation.foreground_window`, after checking the result against the tool's
+/// full output schema.
+fn foreground_window(result: &Value, tool: &str) -> Value {
+    accepted(result);
+    let structured = &result["structuredContent"];
+    let validator = super::output_schema_tests::full_validator(tool);
+    if let Err(error) = validator.validate(structured) {
+        panic!("{tool} result does not match its schema: {error}: {structured}");
+    }
+    structured["observation"]["foreground_window"].clone()
+}
+
+#[tokio::test]
+async fn an_untitled_popup_in_front_is_described_by_class_and_process_only() {
+    let desktop = FakeDesktop::new();
+    let app = desktop.open("Editor", 10);
+    let target = desktop.id(app);
+    let mut harness = start(&desktop).await;
+    begin(&mut harness, &target).await;
+
+    // A popup menu of the target's application has no title, so it gets no reference.
+    desktop.open_owned(app, "");
+    let result = call(
+        &mut harness,
+        PRESS_KEYS,
+        json!({"target_ref": target, "keys": ["down"], "observation": {"mode": "none"}}),
+    )
+    .await;
+    let window = foreground_window(&result, PRESS_KEYS);
+    assert_ne!(
+        window,
+        Value::Null,
+        "a popup in front is not 'no foreground'"
+    );
+    assert_eq!(
+        window,
+        json!({"id": null, "class_name": "FakePopup", "process_id": 10, "same_process_as_target": true})
+    );
+    assert_eq!(
+        result["structuredContent"]["input"]["target_remained_foreground"], true,
+        "{result}"
+    );
+    harness.finish().await;
+}
+
+#[tokio::test]
+async fn a_titled_dialog_in_front_is_described_as_list_windows_lists_it() {
+    let desktop = FakeDesktop::new();
+    let app = desktop.open("Editor", 10);
+    let target = desktop.id(app);
+    let mut harness = start(&desktop).await;
+    begin(&mut harness, &target).await;
+
+    let dialog = desktop.open_owned(app, "Save as");
+    let window = foreground_window(&click(&mut harness, &target).await, CLICK_MOUSE);
+    assert_eq!(window["id"], desktop.id(dialog), "{window}");
+    assert_eq!(window["owner"], target, "{window}");
+    let listed = call(&mut harness, LIST_WINDOWS, json!({})).await;
+    let entry = listed["structuredContent"]["windows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == window["id"])
+        .cloned()
+        .unwrap();
+    assert_eq!(window, entry, "the same description as list_windows");
+    harness.finish().await;
+}
+
+#[tokio::test]
+async fn every_run_actions_input_step_reports_the_window_in_front() {
+    let desktop = FakeDesktop::new();
+    let app = desktop.open("Editor", 10);
+    let target = desktop.id(app);
+    let mut harness = start(&desktop).await;
+    begin(&mut harness, &target).await;
+
+    desktop.open_owned(app, "");
+    let result = call(
+        &mut harness,
+        RUN_ACTIONS,
+        json!({"target_ref": target, "steps": [
+            {"action": "press_keys", "keys": ["down"]},
+            {"action": "wait", "wait_ms": 1},
+            {"action": "press_keys", "keys": ["enter"]}
+        ], "observation": {"mode": "none"}}),
+    )
+    .await;
+    let popup = json!({"id": null, "class_name": "FakePopup", "process_id": 10, "same_process_as_target": true});
+    assert_eq!(foreground_window(&result, RUN_ACTIONS), popup);
+    let steps = result["structuredContent"]["action"]["steps"]
+        .as_array()
+        .unwrap();
+    assert_eq!(steps.len(), 3, "{result}");
+    assert_eq!(steps[0]["foreground_window"], popup, "{result}");
+    // A wait sends no input and reads nothing; the step after it reports the window in front.
+    assert!(steps[1].get("foreground_window").is_none(), "{result}");
+    assert_eq!(steps[2]["foreground_window"], popup, "{result}");
+    harness.finish().await;
+}

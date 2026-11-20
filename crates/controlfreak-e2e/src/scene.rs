@@ -11,6 +11,7 @@ const BUILTIN: &[(&str, &str)] = &[
     ),
     ("busy-app", include_str!("../scenes/busy-app.toml")),
     ("clipped", include_str!("../scenes/clipped.toml")),
+    ("with-popup", include_str!("../scenes/with-popup.toml")),
 ];
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -23,6 +24,10 @@ pub struct Scene {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent fixture switch of the scene file, not a state"
+)]
 pub struct WindowSpec {
     pub key: String,
     #[serde(default = "default_color")]
@@ -42,6 +47,9 @@ pub struct WindowSpec {
     /// The fixture confines the pointer to the left half of its client area while it is active.
     #[serde(default)]
     pub(crate) clip_cursor: bool,
+    /// A press of the fixture's button opens an untitled popup that takes the foreground.
+    #[serde(default)]
+    pub(crate) popup_on_ping: bool,
 }
 
 fn default_color() -> String {
@@ -141,6 +149,7 @@ mod tests {
         assert_eq!(window.lifetime_secs, 240);
         assert_eq!(window.busy_drain_ms, 0);
         assert!(!window.clip_cursor);
+        assert!(!window.popup_on_ping);
     }
 
     #[test]

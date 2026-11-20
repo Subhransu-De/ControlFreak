@@ -988,7 +988,7 @@ impl WindowBackend for Backend {
         control.input_complete();
         target::evidence(control);
         let after = desktop::foreground_desktop(&manager);
-        let observation = observe_foreground(&request.observation)
+        let observation = observe_foreground(&request.observation, control)
             .map_err(|error| post_action_error("switch_virtual_desktop", error.to_string()))?;
         // A missing reading leaves the transition unknown; the input is still reported as sent.
         Ok(desktop::desktop_switch_result(
@@ -1054,7 +1054,7 @@ impl WindowBackend for Backend {
 
         let focused = window_info(hwnd)
             .map_err(|error| post_action_error("focus_window", error.to_string()))?;
-        let observation = observe_display(&focused.display_id, &request.observation)
+        let observation = observe_display(&focused.display_id, &request.observation, control)
             .map_err(|error| post_action_error("focus_window", error.to_string()))?;
         Ok(WindowFocusResult {
             attempts,

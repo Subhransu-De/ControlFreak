@@ -30,6 +30,7 @@ pub(crate) fn suite() -> Suite {
                 .scene("single")
                 .requires(&[Capability::Ocr]),
             task("owned-dialog-accepted", owned_dialog).scene("with-dialog"),
+            task("untitled-popup-described", untitled_popup_described).scene("with-popup"),
             task("foreign-window-refused", foreign_refused).scene("two-processes"),
             task("focus-after-user-input", focus_after_user_input).scene("two-processes"),
             task("taskbar-target-ref", taskbar_target).requires(&[Capability::TaskbarForeground]),
@@ -53,7 +54,18 @@ fn control(cx: &mut Ctx<'_>, key: &str) -> Result<String, Failure> {
 }
 
 fn focus_window(cx: &mut Ctx<'_>) -> Result<(), Failure> {
-    let id = control(cx, "app")?;
+    let id = cx.target("app")?;
+    cx.begin(&id)?;
+    let focused = cx.ok(
+        "focus_window",
+        json!({"window_id": id, "observation": {"mode": "none"}}),
+    )?;
+    // The window in front is reported without a screenshot too, as `list_windows` lists it.
+    let front = &focused["observation"]["foreground_window"];
+    ensure!(
+        front["id"] == id.as_str() && front["is_foreground"] == true,
+        "foreground_window is not the focused window: {focused}"
+    );
     cx.expect("app", "an activation", events::activated)?;
     let windows = cx.ok("list_windows", json!({}))?;
     let listed = windows["windows"]
@@ -445,6 +457,38 @@ fn owned_dialog(cx: &mut Ctx<'_>) -> Result<(), Failure> {
     cx.expect("owner", "the button press", |e| {
         events::button_pressed(e, "ping")
     })?;
+    cx.end()
+}
+
+/// An untitled popup of the target's process, such as a popup menu, gets no target reference.
+/// The result still says that a window holds the foreground and whose it is, without its title.
+fn untitled_popup_described(cx: &mut Ctx<'_>) -> Result<(), Failure> {
+    let id = control(cx, "app")?;
+    let button = cx.center("app", "button")?;
+    let result = cx.click(&id, button)?;
+    ensure!(!result.is_error, "{}", result.structured);
+    cx.expect("app", "the popup", |e| {
+        e.iter()
+            .any(|event| matches!(event, Event::Other(line) if line == "main popup open"))
+    })?;
+    let pid = cx.window("app")?.process_id();
+    let front = &result.structured["observation"]["foreground_window"];
+    let expected = json!({
+        "id": null,
+        "class_name": "ControlFreakFixturePopup",
+        "process_id": pid,
+        "same_process_as_target": true
+    });
+    ensure!(
+        *front == expected,
+        "the popup is not described by class and process: {}",
+        result.structured
+    );
+    ensure!(
+        result.structured["input"]["target_remained_foreground"] == true,
+        "a popup of the target's process should keep the target in front: {}",
+        result.structured
+    );
     cx.end()
 }
 

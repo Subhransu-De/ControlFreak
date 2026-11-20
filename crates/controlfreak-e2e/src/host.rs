@@ -107,6 +107,9 @@ impl Binaries {
         if spec.clip_cursor {
             command.arg("--clip-cursor");
         }
+        if spec.popup_on_ping {
+            command.arg("--popup-on-ping");
+        }
         let child = command
             .spawn()
             .map_err(|error| format!("cannot open fixture {}: {error}", spec.key))?;

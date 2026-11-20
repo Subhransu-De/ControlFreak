@@ -1,0 +1,5 @@
+description = "One fixture window whose button opens an untitled popup of the same process"
+
+[[window]]
+key = "app"
+popup_on_ping = true

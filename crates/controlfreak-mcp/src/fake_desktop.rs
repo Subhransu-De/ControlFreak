@@ -11,17 +11,19 @@
 //! - Input is accepted while the foreground window belongs to the approved window's process. Any
 //!   other foreground is refused for that action only; the session survives.
 //! - Pointer input lands on the foreground window.
+//! - An untitled window gets no reference and is not listed. Action evidence reports the
+//!   foreground window in every observation mode, untitled windows by class and process only.
 //! - A refused focus request is followed by one activation helper answer when a test sets one,
 //!   as `focus_window` asks the helper once after Windows refuses the server's own request.
 
 use controlfreak_core::{
     ActionObservation, ActivationHelperOutcome, BackendIdentity, BackendMetadata,
     CapabilityDescriptor, CaptureWindowRequest, DisplayBackend, DisplayBounds, DisplayInfo,
-    DisplayLayout, FocusWindowRequest, KeyChordRequest, KeyboardActionResult, KeyboardBackend,
-    MouseClickRequest, MousePosition, MutationControl, OcrBackend, PermissionDescriptor, Platform,
-    PlatformError, PointerActionResult, PointerBackend, TextInputRequest, WaitForWindowRequest,
-    WindowBackend, WindowBounds, WindowFocusResult, WindowInfo, WindowList, WindowScreenshot,
-    WindowWaitResult,
+    DisplayLayout, FocusWindowRequest, ForegroundWindow, KeyChordRequest, KeyboardActionResult,
+    KeyboardBackend, MouseClickRequest, MousePosition, MutationControl, OcrBackend,
+    PermissionDescriptor, Platform, PlatformError, PointerActionResult, PointerBackend,
+    TextInputRequest, UnlistedWindow, WaitForWindowRequest, WindowBackend, WindowBounds,
+    WindowFocusResult, WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
 };
 use std::sync::Mutex;
 
@@ -65,11 +67,25 @@ fn reference(window: &FakeWindow) -> String {
     format!("target-{:08X}-0000-0000-0000-000000000000", window.key)
 }
 
+/// Whether the window gets a reference and is listed. As on Windows, an untitled window, such as
+/// a popup menu, does not.
+fn listed(window: &FakeWindow) -> bool {
+    window.open && !window.title.is_empty()
+}
+
+const fn class_name(window: &FakeWindow) -> &'static str {
+    if window.title.is_empty() {
+        "FakePopup"
+    } else {
+        "FakeWindow"
+    }
+}
+
 fn info(window: &FakeWindow, state: &State) -> WindowInfo {
     WindowInfo {
         id: reference(window),
         title: window.title.clone(),
-        class_name: "FakeWindow".into(),
+        class_name: class_name(window).into(),
         process_id: window.process_id,
         bounds: window.bounds,
         display_id: "fake".into(),
@@ -98,7 +114,7 @@ impl State {
     fn resolve(&self, id: &str) -> Option<&FakeWindow> {
         self.windows
             .iter()
-            .find(|window| window.open && reference(window) == id)
+            .find(|window| listed(window) && reference(window) == id)
     }
 
     fn add(&mut self, window: FakeWindow) -> u32 {
@@ -163,7 +179,8 @@ impl FakeDesktop {
         })
     }
 
-    /// Opens a dialog or popup owned by `owner`, in the owner's process, in the foreground.
+    /// Opens a dialog or popup owned by `owner`, in the owner's process, in the foreground. An
+    /// empty title opens an untitled popup, such as a popup menu, which gets no reference.
     pub(super) fn open_owned(&self, owner: u32, title: &str) -> u32 {
         let mut state = self.state();
         let key = state.next_key();
@@ -276,16 +293,39 @@ impl FakeDesktop {
             })
     }
 
+    /// Records accepted input. Every delivery follows admission or a focus of a window that serves
+    /// the target, so the target's process still holds the foreground afterwards.
     fn deliver(control: &MutationControl, events: u64) {
         control.dispatch_started();
         control.dispatch_accepted(events);
         control.input_complete();
+        control.target_foreground(true);
     }
 }
 
-fn nothing() -> ActionObservation {
+/// The evidence after an action, in every observation mode as on Windows: the foreground window
+/// without a screenshot. An untitled window has no reference, so only its class and process are
+/// reported, compared with the approved window's process.
+fn observe(state: &State, control: &MutationControl) -> ActionObservation {
+    let target_process = control
+        .approved_target()
+        .and_then(|id| state.resolve(&id).map(|target| target.process_id));
+    let foreground_window = state
+        .foreground
+        .and_then(|key| state.window(key))
+        .map(|window| {
+            if listed(window) {
+                ForegroundWindow::Listed(info(window, state))
+            } else {
+                ForegroundWindow::Unlisted(UnlistedWindow {
+                    class_name: class_name(window).into(),
+                    process_id: window.process_id,
+                    same_process_as_target: target_process.map(|pid| pid == window.process_id),
+                })
+            }
+        });
     ActionObservation {
-        foreground_window: None,
+        foreground_window,
         screenshot: None,
         settle: None,
     }
@@ -328,7 +368,7 @@ impl WindowBackend for FakeDesktop {
             windows: state
                 .windows
                 .iter()
-                .filter(|window| window.open)
+                .filter(|window| listed(window))
                 .map(|window| info(window, &state))
                 .collect(),
             truncated: false,
@@ -343,7 +383,7 @@ impl WindowBackend for FakeDesktop {
         let window = state
             .windows
             .iter()
-            .filter(|window| window.open)
+            .filter(|window| listed(window))
             .map(|window| info(window, &state))
             .find(|window| request.window_id.as_ref().is_none_or(|id| *id == window.id));
         Ok(WindowWaitResult {
@@ -420,7 +460,7 @@ impl WindowBackend for FakeDesktop {
         Self::deliver(control, 1);
         Ok(WindowFocusResult {
             window: info(&window, &state),
-            observation: nothing(),
+            observation: observe(&state, control),
             attempts: 1,
             elapsed_ms: 0,
         })
@@ -448,7 +488,7 @@ impl PointerBackend for FakeDesktop {
                 virtual_x: i32::try_from(request.x).unwrap_or(i32::MAX),
                 virtual_y: i32::try_from(request.y).unwrap_or(i32::MAX),
             },
-            observation: nothing(),
+            observation: observe(&self.state(), control),
         })
     }
 }
@@ -466,7 +506,7 @@ impl KeyboardBackend for FakeDesktop {
         });
         Self::deliver(control, 2);
         Ok(KeyboardActionResult {
-            observation: nothing(),
+            observation: observe(&self.state(), control),
         })
     }
 
@@ -482,7 +522,7 @@ impl KeyboardBackend for FakeDesktop {
         });
         Self::deliver(control, 2);
         Ok(KeyboardActionResult {
-            observation: nothing(),
+            observation: observe(&self.state(), control),
         })
     }
 }

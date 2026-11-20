@@ -1079,7 +1079,7 @@ fn run_steps(
         match outcome {
             Ok(step_observation) => {
                 report(
-                    json!({ "index": index, "action": step.kind(), "status": "completed", "sent_events": sent_events, "settle": step_observation.settle }),
+                    json!({ "index": index, "action": step.kind(), "status": "completed", "sent_events": sent_events, "settle": step_observation.settle, "foreground_window": super::results::foreground_window(step_observation.foreground_window.as_ref()) }),
                 );
                 observation = Some(step_observation);
             }

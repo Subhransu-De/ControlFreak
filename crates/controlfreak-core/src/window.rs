@@ -26,6 +26,26 @@ pub struct WindowInfo {
     pub owner: Option<String>,
 }
 
+/// The window in the foreground when an action read its evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForegroundWindow {
+    /// A window the server issued a target reference for, described as `list_windows` does.
+    Listed(WindowInfo),
+    /// A window the server cannot issue a reference for (untitled, a tool window or cloaked), such
+    /// as a popup menu. Only its class and process are reported, never its title.
+    Unlisted(UnlistedWindow),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlistedWindow {
+    pub class_name: String,
+    pub process_id: u32,
+    /// Whether the window belongs to the process of the action's approved window; `None` when the
+    /// approved window is no longer known. The same process does not by itself mean that input
+    /// is accepted there: `input.target_remained_foreground` reports that.
+    pub same_process_as_target: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowFocusResult {
     pub window: WindowInfo,

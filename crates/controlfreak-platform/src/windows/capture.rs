@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 
 pub(super) use controlfreak_core::scaled_dimensions;
-use controlfreak_core::{DisplayLayout, MutationControl, SettleOutcome, timing};
+use controlfreak_core::{DisplayLayout, ForegroundWindow, MutationControl, SettleOutcome, timing};
 use windows::System::UserProfile::GlobalizationPreferences;
 use windows::Win32::{
     Foundation::{HWND, RECT},
@@ -9,6 +9,7 @@ use windows::Win32::{
     UI::WindowsAndMessaging::{GetWindowRect, IsHungAppWindow},
 };
 
+use super::desktop::foreground_window;
 use super::settle::{SettlePolicy, Settler};
 use super::visual_change::{ComparisonFrames, SystemPollClock, poll_for_change};
 use super::{
@@ -19,9 +20,9 @@ use super::{
     MAX_CAPTURE_WIDTH, MAX_WAIT_MS, ObservationMode, ObservationOptions, OcrEngine, OcrLine,
     OcrRegionRequest, OcrResult, OcrWord, OnceLock, PlatformError, ReleaseDC, SRCCOPY,
     SelectObject, SoftwareBitmap, SystemTime, UNIX_EPOCH, VISUAL_COMPARE_WIDTH, VisualChangeResult,
-    WaitForVisualChangeRequest, WindowBounds, WindowInfo, c_void, current_cursor_position,
-    ensure_dpi_awareness, enumerate_displays, find_display, foreground_window_handle,
-    initialize_com, last_win32_error, size_of, win32_error, window_info,
+    WaitForVisualChangeRequest, WindowBounds, c_void, current_cursor_position,
+    ensure_dpi_awareness, enumerate_displays, find_display, initialize_com, last_win32_error,
+    size_of, win32_error,
 };
 
 struct ScreenDc(HDC);
@@ -244,21 +245,25 @@ pub(super) fn validate_max_width(max_width: Option<u32>) -> Result<(), PlatformE
     Ok(())
 }
 
+/// Evidence after an action on `display_id`. The foreground window is read in every mode, also
+/// `none`, because it costs a few window queries and no capture.
 pub(super) fn observe_display(
     display_id: &str,
     options: &ObservationOptions,
+    control: &MutationControl,
 ) -> Result<ActionObservation, PlatformError> {
     validate_max_width(options.max_width)?;
+    let target_process = super::target::approved_process_id(control);
     if options.mode == ObservationMode::None {
         return Ok(ActionObservation {
-            foreground_window: None,
+            foreground_window: foreground_window(target_process),
             screenshot: None,
             settle: None,
         });
     }
     let _timer = timing::start("observe");
     let display = find_display(display_id)?;
-    let foreground_window = foreground_window_info();
+    let foreground_window = foreground_window(target_process);
     let screenshot = if options.mode == ObservationMode::Screenshot {
         Some(capture_observation_screenshot(display, options)?)
     } else {
@@ -271,20 +276,24 @@ pub(super) fn observe_display(
     })
 }
 
+/// Evidence after a keyboard action, on the display of the foreground window when it has a
+/// reference, else on the primary display. The foreground window is read in every mode.
 pub(super) fn observe_foreground(
     options: &ObservationOptions,
+    control: &MutationControl,
 ) -> Result<ActionObservation, PlatformError> {
     validate_max_width(options.max_width)?;
+    let target_process = super::target::approved_process_id(control);
     if options.mode == ObservationMode::None {
         return Ok(ActionObservation {
-            foreground_window: None,
+            foreground_window: foreground_window(target_process),
             screenshot: None,
             settle: None,
         });
     }
     let _timer = timing::start("observe");
-    let foreground_window = foreground_window_info();
-    let display = if let Some(window) = &foreground_window {
+    let foreground_window = foreground_window(target_process);
+    let display = if let Some(ForegroundWindow::Listed(window)) = &foreground_window {
         find_display(&window.display_id)?
     } else {
         enumerate_displays()?
@@ -320,13 +329,6 @@ fn capture_observation_screenshot(
     } else {
         capture_display_image(default_display, max_width, options.include_cursor)
     }
-}
-
-fn foreground_window_info() -> Option<WindowInfo> {
-    let hwnd = foreground_window_handle();
-    (!hwnd.is_invalid())
-        .then(|| window_info(hwnd).ok())
-        .flatten()
 }
 
 /// Bitmap dimensions and byte count of a 32-bit capture, refused beyond Win32 and safety limits.

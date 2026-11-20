@@ -1124,6 +1124,22 @@ fn settle_schema() -> Value {
     })
 }
 
+/// A foreground window without a target reference (untitled, a tool window or cloaked): `id` is
+/// null and only its class and process are given, never its title.
+fn unlisted_window_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "null" },
+            "class_name": { "type": "string" },
+            "process_id": { "type": "integer", "minimum": 0 },
+            "same_process_as_target": { "type": ["boolean", "null"] }
+        },
+        "required": ["id", "class_name", "process_id", "same_process_as_target"],
+        "additionalProperties": false
+    })
+}
+
 fn action_output_schema(include_position: bool) -> Arc<JsonObject> {
     action_output_schema_with(include_position, &json!({ "type": "object" }))
 }
@@ -1137,7 +1153,9 @@ fn action_output_schema_with(include_position: bool, action: &Value) -> Arc<Json
             "observation": {
                 "type": "object",
                 "properties": {
-                    "foreground_window": { "oneOf": [def_ref("window"), { "type": "null" }] },
+                    "foreground_window": {
+                        "oneOf": [def_ref("window"), unlisted_window_schema(), { "type": "null" }]
+                    },
                     "screenshot": { "oneOf": [def_ref("screenshot"), { "type": "null" }] },
                     "settle": settle_schema()
                 },

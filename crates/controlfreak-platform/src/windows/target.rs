@@ -1181,6 +1181,14 @@ pub(super) fn approved_window_bounds(
     })
 }
 
+/// Process ID of the approved window, from its reference; `None` without an approved window or
+/// once its reference is gone.
+pub(super) fn approved_process_id(control: &MutationControl) -> Option<u32> {
+    lookup(&control.approved_target()?)
+        .ok()
+        .map(|reference| reference.identity.pid)
+}
+
 /// Records after an action whether the approved target, or a window of its own process, still
 /// holds the foreground. A target that is gone or changed identity ends the session's approval;
 /// a target that merely lost the foreground to another process does not, because the next action
