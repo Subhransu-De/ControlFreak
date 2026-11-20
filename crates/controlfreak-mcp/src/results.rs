@@ -92,8 +92,11 @@ pub(super) fn visual_change_result(result: Encoded<VisualChangeResult>) -> CallT
     image_result(
         base64,
         json!({
-            "changed": result.changed,
-            "timed_out": result.timed_out,
+            "changed": result.changed(),
+            "changed_once": result.changed_once,
+            "currently_changed": result.currently_changed,
+            "settled": result.settled,
+            "timed_out": result.timed_out(),
             "difference": result.difference,
             "elapsed_ms": result.elapsed_ms,
             "screenshot": screenshot_metadata(&result.screenshot),

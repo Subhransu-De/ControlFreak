@@ -9,6 +9,7 @@ use windows::Win32::{
 };
 
 use super::settle::{SettlePolicy, Settler};
+use super::visual_change::{ComparisonFrames, SystemPollClock, poll_for_change};
 use super::{
     ActionObservation, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, BitmapPixelFormat, CAPTUREBLT,
     CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS, DataWriter, DeleteDC, DeleteObject,
@@ -16,10 +17,10 @@ use super::{
     HGDIOBJ, HSTRING, Instant, Language, MAX_ACTION_IMAGE_WIDTH, MAX_CAPTURE_BYTES,
     MAX_CAPTURE_WIDTH, MAX_WAIT_MS, ObservationMode, ObservationOptions, OcrEngine, OcrLine,
     OcrRegionRequest, OcrResult, OcrWord, OnceLock, PlatformError, ReleaseDC, SRCCOPY,
-    SelectObject, SoftwareBitmap, SystemTime, UNIX_EPOCH, VISUAL_COMPARE_WIDTH, VISUAL_POLL_MS,
-    VisualChangeResult, WaitForVisualChangeRequest, WindowBounds, WindowInfo, c_void,
-    current_cursor_position, ensure_dpi_awareness, enumerate_displays, find_display,
-    foreground_window_handle, initialize_com, last_win32_error, size_of, win32_error, window_info,
+    SelectObject, SoftwareBitmap, SystemTime, UNIX_EPOCH, VISUAL_COMPARE_WIDTH, VisualChangeResult,
+    WaitForVisualChangeRequest, WindowBounds, WindowInfo, c_void, current_cursor_position,
+    ensure_dpi_awareness, enumerate_displays, find_display, foreground_window_handle,
+    initialize_com, last_win32_error, size_of, win32_error, window_info,
 };
 
 struct ScreenDc(HDC);
@@ -990,10 +991,32 @@ impl ComparisonCapture {
     }
 }
 
+impl ComparisonFrames for ComparisonCapture {
+    fn frame_len(&self) -> usize {
+        let bounds = self.grabber.bounds;
+        let (_, width, height) = comparison_frame_size(bounds.width, bounds.height);
+        width * height * 4
+    }
+
+    fn read(&mut self, frame: &mut Vec<u8>) -> Result<(), PlatformError> {
+        Self::read(self, frame)
+    }
+}
+
 pub(super) fn capture_comparison_frame(bounds: DisplayBounds) -> Result<Vec<u8>, PlatformError> {
     let mut frame = Vec::new();
     ComparisonCapture::new(bounds)?.read(&mut frame)?;
     Ok(frame)
+}
+
+/// The downscale factor, width and height of the comparison frame of a `width` x `height` region.
+fn comparison_frame_size(width: u32, height: u32) -> (usize, usize, usize) {
+    let factor = width.div_ceil(VISUAL_COMPARE_WIDTH).max(1) as usize;
+    (
+        factor,
+        (width as usize).div_ceil(factor),
+        (height as usize).div_ceil(factor),
+    )
 }
 
 /// Box-averages a top-down BGRA frame into the opaque RGBA comparison frame, at most
@@ -1002,12 +1025,11 @@ pub(super) fn capture_comparison_frame(bounds: DisplayBounds) -> Result<Vec<u8>,
 /// right and bottom edges). The fourth source byte is ignored, as a screen read leaves it
 /// unspecified. These are the bytes that `fnv1a64-rgba320` fingerprints: keep them unchanged.
 fn downscale_comparison_frame(source: &[u8], width: u32, height: u32, target: &mut Vec<u8>) {
-    let factor = width.div_ceil(VISUAL_COMPARE_WIDTH).max(1) as usize;
+    let (factor, target_width, target_height) = comparison_frame_size(width, height);
     let (width, height) = (width as usize, height as usize);
     let stride = width * 4;
-    let target_width = width.div_ceil(factor);
     target.clear();
-    target.resize(target_width * height.div_ceil(factor) * 4, 0);
+    target.resize(target_width * target_height * 4, 0);
     if stride == 0 || source.len() != stride * height {
         return;
     }
@@ -1051,9 +1073,9 @@ pub(super) fn baseline_process_nonce() -> u128 {
     })
 }
 
-/// Polls `capture` until its region changed from `baseline` and then held still. The capture is
-/// reused for every poll and the two comparison buffers are swapped between polls, so the loop
-/// allocates nothing after the first poll.
+/// Polls `capture` until its region changed from `baseline` and then held still (see
+/// `poll_for_change`), then returns a screenshot of the region. The capture is reused for every
+/// poll, so after the first one a poll allocates nothing.
 pub(super) fn wait_for_change(
     display: DisplayInfo,
     mut capture: ComparisonCapture,
@@ -1063,54 +1085,26 @@ pub(super) fn wait_for_change(
     difference_threshold: f64,
     control: &controlfreak_core::MutationControl,
 ) -> Result<VisualChangeResult, PlatformError> {
-    validate_wait_values(timeout_ms, stable_ms, difference_threshold)?;
     let bounds = capture.bounds();
     let started = Instant::now();
-    let mut previous = baseline.to_owned();
-    let mut frame = Vec::with_capacity(baseline.len());
-    let mut difference = 0.0_f64;
-    let mut changed = false;
-    let mut settled = false;
-    let mut stable_since: Option<Instant> = None;
-    let deadline = started + Duration::from_millis(u64::from(timeout_ms));
-
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        control.wait(
-            "wait_for_change",
-            remaining.min(Duration::from_millis(VISUAL_POLL_MS)),
-        )?;
-        capture.read(&mut frame)?;
-        difference = image_difference(baseline, &frame)?;
-        if difference >= difference_threshold {
-            changed = true;
-        }
-        if changed {
-            let consecutive_difference = image_difference(&previous, &frame)?;
-            let stable_threshold = (difference_threshold / 4.0).max(0.001);
-            if consecutive_difference < stable_threshold {
-                let since = *stable_since.get_or_insert_with(Instant::now);
-                if Instant::now().saturating_duration_since(since)
-                    >= Duration::from_millis(u64::from(stable_ms))
-                {
-                    settled = true;
-                    break;
-                }
-            } else {
-                stable_since = None;
-            }
-        }
-        std::mem::swap(&mut previous, &mut frame);
-    }
-
+    let outcome = poll_for_change(
+        &mut capture,
+        baseline,
+        timeout_ms,
+        stable_ms,
+        difference_threshold,
+        control,
+        &SystemPollClock,
+    )?;
     // Free the screen DC, bitmap and full-size buffer before the final screenshot allocates its own.
     drop(capture);
     control.check("wait_for_change")?;
     let screenshot = capture_display_bounds(display, bounds, Some(MAX_ACTION_IMAGE_WIDTH), true)?;
     Ok(VisualChangeResult {
-        changed,
-        timed_out: !settled,
-        difference,
+        changed_once: outcome.changed_once,
+        currently_changed: outcome.currently_changed,
+        settled: outcome.settled,
+        difference: outcome.difference,
         elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         screenshot,
     })
@@ -1316,12 +1310,16 @@ fn ocr_error(error: impl std::fmt::Display) -> PlatformError {
     }
 }
 
+pub(super) fn incompatible_frames() -> PlatformError {
+    PlatformError::OperationFailed {
+        operation: "wait_for_visual_change".to_owned(),
+        reason: "comparison frames had incompatible dimensions".to_owned(),
+    }
+}
+
 pub(super) fn image_difference(left: &[u8], right: &[u8]) -> Result<f64, PlatformError> {
     if left.len() != right.len() || left.is_empty() {
-        return Err(PlatformError::OperationFailed {
-            operation: "wait_for_visual_change".to_owned(),
-            reason: "comparison frames had incompatible dimensions".to_owned(),
-        });
+        return Err(incompatible_frames());
     }
     let (total, channels) = left.chunks_exact(4).zip(right.chunks_exact(4)).fold(
         (0.0_f64, 0.0_f64),
@@ -2016,6 +2014,20 @@ mod comparison_tests {
         downscale_comparison_frame(&second, width, height, &mut frame);
         assert_eq!((frame.as_ptr(), frame.capacity()), (pointer, capacity));
         assert_eq!(frame, reference_comparison_frame(&second, width, height));
+    }
+
+    /// A wait refuses a baseline whose length differs from `comparison_frame_size`, so the size
+    /// must be the length the downscale writes.
+    #[test]
+    fn comparison_frame_size_is_the_length_the_downscale_writes() {
+        for (width, height) in [(1_920, 1_080), (1_366, 768), (641, 7), (300, 200), (1, 1)] {
+            let (_, frame_width, frame_height) = comparison_frame_size(width, height);
+            assert_eq!(
+                comparison(&flat(width, height), width, height).len(),
+                frame_width * frame_height * 4,
+                "{width}x{height}"
+            );
+        }
     }
 }
 

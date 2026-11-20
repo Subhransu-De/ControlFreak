@@ -186,9 +186,12 @@ wait_for_visual_change input width required
 wait_for_visual_change input x required
 wait_for_visual_change input y required
 wait_for_visual_change output anyOf[0].changed required
+wait_for_visual_change output anyOf[0].changed_once required
+wait_for_visual_change output anyOf[0].currently_changed required
 wait_for_visual_change output anyOf[0].difference required
 wait_for_visual_change output anyOf[0].elapsed_ms required
 wait_for_visual_change output anyOf[0].screenshot required
+wait_for_visual_change output anyOf[0].settled required
 wait_for_visual_change output anyOf[0].timed_out required
 wait_for_visual_change output anyOf[1].error required
 wait_for_visual_change output anyOf[1].error.code required
@@ -243,9 +246,12 @@ wait_for_change_since input difference_threshold default=0.01
 wait_for_change_since input stable_ms default=250
 wait_for_change_since input timeout_ms default=5000
 wait_for_change_since output anyOf[0].changed required
+wait_for_change_since output anyOf[0].changed_once required
+wait_for_change_since output anyOf[0].currently_changed required
 wait_for_change_since output anyOf[0].difference required
 wait_for_change_since output anyOf[0].elapsed_ms required
 wait_for_change_since output anyOf[0].screenshot required
+wait_for_change_since output anyOf[0].settled required
 wait_for_change_since output anyOf[0].timed_out required
 wait_for_change_since output anyOf[1].error required
 wait_for_change_since output anyOf[1].error.code required

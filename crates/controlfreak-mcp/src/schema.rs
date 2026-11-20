@@ -209,7 +209,7 @@ pub(super) fn wait_for_visual_change() -> Contract {
     let mut properties = region_properties();
     properties.extend(wait_properties());
     contract(
-        "Wait until a region differs from how it looks at call time and then stays stable for stable_ms, and return its screenshot. A timeout (default 5000 ms, at most 30000; 0 checks once) is a normal result with timed_out=true, not an error. To compare against a moment before an action, use capture_visual_baseline and wait_for_change_since.",
+        "Wait until a region differs from how it looks at call time and then stays stable for stable_ms, and return its screenshot. A timeout (default 5000 ms, at most 30000; 0 checks once) is a normal result with timed_out=true, not an error. changed_once means it changed at some poll; currently_changed means it still differs at the end. To compare against a moment before an action, use capture_visual_baseline and wait_for_change_since.",
         object_schema(properties, &["x", "y", "width", "height"]),
         visual_change_output_schema(),
     )
@@ -247,7 +247,7 @@ pub(super) fn wait_for_change_since() -> Contract {
         }),
     );
     contract(
-        "Wait until a region differs from its saved baseline and is stable, then return a screenshot. A timeout (default 5000 ms, at most 30000) is a normal result. The baseline can be reused until it expires after 5 minutes.",
+        "Wait until a region differs from its saved baseline and is stable, then return a screenshot. A timeout (default 5000 ms, at most 30000) is a normal result. changed_once means it changed at some poll; currently_changed means it still differs at the end. The baseline can be reused until it expires after 5 minutes.",
         object_schema(properties, &["baseline_id"]),
         visual_change_output_schema(),
     )
@@ -1375,12 +1375,18 @@ fn visual_change_output_schema() -> Arc<JsonObject> {
             "type": "object",
             "properties": {
                 "changed": { "type": "boolean" },
+                "changed_once": { "type": "boolean" },
+                "currently_changed": { "type": "boolean" },
+                "settled": { "type": "boolean" },
                 "timed_out": { "type": "boolean" },
-                "difference": { "type": "number", "minimum": 0 },
+                "difference": { "type": "number", "minimum": 0, "maximum": 1 },
                 "elapsed_ms": { "type": "integer", "minimum": 0 },
                 "screenshot": screenshot_schema()
             },
-            "required": ["changed", "timed_out", "difference", "elapsed_ms", "screenshot"],
+            "required": [
+                "changed", "changed_once", "currently_changed", "settled", "timed_out",
+                "difference", "elapsed_ms", "screenshot"
+            ],
             "additionalProperties": false
         })],
         false,
