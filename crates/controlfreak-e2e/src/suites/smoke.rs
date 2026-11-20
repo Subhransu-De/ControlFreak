@@ -43,6 +43,7 @@ pub(crate) fn suite() -> Suite {
             task("held-modifier-refused", held_modifier_refused).scene("single"),
             task("moved-window-keeps-session", moved_window_keeps_session).scene("single"),
             task("baseline-refusal-reasons", baseline_refusal_reasons).scene("single"),
+            task("find-elements-of-the-window", find_elements_of_the_window).scene("single"),
         ],
     }
 }
@@ -96,6 +97,99 @@ fn click_pixel_and_button(cx: &mut Ctx<'_>) -> Result<(), Failure> {
     );
     let button = cx.center("app", "button")?;
     let result = cx.click(&id, button)?;
+    ensure!(!result.is_error, "{}", result.structured);
+    cx.expect("app", "the button press", |e| {
+        events::button_pressed(e, "ping")
+    })?;
+    cx.end()
+}
+
+/// UI Automation finds the fixture's own `Ping` button without a session, with the role, name and
+/// rectangle the fixture itself reports. A second query scoped to the window's element finds it
+/// again, and a click at the centre of the reported bounds, through the normal pointer path inside
+/// a session, presses it.
+fn find_elements_of_the_window(cx: &mut Ctx<'_>) -> Result<(), Failure> {
+    let id = cx.target("app")?;
+    let [left, top, right, bottom] = cx
+        .window("app")?
+        .regions
+        .get("button")
+        .ok_or_else(|| Failure::host("no button region"))?;
+    let all = cx.ok(
+        "find_elements",
+        json!({"target_ref": id, "max_elements": 50}),
+    )?;
+    ensure!(all["status"] == "complete", "{all}");
+    let elements = all["elements"]
+        .as_array()
+        .ok_or_else(|| Failure::assertion(format!("no elements: {all}")))?;
+    let root = elements
+        .iter()
+        .find(|element| element["depth"] == 0)
+        .ok_or_else(|| Failure::assertion(format!("no root element: {all}")))?;
+    let status = cx.ok("get_server_status", json!({}))?;
+    ensure!(
+        status["session"]["approved_target_ref"].is_null(),
+        "find_elements claimed a session: {status}"
+    );
+
+    let found = cx.ok(
+        "find_elements",
+        json!({"target_ref": id, "within": root["element_ref"], "role": "button", "name": "ping"}),
+    )?;
+    let buttons = found["elements"]
+        .as_array()
+        .ok_or_else(|| Failure::assertion(format!("no elements: {found}")))?;
+    ensure!(buttons.len() == 1, "expected one Ping button: {found}");
+    let button = &buttons[0];
+    ensure!(
+        button["role"] == "button" && button["name"] == "Ping" && button["enabled"] == true,
+        "{button}"
+    );
+    ensure!(
+        button["patterns"]
+            .as_array()
+            .is_some_and(|patterns| patterns.iter().any(|pattern| pattern == "invoke")),
+        "the button cannot be invoked: {button}"
+    );
+    let displays = cx.ok("list_displays", json!({}))?;
+    let primary = displays["displays"]
+        .as_array()
+        .and_then(|all| all.iter().find(|display| display["is_primary"] == true))
+        .ok_or_else(|| Failure::assertion(format!("no primary display: {displays}")))?;
+    let bounds = &button["bounds"];
+    ensure!(
+        bounds["display_id"] == primary["id"],
+        "the button is on {} instead of the primary display: {bounds}",
+        bounds["display_id"]
+    );
+    // The fixture sits on the primary display, whose display-local pixels are screen pixels.
+    let reported = [
+        bounds["x"].as_i64(),
+        bounds["y"].as_i64(),
+        bounds["width"].as_i64(),
+        bounds["height"].as_i64(),
+    ];
+    let expected = [left, top, right - left, bottom - top].map(|value| Some(i64::from(value)));
+    ensure!(
+        reported
+            .iter()
+            .zip(&expected)
+            .all(|(reported, expected)| match (reported, expected) {
+                (Some(reported), Some(expected)) => (reported - expected).abs() <= 1,
+                _ => false,
+            }),
+        "UI Automation reported {bounds} but the fixture's button is {:?}",
+        [left, top, right, bottom]
+    );
+
+    cx.begin(&id)?;
+    cx.focus(&id)?;
+    let center = (
+        i32::try_from(reported[0].unwrap_or(0) + reported[2].unwrap_or(0) / 2).unwrap_or(0),
+        i32::try_from(reported[1].unwrap_or(0) + reported[3].unwrap_or(0) / 2).unwrap_or(0),
+    );
+    let result = cx.click(&id, center)?;
     ensure!(!result.is_error, "{}", result.structured);
     cx.expect("app", "the button press", |e| {
         events::button_pressed(e, "ping")

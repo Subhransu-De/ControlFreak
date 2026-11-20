@@ -98,6 +98,8 @@ impl PointerBackend for SyntheticBackend {
     pointer_method!(drag_mouse_controlled, MouseDragRequest);
     pointer_method!(scroll_mouse_controlled, MouseScrollRequest);
 }
+impl controlfreak_core::AccessibilityBackend for SyntheticBackend {}
+
 impl KeyboardBackend for SyntheticBackend {
     fn press_keys_controlled(
         &self,

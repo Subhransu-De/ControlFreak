@@ -16,7 +16,7 @@ ControlFreak lets an AI agent use your Windows desktop. It is a computer-use
 [MCP](https://modelcontextprotocol.io) server written in Rust. Your MCP client, such as Claude
 Code, Codex, Claude Desktop, OpenCode or Pi, starts it on your computer and talks to it over
 STDIO. The agent can take screenshots, read text with the Windows OCR engine on your computer,
-and click, scroll and type in one window that it chose.
+find controls through UI Automation, and click, scroll and type in one window that it chose.
 
 [Install](#install) · [Documentation](https://github.com/Subhransu-De/ControlFreak/blob/main/docs/README.md) · [Privacy](PRIVACY.md) ·
 [Changelog](CHANGELOG.md)
@@ -28,13 +28,14 @@ and click, scroll and type in one window that it chose.
 - Send keyboard shortcuts and type Unicode text without using the clipboard.
 - List, focus, capture, and wait for application windows.
 - Read, find, wait for, and click on-screen text using the local Windows OCR engine. `click_text` clicks the box around the matched words, so a label in the middle of a line can be clicked.
+- Find a window's controls through UI Automation with `find_elements`: role, name, enabled state, patterns and bounds in the pointer tools' coordinates. It is read-only: clicks still go through the pointer tools.
 - Run up to 16 clicks, scrolls and keystrokes on one window in a single call.
 - Inspect and switch between discoverable Windows virtual desktops. `switch_virtual_desktop` moves one or more desktops (`steps`) left or right and ends the session, because the approved window is no longer on screen.
 - Work in the approved window's own dialogs and popup menus. A window of another process is refused.
 - Target the taskbar, the desktop and the Start and Search surfaces. They are checked by window class and by the program that owns them, and there is still no tool that launches applications.
 - Run observation-only with `--profile observe`, or serve only the tools you name with `--tools`. See [Restrict the tools](https://github.com/Subhransu-De/ControlFreak/blob/main/docs/install.md#restrict-the-tools).
 
-See all 27 tools in the [tool reference](https://github.com/Subhransu-De/ControlFreak/blob/main/docs/tools.md).
+See all 28 tools in the [tool reference](https://github.com/Subhransu-De/ControlFreak/blob/main/docs/tools.md).
 
 ## How it works
 
@@ -42,6 +43,7 @@ See all 27 tools in the [tool reference](https://github.com/Subhransu-De/Control
 | --- | --- | --- |
 | Screenshots of any display, region or window | Text on screen, read by Windows OCR on your computer | Clicks, drags, scrolls, keys and typing in the window it chose |
 | Lists windows, displays and virtual desktops | Finds a label and clicks it by name | Up to 16 steps in one call |
+| The controls of a window, through UI Automation | Roles, names and states of buttons, fields and rows | Clicks a control through the pointer tools |
 | Waits for a window or a change on screen | Waits for text to appear or disappear | Works across multiple displays |
 
 ## Ask your agent to
@@ -80,7 +82,7 @@ setup and uninstall, see [Install and configure](https://github.com/Subhransu-De
 
 ## Privacy
 
-Screenshots, OCR text and window details go to your MCP client, which usually sends them to an
+Screenshots, OCR text, control names and window details go to your MCP client, which usually sends them to an
 AI model. ControlFreak itself has no network code and keeps data only in memory. See
 [PRIVACY.md](PRIVACY.md) for what it reads and keeps, and what setup changes.
 

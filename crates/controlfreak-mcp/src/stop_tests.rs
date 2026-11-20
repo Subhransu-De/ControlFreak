@@ -70,6 +70,8 @@ impl PointerBackend for WaitingBackend {
         self.wait(control)
     }
 }
+impl controlfreak_core::AccessibilityBackend for WaitingBackend {}
+
 impl KeyboardBackend for WaitingBackend {
     fn type_text_controlled(
         &self,

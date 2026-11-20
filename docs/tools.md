@@ -1,6 +1,6 @@
 # Tools
 
-ControlFreak exposes 27 MCP tools. Every tool publishes a title, an input schema, an `outputSchema` and annotations. Export the full contract with `controlfreak --print-tools`.
+ControlFreak exposes 28 MCP tools. Every tool publishes a title, an input schema, an `outputSchema` and annotations. Export the full contract with `controlfreak --print-tools`.
 
 - Tools are listed in the order an agent needs them. `stop_desktop_work` is last.
 - Every input tool is annotated `destructiveHint: true` and `openWorldHint: true`. `stop_desktop_work` is also destructive, because it closes input permanently. Use `end_control_session` to finish normally.
@@ -19,6 +19,7 @@ desktop and run inside a [control session](sessions.md).
 | `capture_region` | Observe | Screenshot of a rectangle, 1280 px wide unless `max_width` or `native` is set. |
 | `capture_window` | Observe | Screenshot of a window's visible frame, without focusing it. The window renders itself (`capture_method` `windows_print_window`), so windows covering it do not appear. The render is bounded: a window that Windows flags as hung is not asked, and one that does not answer within 2 seconds is given up on. The screen rectangle is then copied (`windows_gdi`), which shows whatever covers the window, so `capture_method` says which one you got. Menus, popups and dropdowns are separate windows and never appear in it; use an action's screenshot or `capture_display` to see them. Only one render runs at a time: a second `capture_window` call made meanwhile waits for it while it is still rendering, within the same 2 seconds, and copies the screen if that time runs out; if that render was already given up on, the screen is copied at once. Every screenshot result reports `capture_method` as one of `windows_print_window` or `windows_gdi`; display and region captures always report `windows_gdi`. |
 | `list_windows` | Observe | Visible titled windows, including owned dialogs (with an `owner` field), foreground first. At most 200. |
+| `find_elements` | Observe | Controls of one window from UI Automation: role, name, state, patterns and bounds. Read-only, needs no session. See [UI elements](#ui-elements-ui-automation). |
 | `wait_for_window` | Observe | Wait for a window that matches title, class or process. |
 | `list_virtual_desktops` | Observe | Windows grouped by virtual desktop, with the current one marked. Groups at most the 200 windows `list_windows` returns; `truncated: true` means more exist. |
 | `read_text_in_region` | Observe | OCR lines and words with bounds. At most 200 lines, 8000 characters and 128 KiB of lines; see Text (OCR). |
@@ -176,6 +177,22 @@ Tolerant results never approve a click. Use them to pick a strict query and regi
 
 OCR text and checkbox glyphs do not prove the state of a control.
 
+## UI elements (UI Automation)
+
+`find_elements` reads the controls of one window through Windows UI Automation. Use it when OCR cannot tell controls apart: duplicate labels such as an `Approve` button on every row, icon-only buttons, disabled controls. It is read-only. It needs no control session and claims none, and it changes nothing in the window: no pattern is invoked and no value is read or set.
+
+- `target_ref` (required) names the window, from `list_windows`, a screenshot or the session. Only that window's subtree is read: the walk starts at the window and never reaches its parent or its siblings. Elements of another process inside the window, such as an embedded browser control of another program, are skipped with their subtrees and counted in `counts.skipped_other_process`. For a packaged app's frame (`ApplicationFrameHost.exe`), the app's own content process counts as the window's.
+- Filters: `role` (a control type such as `button`, `edit`, `list_item`, `check_box`, `data_item`, `menu_item`, `tab_item`, `tree_item`; an unknown role is refused with the full list) and `name` (a case-insensitive substring of the accessible name, at most 256 characters). The filters choose what is returned, not what is read.
+- Limits: `max_depth` (levels below the root, 0 to 64, default 32), `max_elements` (1 to 500, default 100) and `timeout_ms` (100 to 10000, default 3000). The server also stops at 5,000 elements read and at 256 KiB of elements. Names longer than 256 characters are cut and marked `name_truncated: true`.
+- Each element has `element_ref`, `role`, `name`, `depth` (0 is the root), `enabled`, `focusable`, `focused` (has keyboard focus), `offscreen`, `patterns` (the UI Automation patterns it supports, such as `invoke`, `toggle`, `value`, `expand_collapse`, `selection_item`) and `bounds`.
+- `bounds` is `{display_id, x, y, width, height}` in display-local physical pixels, the space of the pointer tools, on the display that holds the element's centre. `x` and `y` can be negative, or reach past the display, for an element partly outside it. `bounds` is `null` when the element has no on-screen rectangle. To act on an element, begin a session and click inside `bounds` with `click_mouse`: every pointer check applies as for any click. An element with `offscreen: true` is not visible, for example scrolled away; scroll first.
+- `status` is `complete` when everything in scope was read, or `partial`. A partial result lists the limits it reached in `limits_reached` (`max_depth`, `max_elements`, `node_limit`, `timeout`, `response_bytes`, and `truncated` is `true`), or counts the subtrees whose provider failed in `counts.provider_errors`. `counts.visited` is the number of elements read, matching or not.
+- `within` takes an `element_ref` from an earlier result for the same `target_ref` and reads only that element's subtree, for example one table row. An element reference is opaque and is kept for 2 minutes. It is refused with `invalid_argument` when it is unknown or expired, belongs to another `target_ref`, the window's process changed, or the element is no longer in the window; nothing falls back to coordinates. No input tool accepts it.
+- Password fields have `password: true` and an empty `name`, and a `name` filter never matches them. An edit control whose provider does not say whether it is a password field is treated as one. No element's value or text content is read.
+- A provider that cannot be asked or does not answer before anything was read is reported as `platform_operation_failed` with reason `accessibility_unavailable`, never as an empty list. A provider that stops answering part-way gives a `partial` result with what was read. A window that closes or changes during the query fails with `target_invalidated`.
+- The queries run in a separate helper process (`controlfreak --uia-helper`) that the server starts on first use and keeps for later queries. A provider call that does not return stops the query at `timeout_ms`; the helper then answers with what it read and exits, and the server ends a helper that has not answered 3 seconds after `timeout_ms`. A query that was cut short says nothing about whether the application recovered.
+- Custom-drawn applications, games and some canvases expose little or nothing through UI Automation. Use screenshots and OCR for them.
+
 ## Keys
 
 `press_keys` names are case-insensitive, and `-`, `_` and spaces are ignored (`Page-Up` is
@@ -270,6 +287,7 @@ Every error also has `error.retryable`. It says whether repeating the same reque
 | `input_interleaved` | Another input ran during text recognition. Find the text again. | Yes |
 | `cancelled` | A stop, client cancellation or closing session cancelled the work. | No |
 | `ocr_unavailable` | The OCR helper failed. | No |
+| `accessibility_unavailable` | `find_elements` could not ask the window's UI Automation provider, or it did not answer before anything was read. Use screenshots and OCR. | No |
 | `input_blocked` | Windows accepted only part of the input, for example for a higher-integrity window. | No |
 | `target_not_responding` | The window with keyboard focus stopped answering while text was typed, so typing stopped. Observe it before typing the rest. | No |
 | `deadline_reached` | `type_text` or a `run_actions` `type_text` step reached its `timeout_ms` and stopped between two keystrokes. `input.sent_events` shows how much was sent. Observe the text before typing the rest. | No |
@@ -345,7 +363,7 @@ When an input tool cannot start a session, `error.code` says why:
 | `control_environment_unavailable` | The desktop cannot be controlled, for example while it is locked. | No |
 | `desktop_arbitration_unavailable` | Desktop ownership could not be checked. | No |
 
-After a stop, observation tools keep working: `list_displays`, `list_windows`, `list_virtual_desktops`, the captures, `read_text_in_region`, `find_text_on_screen`, `wait_for_text`, `wait_for_window`, `wait_for_visual_change`, `wait_for_change_since` and `get_server_status`. A wait that is already running is cancelled by the stop. Input tools stay refused.
+After a stop, observation tools keep working: `list_displays`, `list_windows`, `list_virtual_desktops`, the captures, `read_text_in_region`, `find_text_on_screen`, `wait_for_text`, `find_elements`, `wait_for_window`, `wait_for_visual_change`, `wait_for_change_since` and `get_server_status`. A wait that is already running is cancelled by the stop. Input tools stay refused.
 
 ## Build identity
 
@@ -364,7 +382,7 @@ A build from a source archive without `.git` takes `revision` from the `CONTROLF
 ## Limits
 
 - Windows 10 version 2004 or later, or Windows 11, on x86-64.
-- No UI Automation. The agent works from screenshots, OCR and coordinates.
+- UI Automation is read-only. `find_elements` finds controls, and clicks still go through the pointer tools. There are no semantic actions such as invoke, toggle or set value.
 - Protected video and HDR content may not capture correctly.
 - No tools for shell commands, launching applications, files, clipboard, registry, network or
   elevation.

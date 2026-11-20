@@ -42,6 +42,8 @@ impl BackendMetadata for HeldTyping {
     }
 }
 
+impl controlfreak_core::AccessibilityBackend for HeldTyping {}
+
 impl KeyboardBackend for HeldTyping {
     fn type_text_controlled(
         &self,

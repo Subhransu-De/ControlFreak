@@ -76,8 +76,9 @@ pub fn backend_with_security(security_context: SecurityContext) -> Box<dyn Platf
     Box::new(implementation::Backend::with_security(security_context))
 }
 
-/// The production backend: OCR runs in `ocr_helper`, and a refused foreground request in
-/// `focus_window` is asked once more through `server_executable --activation-helper`.
+/// The production backend: OCR runs in `ocr_helper`, UI Automation queries run in
+/// `server_executable --uia-helper`, and a refused foreground request in `focus_window` is asked
+/// once more through `server_executable --activation-helper`.
 #[cfg(target_os = "windows")]
 pub fn backend_with_helpers_and_security(
     ocr_helper: OcrHelperCommand,
@@ -86,6 +87,7 @@ pub fn backend_with_helpers_and_security(
 ) -> Box<dyn PlatformBackend> {
     Box::new(
         implementation::Backend::with_ocr_helper_and_security(ocr_helper, security_context)
+            .with_uia_helper(OcrHelperCommand::new(&server_executable).arg("--uia-helper"))
             .with_activation_helper(server_executable),
     )
 }
@@ -129,4 +131,13 @@ pub fn serve_ocr_helper(
     output: impl std::io::Write,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     implementation::serve_ocr_helper(input, output)
+}
+
+/// Serves `--uia-helper`: read-only UI Automation queries, one JSON line each, until input ends.
+#[cfg(target_os = "windows")]
+pub fn serve_uia_helper(
+    input: impl std::io::Read + Send + 'static,
+    output: impl std::io::Write,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    implementation::serve_uia_helper(input, output)
 }

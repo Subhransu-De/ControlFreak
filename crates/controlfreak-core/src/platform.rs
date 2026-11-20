@@ -3,14 +3,14 @@ use serde::{Deserialize, Serialize};
 use crate::{
     CapabilityDescriptor, CapabilityReport, CaptureDisplayRequest, CaptureRegionRequest,
     CaptureWindowRequest, ClickTextRequest, ClickTextResult, DisplayInfo, DisplayScreenshot,
-    DpiAwarenessStatus, FindTextRequest, FindTextResult, FocusWindowRequest, KeyChordRequest,
-    KeyboardActionResult, MouseClickRequest, MouseDragRequest, MouseMoveRequest,
-    MouseScrollRequest, MutationControl, OcrRegionRequest, OcrResult, PermissionDescriptor,
-    PlatformError, PointerActionResult, SecurityContext, TextInputRequest, VirtualDesktopList,
-    VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest,
-    VisualChangeResult, WaitForChangeSinceRequest, WaitForTextRequest, WaitForTextResult,
-    WaitForVisualChangeRequest, WaitForWindowRequest, WindowFocusResult, WindowList,
-    WindowScreenshot, WindowWaitResult,
+    DpiAwarenessStatus, FindElementsRequest, FindElementsResult, FindTextRequest, FindTextResult,
+    FocusWindowRequest, KeyChordRequest, KeyboardActionResult, MouseClickRequest, MouseDragRequest,
+    MouseMoveRequest, MouseScrollRequest, MutationControl, OcrRegionRequest, OcrResult,
+    PermissionDescriptor, PlatformError, PointerActionResult, SecurityContext, TextInputRequest,
+    VirtualDesktopList, VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult, VisualBaseline,
+    VisualBaselineRequest, VisualChangeResult, WaitForChangeSinceRequest, WaitForTextRequest,
+    WaitForTextResult, WaitForVisualChangeRequest, WaitForWindowRequest, WindowFocusResult,
+    WindowList, WindowScreenshot, WindowWaitResult,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,9 +411,30 @@ pub trait KeyboardBackend {
     }
 }
 
+/// Reads the accessibility tree of one window. Read-only: it changes nothing on the desktop and
+/// claims no control session.
+pub trait AccessibilityBackend {
+    fn find_elements_controlled(
+        &self,
+        _request: &FindElementsRequest,
+        _control: &MutationControl,
+    ) -> Result<FindElementsResult, PlatformError> {
+        Err(PlatformError::unsupported(
+            "find_elements",
+            "the active platform backend has no accessibility-tree implementation",
+        ))
+    }
+}
+
 /// Complete backend contract consumed by the MCP adapter.
 pub trait PlatformBackend:
-    BackendMetadata + DisplayBackend + OcrBackend + PointerBackend + WindowBackend + KeyboardBackend
+    BackendMetadata
+    + DisplayBackend
+    + OcrBackend
+    + PointerBackend
+    + WindowBackend
+    + KeyboardBackend
+    + AccessibilityBackend
 {
 }
 
@@ -424,6 +445,7 @@ impl<T> PlatformBackend for T where
         + PointerBackend
         + WindowBackend
         + KeyboardBackend
+        + AccessibilityBackend
 {
 }
 

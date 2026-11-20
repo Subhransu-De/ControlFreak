@@ -19,6 +19,8 @@ mod diagnostics;
 mod encoding_tests;
 #[cfg(test)]
 mod fake_desktop;
+#[cfg(test)]
+mod find_elements_tests;
 mod handlers;
 mod observations;
 mod profile;
@@ -35,10 +37,11 @@ mod stop_tests;
 use diagnostics::Diagnostics;
 use requests::{
     BeginControlSessionInput, CaptureDisplayInput, CaptureRegionInput, CaptureWindowInput,
-    ClickMouseInput, ClickTextInput, DragMouseInput, FindTextInput, FocusWindowInput,
-    MoveMouseInput, NoArguments, OcrRegionInput, PressKeysInput, ScrollMouseInput,
-    SwitchVirtualDesktopInput, TypeTextInput, VisualBaselineInput, WaitForChangeSinceInput,
-    WaitForTextInput, WaitForVisualChangeInput, WaitForWindowInput, parse_arguments,
+    ClickMouseInput, ClickTextInput, DragMouseInput, FindElementsInput, FindTextInput,
+    FocusWindowInput, MoveMouseInput, NoArguments, OcrRegionInput, PressKeysInput,
+    ScrollMouseInput, SwitchVirtualDesktopInput, TypeTextInput, VisualBaselineInput,
+    WaitForChangeSinceInput, WaitForTextInput, WaitForVisualChangeInput, WaitForWindowInput,
+    parse_arguments,
 };
 pub use session::{
     ActivityArbitrator, ActivityIndicator, ArbitrationBusy, ArbitrationError, IndicatorHealth,
@@ -143,6 +146,7 @@ const SWITCH_VIRTUAL_DESKTOP: &str = "switch_virtual_desktop";
 const FOCUS_WINDOW: &str = "focus_window";
 const CAPTURE_WINDOW: &str = "capture_window";
 const WAIT_FOR_WINDOW: &str = "wait_for_window";
+const FIND_ELEMENTS: &str = "find_elements";
 const PRESS_KEYS: &str = "press_keys";
 const TYPE_TEXT: &str = "type_text";
 

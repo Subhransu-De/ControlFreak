@@ -50,7 +50,7 @@ fn expected(name: &str) -> Vec<&'static str> {
         .collect()
 }
 
-const CATALOG_NAMES: [&str; 27] = [
+const CATALOG_NAMES: [&str; 28] = [
     GET_SERVER_STATUS,
     BEGIN_CONTROL_SESSION,
     END_CONTROL_SESSION,
@@ -69,6 +69,7 @@ const CATALOG_NAMES: [&str; 27] = [
     LIST_WINDOWS,
     FOCUS_WINDOW,
     CAPTURE_WINDOW,
+    FIND_ELEMENTS,
     WAIT_FOR_WINDOW,
     MOVE_MOUSE,
     CLICK_MOUSE,

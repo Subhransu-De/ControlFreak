@@ -160,9 +160,10 @@ fn the_documented_tool_table_matches_the_catalog() {
     );
 }
 
-/// Only tools that read pixels show the indicator's reading state, and none of them takes input.
+/// Only tools that read what the screen shows (pixels, or a window's controls) show the
+/// indicator's reading state, and none of them takes input.
 #[test]
-fn only_tools_that_read_pixels_show_the_reading_state() {
+fn only_tools_that_read_the_screen_show_the_reading_state() {
     let mut reading: Vec<&str> = CATALOG
         .iter()
         .filter(|spec| spec.reads_screen)
@@ -176,6 +177,7 @@ fn only_tools_that_read_pixels_show_the_reading_state() {
             "capture_region",
             "capture_visual_baseline",
             "capture_window",
+            "find_elements",
             "find_text_on_screen",
             "read_text_in_region",
             "wait_for_change_since",

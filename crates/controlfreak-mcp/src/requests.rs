@@ -1251,3 +1251,48 @@ impl RunActionsInput {
         Ok(steps)
     }
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FindElementsInput {
+    target_ref: String,
+    within: Option<String>,
+    name: Option<String>,
+    role: Option<controlfreak_core::ElementRole>,
+    #[serde(default = "default_element_depth")]
+    max_depth: u32,
+    #[serde(default = "default_elements")]
+    max_elements: u32,
+    #[serde(default = "default_element_timeout_ms")]
+    timeout_ms: u32,
+}
+
+const fn default_element_depth() -> u32 {
+    controlfreak_core::limits::DEFAULT_ELEMENT_DEPTH
+}
+
+const fn default_elements() -> u32 {
+    controlfreak_core::limits::DEFAULT_ELEMENTS
+}
+
+const fn default_element_timeout_ms() -> u32 {
+    controlfreak_core::limits::DEFAULT_ELEMENT_TIMEOUT_MS
+}
+
+impl FindElementsInput {
+    pub(super) fn into_request(
+        self,
+    ) -> Result<controlfreak_core::FindElementsRequest, PlatformError> {
+        let request = controlfreak_core::FindElementsRequest {
+            target_ref: self.target_ref,
+            within: self.within,
+            name: self.name,
+            role: self.role,
+            max_depth: self.max_depth,
+            max_elements: self.max_elements,
+            timeout_ms: self.timeout_ms,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+}

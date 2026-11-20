@@ -132,6 +132,8 @@ impl PointerBackend for Scripted {
     }
 }
 
+impl controlfreak_core::AccessibilityBackend for Scripted {}
+
 impl KeyboardBackend for Scripted {
     fn type_text_controlled(
         &self,

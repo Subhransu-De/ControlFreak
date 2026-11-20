@@ -63,9 +63,13 @@ mod activation_helper;
 mod baselines;
 mod ocr;
 mod target;
+mod uia;
+mod uia_native;
+mod uia_process;
 mod visual_change;
 pub(crate) use ocr::serve_ocr_helper;
 use ocr::{OcrHelperPool, recognize_text_with_helper_fingerprinted};
+pub(crate) use uia::serve_uia_helper;
 mod arbitration;
 mod capture;
 mod desktop;
@@ -214,7 +218,23 @@ pub struct Backend {
     /// The server's own executable, started with `--activation-helper` when Windows refuses the
     /// server's foreground request. `None` keeps `focus_window` to the server's own requests.
     activation_helper: Option<std::path::PathBuf>,
+    /// The server's own executable started with `--uia-helper`. `None` leaves the accessibility
+    /// tree unsupported.
+    uia_helper: Option<OcrHelperCommand>,
+    uia_helpers: uia_process::HelperPool,
+    element_refs: uia::ElementRefs,
+    accessibility: Mutex<AccessibilityState>,
     security_context: SecurityContext,
+}
+
+/// What the UI Automation helper last showed about the accessibility capability.
+enum AccessibilityState {
+    /// No query has run, so nothing is verified.
+    NotAsked,
+    /// The helper answered a query.
+    Answered,
+    /// The helper or its UI Automation client could not answer at all.
+    Failed(String),
 }
 
 struct NativeActivation<'a> {
@@ -368,17 +388,7 @@ impl activation::Activation for NativeActivation<'_> {
 
 impl Backend {
     pub fn new() -> Self {
-        let security_context = privilege::current_security_context(false).unwrap_or_default();
-        Self {
-            input_lock: Mutex::new(()),
-            input_generation: AtomicU64::new(0),
-            visual_baselines: visual_baseline_store(),
-            next_baseline_id: AtomicU64::new(1),
-            ocr_helper: None,
-            ocr_helpers: OcrHelperPool::default(),
-            activation_helper: None,
-            security_context,
-        }
+        Self::with_security(privilege::current_security_context(false).unwrap_or_default())
     }
 
     pub fn with_security(security_context: SecurityContext) -> Self {
@@ -390,6 +400,10 @@ impl Backend {
             ocr_helper: None,
             ocr_helpers: OcrHelperPool::default(),
             activation_helper: None,
+            uia_helper: None,
+            uia_helpers: uia_process::HelperPool::default(),
+            element_refs: uia::ElementRefs::default(),
+            accessibility: Mutex::new(AccessibilityState::NotAsked),
             security_context,
         }
     }
@@ -399,15 +413,17 @@ impl Backend {
         security_context: SecurityContext,
     ) -> Self {
         Self {
-            input_lock: Mutex::new(()),
-            input_generation: AtomicU64::new(0),
-            visual_baselines: visual_baseline_store(),
-            next_baseline_id: AtomicU64::new(1),
             ocr_helper: Some(command),
-            ocr_helpers: OcrHelperPool::default(),
-            activation_helper: None,
-            security_context,
+            ..Self::with_security(security_context)
         }
+    }
+
+    /// Lets `find_elements` read the accessibility tree through `command`, which must start this
+    /// server's executable with `--uia-helper`.
+    #[must_use]
+    pub fn with_uia_helper(mut self, command: OcrHelperCommand) -> Self {
+        self.uia_helper = Some(command);
+        self
     }
 
     /// Lets `focus_window` start `program --activation-helper` when Windows refuses the server's
@@ -524,11 +540,10 @@ impl BackendMetadata for Backend {
                     | Capability::WindowEnumeration
                     | Capability::PointerMovement
                     | Capability::InputInjection => CapabilityState::Supported,
-                    Capability::AccessibilityTree | Capability::Elevation => {
-                        CapabilityState::Unsupported {
-                            reason: "native implementation is not available yet".to_owned(),
-                        }
-                    }
+                    Capability::AccessibilityTree => self.accessibility_state(),
+                    Capability::Elevation => CapabilityState::Unsupported {
+                        reason: "native implementation is not available yet".to_owned(),
+                    },
                 };
 
                 CapabilityDescriptor {
@@ -1213,6 +1228,63 @@ fn win32_error(operation: &str, error: &windows::core::Error) -> PlatformError {
     PlatformError::OperationFailed {
         operation: operation.to_owned(),
         reason: error.to_string(),
+    }
+}
+
+impl Backend {
+    /// Supported only after the helper answered a query: nothing else proves that UI Automation
+    /// works on this desktop.
+    fn accessibility_state(&self) -> CapabilityState {
+        if self.uia_helper.is_none() {
+            return CapabilityState::Unsupported {
+                reason: "this backend has no UI Automation helper; a running server queries UI Automation through its own".to_owned(),
+            };
+        }
+        match &*self
+            .accessibility
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            AccessibilityState::NotAsked => CapabilityState::Degraded {
+                reason: "not verified yet: the UI Automation helper starts with the first find_elements call".to_owned(),
+            },
+            AccessibilityState::Answered => CapabilityState::Supported,
+            AccessibilityState::Failed(reason) => CapabilityState::Degraded {
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
+impl controlfreak_core::AccessibilityBackend for Backend {
+    fn find_elements_controlled(
+        &self,
+        request: &controlfreak_core::FindElementsRequest,
+        control: &MutationControl,
+    ) -> Result<controlfreak_core::FindElementsResult, PlatformError> {
+        let _timer = controlfreak_core::timing::start("find_elements");
+        let Some(command) = &self.uia_helper else {
+            return Err(PlatformError::Unsupported {
+                operation: "find_elements".to_owned(),
+                reason: "this backend has no UI Automation helper".to_owned(),
+            });
+        };
+        ensure_dpi_awareness()?;
+        let record = |outcome: Result<(), String>| {
+            *self
+                .accessibility
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = match outcome {
+                Ok(()) => AccessibilityState::Answered,
+                Err(reason) => AccessibilityState::Failed(reason),
+            };
+        };
+        let environment = uia::HelperEnvironment {
+            command,
+            pool: &self.uia_helpers,
+            answered: &record,
+        };
+        uia::find_elements(request, control, &environment, &self.element_refs)
     }
 }
 

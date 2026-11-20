@@ -6,9 +6,11 @@ use super::{
     requests::MAX_RUN_ACTION_STEPS,
 };
 use controlfreak_core::limits::{
-    DEFAULT_CAPTURE_WIDTH, DEFAULT_QUIET_SETTLE_MS, DEFAULT_SETTLE_MS, MAX_CAPTURE_WIDTH,
-    MAX_MOVE_DURATION_MS, MAX_RUN_ACTIONS_WAIT_MS, MAX_SCROLL_DELTA, MAX_SETTLE_MS,
-    MAX_TEXT_TIMEOUT_MS, MAX_TEXT_UTF16_UNITS, MAX_WAIT_MS, MIN_TEXT_TIMEOUT_MS, MIN_WAIT_MS,
+    DEFAULT_CAPTURE_WIDTH, DEFAULT_ELEMENT_DEPTH, DEFAULT_ELEMENT_TIMEOUT_MS, DEFAULT_ELEMENTS,
+    DEFAULT_QUIET_SETTLE_MS, DEFAULT_SETTLE_MS, MAX_CAPTURE_WIDTH, MAX_ELEMENT_DEPTH,
+    MAX_ELEMENT_TIMEOUT_MS, MAX_ELEMENTS, MAX_MOVE_DURATION_MS, MAX_RUN_ACTIONS_WAIT_MS,
+    MAX_SCROLL_DELTA, MAX_SETTLE_MS, MAX_TEXT_TIMEOUT_MS, MAX_TEXT_UTF16_UNITS, MAX_WAIT_MS,
+    MIN_ELEMENT_TIMEOUT_MS, MIN_TEXT_TIMEOUT_MS, MIN_WAIT_MS,
 };
 
 /// What a tool's schema builder writes: the parts of a tool that the catalog row does not hold.
@@ -459,6 +461,101 @@ pub(super) fn capture_window() -> Contract {
         object_schema(properties, &[]),
         output_schema(vec![window_screenshot_schema()], false),
     )
+}
+
+pub(super) fn find_elements() -> Contract {
+    let mut properties = JsonObject::new();
+    properties.insert(
+        "within".into(),
+        json!({ "type": "string", "minLength": 1, "description": "An element_ref: read its subtree." }),
+    );
+    properties.insert(
+        "name".into(),
+        json!({ "type": "string", "minLength": 1, "description": "Substring, any case." }),
+    );
+    // A refusal lists the roles and the name limit; in the schema they would cost every
+    // tools/list 600 bytes.
+    properties.insert("role".into(), json!({ "type": "string" }));
+    properties.insert(
+        "max_depth".into(),
+        json!({ "type": "integer", "minimum": 0, "maximum": MAX_ELEMENT_DEPTH, "default": DEFAULT_ELEMENT_DEPTH }),
+    );
+    properties.insert(
+        "max_elements".into(),
+        json!({ "type": "integer", "minimum": 1, "maximum": MAX_ELEMENTS, "default": DEFAULT_ELEMENTS }),
+    );
+    properties.insert(
+        "timeout_ms".into(),
+        json!({ "type": "integer", "minimum": MIN_ELEMENT_TIMEOUT_MS, "maximum": MAX_ELEMENT_TIMEOUT_MS, "default": DEFAULT_ELEMENT_TIMEOUT_MS }),
+    );
+    contract(
+        "Read-only, no session: one window's UI Automation controls with role, name, state, patterns and display-local bounds; click inside bounds with click_mouse. Values are never read. status=partial: see limits_reached.",
+        object_schema(properties, &[]),
+        output_schema(vec![find_elements_output_schema()], false),
+    )
+}
+
+fn find_elements_output_schema() -> Value {
+    let roles: Vec<&str> = controlfreak_core::ElementRole::ALL
+        .iter()
+        .map(|role| role.name())
+        .collect();
+    let patterns: Vec<Value> = controlfreak_core::ElementPattern::ALL
+        .iter()
+        .map(|pattern| json!(pattern))
+        .collect();
+    let element = json!({
+        "type": "object",
+        "properties": {
+            "element_ref": { "type": "string" },
+            "role": { "type": "string", "enum": roles },
+            "name": { "type": "string" },
+            "name_truncated": { "const": true },
+            "password": { "const": true },
+            "depth": { "type": "integer", "minimum": 0 },
+            "enabled": { "type": "boolean" },
+            "focusable": { "type": "boolean" },
+            "focused": { "type": "boolean" },
+            "offscreen": { "type": "boolean" },
+            "bounds": { "oneOf": [{
+                "type": "object",
+                "properties": {
+                    "display_id": { "type": "string" },
+                    "x": { "type": "integer" },
+                    "y": { "type": "integer" },
+                    "width": { "type": "integer", "minimum": 1 },
+                    "height": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["display_id", "x", "y", "width", "height"],
+                "additionalProperties": false
+            }, { "type": "null" }] },
+            "patterns": { "type": "array", "items": { "type": "string", "enum": patterns } }
+        },
+        "required": ["element_ref", "role", "name", "depth", "enabled", "focusable", "focused", "offscreen", "bounds", "patterns"],
+        "additionalProperties": false
+    });
+    json!({
+        "type": "object",
+        "properties": {
+            "status": { "type": "string", "enum": ["complete", "partial"] },
+            "truncated": { "type": "boolean" },
+            "limits_reached": { "type": "array", "items": { "type": "string",
+                "enum": ["max_depth", "max_elements", "node_limit", "timeout", "response_bytes"] } },
+            "counts": {
+                "type": "object",
+                "properties": {
+                    "visited": { "type": "integer", "minimum": 0 },
+                    "provider_errors": { "type": "integer", "minimum": 0 },
+                    "skipped_other_process": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["visited", "provider_errors", "skipped_other_process"],
+                "additionalProperties": false
+            },
+            "elements": { "type": "array", "items": element }
+        },
+        "required": ["status", "truncated", "limits_reached", "counts", "elements"],
+        "additionalProperties": false
+    })
 }
 
 pub(super) fn wait_for_window() -> Contract {

@@ -5,14 +5,14 @@
 
 use super::{
     BEGIN_CONTROL_SESSION, CAPTURE_DISPLAY, CAPTURE_REGION, CAPTURE_VISUAL_BASELINE,
-    CAPTURE_WINDOW, CLICK_MOUSE, CLICK_TEXT, DRAG_MOUSE, END_CONTROL_SESSION, FIND_TEXT_ON_SCREEN,
-    FOCUS_WINDOW, GET_SERVER_STATUS, InputPrepare, LIST_DISPLAYS, LIST_VIRTUAL_DESKTOPS,
-    LIST_WINDOWS, MOVE_MOUSE, PRESS_KEYS, READ_TEXT_IN_REGION, RUN_ACTIONS, SCROLL_MOUSE,
-    STOP_DESKTOP_WORK, SWITCH_VIRTUAL_DESKTOP, TYPE_TEXT, ToolHandler, WAIT_FOR_CHANGE_SINCE,
-    WAIT_FOR_TEXT, WAIT_FOR_VISUAL_CHANGE, WAIT_FOR_WINDOW,
+    CAPTURE_WINDOW, CLICK_MOUSE, CLICK_TEXT, DRAG_MOUSE, END_CONTROL_SESSION, FIND_ELEMENTS,
+    FIND_TEXT_ON_SCREEN, FOCUS_WINDOW, GET_SERVER_STATUS, InputPrepare, LIST_DISPLAYS,
+    LIST_VIRTUAL_DESKTOPS, LIST_WINDOWS, MOVE_MOUSE, PRESS_KEYS, READ_TEXT_IN_REGION, RUN_ACTIONS,
+    SCROLL_MOUSE, STOP_DESKTOP_WORK, SWITCH_VIRTUAL_DESKTOP, TYPE_TEXT, ToolHandler,
+    WAIT_FOR_CHANGE_SINCE, WAIT_FOR_TEXT, WAIT_FOR_VISUAL_CHANGE, WAIT_FOR_WINDOW,
     handlers::{
         call_capture_display, call_capture_region, call_capture_visual_baseline,
-        call_capture_window, call_find_text_on_screen, call_list_displays,
+        call_capture_window, call_find_elements, call_find_text_on_screen, call_list_displays,
         call_list_virtual_desktops, call_list_windows, call_read_text_in_region,
         call_wait_for_change_since, call_wait_for_text, call_wait_for_visual_change,
         call_wait_for_window, prepare_click_mouse, prepare_click_text, prepare_drag_mouse,
@@ -71,8 +71,8 @@ pub(super) struct ToolSpec {
     /// Whether repeating the same call has no further effect (`idempotentHint`).
     pub(super) idempotent: bool,
     pub(super) target_ref: TargetRef,
-    /// Reads pixels from the screen. Such a call claims no session; the indicator only shows a
-    /// brief "reading the screen" state for it.
+    /// Reads what the screen shows: its pixels, or the controls of a window. Such a call claims
+    /// no session; the indicator only shows a brief "reading the screen" state for it.
     pub(super) reads_screen: bool,
     /// Writes the description and the input and output schemas.
     pub(super) schema: fn() -> Contract,
@@ -259,6 +259,19 @@ pub(super) static CATALOG: &[ToolSpec] = &[
         target_ref: TargetRef::None,
         reads_screen: true,
         schema: schema::capture_window,
+    },
+    ToolSpec {
+        name: FIND_ELEMENTS,
+        title: "Find elements",
+        // A read-only observation: it claims no session and sends no input. It can wait for a
+        // slow provider for seconds, so a stop cancels it like the other waits.
+        route: Route::Watch(handler!(call_find_elements)),
+        idempotent: false,
+        target_ref: TargetRef::Required,
+        // It reads the window's content, so the indicator shows the reading state as for a
+        // screenshot.
+        reads_screen: true,
+        schema: schema::find_elements,
     },
     ToolSpec {
         name: WAIT_FOR_WINDOW,

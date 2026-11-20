@@ -10,6 +10,8 @@ short-lived visual baselines in memory; move/click/drag/scroll the pointer; focu
 and inject keyboard input. Mouse clicks and drags are bounded atomic operations: the server
 does not expose raw button-down/button-up tools and attempts release cleanup after partial failures.
 The semantic text-click tool rejects zero or ambiguous OCR matches before injecting input.
+The MCP can also read the UI Automation controls of one window; that tool is read-only and is
+described below.
 These are powerful local operations. Run it only for MCP clients you trust, and
 report suspected security problems privately through GitHub's security advisory interface instead
 of a public issue.
@@ -73,6 +75,8 @@ One exception to the desktop, foreground and same-process rules is `switch_virtu
 
 A double or triple click is sent as separate batches with a 20 ms dwell after each press. The target, foreground, input desktop, integrity, hit window and cursor position are validated again immediately before every batch that carries new input, and a refusal releases only the input that the system acknowledged; cleanup never sends a new press.
 
+`find_elements` reads the UI Automation tree of one window and changes nothing: it invokes no pattern, reads no value and claims no session, so the boundaries above are unchanged. Clicking a control it found is an ordinary pointer action with every check above. Its element references are accepted only as the root of a later query and by no input tool. Semantic actions (invoke, toggle, set value) are not offered; they would bypass the foreground and hit-test model above and need their own validation rule first. The query reads only the subtree of the window that its `target_ref` resolves to, after the same identity checks as any reference: it never walks to the window's parent or siblings, and it skips elements of any process other than the window's own (and, for a packaged app's frame, the app's content process), with their subtrees. An element reference is bound to that `target_ref`, the process creation time and the element's UI Automation runtime ID, expires after 2 minutes, and is refused when any of these changed. The window is resolved again after the walk, and a window that closed or changed meanwhile fails the query. Windows does not let a process read the UI Automation tree of a higher-integrity process, so such a query fails or reads little. Provider calls are cross-process calls into the application, so they run in a helper process of the server's own executable (`--uia-helper`) on one dedicated thread, never on the server's async workers. The helper stops at the request's deadline, answers with what it read and exits if a provider call does not return, and the server kills a helper that has not answered 3 seconds after the deadline. A cut-short query is reported as partial or as `accessibility_unavailable`, never as an empty tree, and ending the helper is not evidence that the application recovered. A password field's name is withheld, and so is the name of an edit control whose provider does not say whether it is one. Two residual risks are accepted: a provider that moves an element to another window of the same process between two calls of one walk can make the walk continue among that window's elements, and a provider can give a new element the runtime ID of a destroyed one, so a reference can then name the new element. Both stay inside the target's process, which is already one trust domain for input, and neither can send input.
+
 Window capture renders the window itself with `PrintWindow`. That call can wait for the target program, so it runs on a watchdog thread with a 2-second deadline, is skipped for windows that Windows flags as hung, and runs one render at a time. A second capture waits for the slot while its render is live, within the same deadline; after a timeout, or behind a render that was already given up on, the screen is copied at once and `capture_method` says `windows_gdi`.
 
 The taskbar, secondary taskbars, the desktop and the Start and Search surfaces can be approved as
@@ -100,7 +104,7 @@ boundaries.
 
 For transport diagnosis, the server emits process lifecycle plus tool name, operation ID, status,
 duration, and named per-stage durations to stderr. These events deliberately exclude tool arguments, typed text, OCR contents,
-window titles, screenshots, and image data. ControlFreak writes no diagnostics to disk by default.
+UI Automation names, window titles, screenshots, and image data. ControlFreak writes no diagnostics to disk by default.
 Setting `CONTROLFREAK_GLOW_ERROR_LOG` opts into an append-only log at the given path, recording
 indicator helper lifecycle, helper stderr, and error text. That log carries no desktop content.
 

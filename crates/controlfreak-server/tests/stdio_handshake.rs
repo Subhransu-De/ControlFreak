@@ -662,6 +662,7 @@ fn assert_tool_names(tools: &Value) {
             "list_windows",
             "focus_window",
             "capture_window",
+            "find_elements",
             "wait_for_window",
             "move_mouse",
             "click_mouse",
@@ -745,6 +746,7 @@ fn observe_profile_hides_input_tools_over_stdio() {
             "list_virtual_desktops",
             "list_windows",
             "capture_window",
+            "find_elements",
             "wait_for_window",
             "stop_desktop_work",
         ]
