@@ -10,7 +10,9 @@ use crate::{CleanupStatus, MutationControl, PlatformError};
 /// a weak reference to its owner disappears with it.
 type Listener = Box<dyn Fn() -> bool + Send + Sync>;
 
-/// A lifetime-latched stop. No client operation can reopen admission.
+/// A latched stop. No client operation can reopen admission. Only the user can, and only after a
+/// stop of their own: see [`StopController::rearm_by_user`]. Every other stop lasts for the life of
+/// the server.
 #[derive(Clone, Default)]
 pub struct StopController(Arc<Inner>);
 
@@ -31,8 +33,19 @@ struct Inner {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StopReason {
-    User,
+    /// The user stopped. `then_other` records a stop other than the user's that came after it
+    /// (`stop_desktop_work`, shutdown, a failure): the stop is still reported as the user's, but
+    /// it lasts for the life of the server.
+    User {
+        then_other: bool,
+    },
     Other,
+}
+
+impl StopReason {
+    const fn is_user(self) -> bool {
+        matches!(self, Self::User { .. })
+    }
 }
 
 #[derive(Default)]
@@ -48,20 +61,90 @@ struct State {
     cleanup_failed: bool,
     next_id: u64,
     active: Vec<(u64, MutationControl)>,
+    /// Counts the user's re-arms. A re-arm needs every registration from before the stop to be
+    /// gone, so none of them carries into the new epoch; watchers compare epochs to tell a new
+    /// stop from the one they already reported.
+    epoch: u64,
 }
 
 impl State {
+    /// A stop other than the user's: it keeps a user's stop as the reported reason, but makes it
+    /// last for the life of the server.
+    fn close_for_good(&mut self) {
+        match &mut self.stop_reason {
+            Some(StopReason::User { then_other }) => *then_other = true,
+            Some(StopReason::Other) => {}
+            None => self.stop_reason = Some(StopReason::Other),
+        }
+    }
+
     fn recovery(&self) -> Option<StopRecovery> {
         if self.cleanup_failed {
             Some(StopRecovery::ResolveHeldInput)
         } else if self.stop_reason.is_none() {
             None
-        } else if self.active.is_empty() {
-            Some(StopRecovery::RestartClient)
-        } else {
+        } else if !self.active.is_empty() {
             Some(StopRecovery::WaitForDrain)
+        } else if self.user_may_rearm() {
+            Some(StopRecovery::AllowAgain)
+        } else {
+            Some(StopRecovery::RestartClient)
         }
     }
+
+    /// A stop the user made, with no server failure and no doubt about released input. Only such
+    /// a stop can be reversed, and only by the user, once it has drained.
+    fn user_may_rearm(&self) -> bool {
+        self.stop_reason == Some(StopReason::User { then_other: false })
+            && self.failure.is_none()
+            && !self.cleanup_failed
+    }
+
+    fn rearm_refusal(&self) -> Option<RearmRefusal> {
+        if self.cleanup_failed {
+            Some(RearmRefusal::CleanupFailed)
+        } else if self.failure.is_some() {
+            Some(RearmRefusal::ServerFailure)
+        } else {
+            match self.stop_reason {
+                None => Some(RearmRefusal::NotStopped),
+                Some(StopReason::Other | StopReason::User { then_other: true }) => {
+                    Some(RearmRefusal::NotUserStop)
+                }
+                Some(StopReason::User { then_other: false })
+                    if self.session_active || !self.active.is_empty() =>
+                {
+                    Some(RearmRefusal::Draining)
+                }
+                Some(StopReason::User { then_other: false }) => None,
+            }
+        }
+    }
+}
+
+/// Why [`StopController::rearm_by_user`] kept admission closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RearmRefusal {
+    /// Admission is open; there is nothing to re-arm.
+    NotStopped,
+    /// A client (`stop_desktop_work`) or the server stopped, even after the user did. That stop is
+    /// permanent.
+    NotUserStop,
+    /// The server closed admission because something failed. That stop is permanent.
+    ServerFailure,
+    /// Held input may not have been released. That stop is permanent.
+    CleanupFailed,
+    /// Work admitted before the stop, or its session, is still finishing.
+    Draining,
+}
+
+/// One consistent reading of the latch, for a watcher that reports its changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StopSnapshot {
+    /// Bumped by every re-arm.
+    pub epoch: u64,
+    pub recovery: Option<StopRecovery>,
+    pub user_stop: bool,
 }
 
 /// Outcome of `StopController::wait_for_esc_hook`.
@@ -78,11 +161,14 @@ pub enum EscHook {
 }
 
 /// What has to happen before this server can accept input again, once its stop latch is closed.
-/// No MCP call reopens the latch, so every path ends in a restart the user controls.
+/// No MCP call reopens the latch, so every path ends in a step the user controls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopRecovery {
     /// Work admitted before the stop is still finishing. Wait for the drain to end.
     WaitForDrain,
+    /// The user stopped and nothing is running. The user may press Allow again on the session
+    /// tab with a mouse, touch or pen, or restart the server from the MCP client.
+    AllowAgain,
     /// Nothing is running. The user must restart the server from the MCP client.
     RestartClient,
     /// A key or mouse button may still be held. The user must release it, then restart.
@@ -95,7 +181,7 @@ impl StopRecovery {
     pub const fn actor(self) -> &'static str {
         match self {
             Self::WaitForDrain => "agent",
-            Self::RestartClient | Self::ResolveHeldInput => "user",
+            Self::AllowAgain | Self::RestartClient | Self::ResolveHeldInput => "user",
         }
     }
 
@@ -103,6 +189,7 @@ impl StopRecovery {
     pub const fn action(self) -> &'static str {
         match self {
             Self::WaitForDrain => "wait_for_drain",
+            Self::AllowAgain => "allow_again",
             Self::RestartClient => "restart_client",
             Self::ResolveHeldInput => "resolve_held_input",
         }
@@ -115,7 +202,7 @@ impl StopRecovery {
         match recovery {
             None => "ready",
             Some(Self::WaitForDrain) => "draining",
-            Some(Self::RestartClient) => "stopped",
+            Some(Self::AllowAgain | Self::RestartClient) => "stopped",
             Some(Self::ResolveHeldInput) => "cleanup_failed",
         }
     }
@@ -127,6 +214,7 @@ impl StopRecovery {
             Self::WaitForDrain => {
                 "Work that started before the stop is finishing. Wait until stop_state is stopped; input stays closed."
             }
+            Self::AllowAgain => ALLOW_AGAIN_GUIDANCE,
             Self::RestartClient => RESTART_GUIDANCE,
             Self::ResolveHeldInput => {
                 "ControlFreak could not confirm that every key and mouse button was released. Press and release any key or button that seems stuck, then use your MCP client's server restart control or fully quit and reopen the client."
@@ -136,6 +224,7 @@ impl StopRecovery {
 }
 
 const RESTART_GUIDANCE: &str = "This ControlFreak instance cannot accept more input. To allow input again, use your MCP client's server restart control or fully quit and reopen the client, then list windows and select the target again.";
+const ALLOW_AGAIN_GUIDANCE: &str = "Input stays off until you allow it again. To allow it, press Allow again on the ControlFreak tab with a mouse, touch or pen, or use your MCP client's server restart control or fully quit and reopen the client. Then list windows and select the target again.";
 
 impl StopController {
     fn state(&self) -> MutexGuard<'_, State> {
@@ -305,7 +394,7 @@ impl StopController {
             if !state.session_active || state.stop_reason.is_some() {
                 false
             } else {
-                state.stop_reason = Some(StopReason::User);
+                state.stop_reason = Some(StopReason::User { then_other: false });
                 for (_, control) in &state.active {
                     control.cancel();
                 }
@@ -319,14 +408,61 @@ impl StopController {
     }
 
     pub fn user_stopped(&self) -> bool {
-        self.state().stop_reason == Some(StopReason::User)
+        self.state().stop_reason.is_some_and(StopReason::is_user)
+    }
+
+    /// Whether the latch is closed by a stop the user can still reverse: their own, with no
+    /// server failure and no doubt about released input. It may still be draining.
+    pub fn user_may_rearm(&self) -> bool {
+        self.state().user_may_rearm()
+    }
+
+    /// Whether [`StopController::rearm_by_user`] would reopen admission now.
+    pub fn can_rearm(&self) -> bool {
+        self.state().rearm_refusal().is_none()
+    }
+
+    /// Reopens admission after the user's own stop. Only the session tab's Allow again control
+    /// calls this, from a press whose origin is input hardware; no MCP call reaches it. It is
+    /// refused unless the stop was the user's, everything admitted before it has drained and its
+    /// session is released, nothing failed and every held input was released. A client or server
+    /// stop stays permanent.
+    ///
+    /// Nothing resumes: the next action starts a new session through ordinary admission, with its
+    /// own indicator and Esc hook confirmation.
+    pub fn rearm_by_user(&self) -> Result<(), RearmRefusal> {
+        {
+            let mut state = self.state();
+            if let Some(refusal) = state.rearm_refusal() {
+                return Err(refusal);
+            }
+            state.stop_reason = None;
+            state.epoch = state.epoch.wrapping_add(1);
+        }
+        self.notify();
+        Ok(())
+    }
+
+    /// Counts re-arms, so a watcher can tell a new stop from one it already reported.
+    pub fn stop_epoch(&self) -> u64 {
+        self.state().epoch
+    }
+
+    /// The epoch, recovery step and whether the user stopped, read together.
+    pub fn snapshot(&self) -> StopSnapshot {
+        let state = self.state();
+        StopSnapshot {
+            epoch: state.epoch,
+            recovery: state.recovery(),
+            user_stop: state.stop_reason.is_some_and(StopReason::is_user),
+        }
     }
 
     /// Close admission and cancel all registered work without waiting for providers.
     pub fn stop(&self) {
         {
             let mut state = self.state();
-            state.stop_reason.get_or_insert(StopReason::Other);
+            state.close_for_good();
             for (_, control) in &state.active {
                 control.cancel();
             }
@@ -354,8 +490,7 @@ impl StopController {
 
     /// The refusal text, including the recorded failure reason when there is one.
     pub fn refusal_message(&self) -> Option<String> {
-        let state = self.state();
-        refusal(state.stop_reason, state.failure.as_deref())
+        refusal(&self.state())
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -375,7 +510,7 @@ impl StopController {
     /// Register before queuing work. The guard stays with the blocking worker through cleanup.
     pub fn register(&self, control: MutationControl) -> Result<StopRegistration, PlatformError> {
         let mut state = self.state();
-        if let Some(reason) = refusal(state.stop_reason, state.failure.as_deref()) {
+        if let Some(reason) = refusal(&state) {
             return Err(PlatformError::failed(
                 crate::FailureCause::DesktopWorkStopped,
                 "admission",
@@ -415,7 +550,7 @@ impl Drop for StopRegistration {
             state.active.retain(|(id, _)| *id != self.id);
             if self.control.progress().cleanup == CleanupStatus::Unknown {
                 state.cleanup_failed = true;
-                state.stop_reason.get_or_insert(StopReason::Other);
+                state.close_for_good();
                 for (_, control) in &state.active {
                     control.cancel();
                 }
@@ -426,9 +561,12 @@ impl Drop for StopRegistration {
     }
 }
 
-fn stop_message(reason: Option<StopReason>) -> Option<String> {
-    match reason? {
-        StopReason::User => Some(format!("You stopped desktop input. {RESTART_GUIDANCE}")),
+fn stop_message(state: &State) -> Option<String> {
+    match state.stop_reason? {
+        StopReason::User { .. } if state.user_may_rearm() => {
+            Some(format!("You stopped desktop input. {ALLOW_AGAIN_GUIDANCE}"))
+        }
+        StopReason::User { .. } => Some(format!("You stopped desktop input. {RESTART_GUIDANCE}")),
         StopReason::Other => {
             Some("desktop work is stopped; only the user may restart the server".to_owned())
         }
@@ -481,9 +619,9 @@ pub fn retry_with_backoff<T, E>(
     }
 }
 
-fn refusal(reason: Option<StopReason>, failure: Option<&str>) -> Option<String> {
-    let message = stop_message(reason)?;
-    Some(match failure {
+fn refusal(state: &State) -> Option<String> {
+    let message = stop_message(state)?;
+    Some(match state.failure.as_deref() {
         Some(failure) => format!("{message} ({failure})"),
         None => message,
     })
@@ -527,13 +665,25 @@ mod tests {
         assert_eq!(StopRecovery::WaitForDrain.actor(), "agent");
         drop(guard);
         let recovery = stop.recovery().unwrap();
-        assert_eq!(recovery, StopRecovery::RestartClient);
+        assert_eq!(recovery, StopRecovery::AllowAgain);
+        assert_eq!(
+            (recovery.actor(), recovery.action()),
+            ("user", "allow_again")
+        );
+        assert_eq!(stop.status(), "stopped");
+        assert!(recovery.guidance().contains("Allow again"));
+        assert!(recovery.guidance().contains("server restart control"));
+        assert!(stop.register(MutationControl::default()).is_err());
+
+        // A client stop can only be undone by a restart.
+        let stop = StopController::default();
+        stop.stop();
+        let recovery = stop.recovery().unwrap();
         assert_eq!(
             (recovery.actor(), recovery.action()),
             ("user", "restart_client")
         );
-        assert!(recovery.guidance().contains("server restart control"));
-        assert!(stop.register(MutationControl::default()).is_err());
+        assert!(!recovery.guidance().contains("Allow again"));
 
         let stop = StopController::default();
         let control = MutationControl::default();
@@ -549,6 +699,116 @@ mod tests {
             ("user", "resolve_held_input")
         );
         assert_eq!(stop.status(), "cleanup_failed");
+    }
+
+    /// A session owned with one action in flight, stopped by the user.
+    fn user_stop_with_work() -> (StopController, MutationControl, StopRegistration) {
+        let stop = StopController::default();
+        let control = MutationControl::default();
+        let guard = stop.register(control.clone()).unwrap();
+        stop.set_session_active(true);
+        assert!(stop.stop_by_user());
+        (stop, control, guard)
+    }
+
+    #[test]
+    fn the_user_can_rearm_only_their_own_drained_stop() {
+        // Nothing to re-arm while admission is open.
+        let open = StopController::default();
+        assert_eq!(open.rearm_by_user(), Err(RearmRefusal::NotStopped));
+
+        // Refused while the stopped work drains, then while its session is still owned.
+        let (stop, _control, guard) = user_stop_with_work();
+        assert!(stop.user_may_rearm(), "reversible once it drains");
+        assert!(!stop.can_rearm());
+        assert_eq!(stop.rearm_by_user(), Err(RearmRefusal::Draining));
+        drop(guard);
+        assert_eq!(stop.rearm_by_user(), Err(RearmRefusal::Draining));
+        assert!(stop.is_stopped(), "a refused re-arm changes nothing");
+        stop.set_session_active(false);
+
+        // Drained, with the session released: the user's press reopens admission.
+        assert!(stop.can_rearm());
+        let epoch = stop.stop_epoch();
+        let wakes = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&wakes);
+        stop.subscribe(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        assert_eq!(stop.rearm_by_user(), Ok(()));
+        assert_eq!(wakes.load(Ordering::SeqCst), 1, "watchers hear the re-arm");
+        assert_eq!(stop.stop_epoch(), epoch + 1, "a new stop epoch");
+        assert!(!stop.is_stopped() && !stop.user_stopped());
+        assert_eq!(stop.recovery(), None);
+        assert_eq!(stop.status(), "ready");
+        assert_eq!(stop.refusal_message(), None);
+        assert_eq!(
+            stop.rearm_by_user(),
+            Err(RearmRefusal::NotStopped),
+            "a second press changes nothing"
+        );
+
+        // A new session is admitted the ordinary way, and a later stop latches again.
+        let next = MutationControl::default();
+        let guard = stop.register(next.clone()).unwrap();
+        stop.set_session_active(true);
+        assert!(stop.stop_by_user());
+        assert!(next.is_cancelled());
+        assert_eq!(
+            stop.snapshot(),
+            StopSnapshot {
+                epoch: epoch + 1,
+                recovery: Some(StopRecovery::WaitForDrain),
+                user_stop: true,
+            }
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn a_failed_release_a_server_failure_or_a_client_stop_is_never_rearmed() {
+        // Cleanup that could not be confirmed after the user's stop.
+        let (stop, control, guard) = user_stop_with_work();
+        control.cleanup_status(CleanupStatus::Unknown);
+        drop(guard);
+        stop.set_session_active(false);
+        assert!(!stop.user_may_rearm());
+        assert_eq!(stop.rearm_by_user(), Err(RearmRefusal::CleanupFailed));
+        assert_eq!(stop.status(), "cleanup_failed");
+
+        // The server failed after the user's stop.
+        let (stop, _control, guard) = user_stop_with_work();
+        drop(guard);
+        stop.set_session_active(false);
+        stop.stop_with_failure("the session tab failed");
+        assert_eq!(stop.rearm_by_user(), Err(RearmRefusal::ServerFailure));
+        assert_eq!(stop.recovery(), Some(StopRecovery::RestartClient));
+        assert!(!stop.refusal_message().unwrap().contains("Allow again"));
+
+        // `stop_desktop_work` after the user's own stop still closes input for good.
+        let (stop, _control, guard) = user_stop_with_work();
+        stop.stop();
+        drop(guard);
+        stop.set_session_active(false);
+        assert!(stop.user_stopped(), "the user's stop is still reported");
+        assert_eq!(stop.rearm_by_user(), Err(RearmRefusal::NotUserStop));
+        assert_eq!(stop.recovery(), Some(StopRecovery::RestartClient));
+
+        // `stop_desktop_work` and the server's own stops.
+        let stop = StopController::default();
+        stop.set_session_active(true);
+        stop.stop();
+        stop.set_session_active(false);
+        assert_eq!(stop.rearm_by_user(), Err(RearmRefusal::NotUserStop));
+        let failed = StopController::default();
+        failed.stop_with_failure("no monitors");
+        assert_eq!(failed.rearm_by_user(), Err(RearmRefusal::ServerFailure));
+        for stop in [stop, failed] {
+            assert!(stop.is_stopped(), "permanent");
+            assert!(!stop.can_rearm() && !stop.user_may_rearm());
+            assert_eq!(stop.stop_epoch(), 0);
+        }
     }
 
     #[test]

@@ -215,7 +215,8 @@ async fn assert_human_stop_lifecycle(requested: ProtocolVersion) {
     assert!(refused.to_string().contains("You stopped desktop input"));
     assert_eq!(
         refused["result"]["structuredContent"]["error"]["details"]["recovery"]["action"],
-        "restart_client"
+        "allow_again",
+        "the user's own stop, drained: the user may allow input again"
     );
     drop(client);
     tokio::time::timeout(Duration::from_secs(5), serving)
@@ -368,7 +369,13 @@ async fn receive_stop_status(client: &mut BufReader<tokio::io::DuplexStream>, ex
             status_received = true;
         }
         if value["method"] == "notifications/controlfreak/session_stopped" {
-            assert_eq!(value["params"]["event"], "user_stopped_session");
+            // The stop comes first; the end of its drain may follow before the status reply.
+            let expected = if event_received && expect_event {
+                "stop_drained"
+            } else {
+                "user_stopped_session"
+            };
+            assert_eq!(value["params"]["event"], expected);
             event_received = true;
         }
     }

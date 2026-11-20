@@ -1,10 +1,10 @@
 #![allow(unsafe_code)]
 
-//! The session tab, its Stop button and the physical-Esc monitor.
+//! The session tab, its Stop and Allow again controls and the physical-Esc monitor.
 //!
 //! Two threads, so a slow paint can never delay a keystroke. The tab thread paints the tab and
-//! the Stop button and owns every window. The Esc thread owns the low-level keyboard hook, and
-//! only while a session is owned; it does nothing else.
+//! its controls and owns every window. The Esc thread owns the low-level keyboard hook, and only
+//! while a session is owned; it does nothing else.
 
 use controlfreak_core::StopController;
 use std::{
@@ -28,8 +28,8 @@ use windows::{
         UI::{
             Accessibility::NotifyWinEvent,
             Input::{
-                GetCurrentInputMessageSource, IMO_HARDWARE, INPUT_MESSAGE_ORIGIN_ID,
-                INPUT_MESSAGE_SOURCE,
+                GetCurrentInputMessageSource, IMDT_MOUSE, IMDT_PEN, IMDT_TOUCH, IMDT_TOUCHPAD,
+                IMO_HARDWARE, INPUT_MESSAGE_ORIGIN_ID, INPUT_MESSAGE_SOURCE,
                 KeyboardAndMouse::{
                     GetAsyncKeyState, GetCapture, ReleaseCapture, SetCapture, TME_LEAVE,
                     TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE,
@@ -42,9 +42,9 @@ use windows::{
                 BM_CLICK, BS_OWNERDRAW, CHILDID_SELF, CallNextHookEx, CreateWindowExW,
                 DefWindowProcW, DestroyWindow, DispatchMessageW, EVENT_OBJECT_NAMECHANGE,
                 EVENT_SYSTEM_ALERT, GetClientRect, GetForegroundWindow, HHOOK, HTTRANSPARENT,
-                HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MA_NOACTIVATE, MSG,
-                MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, OBJID_WINDOW, PM_REMOVE,
-                PeekMessageW, PostThreadMessageW, QS_ALLINPUT, RegisterClassW, SW_HIDE,
+                HWND_TOPMOST, IDC_ARROW, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LoadCursorW,
+                MA_NOACTIVATE, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, OBJID_WINDOW,
+                PM_REMOVE, PeekMessageW, PostThreadMessageW, QS_ALLINPUT, RegisterClassW, SW_HIDE,
                 SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowDisplayAffinity,
                 SetWindowPos, SetWindowTextW, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx,
                 UnregisterClassW, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WINDOW_STYLE, WM_APP,
@@ -85,6 +85,12 @@ const SETTINGS_INTERVAL: Duration = Duration::from_millis(500);
 const IDLE_SETTINGS_INTERVAL: Duration = Duration::from_secs(2);
 /// The label of the Stop button, which is also its accessible name.
 const STOP_BUTTON_LABEL: &str = "Stop agent";
+/// The window class of the Allow again control. Deliberately not `BUTTON`: see [`ButtonRole`].
+const ALLOW_AGAIN_CLASS: windows::core::PCWSTR = w!("ControlFreakAllowAgain");
+/// The words painted on the Allow again control.
+const ALLOW_AGAIN_LABEL: &str = "Allow again";
+/// Its accessible name, which says that assistive technology cannot press it.
+const ALLOW_AGAIN_NAME: &str = "Allow again, with a mouse, touch or pen only";
 /// Identifies this module's subclass on the Stop button.
 const BUTTON_SUBCLASS_ID: usize = 0x5354_4f50;
 /// Sent to a window when the pointer leaves it, after `TrackMouseEvent` asked for it.
@@ -99,6 +105,8 @@ enum EscapeState {
 
 thread_local! {
     static CONTROLLER: RefCell<Option<StopController>> = const { RefCell::new(None) };
+    /// On the Esc thread: what the tab shows, which decides whether Esc stops.
+    static SIGNALS: RefCell<Option<Arc<SessionSignals>>> = const { RefCell::new(None) };
     static ESC_STATE: Cell<EscapeState> = const { Cell::new(EscapeState::Released) };
     static SETTINGS_CHANGED: Cell<bool> = const { Cell::new(false) };
     /// The look of every Stop button on this thread, by window handle. The tab loop paints the
@@ -177,6 +185,8 @@ pub struct SessionSignals {
     ui_thread: AtomicU32,
     /// The tab about to start was started by a screen read, which it should show.
     announce_read: AtomicBool,
+    /// The tab shows "Esc to stop". Written by the tab thread, read by the Esc hook.
+    esc_hint: AtomicBool,
     elevated: bool,
 }
 
@@ -187,6 +197,7 @@ impl SessionSignals {
             actions: AtomicU64::new(0),
             ui_thread: AtomicU32::new(0),
             announce_read: AtomicBool::new(false),
+            esc_hint: AtomicBool::new(false),
             elevated,
         }
     }
@@ -202,8 +213,10 @@ impl SessionSignals {
         if acting {
             self.actions.fetch_add(1, Ordering::AcqRel);
         }
+        // Sequentially consistent with the Esc hint, which the hook reads before it (see
+        // `escape_stops`).
         self.activity
-            .store(if acting { 2 } else { 1 }, Ordering::Release);
+            .store(if acting { 2 } else { 1 }, Ordering::SeqCst);
         self.wake();
     }
 
@@ -223,6 +236,25 @@ impl SessionSignals {
 
     fn actions(&self) -> u64 {
         self.actions.load(Ordering::Acquire)
+    }
+
+    /// Records whether the tab now shows "Esc to stop".
+    fn show_esc_hint(&self, shown: bool) {
+        self.esc_hint.store(shown, Ordering::SeqCst);
+    }
+
+    /// Whether a physical Esc stops the session now: while an action runs, and for as long as the
+    /// tab still says "Esc to stop". While the tab says the agent is waiting, Esc belongs to the
+    /// application. Both are atomics, so the hook answers without waiting for anything. An action
+    /// counts from the moment its level is acknowledged, before the tab repaints, so Esc never
+    /// passes through while input is being sent.
+    ///
+    /// The hint is read first, and all four accesses are sequentially consistent. A hint already
+    /// cleared means the tab said "waiting" by then, and an action acknowledged before the second
+    /// read is still seen; a tab thread that clears a stale hint while an action starts can then
+    /// never hide both from the hook.
+    fn escape_stops(&self) -> bool {
+        self.esc_hint.load(Ordering::SeqCst) || self.activity.load(Ordering::SeqCst) == 2
     }
 
     fn wake(&self) {
@@ -304,8 +336,10 @@ impl UserStop {
     pub fn attach_session_monitor(&mut self, controller: &StopController) -> Result<(), String> {
         if self.escape.is_none() {
             self.escape = Some(
-                EscapeMonitor::start(controller, || Box::new(SystemHook::default()))
-                    .map_err(|error| format!("the Esc monitor could not start: {error}"))?,
+                EscapeMonitor::start(controller, Arc::clone(&self.signals), || {
+                    Box::new(SystemHook::default())
+                })
+                .map_err(|error| format!("the Esc monitor could not start: {error}"))?,
             );
         }
         Ok(())
@@ -449,6 +483,7 @@ struct EscapeMonitor {
 impl EscapeMonitor {
     fn start(
         controller: &StopController,
+        signals: Arc<SessionSignals>,
         make_hook: impl FnOnce() -> Box<dyn KeyboardHook> + Send + 'static,
     ) -> io::Result<Self> {
         let exiting = Arc::new(AtomicBool::new(false));
@@ -466,7 +501,11 @@ impl EscapeMonitor {
             let exiting = Arc::clone(&exiting);
             thread::Builder::new()
                 .name("controlfreak-escape-hook".to_owned())
-                .spawn(move || escape_loop(&controller, make_hook(), &thread_id, &exiting))
+                .spawn(move || {
+                    SIGNALS.with(|slot| *slot.borrow_mut() = Some(signals));
+                    escape_loop(&controller, make_hook(), &thread_id, &exiting);
+                    SIGNALS.with(|slot| *slot.borrow_mut() = None);
+                })
                 // The listener above is already subscribed; mark it finished so it removes
                 // itself on the next notification instead of lingering.
                 .inspect_err(|_| wake_exiting_on_failure.store(true, Ordering::Release))?
@@ -637,6 +676,20 @@ impl NativeStop {
                     &windows::core::Error::from_thread(),
                 ));
             }
+            // The arrow is a shared system cursor, never destroyed; without a class cursor the
+            // pointer would keep whatever shape it had where it came from.
+            let allow_again = WNDCLASSW {
+                lpfnWndProc: Some(allow_again_proc),
+                hInstance: instance,
+                hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                lpszClassName: ALLOW_AGAIN_CLASS,
+                ..Default::default()
+            };
+            if RegisterClassW(&raw const allow_again) == 0 {
+                let error = windows::core::Error::from_thread();
+                let _ = UnregisterClassW(CLASS_NAME, Some(instance));
+                return Err(windows_error("RegisterClassW", &error));
+            }
             Ok(Self {
                 instance,
                 tabs: Vec::new(),
@@ -662,9 +715,10 @@ impl Drop for NativeStop {
     fn drop(&mut self) {
         // Destroy the windows before their class.
         self.tabs.clear();
-        // SAFETY: The class was registered on this thread and is released once.
+        // SAFETY: Both classes were registered on this thread and are released once.
         unsafe {
             let _ = UnregisterClassW(CLASS_NAME, Some(self.instance));
+            let _ = UnregisterClassW(ALLOW_AGAIN_CLASS, Some(self.instance));
         }
     }
 }
@@ -680,11 +734,12 @@ struct TabWindow {
     visible: bool,
     /// The accessible name last given to the window.
     name: String,
-    button: StopButton,
+    button: TabButton,
+    allow_again: TabButton,
     text_scale: f32,
 }
 
-/// Size of the Stop button in physical pixels for one display.
+/// Size of a tab control (Stop or Allow again) in physical pixels for one display.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ButtonMetrics {
     width: i32,
@@ -736,8 +791,9 @@ fn button_origin(
 /// agent's own input tools are injected, and a posted message from another process reports no
 /// origin (`IMO_UNAVAILABLE`), so neither can press the button. `IMO_SYSTEM` is refused too: no
 /// supported way to press the button produces it. An unreadable origin is refused. Assistive
-/// technology that invokes the button through UI Automation does not need an origin: it sends
-/// `BM_CLICK`, which is handled before this check.
+/// technology that invokes the Stop button through UI Automation does not need an origin: it
+/// sends `BM_CLICK`, which is handled before this check. The Allow again control has no such
+/// path, so this check is the only way to press it.
 fn input_is_from_a_person(source: windows::core::Result<INPUT_MESSAGE_SOURCE>) -> bool {
     source.is_ok_and(|source| is_hardware(source.originId))
 }
@@ -746,49 +802,105 @@ fn is_hardware(origin: INPUT_MESSAGE_ORIGIN_ID) -> bool {
     origin == IMO_HARDWARE
 }
 
-/// The current message's source. `BM_CLICK` and the other messages that do not come from the
-/// input queue report no origin; they are not input and are handled before this is asked.
-fn current_input_is_from_a_person() -> bool {
+/// The stricter rule of the Allow again control: a hardware origin, and a pointing device as
+/// the device. Windows also reports `IMO_HARDWARE` for input that an application with the
+/// `UIAccess` manifest attribute injects, so the device type is a second check: a keyboard, and a
+/// device Windows cannot name (as for sent messages and, possibly, such injection), are refused.
+fn pointer_is_from_a_person(source: windows::core::Result<INPUT_MESSAGE_SOURCE>) -> bool {
+    let pointing = IMDT_MOUSE.0 | IMDT_TOUCH.0 | IMDT_PEN.0 | IMDT_TOUCHPAD.0;
+    source.is_ok_and(|source| {
+        is_hardware(source.originId)
+            && source.deviceType.0 != 0
+            && source.deviceType.0 & !pointing == 0
+    })
+}
+
+fn current_input_source() -> windows::core::Result<INPUT_MESSAGE_SOURCE> {
     let mut source = INPUT_MESSAGE_SOURCE::default();
     // SAFETY: `source` is writable for the synchronous call, which reads the calling thread's
     // current message.
-    input_is_from_a_person(
-        unsafe { GetCurrentInputMessageSource(&raw mut source) }.map(|()| source),
-    )
+    unsafe { GetCurrentInputMessageSource(&raw mut source) }.map(|()| source)
 }
 
-/// A real, native button on its own small window, owned by the tab. Being a standard `BUTTON`
-/// it exposes the Invoke pattern to UI Automation, so voice control and switch access can press
-/// it, as can a mouse, finger or pen; an on-screen keyboard sends keys, which the button drops.
-/// It is enabled and not transparent, so hit-testing resolves to it, and its process is not the
-/// target's, which the pointer checks refuse; its subclass also drops injected input. It never
-/// takes focus.
+/// The current message's source. `BM_CLICK` and the other messages that do not come from the
+/// input queue report no origin; they are not input and are handled before this is asked.
+fn current_input_is_from_a_person() -> bool {
+    input_is_from_a_person(current_input_source())
+}
+
+/// Which control a [`TabButton`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ButtonRole {
+    /// Stops the session. A standard `BUTTON`, so UI Automation can invoke it: anyone may stop.
+    Stop,
+    /// Reopens input after the user's own stop. It is not a `BUTTON`, so UI Automation offers no
+    /// Invoke pattern for it, and it ignores `BM_CLICK`, which any process on the desktop can
+    /// send, including one the agent drives. Only a press whose origin is input hardware counts.
+    AllowAgain,
+}
+
+impl ButtonRole {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Stop => STOP_BUTTON_LABEL,
+            Self::AllowAgain => ALLOW_AGAIN_LABEL,
+        }
+    }
+
+    const fn accessible_name(self) -> &'static str {
+        match self {
+            Self::Stop => STOP_BUTTON_LABEL,
+            Self::AllowAgain => ALLOW_AGAIN_NAME,
+        }
+    }
+}
+
+/// A control on its own small window, owned by the tab: the Stop button or the Allow again
+/// control. It is enabled and not transparent, so hit-testing resolves to it, and its process is
+/// not the target's, which the pointer checks refuse; it also drops input whose origin is not
+/// input hardware, so the agent's injected input cannot press it. It never takes focus.
 ///
-/// The class gives the button its role and name; its picture and its press are handled here.
-/// It is owner-drawn and layered, and shows faces the tab's painter made, so it has the tab's
-/// colours, type and rounded corners instead of the unthemed system button. The press is
-/// tracked by the subclass (see [`pointer_message`]), because a top-level button reports its
-/// click to the desktop window, where nothing of ours hears it.
-struct StopButton {
+/// The Stop button is a real, native `BUTTON`: it exposes the Invoke pattern to UI Automation,
+/// so voice control and switch access can press it, as can a mouse, finger or pen; an on-screen
+/// keyboard sends keys, which the button drops. The Allow again control is a window of this
+/// module's own class instead, so only a mouse, finger or pen can press it (see [`ButtonRole`]).
+///
+/// The window text is the accessible name; the picture and the press are handled here. Both are
+/// layered and show faces the tab's painter made, so they have the tab's colours, type and
+/// rounded corners. The press is tracked here (see [`pointer_message`]), because a top-level
+/// button reports its click to the desktop window, where nothing of ours hears it.
+struct TabButton {
+    role: ButtonRole,
     hwnd: HWND,
     /// The DPI, text scale and palette the faces were painted for.
     fitted: Option<(u32, u32, Palette)>,
     shown: Option<(i32, i32, i32, i32)>,
 }
 
-impl StopButton {
-    fn create(instance: HINSTANCE, owner: HWND) -> io::Result<Self> {
-        // The window text is the button's accessible name.
-        let name: Vec<u16> = STOP_BUTTON_LABEL.encode_utf16().chain(Some(0)).collect();
-        // SAFETY: The class is a system class, the owner is a live window of this thread, `name`
-        // is NUL-terminated and copied by the call, and the returned HWND is owned by this value
-        // until Drop destroys it.
+impl TabButton {
+    fn create(instance: HINSTANCE, owner: HWND, role: ButtonRole) -> io::Result<Self> {
+        // The window text is the control's accessible name.
+        let name: Vec<u16> = role
+            .accessible_name()
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let (class, style) = match role {
+            ButtonRole::Stop => (
+                w!("BUTTON"),
+                WS_POPUP | WINDOW_STYLE(BS_OWNERDRAW.cast_unsigned()),
+            ),
+            ButtonRole::AllowAgain => (ALLOW_AGAIN_CLASS, WS_POPUP),
+        };
+        // SAFETY: The class is a system class or one this thread registered, the owner is a live
+        // window of this thread, `name` is NUL-terminated and copied by the call, and the
+        // returned HWND is owned by this value until Drop destroys it.
         let hwnd = unsafe {
             CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
-                w!("BUTTON"),
+                class,
                 PCWSTR(name.as_ptr()),
-                WS_POPUP | WINDOW_STYLE(BS_OWNERDRAW.cast_unsigned()),
+                style,
                 0,
                 0,
                 1,
@@ -799,18 +911,21 @@ impl StopButton {
                 None,
             )
         }
-        .map_err(|error| windows_error("CreateWindowExW(BUTTON)", &error))?;
+        .map_err(|error| windows_error("CreateWindowExW(tab control)", &error))?;
         // SAFETY: This thread owns `hwnd`; capture affinity stores no Rust pointers.
         if let Err(error) = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } {
             // SAFETY: Window creation succeeded and ownership has not escaped this function.
             let _ = unsafe { DestroyWindow(hwnd) };
             return Err(windows_error("SetWindowDisplayAffinity", &error));
         }
-        // SAFETY: `hwnd` belongs to this thread; the callback is a plain function and keeps no
-        // reference data.
-        if !unsafe { SetWindowSubclass(hwnd, Some(button_subclass), BUTTON_SUBCLASS_ID, 0) }
-            .as_bool()
-        {
+        // The Allow again class has its own window procedure; only the system button needs the
+        // subclass.
+        let subclassed = role != ButtonRole::Stop
+            // SAFETY: `hwnd` belongs to this thread; the callback is a plain function and keeps no
+            // reference data.
+            || unsafe { SetWindowSubclass(hwnd, Some(button_subclass), BUTTON_SUBCLASS_ID, 0) }
+                .as_bool();
+        if !subclassed {
             // SAFETY: Window creation succeeded and ownership has not escaped this function.
             let _ = unsafe { DestroyWindow(hwnd) };
             return Err(windows_error(
@@ -819,6 +934,7 @@ impl StopButton {
             ));
         }
         Ok(Self {
+            role,
             hwnd,
             fitted: None,
             shown: None,
@@ -840,8 +956,8 @@ impl StopButton {
             return Ok(false);
         }
         let size = (metrics.width, metrics.height);
-        let paint =
-            |state| painter.paint_button(STOP_BUTTON_LABEL, state, palette, dpi, text_scale, size);
+        let label = self.role.label();
+        let paint = |state| painter.paint_button(label, state, palette, dpi, text_scale, size);
         let [rest, hot, pressed] = ButtonState::ALL;
         let faces = [paint(rest)?, paint(hot)?, paint(pressed)?];
         BUTTON_LOOKS.with(|looks| {
@@ -930,14 +1046,16 @@ impl StopButton {
     }
 }
 
-impl Drop for StopButton {
+impl Drop for TabButton {
     fn drop(&mut self) {
         // The faces go with the button; a thread that is already ending has dropped them.
         let _ = BUTTON_LOOKS.try_with(|looks| looks.borrow_mut().remove(&button_key(self.hwnd)));
         // SAFETY: The window is owned by this value and released once. Destroying the owner
         // earlier would already have destroyed the window, which only makes this fail.
         unsafe {
-            let _ = RemoveWindowSubclass(self.hwnd, Some(button_subclass), BUTTON_SUBCLASS_ID);
+            if self.role == ButtonRole::Stop {
+                let _ = RemoveWindowSubclass(self.hwnd, Some(button_subclass), BUTTON_SUBCLASS_ID);
+            }
             let _ = DestroyWindow(self.hwnd);
         }
     }
@@ -952,7 +1070,17 @@ fn invoke_stop() -> bool {
     })
 }
 
-/// Whether a message is mouse or key input, which the Stop button ignores when injected.
+/// Reopens input after the user's own stop, when the stop allows it (see
+/// [`StopController::rearm_by_user`]).
+fn invoke_rearm() -> bool {
+    CONTROLLER.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|controller| controller.rearm_by_user().is_ok())
+    })
+}
+
+/// Whether a message is mouse or key input, which both controls ignore when injected.
 fn is_person_only_message(message: u32) -> bool {
     matches!(
         message,
@@ -986,8 +1114,8 @@ fn pointer_is_on(window: HWND, lparam: LPARAM) -> bool {
     (client.left..client.right).contains(&x) && (client.top..client.bottom).contains(&y)
 }
 
-/// Handles the pointer on the Stop button: the look under the pointer, the press, and the click
-/// that stops the session. `Some` is the message's result; `None` leaves it to the button class.
+/// Handles the pointer on a tab control: the look under the pointer, the press, and the click
+/// that calls `press`. `Some` is the message's result; `None` leaves it to the window class.
 ///
 /// The class cannot be left to track the press. As a top-level window it ignores the first click
 /// (it arms only once it holds the focus) and reports a click to its parent, which for a
@@ -995,7 +1123,12 @@ fn pointer_is_on(window: HWND, lparam: LPARAM) -> bool {
 /// The press is the usual one: it starts on the button, shows while the pointer is on it, and
 /// counts when the pointer is released there. The caller has already dropped presses and
 /// releases that did not come from input hardware, and nothing here asks for the focus.
-fn pointer_message(window: HWND, message: u32, lparam: LPARAM) -> Option<LRESULT> {
+fn pointer_message(
+    window: HWND,
+    message: u32,
+    lparam: LPARAM,
+    press: fn() -> bool,
+) -> Option<LRESULT> {
     // SAFETY: Reads which window of this thread holds the mouse capture; no pointers.
     let pressing = || unsafe { GetCapture() } == window;
     match message {
@@ -1039,7 +1172,7 @@ fn pointer_message(window: HWND, message: u32, lparam: LPARAM) -> Option<LRESULT
                 let _ = unsafe { ReleaseCapture() };
                 change_button(window, |look| look.pressed = false);
                 if clicked {
-                    invoke_stop();
+                    press();
                 }
             }
             Some(LRESULT(0))
@@ -1067,6 +1200,8 @@ unsafe extern "system" fn button_subclass(
     match message {
         // A click never activates the button's window, so it never takes focus from the user.
         WM_MOUSEACTIVATE => return LRESULT(isize::try_from(MA_NOACTIVATE).unwrap_or(3)),
+        // Only the tab removes its controls; another process cannot close it.
+        WM_CLOSE => return LRESULT(0),
         // UI Automation's Invoke pattern, and therefore assistive technology, clicks this way.
         // It is not input, so it needs no origin.
         BM_CLICK => {
@@ -1078,7 +1213,7 @@ unsafe extern "system" fn button_subclass(
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_LBUTTONUP | WM_MOUSEMOVE | WM_CAPTURECHANGED
         | WM_MOUSELEAVE => {
-            if let Some(result) = pointer_message(window, message, lparam) {
+            if let Some(result) = pointer_message(window, message, lparam, invoke_stop) {
                 return result;
             }
         }
@@ -1091,6 +1226,49 @@ unsafe extern "system" fn button_subclass(
     }
     // SAFETY: Forward unchanged callback arguments to the next procedure in the chain.
     unsafe { DefSubclassProc(window, message, wparam, lparam) }
+}
+
+/// What the Allow again control does with a message, or `None` to leave it to the default
+/// procedure. `from_a_person` reads the current message's origin; it is asked only for mouse and
+/// key input.
+///
+/// Nothing that another process can send presses it. `BM_CLICK` is ignored: that is how UI
+/// Automation would invoke a button, and any process on the desktop can send it, including one
+/// the agent drives. Keys are ignored too: the control never has the focus. `WM_CLOSE` is
+/// ignored, so no other process can remove it. A mouse message counts only when its origin is
+/// input hardware and its device a pointing device (see [`pointer_is_from_a_person`]), which a
+/// mouse, touch screen or pen gives and injected input, a posted message and a sent one do not.
+fn allow_again_message(
+    window: HWND,
+    message: u32,
+    lparam: LPARAM,
+    from_a_person: impl FnOnce() -> bool,
+) -> Option<LRESULT> {
+    match message {
+        WM_MOUSEACTIVATE => Some(LRESULT(isize::try_from(MA_NOACTIVATE).unwrap_or(3))),
+        BM_CLICK | WM_CLOSE | WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP | WM_CHAR => {
+            Some(LRESULT(0))
+        }
+        message if is_person_only_message(message) && !from_a_person() => Some(LRESULT(0)),
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_LBUTTONUP | WM_MOUSEMOVE | WM_CAPTURECHANGED
+        | WM_MOUSELEAVE => pointer_message(window, message, lparam, invoke_rearm),
+        _ => None,
+    }
+}
+
+unsafe extern "system" fn allow_again_proc(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if let Some(result) = allow_again_message(window, message, lparam, || {
+        pointer_is_from_a_person(current_input_source())
+    }) {
+        return result;
+    }
+    // SAFETY: Forward unchanged Win32 callback arguments to the default procedure.
+    unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
 
 impl TabWindow {
@@ -1127,8 +1305,12 @@ impl TabWindow {
             let _ = unsafe { DestroyWindow(hwnd) };
             return Err(windows_error("SetWindowDisplayAffinity", &error));
         }
-        let button = match StopButton::create(instance, hwnd) {
-            Ok(button) => button,
+        let controls = TabButton::create(instance, hwnd, ButtonRole::Stop).and_then(|button| {
+            TabButton::create(instance, hwnd, ButtonRole::AllowAgain)
+                .map(|allow_again| (button, allow_again))
+        });
+        let (button, allow_again) = match controls {
+            Ok(controls) => controls,
             Err(error) => {
                 // SAFETY: Window creation succeeded and ownership has not escaped this function.
                 let _ = unsafe { DestroyWindow(hwnd) };
@@ -1146,41 +1328,51 @@ impl TabWindow {
             visible: false,
             name: String::new(),
             button,
+            allow_again,
             text_scale: 1.0,
         })
     }
 
-    /// Shows or hides the Stop button under the tab body. It is offered only while `offered`,
-    /// the tab is fully shown and the display has room for it.
-    fn place_stop_button(
+    /// Shows or hides the Stop button and the Allow again control under the tab body, in the
+    /// same place; `(stop, allow_again)` says which is offered, and at most one is. Each is shown
+    /// only while it is offered, the tab is fully shown and the display has room for it.
+    fn place_controls(
         &mut self,
-        offered: bool,
+        (stop, allow_again): (bool, bool),
         painter: &Painter,
         palette: &Palette,
     ) -> io::Result<()> {
         let metrics = button_metrics(self.monitor.dpi, self.text_scale);
-        let rect = self
-            .tab
-            .as_ref()
-            .filter(|_| offered && self.visible)
-            .and_then(|tab| {
-                button_origin(
-                    self.monitor,
-                    self.origin.x,
-                    tab.width,
-                    tab.body_bottom,
-                    metrics,
-                )
-                .map(|origin| (origin.x, origin.y, metrics.width, metrics.height))
-            });
-        let Some(rect) = rect else {
-            self.button.hide();
-            return Ok(());
-        };
-        let repainted =
-            self.button
-                .fit(painter, palette, self.monitor.dpi, self.text_scale, metrics)?;
-        self.button.place(rect, repainted)
+        let rect = self.tab.as_ref().filter(|_| self.visible).and_then(|tab| {
+            button_origin(
+                self.monitor,
+                self.origin.x,
+                tab.width,
+                tab.body_bottom,
+                metrics,
+            )
+            .map(|origin| (origin.x, origin.y, metrics.width, metrics.height))
+        });
+        let (dpi, text_scale) = (self.monitor.dpi, self.text_scale);
+        // Hide first, so the two never stand in the same place at once.
+        for (control, offered) in [
+            (&mut self.button, stop),
+            (&mut self.allow_again, allow_again),
+        ] {
+            if !offered || rect.is_none() {
+                control.hide();
+            }
+        }
+        for (control, offered) in [
+            (&mut self.button, stop),
+            (&mut self.allow_again, allow_again),
+        ] {
+            if let Some(rect) = rect.filter(|_| offered) {
+                let repainted = control.fit(painter, palette, dpi, text_scale, metrics)?;
+                control.place(rect, repainted)?;
+            }
+        }
+        Ok(())
     }
 
     /// Paints `view` for this display and names the window with its words, so a window rebuilt
@@ -1253,6 +1445,7 @@ impl TabWindow {
     /// Keeps a visible tab above windows that became topmost after it.
     fn raise(&self) {
         self.button.raise();
+        self.allow_again.raise();
         if self.visible {
             // SAFETY: This thread owns the HWND; the call changes only z-order, without
             // activating the window or changing its size or position.
@@ -1297,6 +1490,7 @@ impl TabWindow {
 
     fn hide(&mut self) {
         self.button.hide();
+        self.allow_again.hide();
         if self.visible {
             // SAFETY: Hiding a window owned by this thread retains no pointers.
             let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
@@ -1307,8 +1501,8 @@ impl TabWindow {
 
 impl Drop for TabWindow {
     fn drop(&mut self) {
-        // Destroying the owner destroys the button's window with it; the button then only
-        // releases its font.
+        // Destroying the owner destroys the controls' windows with it; they then only release
+        // their faces.
         // SAFETY: `hwnd` is owned by this value and is destroyed exactly once.
         let _ = unsafe { DestroyWindow(self.hwnd) };
     }
@@ -1420,6 +1614,21 @@ impl Presenter {
     /// there is nothing left to stop or no session to stop.
     fn stop_button_offered(&self) -> bool {
         !self.fading() && self.shown.is_some_and(|view| stop_button_for(view.kind))
+    }
+
+    /// Whether the steady tab is the user's stop, under which Allow again may hang. The caller
+    /// also asks the latch whether a re-arm would succeed now.
+    fn allow_again_offered(&self) -> bool {
+        !self.fading() && self.shown.is_some_and(|view| view.kind == TabKind::Stopped)
+    }
+
+    /// Whether the tab says "Esc to stop": a working tab painted while the hook is confirmed,
+    /// including while it fades in. The Esc hook reads this, so Esc never passes through while
+    /// the tab says it stops.
+    fn shows_esc_hint(&self) -> bool {
+        self.painter.esc_hint_offered()
+            && self.shown.is_some_and(|view| view.kind == TabKind::Working)
+            && !matches!(self.phase, Phase::FadingOut(_))
     }
 
     fn paint(
@@ -1563,6 +1772,8 @@ fn announces(previous: Option<TabView>, next: TabView) -> bool {
         }
         TabKind::Stopping => previous != Some(TabKind::Stopping),
         TabKind::InputHeld => previous != Some(TabKind::InputHeld),
+        // The user's stop is announced, so a screen-reader user hears how to get input back.
+        TabKind::Stopped => previous != Some(TabKind::Stopped),
         // Reading the screen is a quiet rename: it claims nothing and takes nothing.
         TabKind::Reading => false,
         // A normal end is a quiet rename; the handback after a stop is announced.
@@ -1700,7 +1911,12 @@ fn tab_loop(
             now,
             TabInputs {
                 session_active: session_owned,
-                stop: StopStatus::parse(controller.status()),
+                // A stop the user can reverse shows its own card, with Allow again.
+                stop: if controller.user_may_rearm() {
+                    StopStatus::ByUser
+                } else {
+                    StopStatus::parse(controller.status())
+                },
                 activity: signals.activity(),
                 actions: signals.actions(),
                 elevated: signals.elevated,
@@ -1717,15 +1933,23 @@ fn tab_loop(
         }
         was_shown = view.is_some();
         presenter.update(&mut native.tabs, view, &settings, repaint, now)?;
+        signals.show_esc_hint(presenter.shows_esc_hint());
         // The Stop button is offered with a tab that says an agent owns the PC, once it is fully
-        // on screen, and never with any other message.
-        let offered = presenter.stop_button_offered();
+        // on screen, and never with any other message. Allow again hangs under the user's stop
+        // once its work has drained, when a press can succeed.
+        let offered = (
+            presenter.stop_button_offered(),
+            presenter.allow_again_offered() && controller.can_rearm(),
+        );
         for tab in &mut native.tabs {
-            tab.place_stop_button(offered, &presenter.painter, &settings.palette)?;
+            tab.place_controls(offered, &presenter.painter, &settings.palette)?;
         }
+        // The user's stop can stay for hours and changes only on a stop, session or Windows
+        // message, so it waits for those and the settings check, not for the tab's timers.
+        let timed = was_shown && view.is_none_or(|view| view.kind != TabKind::Stopped);
         let timeout = wait_timeout_ms(
             presenter.fading(),
-            was_shown,
+            timed,
             next_settings.saturating_duration_since(now),
         );
         wait_for_input(timeout)
@@ -1743,14 +1967,14 @@ const fn settings_interval(shown: bool) -> Duration {
     }
 }
 
-/// How long the tab thread sleeps before it must look again. While a tab is fading, shown or
-/// about to change on a timer (the waiting delay, the handback, the reading state), it paces
-/// those timers. With nothing shown there is no timer: the thread sleeps until the next settings
-/// check, and a session, stop, observation or Windows message wakes it earlier.
-fn wait_timeout_ms(fading: bool, shown: bool, until_settings: Duration) -> u32 {
+/// How long the tab thread sleeps before it must look again. While a tab is fading, or shown and
+/// about to change on a timer (`timed`: the waiting delay, the handback, the reading state), it
+/// paces those timers. With nothing shown, or a tab with no timer, the thread sleeps until the
+/// next settings check, and a session, stop, observation or Windows message wakes it earlier.
+fn wait_timeout_ms(fading: bool, timed: bool, until_settings: Duration) -> u32 {
     if fading {
         FADE_FRAME_MS
-    } else if shown {
+    } else if timed {
         POLL_INTERVAL_MS
     } else {
         u32::try_from(until_settings.as_millis())
@@ -1787,12 +2011,17 @@ fn wait_for_input(timeout_ms: u32) -> windows::core::Result<WaitOutcome> {
     }
 }
 
+/// Decides one key event: `true` swallows it. A physical Esc press stops the owned session and
+/// is swallowed with its release only when `stops`, that is while the agent acts or the tab says
+/// "Esc to stop" (see [`SessionSignals::escape_stops`]). While the agent waits, the press and its
+/// release reach the application and nothing latches. Injected Esc and every other key always
+/// pass through.
 fn consume_escape(
     controller: &StopController,
     key: u32,
     injected: bool,
-    down: bool,
-    up: bool,
+    (down, up): (bool, bool),
+    stops: bool,
     state: &Cell<EscapeState>,
 ) -> bool {
     if key != u32::from(VK_ESCAPE.0) || injected {
@@ -1800,7 +2029,7 @@ fn consume_escape(
     }
     if down {
         if state.get() == EscapeState::Released {
-            state.set(if controller.stop_by_user() {
+            state.set(if stops && controller.stop_by_user() {
                 EscapeState::Consumed
             } else {
                 EscapeState::PassedThrough
@@ -1819,6 +2048,12 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         // SAFETY: HC_ACTION for WH_KEYBOARD_LL supplies a valid KBDLLHOOKSTRUCT
         // for this callback only. Read key/flags without retaining keyboard data.
         let key = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        // Without the tab's signals the hook keeps the stricter rule: Esc stops.
+        let stops = SIGNALS.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_none_or(|signals| signals.escape_stops())
+        });
         let handled = CONTROLLER.with(|slot| {
             slot.borrow().as_ref().is_some_and(|controller| {
                 ESC_STATE.with(|state| {
@@ -1826,8 +2061,11 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                         controller,
                         key.vkCode,
                         key.flags.contains(LLKHF_INJECTED),
-                        wparam.0 == WM_KEYDOWN as usize || wparam.0 == WM_SYSKEYDOWN as usize,
-                        wparam.0 == WM_KEYUP as usize || wparam.0 == WM_SYSKEYUP as usize,
+                        (
+                            wparam.0 == WM_KEYDOWN as usize || wparam.0 == WM_SYSKEYDOWN as usize,
+                            wparam.0 == WM_KEYUP as usize || wparam.0 == WM_SYSKEYUP as usize,
+                        ),
+                        stops,
                         state,
                     )
                 })
@@ -2207,25 +2445,121 @@ mod tests {
         assert_eq!(activate.0, isize::try_from(MA_NOACTIVATE).unwrap());
     }
 
+    const DOWN: (bool, bool) = (true, false);
+    const UP: (bool, bool) = (false, true);
+
     #[test]
     fn only_physical_escape_in_an_owned_session_stops_and_consumes_key_pair() {
         let stop = StopController::default();
         let consumed = Cell::new(EscapeState::Released);
         let esc = u32::from(VK_ESCAPE.0);
-        assert!(!consume_escape(&stop, esc, false, true, false, &consumed));
+        assert!(!consume_escape(&stop, esc, false, DOWN, true, &consumed));
         stop.set_session_active(true);
         // Repeats from a press before ownership, and its release, pass through.
-        assert!(!consume_escape(&stop, esc, false, true, false, &consumed));
-        assert!(!consume_escape(&stop, esc, false, false, true, &consumed));
-        assert!(!consume_escape(&stop, esc, true, true, false, &consumed));
-        assert!(!consume_escape(&stop, 65, false, true, false, &consumed));
+        assert!(!consume_escape(&stop, esc, false, DOWN, true, &consumed));
+        assert!(!consume_escape(&stop, esc, false, UP, true, &consumed));
+        assert!(!consume_escape(&stop, esc, true, DOWN, true, &consumed));
+        assert!(!consume_escape(&stop, 65, false, DOWN, true, &consumed));
         assert!(!stop.is_stopped());
-        assert!(consume_escape(&stop, esc, false, true, false, &consumed));
+        assert!(consume_escape(&stop, esc, false, DOWN, true, &consumed));
         assert!(stop.user_stopped());
         stop.set_session_active(false);
-        assert!(consume_escape(&stop, esc, false, true, false, &consumed));
-        assert!(consume_escape(&stop, esc, false, false, true, &consumed));
-        assert!(!consume_escape(&stop, esc, false, false, true, &consumed));
+        assert!(consume_escape(&stop, esc, false, DOWN, true, &consumed));
+        assert!(consume_escape(&stop, esc, false, UP, true, &consumed));
+        assert!(!consume_escape(&stop, esc, false, UP, true, &consumed));
+    }
+
+    #[test]
+    fn escape_reaches_the_application_while_the_agent_waits_and_stops_while_it_acts() {
+        let stop = StopController::default();
+        stop.set_session_active(true);
+        let state = Cell::new(EscapeState::Released);
+        let esc = u32::from(VK_ESCAPE.0);
+        let signals = SessionSignals::new(false);
+        // Waiting: the press and its release pass through, and nothing latches.
+        signals.set_acting(false);
+        assert!(!signals.escape_stops(), "the tab says waiting");
+        let waiting = signals.escape_stops();
+        assert!(!consume_escape(&stop, esc, false, DOWN, waiting, &state));
+        assert!(
+            !consume_escape(&stop, esc, false, DOWN, waiting, &state),
+            "repeat"
+        );
+        assert!(!consume_escape(&stop, esc, false, UP, waiting, &state));
+        assert!(!stop.is_stopped(), "Esc while waiting is not a stop");
+
+        // A press that began while waiting stays the application's, even if an action starts
+        // before it is released.
+        assert!(!consume_escape(&stop, esc, false, DOWN, false, &state));
+        assert!(!consume_escape(&stop, esc, false, DOWN, true, &state));
+        assert!(!consume_escape(&stop, esc, false, UP, true, &state));
+        assert!(!stop.is_stopped());
+
+        // Acting: consumed with its release, and latched as the user's stop.
+        signals.set_acting(true);
+        let acting = signals.escape_stops();
+        assert!(acting);
+        assert!(consume_escape(&stop, esc, false, DOWN, acting, &state));
+        assert!(stop.user_stopped());
+        assert!(consume_escape(&stop, esc, false, UP, acting, &state));
+    }
+
+    #[test]
+    fn esc_stops_while_an_action_runs_and_while_the_tab_says_so() {
+        let signals = SessionSignals::new(false);
+        assert!(!signals.escape_stops(), "no level acknowledged yet");
+        signals.set_acting(true);
+        assert!(
+            signals.escape_stops(),
+            "an action counts before the tab repaints"
+        );
+        signals.show_esc_hint(true);
+        signals.set_acting(false);
+        assert!(
+            signals.escape_stops(),
+            "the tab still says working, and Esc to stop"
+        );
+        signals.show_esc_hint(false);
+        assert!(!signals.escape_stops(), "the tab now says waiting");
+        // A stale "waiting" repaint that clears the hint while the next action starts still
+        // leaves that action visible to the hook.
+        signals.show_esc_hint(true);
+        signals.set_acting(true);
+        signals.show_esc_hint(false);
+        assert!(signals.escape_stops());
+        signals.clear();
+        assert!(!signals.escape_stops());
+    }
+
+    #[test]
+    fn the_tab_reports_the_esc_hint_only_for_a_working_tab_with_a_confirmed_hook() {
+        let mut presenter = Presenter::new(Painter::new().unwrap());
+        let settings = Settings {
+            palette: Palette::STANDARD,
+            text_scale: 1.0,
+            animated: false,
+        };
+        let show = |presenter: &mut Presenter, kind: Option<TabKind>| {
+            let view = kind.map(|kind| TabView {
+                kind,
+                admin: false,
+                expanded: false,
+            });
+            presenter
+                .update(&mut [], view, &settings, false, Instant::now())
+                .unwrap();
+            presenter.shows_esc_hint()
+        };
+        assert!(!show(&mut presenter, None));
+        assert!(show(&mut presenter, Some(TabKind::Working)));
+        assert!(!show(&mut presenter, Some(TabKind::Waiting)));
+        assert!(!show(&mut presenter, Some(TabKind::Stopping)));
+        assert!(!show(&mut presenter, Some(TabKind::Stopped)));
+        presenter.painter.set_esc_hint(false);
+        assert!(
+            !show(&mut presenter, Some(TabKind::Working)),
+            "no hook, no hint"
+        );
     }
 
     #[derive(Clone, Default)]
@@ -2288,7 +2622,7 @@ mod tests {
     fn the_keyboard_hook_exists_only_while_a_session_is_owned() {
         let controller = StopController::default();
         let counts = HookCounts::default();
-        let monitor = EscapeMonitor::start(&controller, {
+        let monitor = EscapeMonitor::start(&controller, Arc::new(SessionSignals::new(false)), {
             let counts = counts.clone();
             move || Box::new(FakeHook(counts))
         })
@@ -2328,7 +2662,7 @@ mod tests {
         let controller = StopController::default();
         let counts = HookCounts::default();
         counts.fail.store(true, Ordering::SeqCst);
-        let monitor = EscapeMonitor::start(&controller, {
+        let monitor = EscapeMonitor::start(&controller, Arc::new(SessionSignals::new(false)), {
             let counts = counts.clone();
             move || Box::new(FakeHook(counts))
         })
@@ -2361,7 +2695,7 @@ mod tests {
     fn admission_can_wait_for_the_monitor_to_confirm_the_hook() {
         let controller = StopController::default();
         let counts = HookCounts::default();
-        let monitor = EscapeMonitor::start(&controller, {
+        let monitor = EscapeMonitor::start(&controller, Arc::new(SessionSignals::new(false)), {
             let counts = counts.clone();
             move || Box::new(FakeHook(counts))
         })
@@ -2510,6 +2844,7 @@ mod tests {
         };
         assert!(!presenter.stop_button_offered(), "nothing shown");
         assert!(show(&mut presenter, TabKind::Working));
+        assert!(!presenter.allow_again_offered());
         assert!(show(&mut presenter, TabKind::Waiting));
         assert!(!show(&mut presenter, TabKind::Stopping));
         assert!(!show(&mut presenter, TabKind::InputHeld));
@@ -2517,6 +2852,11 @@ mod tests {
             &mut presenter,
             TabKind::HandedBack { after_stop: false }
         ));
+        assert!(
+            !show(&mut presenter, TabKind::Stopped),
+            "the user already stopped"
+        );
+        assert!(presenter.allow_again_offered(), "Allow again hangs there");
         assert!(
             !show(&mut presenter, TabKind::Reading),
             "reading the screen owns nothing to stop"
@@ -2623,7 +2963,7 @@ mod tests {
         native.sync_monitors(&[monitor]).unwrap();
         let button = &mut native.tabs[0].button;
         let metrics = button_metrics(monitor.dpi, 1.0);
-        let fit = |button: &mut StopButton| {
+        let fit = |button: &mut TabButton| {
             button
                 .fit(&painter, &Palette::STANDARD, monitor.dpi, 1.0, metrics)
                 .unwrap()
@@ -2672,7 +3012,7 @@ mod tests {
             "the window is exactly the painted face"
         );
 
-        assert!(pointer_message(button, WM_MOUSEMOVE, LPARAM(0)).is_none());
+        assert!(pointer_message(button, WM_MOUSEMOVE, LPARAM(0), invoke_stop).is_none());
         native.tabs[0].button.hide();
         assert_eq!(
             look_of(button),
@@ -2698,7 +3038,7 @@ mod tests {
             LPARAM((isize::try_from(y).unwrap() << 16) | isize::try_from(x).unwrap())
         };
         let (on, off) = (at(4, 4), at(metrics.width + 40, 4));
-        let mouse = |message, point| pointer_message(button, message, point);
+        let mouse = |message, point| pointer_message(button, message, point, invoke_stop);
         // SAFETY: Reads this thread's capture; no pointers.
         let captured = || unsafe { GetCapture() } == button;
 
@@ -2796,6 +3136,292 @@ mod tests {
             isize::try_from(HTCLIENT).unwrap(),
             "the button is not: a click on it belongs to this process, which the target \
              checks refuse"
+        );
+    }
+
+    /// A latch closed by the user's own stop that has drained, so a re-arm would succeed.
+    fn drained_user_stop() -> StopController {
+        let stop = StopController::default();
+        stop.set_session_active(true);
+        assert!(stop.stop_by_user());
+        stop.set_session_active(false);
+        assert!(stop.can_rearm());
+        stop
+    }
+
+    #[test]
+    fn the_allow_again_control_is_its_own_window_class_owned_by_the_tab() {
+        use windows::Win32::UI::{
+            Input::KeyboardAndMouse::IsWindowEnabled,
+            WindowsAndMessaging::{
+                GWL_EXSTYLE, GetClassNameW, GetParent, GetWindowLongPtrW, GetWindowTextW, HTCLIENT,
+            },
+        };
+        let _windows = window_class_lock();
+        super::super::ensure_dpi_awareness().unwrap();
+        let mut native = NativeStop::create().unwrap();
+        let monitor = enumerate_monitors().unwrap().remove(0);
+        native.sync_monitors(&[monitor]).unwrap();
+        let tab = &native.tabs[0];
+        let control = tab.allow_again.hwnd;
+        let mut class = [0_u16; 64];
+        let mut name = [0_u16; 128];
+        // SAFETY: Both windows are live and owned by this thread; the buffers are writable for
+        // these synchronous calls.
+        unsafe {
+            let length = usize::try_from(GetClassNameW(control, &mut class)).unwrap();
+            assert_eq!(
+                String::from_utf16_lossy(&class[..length]),
+                "ControlFreakAllowAgain",
+                "not a BUTTON, so nothing offers it an Invoke pattern"
+            );
+            let length = usize::try_from(GetWindowTextW(control, &mut name)).unwrap();
+            assert_eq!(
+                String::from_utf16_lossy(&name[..length]),
+                ALLOW_AGAIN_NAME,
+                "its accessible name says who can press it"
+            );
+            assert!(IsWindowEnabled(control).as_bool());
+            let style = u32::try_from(GetWindowLongPtrW(control, GWL_EXSTYLE)).unwrap();
+            assert_eq!(style & WS_EX_TRANSPARENT.0, 0);
+            assert_ne!(style & WS_EX_NOACTIVATE.0, 0, "never takes focus");
+            assert_eq!(GetParent(control).unwrap(), tab.hwnd, "owned by its tab");
+            let hit = SendMessageW(control, WM_NCHITTEST, Some(WPARAM(0)), Some(LPARAM(0)));
+            assert_eq!(hit.0, isize::try_from(HTCLIENT).unwrap(), "takes clicks");
+            let activate =
+                SendMessageW(control, WM_MOUSEACTIVATE, Some(WPARAM(0)), Some(LPARAM(0)));
+            assert_eq!(activate.0, isize::try_from(MA_NOACTIVATE).unwrap());
+        }
+        let mut affinity = 0_u32;
+        // SAFETY: `affinity` is writable for the synchronous call and the window is live.
+        unsafe { GetWindowDisplayAffinity(control, &raw mut affinity) }.unwrap();
+        assert_eq!(affinity, WDA_EXCLUDEFROMCAPTURE.0, "never in screenshots");
+    }
+
+    #[test]
+    fn only_a_hardware_press_allows_input_again() {
+        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+        let _windows = window_class_lock();
+        super::super::ensure_dpi_awareness().unwrap();
+        let mut native = NativeStop::create().unwrap();
+        let monitor = enumerate_monitors().unwrap().remove(0);
+        native.sync_monitors(&[monitor]).unwrap();
+        let control = native.tabs[0].allow_again.hwnd;
+        let controller = drained_user_stop();
+        CONTROLLER.with(|slot| *slot.borrow_mut() = Some(controller.clone()));
+        // A point on the (still 1 by 1 pixel) control.
+        let on = LPARAM(0);
+        let press = |from_a_person: bool| {
+            for message in [WM_LBUTTONDOWN, WM_LBUTTONUP] {
+                assert!(allow_again_message(control, message, on, || from_a_person).is_some());
+            }
+        };
+
+        // BM_CLICK is how UI Automation invokes a button, and any process can send it: never a
+        // press, whatever the origin. Keys never press it either, and nothing can close it.
+        for message in [BM_CLICK, WM_CLOSE, WM_KEYDOWN, WM_KEYUP, WM_CHAR] {
+            assert_eq!(
+                allow_again_message(control, message, on, || true),
+                Some(LRESULT(0)),
+                "message {message:#x}"
+            );
+        }
+        // Injected input and posted or sent messages report no hardware origin.
+        press(false);
+        assert!(controller.is_stopped(), "only a person allows input again");
+
+        // The same through the window itself: sent, posted, and BM_CLICK.
+        // SAFETY: Value-only messages to a live window of this thread; the posted ones are
+        // dispatched below on this thread.
+        unsafe {
+            SendMessageW(control, BM_CLICK, Some(WPARAM(0)), Some(LPARAM(0)));
+            for message in [WM_LBUTTONDOWN, WM_LBUTTONUP] {
+                SendMessageW(control, message, Some(WPARAM(1)), Some(on));
+            }
+            for message in [WM_LBUTTONDOWN, WM_LBUTTONUP] {
+                PostMessageW(Some(control), message, WPARAM(1), on).unwrap();
+            }
+        }
+        drain_messages();
+        assert!(
+            controller.is_stopped(),
+            "a sent or posted press does nothing"
+        );
+        assert_eq!(controller.stop_epoch(), 0);
+
+        // A press from input hardware, released on the control: input is allowed again.
+        press(true);
+        assert!(!controller.is_stopped(), "a person's press re-arms");
+        assert_eq!(controller.stop_epoch(), 1);
+        assert_eq!(controller.status(), "ready");
+
+        // A stop the user cannot reverse is not reopened by a person's press either.
+        let permanent = StopController::default();
+        permanent.stop();
+        CONTROLLER.with(|slot| *slot.borrow_mut() = Some(permanent.clone()));
+        press(true);
+        assert!(permanent.is_stopped(), "a client stop stays");
+        CONTROLLER.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    #[test]
+    fn allow_again_takes_a_hardware_origin_from_a_pointing_device_only() {
+        use windows::Win32::UI::Input::{
+            IMDT_KEYBOARD, IMDT_UNAVAILABLE, IMO_INJECTED, IMO_SYSTEM, IMO_UNAVAILABLE,
+            INPUT_MESSAGE_DEVICE_TYPE,
+        };
+        let from = |origin, device| {
+            pointer_is_from_a_person(Ok(INPUT_MESSAGE_SOURCE {
+                deviceType: device,
+                originId: origin,
+            }))
+        };
+        for device in [IMDT_MOUSE, IMDT_TOUCH, IMDT_PEN, IMDT_TOUCHPAD] {
+            assert!(from(IMO_HARDWARE, device), "{device:?}");
+            for origin in [IMO_INJECTED, IMO_SYSTEM, IMO_UNAVAILABLE] {
+                assert!(!from(origin, device), "{origin:?} {device:?}");
+            }
+        }
+        // A hardware origin without a pointing device: a keyboard, or no device Windows can
+        // name, as for a sent message or input another application injected.
+        for device in [
+            IMDT_KEYBOARD,
+            IMDT_UNAVAILABLE,
+            INPUT_MESSAGE_DEVICE_TYPE(IMDT_MOUSE.0 | IMDT_KEYBOARD.0),
+            INPUT_MESSAGE_DEVICE_TYPE(64),
+        ] {
+            assert!(!from(IMO_HARDWARE, device), "{device:?}");
+        }
+        assert!(!pointer_is_from_a_person(Err(
+            windows::core::Error::from_hresult(windows::core::HRESULT(-1))
+        )));
+    }
+
+    #[test]
+    fn no_other_process_can_close_a_tab_control() {
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+        let _windows = window_class_lock();
+        super::super::ensure_dpi_awareness().unwrap();
+        let mut native = NativeStop::create().unwrap();
+        let monitor = enumerate_monitors().unwrap().remove(0);
+        native.sync_monitors(&[monitor]).unwrap();
+        let tab = &native.tabs[0];
+        for control in [tab.button.hwnd, tab.allow_again.hwnd] {
+            // SAFETY: A value-only message to a live window of this thread.
+            unsafe { SendMessageW(control, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0))) };
+            // SAFETY: Only asks whether the handle still names a window.
+            assert!(unsafe { IsWindow(Some(control)) }.as_bool());
+        }
+    }
+
+    /// UI Automation, as a screen reader or voice control uses it, from outside the tab thread.
+    /// The Stop button can be invoked that way; Allow again cannot, not even through the
+    /// accessibility default action.
+    #[test]
+    fn ui_automation_can_press_stop_but_not_allow_again() {
+        use windows::Win32::{
+            System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
+            UI::Accessibility::{
+                CUIAutomation, IUIAutomation, IUIAutomationInvokePattern,
+                IUIAutomationLegacyIAccessiblePattern, UIA_InvokePatternId,
+                UIA_LegacyIAccessiblePatternId,
+            },
+        };
+        use windows::core::Interface;
+        let _windows = window_class_lock();
+        let controller = StopController::default();
+        controller.set_session_active(true);
+        let exiting = Arc::new(AtomicBool::new(false));
+        let (sender, windows) = mpsc::channel();
+        // The tab thread, pumping its messages as the real one does.
+        let ui = {
+            let controller = controller.clone();
+            let exiting = Arc::clone(&exiting);
+            thread::spawn(move || {
+                super::super::ensure_dpi_awareness().unwrap();
+                CONTROLLER.with(|slot| *slot.borrow_mut() = Some(controller));
+                let mut native = NativeStop::create().unwrap();
+                let (stop, _, origin) = show_stop_button(&mut native);
+                let painter = Painter::new().unwrap();
+                let monitor = native.tabs[0].monitor;
+                let metrics = button_metrics(monitor.dpi, 1.0);
+                let allow = &mut native.tabs[0].allow_again;
+                allow
+                    .fit(&painter, &Palette::STANDARD, monitor.dpi, 1.0, metrics)
+                    .unwrap();
+                allow
+                    .place(
+                        (
+                            origin.x,
+                            origin.y + metrics.height + 8,
+                            metrics.width,
+                            metrics.height,
+                        ),
+                        true,
+                    )
+                    .unwrap();
+                sender
+                    .send((stop.0 as isize, allow.hwnd.0 as isize))
+                    .unwrap();
+                while !exiting.load(Ordering::SeqCst) {
+                    drain_messages();
+                    let _ = wait_for_input(20);
+                }
+                CONTROLLER.with(|slot| *slot.borrow_mut() = None);
+            })
+        };
+        let (stop, allow) = windows.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (done, outcome) = mpsc::channel();
+        let checked = controller.clone();
+        // UI Automation runs on a thread of its own, so a hang fails the test instead of
+        // stalling it.
+        thread::spawn(move || {
+            let _com = ComApartment::multithreaded().unwrap();
+            // SAFETY: COM is initialized on this thread; the class ID is the system's.
+            let automation: IUIAutomation =
+                unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }.unwrap();
+            let element = |hwnd: isize| {
+                // SAFETY: The handle names a live window of this process.
+                unsafe { automation.ElementFromHandle(HWND(hwnd as *mut _)) }.unwrap()
+            };
+            let stop = element(stop);
+            // SAFETY: Calls on live UI Automation elements of this process.
+            unsafe {
+                stop.GetCurrentPattern(UIA_InvokePatternId)
+                    .and_then(|pattern| pattern.cast::<IUIAutomationInvokePattern>())
+                    .expect("the Stop button offers Invoke")
+                    .Invoke()
+                    .unwrap();
+            }
+            eventually("the invoked Stop button to stop", || checked.user_stopped());
+            checked.set_session_active(false);
+            assert!(checked.can_rearm());
+
+            let allow = element(allow);
+            // SAFETY: Calls on a live UI Automation element of this process.
+            unsafe {
+                assert_eq!(allow.CurrentName().unwrap().to_string(), ALLOW_AGAIN_NAME);
+                assert!(
+                    allow.GetCurrentPattern(UIA_InvokePatternId).is_err(),
+                    "Allow again offers no Invoke pattern"
+                );
+                if let Ok(legacy) = allow
+                    .GetCurrentPattern(UIA_LegacyIAccessiblePatternId)
+                    .and_then(|pattern| pattern.cast::<IUIAutomationLegacyIAccessiblePattern>())
+                {
+                    let _ = legacy.DoDefaultAction();
+                }
+            }
+            thread::sleep(Duration::from_millis(300));
+            done.send(checked.is_stopped()).unwrap();
+        });
+        let still_stopped = outcome.recv_timeout(Duration::from_secs(30));
+        exiting.store(true, Ordering::SeqCst);
+        ui.join().unwrap();
+        assert_eq!(
+            still_stopped,
+            Ok(true),
+            "UI Automation must not allow input again"
         );
     }
 

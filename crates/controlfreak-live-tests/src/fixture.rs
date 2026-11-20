@@ -11,6 +11,9 @@
 //! controlfreak-fixture --title TEXT --log FILE [--color RRGGBB] [--pos X,Y] [--topmost]
 //!                      [--with-dialog] [--lifetime-secs N] [--busy-drain-ms N] [--clip-cursor]
 //! controlfreak-fixture --stop-button-rect     # print the screen rectangle of the Stop agent button
+//! controlfreak-fixture --invoke-stop-button   # send BM_CLICK to it, as UI Automation's Invoke does
+//! controlfreak-fixture --allow-again-rect     # print the screen rectangle of the Allow again control
+//! controlfreak-fixture --message-allow-again  # send BM_CLICK and sent and posted clicks to it
 //! controlfreak-fixture --activate-taskbar     # try to bring the shell taskbar to the foreground
 //! controlfreak-fixture --inject-click X,Y     # SendInput a left click at a screen point
 //! controlfreak-fixture --release-clip         # free the pointer from any ClipCursor rectangle
@@ -79,15 +82,16 @@ mod win {
                     MOUSEINPUT, SendInput, SetFocus, VIRTUAL_KEY,
                 },
                 WindowsAndMessaging::{
-                    AdjustWindowRectEx, BN_CLICKED, BS_PUSHBUTTON, ClipCursor, CreateWindowExW,
-                    DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, FindWindowW,
-                    GetClassNameW, GetClipCursor, GetForegroundWindow, GetMessageW, GetWindowRect,
-                    GetWindowTextW, HMENU, IDC_ARROW, IsWindowVisible, LoadCursorW, MSG, PM_REMOVE,
-                    PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SWP_NOACTIVATE,
-                    SWP_NOSIZE, SWP_NOZORDER, SetCursorPos, SetForegroundWindow, SetTimer,
-                    SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
-                    WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN,
-                    WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT, WM_PRINTCLIENT, WM_QUIT,
+                    AdjustWindowRectEx, BM_CLICK, BN_CLICKED, BS_PUSHBUTTON, ClipCursor,
+                    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows,
+                    FindWindowW, GetClassNameW, GetClipCursor, GetForegroundWindow, GetMessageW,
+                    GetWindowRect, GetWindowTextW, HMENU, IDC_ARROW, IsWindowVisible, LoadCursorW,
+                    MSG, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
+                    SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW,
+                    SetCursorPos, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
+                    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CHAR,
+                    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP,
+                    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT, WM_PRINTCLIENT, WM_QUIT,
                     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
                     WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP,
                     WS_SYSMENU, WS_VISIBLE, WaitMessage,
@@ -187,7 +191,10 @@ mod win {
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--stop-button-rect" => return print_stop_button_rect(),
+                "--stop-button-rect" => return print_rect(&STOP_BUTTON),
+                "--invoke-stop-button" => return invoke_stop_button(),
+                "--allow-again-rect" => return print_rect(&ALLOW_AGAIN),
+                "--message-allow-again" => return message_allow_again(),
                 "--activate-taskbar" => return activate_taskbar(),
                 "--inject-click" => return inject_click(&args.next().unwrap_or_default()),
                 "--hold-key" => return inject_key(&args.next().unwrap_or_default(), false),
@@ -771,15 +778,31 @@ mod win {
         }
     }
 
-    struct Search {
-        found: Option<RECT>,
+    /// A window of the server's session tab, found by its class and accessible name.
+    struct Control {
+        class: &'static str,
+        title: &'static str,
     }
 
-    unsafe extern "system" fn stop_button_callback(hwnd: HWND, data: LPARAM) -> BOOL {
+    const STOP_BUTTON: Control = Control {
+        class: "Button",
+        title: "Stop agent",
+    };
+    const ALLOW_AGAIN: Control = Control {
+        class: "ControlFreakAllowAgain",
+        title: "Allow again, with a mouse, touch or pen only",
+    };
+
+    struct Search {
+        control: &'static Control,
+        found: Option<(HWND, RECT)>,
+    }
+
+    unsafe extern "system" fn control_callback(hwnd: HWND, data: LPARAM) -> BOOL {
         // SAFETY: `data` is the unique `Search` passed to the synchronous EnumWindows below.
         let search = unsafe { &mut *(data.0 as *mut Search) };
-        let mut class = [0_u16; 32];
-        let mut title = [0_u16; 32];
+        let mut class = [0_u16; 64];
+        let mut title = [0_u16; 64];
         // SAFETY: Both buffers are writable for these synchronous queries on an enumerated handle.
         let (class_len, title_len, visible) = unsafe {
             (
@@ -790,35 +813,83 @@ mod win {
         };
         let class = String::from_utf16_lossy(&class[..usize::try_from(class_len).unwrap_or(0)]);
         let title = String::from_utf16_lossy(&title[..usize::try_from(title_len).unwrap_or(0)]);
-        if visible && class.eq_ignore_ascii_case("Button") && title == "Stop agent" {
+        if visible
+            && class.eq_ignore_ascii_case(search.control.class)
+            && title == search.control.title
+        {
             let mut rect = RECT::default();
             // SAFETY: `rect` is writable for the synchronous call.
             if unsafe { GetWindowRect(hwnd, &raw mut rect) }.is_ok() {
-                search.found = Some(rect);
+                search.found = Some((hwnd, rect));
                 return BOOL(0);
             }
         }
         BOOL(1)
     }
 
-    /// Prints `left top right bottom` of the visible Stop agent button, or exits with 1.
-    fn print_stop_button_rect() -> i32 {
-        let mut search = Search { found: None };
+    /// The visible window of `control` and its screen rectangle.
+    fn find(control: &'static Control) -> Option<(HWND, RECT)> {
+        let mut search = Search {
+            control,
+            found: None,
+        };
         // SAFETY: The LPARAM points at `search`, which outlives this synchronous enumeration.
         // EnumWindows reports an error when the callback stops it early, which is expected here.
         let _ = unsafe {
             EnumWindows(
-                Some(stop_button_callback),
+                Some(control_callback),
                 LPARAM((&raw mut search).cast::<c_void>() as isize),
             )
         };
-        match search.found {
-            Some(rect) => {
+        search.found
+    }
+
+    /// Prints `left top right bottom` of the visible control, or exits with 1.
+    fn print_rect(control: &'static Control) -> i32 {
+        match find(control) {
+            Some((_, rect)) => {
                 println!("{} {} {} {}", rect.left, rect.top, rect.right, rect.bottom);
                 0
             }
             None => 1,
         }
+    }
+
+    /// Presses the Stop button the way UI Automation's Invoke pattern does, with `BM_CLICK` from
+    /// another process. The server accepts that as the user's stop, which is how the live test
+    /// reaches the stopped tab without a person. Exit code 0 once the message was handled.
+    fn invoke_stop_button() -> i32 {
+        let Some((button, _)) = find(&STOP_BUTTON) else {
+            return 1;
+        };
+        // SAFETY: A value-only message to a window of another process; it carries no pointers.
+        unsafe { SendMessageW(button, BM_CLICK, Some(WPARAM(0)), Some(LPARAM(0))) };
+        0
+    }
+
+    /// Tries every way another process can press the Allow again control without input
+    /// hardware: `BM_CLICK` (what UI Automation would send), and a left click as sent and as
+    /// posted window messages at its centre. Exit code 0 once all were delivered.
+    fn message_allow_again() -> i32 {
+        let Some((control, rect)) = find(&ALLOW_AGAIN) else {
+            return 1;
+        };
+        let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+        let centre = ((height / 2) << 16) | (width / 2);
+        let point = LPARAM(isize::try_from(centre).unwrap_or(0));
+        // SAFETY: Value-only messages to a window of another process; they carry no pointers.
+        unsafe {
+            SendMessageW(control, BM_CLICK, Some(WPARAM(0)), Some(LPARAM(0)));
+            for message in [WM_LBUTTONDOWN, WM_LBUTTONUP] {
+                SendMessageW(control, message, Some(WPARAM(1)), Some(point));
+            }
+            for message in [WM_LBUTTONDOWN, WM_LBUTTONUP] {
+                if PostMessageW(Some(control), message, WPARAM(1), point).is_err() {
+                    return 1;
+                }
+            }
+        }
+        0
     }
 
     /// Sends one real `SendInput` left click at a screen point (physical pixels), the way any

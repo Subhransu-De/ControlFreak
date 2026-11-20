@@ -405,6 +405,7 @@ fn schemas_describe_idle_busy_and_stopped_server_status() {
     assert!(validator.is_valid(&busy), "{busy}");
     for (stop_state, actor, action) in [
         ("draining", "agent", "wait_for_drain"),
+        ("stopped", "user", "allow_again"),
         ("stopped", "user", "restart_client"),
         ("cleanup_failed", "user", "resolve_held_input"),
     ] {

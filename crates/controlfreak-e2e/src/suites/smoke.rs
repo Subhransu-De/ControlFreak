@@ -36,6 +36,9 @@ pub(crate) fn suite() -> Suite {
             task("injected-stop-click-ignored", injected_stop_click)
                 .scene("single")
                 .budget_secs(40),
+            task("injected-allow-again-ignored", injected_allow_again)
+                .scene("single")
+                .budget_secs(40),
             task("held-modifier-refused", held_modifier_refused).scene("single"),
             task("moved-window-keeps-session", moved_window_keeps_session).scene("single"),
         ],
@@ -584,26 +587,39 @@ fn taskbar_target(cx: &mut Ctx<'_>) -> Result<(), Failure> {
     cx.end()
 }
 
+/// Runs the fixture helper with `args` until it succeeds, for at most 20 seconds, and returns its
+/// standard output. The session tab shows its controls a moment after the state that offers them.
+fn helper_until(cx: &mut Ctx<'_>, args: &[&str], what: &str) -> Result<String, Failure> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let output = cx.helper(args)?;
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+        }
+        ensure!(Instant::now() < deadline, "{what}");
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// The centre of a control whose rectangle the fixture printed as `left top right bottom`.
+fn centre_of(rect: &str) -> Result<(i32, i32), Failure> {
+    let rect: Vec<i32> = rect
+        .split_whitespace()
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    let [left, top, right, bottom] = <[i32; 4]>::try_from(rect.as_slice())
+        .map_err(|_| Failure::assertion(format!("bad control rectangle {rect:?}")))?;
+    Ok((left.midpoint(right), top.midpoint(bottom)))
+}
+
 fn injected_stop_click(cx: &mut Ctx<'_>) -> Result<(), Failure> {
     let id = control(cx, "app")?;
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let rect: Vec<i32> = loop {
-        let output = cx.helper(&["--stop-button-rect"])?;
-        if output.status.success() {
-            break String::from_utf8_lossy(&output.stdout)
-                .split_whitespace()
-                .filter_map(|n| n.parse().ok())
-                .collect();
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "the Stop agent button never appeared during a session"
-        );
-        thread::sleep(Duration::from_millis(250));
-    };
-    let [left, top, right, bottom] = <[i32; 4]>::try_from(rect.as_slice())
-        .map_err(|_| Failure::assertion(format!("bad button rectangle {rect:?}")))?;
-    let center = (left.midpoint(right), top.midpoint(bottom));
+    let rect = helper_until(
+        cx,
+        &["--stop-button-rect"],
+        "the Stop agent button never appeared during a session",
+    )?;
+    let center = centre_of(&rect)?;
     let refused = cx.refused(
         "click_mouse",
         json!({"target_ref": id, "x": center.0, "y": center.1, "observation": {"mode": "none"}}),
@@ -631,6 +647,64 @@ fn injected_stop_click(cx: &mut Ctx<'_>) -> Result<(), Failure> {
         !accepted.is_error,
         "control was stopped: {}",
         accepted.structured
+    );
+    cx.end()
+}
+
+/// After the user's stop the tab keeps an Allow again control that only input hardware can press.
+/// The fixture stops the session the way UI Automation does (`BM_CLICK` on Stop agent), which the
+/// server takes as the user's stop. Then it tries what a process the agent drives could do: a real
+/// injected click on Allow again, `BM_CLICK`, and a left click sent and posted as window messages.
+/// Input must stay closed with the `allow_again` recovery step, and a new session is refused.
+fn injected_allow_again(cx: &mut Ctx<'_>) -> Result<(), Failure> {
+    let id = control(cx, "app")?;
+    helper_until(
+        cx,
+        &["--invoke-stop-button"],
+        "the Stop agent button never appeared during a session",
+    )?;
+    let stopped = |status: &serde_json::Value| {
+        status["stop_state"] == "stopped"
+            && status["stop_reason"] == "user_stop"
+            && status["input_admission"] == "closed"
+            && status["recovery"]["action"] == "allow_again"
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = cx.ok("get_server_status", json!({}))?;
+        if stopped(&status) {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "the invoked Stop button did not leave a stop the user can reverse: {status}"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    let rect = helper_until(
+        cx,
+        &["--allow-again-rect"],
+        "Allow again never appeared after the user's stop",
+    )?;
+    let center = centre_of(&rect)?;
+    let output = cx.helper(&["--inject-click", &format!("{},{}", center.0, center.1)])?;
+    ensure!(
+        output.status.success(),
+        "the fixture could not inject the click"
+    );
+    let output = cx.helper(&["--message-allow-again"])?;
+    ensure!(
+        output.status.success(),
+        "the fixture could not message Allow again"
+    );
+    thread::sleep(Duration::from_millis(500));
+    let status = cx.ok("get_server_status", json!({}))?;
+    ensure!(stopped(&status), "input was allowed again: {status}");
+    let refused = cx.refused("begin_control_session", json!({"target_ref": id}))?;
+    ensure!(
+        refused.error_code() == Some("desktop_work_stopped"),
+        "a new session was not refused: {}",
+        refused.structured
     );
     cx.end()
 }

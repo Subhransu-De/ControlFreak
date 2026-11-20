@@ -138,7 +138,7 @@ const WAIT_FOR_WINDOW: &str = "wait_for_window";
 const PRESS_KEYS: &str = "press_keys";
 const TYPE_TEXT: &str = "type_text";
 
-const SERVER_INSTRUCTIONS: &str = "ControlFreak drives a Windows desktop. Workflow: list_windows (or any screenshot) gives a target_ref; begin_control_session(target_ref) once; focus_window; input tools; end_control_session when done. Input works only while the approved window, or a dialog or menu of its application, is in the foreground; another process needs a new session. x and y are display-local physical pixels, or pass a screenshot's observation_id with image_x and image_y. Each action returns a 1280 px screenshot taken once the window stops changing (see observation.settle); reuse it instead of capturing. Check isError and status; never repeat an action when retry_action=false. stop_desktop_work is an emergency stop that closes input permanently. stop_reason=user_stop or a session_stopped notification means the user ended control: ask before resuming; only a client restart reopens input (see recovery).";
+const SERVER_INSTRUCTIONS: &str = "ControlFreak drives a Windows desktop. Workflow: list_windows (or any screenshot) gives a target_ref; begin_control_session(target_ref) once; focus_window; input tools; end_control_session when done. Input works only while the approved window, or a dialog or menu of its application, is in the foreground; another process needs a new session. x and y are display-local physical pixels, or pass a screenshot's observation_id with image_x and image_y. Each action returns a 1280 px screenshot taken once the window stops changing (see observation.settle); reuse it instead of capturing. Check isError and status; never repeat an action when retry_action=false. stop_desktop_work is an emergency stop that closes input permanently. stop_reason=user_stop or a session_stopped notification means the user ended control: ask before resuming; only the user can reopen input (see recovery).";
 
 #[derive(Debug)]
 enum BeginSessionError {
@@ -454,13 +454,18 @@ impl ControlFreakServer {
 impl ServerHandler for ControlFreakServer {
     fn get_info(&self) -> ServerConfig {
         let mut capabilities = ServerCapabilities::builder().enable_tools().build();
-        capabilities.experimental = Some(std::collections::BTreeMap::from([(
-            "controlfreak/user-stop".to_owned(),
-            serde_json::Map::from_iter([(
-                "notification".to_owned(),
-                json!("notifications/controlfreak/session_stopped"),
-            )]),
-        )]));
+        let notification =
+            |method: &str| serde_json::Map::from_iter([("notification".to_owned(), json!(method))]);
+        capabilities.experimental = Some(std::collections::BTreeMap::from([
+            (
+                "controlfreak/user-stop".to_owned(),
+                notification(stop::STOPPED_NOTIFICATION),
+            ),
+            (
+                "controlfreak/user-rearm".to_owned(),
+                notification(stop::REARMED_NOTIFICATION),
+            ),
+        ]));
         ServerConfig::new(capabilities)
             .with_server_info(Implementation::new(
                 "controlfreak",
@@ -481,41 +486,30 @@ impl ServerHandler for ControlFreakServer {
                     .map(|changed| changed.notify_one())
                     .is_some()
             });
-            // One notification when the user stops, and one more when a drain ends, so the
-            // client learns when the restart step applies.
+            // One notification when the user stops, one more when a drain ends, so the client
+            // learns when the user's step applies, and one when the user allows input again.
+            // A re-arm starts a new stop epoch, so a later stop is reported afresh.
+            let mut epoch = stop.stop_epoch();
             let mut reported: Option<controlfreak_core::StopRecovery> = None;
             while !context.peer.is_transport_closed() {
-                let recovery = stop.recovery();
-                if stop.user_stopped()
-                    && let Some(current) = recovery
-                    && reported != Some(current)
-                {
-                    let event = if reported.is_none() {
-                        "user_stopped_session"
-                    } else {
-                        "stop_drained"
-                    };
-                    let notification = rmcp::model::CustomNotification::new(
-                        "notifications/controlfreak/session_stopped",
-                        Some(json!({
-                            "event": event,
-                            "reason": "user_stop",
-                            "message": format!("You stopped desktop input. {}", current.guidance()),
-                            "stop_state": controlfreak_core::StopRecovery::stop_state(recovery),
-                            "recovery": stop::recovery_json(recovery),
-                            "retry_action": false,
-                        })),
-                    );
+                let now = stop.snapshot();
+                if now.epoch != epoch {
+                    epoch = now.epoch;
+                    reported = None;
                     let _ = context
                         .peer
-                        .send_notification(rmcp::model::ServerNotification::CustomNotification(
-                            notification,
-                        ))
+                        .send_notification(stop::rearmed_notification())
+                        .await;
+                }
+                if now.user_stop
+                    && let Some(current) = now.recovery
+                    && reported != Some(current)
+                {
+                    let _ = context
+                        .peer
+                        .send_notification(stop::stopped_notification(current, reported))
                         .await;
                     reported = Some(current);
-                    if current != controlfreak_core::StopRecovery::WaitForDrain {
-                        break;
-                    }
                 }
                 let _ = tokio::time::timeout(Duration::from_secs(5), changed.notified()).await;
             }

@@ -1,5 +1,7 @@
 //! After a user stop, every surface an agent reads tells it the same recovery step, over one
-//! connection: the refusal, `get_server_status`, the end result and the stop notifications.
+//! connection: the refusal, `get_server_status`, the end result and the stop notifications. When
+//! the user allows input again from the tab, the client hears it and a new session is admitted;
+//! no tool call can do the same.
 
 use super::session_error_tests::{Harness, harness_with_backend};
 use super::*;
@@ -11,6 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 const TARGET: &str = "target-00000000-0000-0000-0000-000000000003";
 const NOTIFICATION: &str = "notifications/controlfreak/session_stopped";
+const REARMED: &str = "notifications/controlfreak/session_rearmed";
 
 /// Lists one window and holds `type_text` until the test releases it, so the stop drains for as
 /// long as the test needs. With `fail_cleanup`, the stopped action cannot confirm its release.
@@ -97,6 +100,7 @@ impl PointerBackend for HeldTyping {}
 struct Connection {
     harness: Harness,
     notifications: Vec<Value>,
+    rearmed: Vec<Value>,
     schemas: Vec<Value>,
     next_id: u64,
 }
@@ -112,6 +116,7 @@ impl Connection {
         Self {
             harness,
             notifications: Vec::new(),
+            rearmed: Vec::new(),
             schemas: listed["result"]["tools"].as_array().unwrap().clone(),
             next_id: 100,
         }
@@ -143,6 +148,9 @@ impl Connection {
         let value: Value = serde_json::from_str(&line).unwrap();
         if value["method"] == NOTIFICATION {
             self.notifications.push(value["params"].clone());
+        }
+        if value["method"] == REARMED {
+            self.rearmed.push(value["params"].clone());
         }
         value
     }
@@ -240,7 +248,125 @@ async fn stop_and_recover(fail_cleanup: bool) {
     after_the_drain(&mut connection, fail_cleanup).await;
     assert!(stop.is_stopped(), "no call reopened the latch");
     assert_eq!(connection.notifications.len(), 2, "one per stop state");
+    if fail_cleanup {
+        assert_eq!(
+            stop.rearm_by_user(),
+            Err(controlfreak_core::RearmRefusal::CleanupFailed),
+            "a release that could not be confirmed is never re-armed"
+        );
+    } else {
+        allow_again(&mut connection).await;
+    }
+    assert!(connection.rearmed.len() <= 1);
     connection.harness.finish().await;
+}
+
+/// The user presses Allow again on the tab: the client hears it, status reopens, a new session
+/// is admitted and acts, and a second stop is reported afresh.
+async fn allow_again(connection: &mut Connection) {
+    let stop = connection.harness.runtime.stop.clone();
+    // What the tab's Allow again control does after a press from input hardware.
+    assert_eq!(stop.rearm_by_user(), Ok(()));
+    while connection.rearmed.is_empty() {
+        connection.read().await;
+    }
+    let rearmed = &connection.rearmed[0];
+    assert_eq!(rearmed["event"], "user_allowed_input");
+    assert_eq!(rearmed["stop_state"], "ready");
+    assert_eq!(rearmed["input_admission"], "open");
+    assert_eq!(rearmed["recovery"], Value::Null);
+    assert!(
+        rearmed["message"]
+            .as_str()
+            .unwrap()
+            .contains("ask the user before you continue")
+    );
+
+    let status = connection.call(GET_SERVER_STATUS, json!({})).await;
+    let status = &status["structuredContent"];
+    assert_eq!(status["input_admission"], "open");
+    assert_eq!(status["stop_state"], "ready");
+    assert_eq!(status["recovery"], Value::Null);
+    assert!(status.get("stop_reason").is_none(), "{status}");
+    assert_eq!(
+        status["session"]["owns_arbitration"], false,
+        "nothing resumed on its own"
+    );
+
+    // A new session goes through ordinary admission.
+    let begun = connection
+        .call(BEGIN_CONTROL_SESSION, json!({"target_ref": TARGET}))
+        .await;
+    assert_ne!(begun["isError"], true, "{begun}");
+    assert_eq!(
+        begun["structuredContent"]["session"]["approved_target_ref"],
+        TARGET
+    );
+
+    // A second stop in the new epoch is reported again. The idle session may already be released
+    // when the watcher looks, so the step is the drain or, once drained, Allow again.
+    assert!(stop.stop_by_user());
+    let again = connection.notification(3).await;
+    assert_eq!(again["event"], "user_stopped_session");
+    assert!(
+        ["wait_for_drain", "allow_again"].contains(&recovery_action(&again["recovery"])),
+        "{again}"
+    );
+}
+
+#[tokio::test]
+async fn no_tool_call_reopens_input_after_a_user_stop() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (started, _started) = tokio::sync::oneshot::channel();
+        let (_release, release_signal) = std::sync::mpsc::channel();
+        let backend = Arc::new(HeldTyping {
+            fail_cleanup: false,
+            started: Mutex::new(Some(started)),
+            release: Mutex::new(release_signal),
+        });
+        let mut connection = Connection::open(backend).await;
+        let stop = connection.harness.runtime.stop.clone();
+        let begun = connection
+            .call(BEGIN_CONTROL_SESSION, json!({"target_ref": TARGET}))
+            .await;
+        assert_ne!(begun["isError"], true, "{begun}");
+        assert!(stop.stop_by_user());
+        // Wait until the client was told the user may allow input again, so the client stop
+        // below changes a step the client already knows.
+        let mut seen = 1;
+        while recovery_action(&connection.notification(seen).await["recovery"]) != "allow_again" {
+            seen += 1;
+        }
+        // Every tool that takes no target, called after the stop has drained.
+        for tool in [
+            END_CONTROL_SESSION,
+            GET_SERVER_STATUS,
+            LIST_WINDOWS,
+            STOP_DESKTOP_WORK,
+            END_CONTROL_SESSION,
+        ] {
+            connection.call(tool, json!({})).await;
+        }
+        let begun = connection
+            .call(BEGIN_CONTROL_SESSION, json!({"target_ref": TARGET}))
+            .await;
+        assert_eq!(begun["isError"], true, "{begun}");
+        assert!(stop.is_stopped());
+        assert!(connection.rearmed.is_empty(), "no re-arm was announced");
+        // `stop_desktop_work` closes input for good, even after the user's own stop, and the
+        // client hears the new step.
+        assert!(stop.user_stopped());
+        let changed = connection.notification(seen + 1).await;
+        assert_eq!(changed["event"], "recovery_changed", "{changed}");
+        assert_eq!(recovery_action(&changed["recovery"]), "restart_client");
+        assert_eq!(
+            stop.rearm_by_user(),
+            Err(controlfreak_core::RearmRefusal::NotUserStop)
+        );
+        connection.harness.finish().await;
+    })
+    .await
+    .expect("the calls finish in time");
 }
 
 /// End, begin, an input tool, status and a read once the drain has ended.
@@ -250,7 +376,7 @@ async fn after_the_drain(connection: &mut Connection, fail_cleanup: bool) {
     let (stop_state, expected) = if fail_cleanup {
         ("cleanup_failed", "resolve_held_input")
     } else {
-        ("stopped", "restart_client")
+        ("stopped", "allow_again")
     };
     assert_eq!(second["stop_state"], stop_state);
     assert_eq!(recovery_action(&second["recovery"]), expected);
@@ -282,6 +408,11 @@ async fn after_the_drain(connection: &mut Connection, fail_cleanup: bool) {
     let message = error["message"].as_str().unwrap();
     assert!(message.contains("server restart control"), "{message}");
     assert!(message.contains("quit and reopen the client"), "{message}");
+    assert_eq!(
+        message.contains("press Allow again"),
+        !fail_cleanup,
+        "{message}"
+    );
     let recovery = error["details"]["recovery"].clone();
     assert_eq!(recovery_action(&recovery), expected);
 

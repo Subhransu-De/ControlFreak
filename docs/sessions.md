@@ -25,19 +25,20 @@ lamps that show an automated system is driving a car.
 | State | Lamp | Tab |
 | --- | --- | --- |
 | Working | Turquoise | "An agent is using this PC", "ControlFreak is working", "Press Esc to stop" |
-| Waiting | Turquoise | The same, with "ControlFreak is waiting for the next action" once no action has run for 1 second |
+| Waiting | Turquoise | "An agent is using this PC", "ControlFreak is waiting for the next action" once no action has run for 1 second. No Esc hint: Esc goes to the application |
 | Reading the screen | Off | "ControlFreak is reading the screen", "It is not using the keyboard or mouse", for about 1.5 seconds after a capture or OCR call, only when no session is owned |
 | Stopping | Unchanged | "Stopping desktop control", "ControlFreak is releasing held keys and mouse buttons" |
 | Cleanup failed | Amber double line | "A key or mouse button may still be held" and steps to release it |
-| Session ended | Off | "This PC is yours again" for 1 second after `end_control_session` or a hold ending, 2.5 seconds after a stop |
+| Stopped by you | Off | "You stopped the agent", then how to allow input again, with an **Allow again** control. It stays until you press it or the server exits |
+| Session ended | Off | "This PC is yours again" for 1 second after `end_control_session` or a hold ending, 2.5 seconds after a client stop |
 
 - For the first 3 seconds of a session the tab shows two lines. It then shrinks to one row:
-  "An agent is using this PC", "ControlFreak is working" or "ControlFreak is waiting for the next action", and
-  "Esc to stop". A session that starts within a minute of the last one ending, such as a run of
+  "An agent is using this PC" and "ControlFreak is working" with "Esc to stop", or "ControlFreak is waiting for the next action" without it. The tab is narrower while it waits, because Esc does not stop then. A session that starts within a minute of the last one ending, such as a run of
   one-shot actions, starts as one row. Every change of message, including from two lines to one
   row, appears at once at full strength; only the tab appearing and disappearing fades.
-- After a normal end, "This PC is yours again" is one row. After Esc or a client stop it has a
+- After a normal end, "This PC is yours again" is one row. After a client stop it has a
   second line: "Restart your agent app to use ControlFreak".
+- After you stop the agent with Esc or the Stop button, the tab stays once the stopped work has finished. It says "You stopped the agent", "Press Allow again with a mouse, touch or pen to let ControlFreak act." and "Using a screen reader or voice control? Restart your agent app instead.", with an **Allow again** control under it. The lamp is off.
 - An elevated server shows a red lamp and an "Administrator" label on the tab. The label stays
   while stopping and after a cleanup failure, when the lamp becomes the amber double line.
 - After a cleanup failure, the lamp becomes a double amber line and the tab stays, unchanged,
@@ -51,7 +52,7 @@ lamps that show an automated system is driving a car.
 - Each tab window is named with the words the tab shows, so screen readers can read it; an
   elevated server's name says "Running as administrator", and after a cleanup failure the name
   keeps the whole warning, even on a short display. A session that introduces itself,
-  stopping, a possible held key, and the handback after a stop also raise a system alert once the
+  stopping, a possible held key, your stop, and the handback after a client stop also raise a system alert once the
   tab is fully on screen. Working and waiting, and quick returns within a minute, only rename the
   window.
 - On a narrow display, or with a large Windows text size, the stop key moves under the message
@@ -62,7 +63,8 @@ lamps that show an automated system is driving a car.
 - Both are click-through and never take the focus, except for the Stop button described below.
 - While the tab says "working" or "waiting", a **Stop agent** button hangs under it. It is a native button, so a mouse, a finger, a pen and accessibility tools that invoke it through UI Automation can press it. A tool that works by injecting pointer or key input cannot, and an on-screen keyboard sends keys, which the button drops too. It is drawn in the tab's own style, with the same colors, type and rounded corners, lightens under the pointer and darkens while pressed. It never takes focus, follows the display's DPI and the Windows text size, uses the system colors in High Contrast, and is excluded from screen capture. It appears only with a steady tab and never during stopping, a held-key warning, a handback or reading.
 - The agent cannot press the button. Only mouse and key messages from input hardware are accepted: injected input (`SendInput` and its relatives), messages posted by another process and messages with an unreadable origin are dropped before the button sees them. A pointer action on the button is refused anyway, with reason `own_indicator`, because the window under the point belongs to ControlFreak, not to the approved target. Pressing it is a user stop, with the same effects as Esc.
-- The tab says "Press Esc to stop" only while the keyboard hook is confirmed installed. A session is admitted only after the monitor confirms the hook, waiting at most 2 seconds, so a physical Esc is caught from the first action. If the hook cannot be installed or is not confirmed in time, `begin_control_session` and input tools are refused with that reason, the session is released and the next session tries again.
+- **Allow again** hangs under the tab after your own stop, once the stopped work has finished. It has the Stop button's look, size and place. Only a press with a mouse, finger, pen or touchpad counts: it takes only mouse messages whose origin is input hardware from a pointing device, ignores `BM_CLICK`, `WM_CLOSE` and keys, and is not a standard button, so UI Automation offers no Invoke action for it. Screen-reader, voice-control and switch-access users therefore cannot press it; the tab tells them to restart the agent app instead, and its window name and system alert carry that sentence. Its accessible name is "Allow again, with a mouse, touch or pen only". It never takes focus and is excluded from screen capture.
+- The tab says "Press Esc to stop" only while the keyboard hook is confirmed installed and the agent is working. A session is admitted only after the monitor confirms the hook, waiting at most 2 seconds, so a physical Esc is caught from the first action. If the hook cannot be installed or is not confirmed in time, `begin_control_session` and input tools are refused with that reason, the session is released and the next session tries again.
 - Nothing pulses. With Windows animation effects off, the tab and lamp also appear and disappear
   without fading.
 - With a High Contrast theme on, both use the theme's colors, and an elevated server's lamp is
@@ -85,24 +87,29 @@ The indicator is event driven. An idle server has no polling loop for it: the ta
 
 Control stops when:
 
-- the user presses the physical Esc key during a session. Injected Esc is ignored, and the key
-  press does not reach the application. The keyboard hook exists only while a session is owned, on a thread of its own that does nothing else; it is removed when the session ends, and a server that never starts a session never installs one.
+- the user presses the physical Esc key while the agent is working, that is while the tab says "Esc to stop". Injected Esc is ignored, and the key
+  press does not reach the application. While the tab says the agent is waiting for the next action, Esc goes to the application, for example to close a menu, and does not stop; use the Stop button then. An action counts as working from the moment it starts, before the tab repaints, and for the 1 second the tab keeps saying "working" after it, so Esc never passes through while input is being sent. The keyboard hook exists only while a session is owned, on a thread of its own that does nothing else; it is removed when the session ends, and a server that never starts a session never installs one.
 - the user presses the **Stop agent** button on the tab with a mouse, touch or pen, or through an accessibility tool. Injected clicks are ignored.
 - a client calls `stop_desktop_work`.
 
 After a stop:
 
-- New input is refused with `desktop_work_stopped` for the rest of the server's life.
-  `begin_control_session` and `end_control_session` cannot clear it.
+- New input is refused with `desktop_work_stopped`. After your own stop, that lasts until you press **Allow again** on the tab. After any other stop it lasts for the rest of the server's life.
+  No tool clears it: `begin_control_session`, `end_control_session` and `stop_desktop_work` cannot.
 - Observation tools, `get_server_status` and session cleanup still work.
 - Input already sent to an application cannot be undone.
-- On a user stop, the server sends `notifications/controlfreak/session_stopped` with `event="user_stopped_session"`, `reason="user_stop"` and `retry_action=false`. If work was still finishing, it sends a second one with `event="stop_drained"` when the drain ends. It advertises this as `experimental.controlfreak/user-stop`. `get_server_status` reports `stop_reason="user_stop"`.
+- On a user stop, the server sends `notifications/controlfreak/session_stopped` with `event="user_stopped_session"`, `reason="user_stop"` and `retry_action=false`. If work was still finishing, it sends a second one with `event="stop_drained"` when the drain ends. If the recovery step changes later, for example when a client calls `stop_desktop_work` after the user's stop, it sends one with `event="recovery_changed"`. It advertises this as `experimental.controlfreak/user-stop`. `get_server_status` reports `stop_reason="user_stop"`.
+- When you press **Allow again**, the server sends `notifications/controlfreak/session_rearmed` with `event="user_allowed_input"`, `stop_state="ready"`, `input_admission="open"` and `recovery=null`. It advertises this as `experimental.controlfreak/user-rearm`.
 - `get_server_status` reports `input_admission` (`open` or `closed`) separately from `status`, which describes the server and its indicator. A stopped server can report `status: "ready"` with `input_admission: "closed"`.
 - `end_control_session` reports `closed`, `closing` while pending actions finish, or `not_owned` when the stop or the hold already closed the session. A closed session reports `approved_target_ref: null`.
 
 ### Getting input back
 
-Only the user can allow input again, by restarting this server from the MCP client: use the client's server restart control, or fully quit and reopen the client. Then list windows and begin a new session. The agent should ask the user before it resumes.
+Only the user can allow input again. No tool can.
+
+- After your own stop with Esc or the Stop button, and once the stopped work has finished, press **Allow again** on the tab with a mouse, touch or pen. Nothing resumes on its own: the tab goes away, and the agent's next action starts a new session with the lamp, the tab and the Esc check, as any session does. The agent should ask you before it resumes.
+- After a client stop (`stop_desktop_work`, even after your own stop), a failure of the tab, or a key or button that may still be held, input stays closed until you restart this server from the MCP client: use the client's server restart control, or fully quit and reopen the client. Then list windows and begin a new session.
+- With a screen reader, voice control or switch access, restart the server the same way: Allow again does not accept UI Automation or any other input that does not come from a mouse, touch screen or pen.
 
 Do not end `controlfreak.exe` by hand, for example in Task Manager. Most clients do not start a STDIO server again on their own, so the read-only tools stop working too until the client restarts.
 
@@ -112,7 +119,8 @@ The refusal (`error.details.recovery`), `get_server_status.recovery`, the `end_c
 | --- | --- | --- | --- |
 | `ready` | none | none | Accepting work. |
 | `draining` | `wait_for_drain` | `agent` | Stopped. In-flight work is finishing. Wait for `stopped`. |
-| `stopped` | `restart_client` | `user` | Stopped. Nothing is running. The user restarts the server from the client. |
+| `stopped` | `allow_again` | `user` | The user stopped. Nothing is running. The user presses Allow again on the tab with a mouse, touch or pen, or restarts the server from the client. |
+| `stopped` | `restart_client` | `user` | A client stop or a failure. Nothing is running. The user restarts the server from the client. |
 | `cleanup_failed` | `resolve_held_input` | `user` | Held keys or buttons could not be released for certain. The desktop stays reserved. The user releases any stuck key or button, then restarts the server from the client. |
 
 To cancel a single request without stopping the server, send the MCP `notifications/cancelled` notification. Cancelling a `begin_control_session` that renews a live session leaves that session as it was, with its hold and deadline; cancelling a first begin releases the desktop.
