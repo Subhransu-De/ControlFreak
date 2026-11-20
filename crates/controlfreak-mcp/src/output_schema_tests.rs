@@ -404,7 +404,7 @@ fn schemas_describe_idle_busy_and_stopped_server_status() {
         "backend": {"platform": "windows", "display_server": "dwm", "backend_id": "b"},
         "input_admission": "open",
         "recovery": null,
-        "stop_state": "ready"
+        "stop_state": "ready", "profile": {"name": "full", "tool_allowlist": null}
     });
     assert!(validator.is_valid(&base));
     let busy = with(

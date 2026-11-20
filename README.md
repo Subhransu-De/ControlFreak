@@ -32,6 +32,7 @@ and click, scroll and type in one window that it chose.
 - Inspect and switch between discoverable Windows virtual desktops. `switch_virtual_desktop` moves one or more desktops (`steps`) left or right and ends the session, because the approved window is no longer on screen.
 - Work in the approved window's own dialogs and popup menus. A window of another process is refused.
 - Target the taskbar, the desktop and the Start and Search surfaces. They are checked by window class and by the program that owns them, and there is still no tool that launches applications.
+- Run observation-only with `--profile observe`, or serve only the tools you name with `--tools`. See [Restrict the tools](https://github.com/Subhransu-De/ControlFreak/blob/main/docs/install.md#restrict-the-tools).
 
 See all 27 tools in the [tool reference](https://github.com/Subhransu-De/ControlFreak/blob/main/docs/tools.md).
 

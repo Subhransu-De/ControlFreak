@@ -54,15 +54,24 @@ async fn harness_with_hold(
 }
 
 /// Serves `backend` with `runtime` over an in-memory transport and completes the handshake.
-pub(super) async fn serve_with_runtime(
+async fn serve_with_runtime(
     backend: Arc<dyn PlatformBackend>,
     runtime: Arc<SessionRuntime>,
+) -> Harness {
+    serve_with_profile(backend, runtime, Profile::full()).await
+}
+
+pub(super) async fn serve_with_profile(
+    backend: Arc<dyn PlatformBackend>,
+    runtime: Arc<SessionRuntime>,
+    profile: Profile,
 ) -> Harness {
     let server = ControlFreakServer::with_indicator(
         backend,
         SafetyIndicator::dormant(),
         Some(Arc::clone(&runtime)),
-    );
+    )
+    .with_profile(profile);
     let (client_io, server_io) = tokio::io::duplex(256 * 1024);
     let serving = tokio::spawn(async move {
         server

@@ -178,6 +178,11 @@ fn assert_server_status(status: &Value) {
     assert!(content["server_elevated"].is_boolean());
     assert!(content["windows_integrity_level"].is_string());
     assert!(content["elevated_operation_allowed"].is_boolean());
+    assert_eq!(
+        content["profile"],
+        serde_json::json!({"name": "full", "tool_allowlist": null}),
+        "no profile flag serves every tool"
+    );
     // The manifest sets per-monitor v2 before the server runs, so its own request is refused
     // with access denied and the awareness read back must still be v2.
     let expected_dpi = if cfg!(target_os = "windows") {
@@ -668,4 +673,130 @@ fn assert_tool_names(tools: &Value) {
             "stop_desktop_work"
         ]
     );
+}
+
+/// #36: the observe profile lists no session or input tool, refuses one called by name like an
+/// unknown tool, and reports itself in `get_server_status`.
+#[test]
+fn observe_profile_hides_input_tools_over_stdio() {
+    let mut child = test_server_command()
+        .args(["--profile", "observe"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn controlfreak server");
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"integration-test","version":"0.1.0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"type_text","arguments":{"target_ref":"target-00000000-0000-0000-0000-000000000001","text":"a"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_server_status","arguments":{}}}"#,
+        "\n",
+    );
+    child
+        .stdin
+        .take()
+        .expect("open server stdin")
+        .write_all(requests.as_bytes())
+        .expect("write MCP requests");
+    let output = child.wait_with_output().expect("wait for server");
+    assert!(
+        output.status.success(),
+        "server failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses: Vec<Value> = String::from_utf8(output.stdout)
+        .expect("MCP output is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSON-RPC response"))
+        .collect();
+    let response = |id: u64| {
+        responses
+            .iter()
+            .find(|response| response["id"] == id)
+            .unwrap_or_else(|| panic!("response {id}"))
+    };
+
+    let names: Vec<&str> = response(2)["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "get_server_status",
+            "end_control_session",
+            "list_displays",
+            "capture_display",
+            "capture_region",
+            "wait_for_visual_change",
+            "capture_visual_baseline",
+            "wait_for_change_since",
+            "read_text_in_region",
+            "find_text_on_screen",
+            "wait_for_text",
+            "list_virtual_desktops",
+            "list_windows",
+            "capture_window",
+            "wait_for_window",
+            "stop_desktop_work",
+        ]
+    );
+    let refused = &response(3)["result"];
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert_eq!(
+        refused["structuredContent"]["error"]["message"],
+        "unknown ControlFreak tool 'type_text'"
+    );
+    assert_eq!(
+        response(4)["result"]["structuredContent"]["profile"],
+        serde_json::json!({"name": "observe", "tool_allowlist": null})
+    );
+    let started = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .find_map(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .filter(|event| event["event"] == "server_started")
+        })
+        .expect("server_started event");
+    assert_eq!(started["profile"]["name"], "observe");
+}
+
+/// #36: a malformed profile flag stops the server before it serves anything, with one bounded
+/// structured error on stderr.
+#[test]
+fn malformed_profile_flags_exit_at_startup() {
+    let long = "x".repeat(4096);
+    for arguments in [
+        vec!["--tools", "typo_text"],
+        vec!["--tools", ""],
+        vec!["--tools", "list_windows,"],
+        vec!["--tools", long.as_str()],
+        vec!["--profile", "everything"],
+        vec!["--profile"],
+        vec!["--profile", "observe", "--tools", "type_text"],
+    ] {
+        let output = test_server_command()
+            .args(&arguments)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run controlfreak");
+        assert!(!output.status.success(), "{arguments:?} must not start");
+        assert!(output.stdout.is_empty(), "{arguments:?} served on stdout");
+        let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+        assert!(stderr.len() < 4096, "{arguments:?}: {} bytes", stderr.len());
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert_eq!(lines.len(), 1, "{arguments:?}: {stderr}");
+        let error: Value = serde_json::from_str(lines[0]).expect("structured startup error");
+        assert_eq!(error["event"], "startup_failed", "{arguments:?}");
+        assert_eq!(error["error"]["code"], "server_startup_failed");
+    }
 }

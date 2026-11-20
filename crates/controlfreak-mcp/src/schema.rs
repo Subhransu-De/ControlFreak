@@ -2,6 +2,7 @@ use super::{
     Arc, JsonObject, Tool, ToolAnnotations, Value,
     catalog::{CATALOG, Route, TargetRef, ToolSpec},
     json,
+    profile::Profile,
     requests::MAX_RUN_ACTION_STEPS,
 };
 use controlfreak_core::limits::{
@@ -80,15 +81,24 @@ fn build_tool(spec: &ToolSpec) -> Tool {
 /// Every success branch lists only its top-level fields, with shallow types, and allows others:
 /// the full result schemas were most of a list that clients resend with every turn. Error
 /// branches stay complete and closed, because they carry the recovery guidance. [`full_tools`]
-/// keeps the full contract.
-pub fn tools() -> Vec<Tool> {
-    let mut tools = full_tools();
-    for tool in &mut tools {
-        if let Some(schema) = tool.output_schema.as_mut() {
-            *schema = Arc::new(compact_output_schema(schema));
-        }
-    }
-    tools
+/// keeps the full contract. Only the tools that `profile` serves are listed, in catalog order.
+pub(super) fn tools_for(profile: &Profile) -> Vec<Tool> {
+    profile
+        .specs()
+        .map(|spec| {
+            let mut tool = build_tool(spec);
+            if let Some(schema) = tool.output_schema.as_mut() {
+                *schema = Arc::new(compact_output_schema(schema));
+            }
+            tool
+        })
+        .collect()
+}
+
+/// What `tools/list` publishes with every tool served.
+#[cfg(test)]
+pub(super) fn tools() -> Vec<Tool> {
+    tools_for(&Profile::full())
 }
 
 /// Every tool with its full result contract, closed against extra fields, for `--print-tools`.
@@ -1305,6 +1315,19 @@ fn end_session_output_schema() -> Arc<JsonObject> {
     )
 }
 
+/// The tool profile in `get_server_status`: `full` or `observe`, and the `--tools` list or null.
+fn profile_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "enum": ["full", "observe"] },
+            "tool_allowlist": { "type": ["array", "null"], "items": { "type": "string" } }
+        },
+        "required": ["name", "tool_allowlist"],
+        "additionalProperties": false
+    })
+}
+
 fn server_status_output_schema() -> Arc<JsonObject> {
     output_schema(
         vec![json!({
@@ -1386,13 +1409,14 @@ fn server_status_output_schema() -> Arc<JsonObject> {
                 "input_admission": { "enum": ["open", "closed"] },
                 "recovery": { "oneOf": [def_ref("recovery"), { "type": "null" }] },
                 "stop_state": { "enum": ["ready", "draining", "stopped", "cleanup_failed"] },
-                "stop_reason": { "const": "user_stop" }
+                "stop_reason": { "const": "user_stop" },
+                "profile": profile_schema()
             },
             "required": [
                 "status", "safety_indicator", "session", "version", "build", "instance_id", "process_id",
                 "server_elevated", "windows_integrity_level", "elevated_operation_allowed", "dpi_awareness", "uptime_ms",
                 "operations_started", "operations_completed", "operations_failed", "recent_operations",
-                "backend", "input_admission", "recovery", "stop_state"
+                "backend", "input_admission", "recovery", "stop_state", "profile"
             ],
             "additionalProperties": false
         })],

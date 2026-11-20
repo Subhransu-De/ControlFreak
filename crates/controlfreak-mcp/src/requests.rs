@@ -1069,6 +1069,18 @@ impl ActionStep {
             Self::Wait { .. } => "wait",
         }
     }
+
+    /// The tool whose input the step sends, which the server's profile must serve. A wait sends
+    /// none.
+    pub(super) const fn tool(&self) -> Option<&'static str> {
+        match self {
+            Self::Click { .. } => Some(super::CLICK_MOUSE),
+            Self::Scroll { .. } => Some(super::SCROLL_MOUSE),
+            Self::TypeText { .. } => Some(super::TYPE_TEXT),
+            Self::PressKeys { .. } => Some(super::PRESS_KEYS),
+            Self::Wait { .. } => None,
+        }
+    }
 }
 
 fn point(

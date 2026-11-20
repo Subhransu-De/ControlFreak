@@ -21,6 +21,9 @@ mod encoding_tests;
 mod fake_desktop;
 mod handlers;
 mod observations;
+mod profile;
+#[cfg(test)]
+mod profile_tests;
 mod requests;
 mod session;
 mod stop;
@@ -68,6 +71,7 @@ use catalog::{Route, ToolSpec};
 #[cfg(test)]
 use controlfreak_core::{CaptureWindowRequest, WaitForChangeSinceRequest, WaitForWindowRequest};
 use handlers::call_get_server_status;
+pub use profile::{Profile, ProfileError};
 use results::{
     CarriesPng, Encoded, click_text_result, keyboard_result, pointer_result, read_text_result,
     screenshot_result, tool_error, tool_execution_error, virtual_desktop_list_result,
@@ -75,6 +79,7 @@ use results::{
     window_focus_result, window_screenshot_result, window_wait_result,
 };
 pub use schema::full_tools as full_tool_definitions;
+#[cfg(test)]
 use schema::tools;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -143,6 +148,8 @@ const TYPE_TEXT: &str = "type_text";
 
 const SERVER_INSTRUCTIONS: &str = "ControlFreak drives a Windows desktop. Workflow: list_windows (or any screenshot) gives a target_ref; begin_control_session(target_ref) once; focus_window; input tools; end_control_session when done. Input works only while the approved window, or a dialog or menu of its application, is in the foreground; another process needs a new session. x and y are display-local physical pixels, or pass a screenshot's observation_id with image_x and image_y. Each action returns a 1280 px screenshot taken once the window stops changing (see observation.settle); reuse it instead of capturing. Check isError and status; never repeat an action when retry_action=false. stop_desktop_work is an emergency stop that closes input permanently. stop_reason=user_stop or a session_stopped notification means the user ended control: ask before resuming; only the user can reopen input (see recovery).";
 
+const RESTRICTED_PROFILE_INSTRUCTIONS: &str = "This server runs a restricted tool profile (get_server_status reports it): only the tools in tools/list exist, so skip workflow steps whose tools are missing.";
+
 #[derive(Debug)]
 enum BeginSessionError {
     Target(PlatformError),
@@ -168,7 +175,8 @@ type InputRun =
 /// refusal to return as is: `invalid_arguments` or `invalid_argument`, with `not_started`
 /// progress. Live checks (target, display, observation lookup) stay in the run, after the lease.
 type PreparedInput = Result<InputRun, Box<CallToolResponse>>;
-type InputPrepare = fn(Option<JsonObject>) -> PreparedInput;
+/// The profile is for `run_actions`, which refuses a step whose tool the server does not serve.
+type InputPrepare = fn(Option<JsonObject>, &Profile) -> PreparedInput;
 
 fn is_mutating_tool(tool: &str) -> bool {
     catalog::spec(tool).is_some_and(ToolSpec::is_mutating)
@@ -182,6 +190,8 @@ struct ControlFreakServer {
     session_runtime: Option<Arc<SessionRuntime>>,
     stop: controlfreak_core::StopController,
     build: Arc<BuildInfo>,
+    /// The tools this server serves, fixed for its lifetime.
+    profile: Arc<Profile>,
 }
 
 impl ControlFreakServer {
@@ -208,7 +218,14 @@ impl ControlFreakServer {
                 None,
                 "unknown",
             )),
+            profile: Arc::new(Profile::full()),
         }
+    }
+
+    /// Serves only the tools of `profile`.
+    fn with_profile(mut self, profile: Profile) -> Self {
+        self.profile = Arc::new(profile);
+        self
     }
 
     /// Runs one request through admission and its handler.
@@ -219,7 +236,9 @@ impl ControlFreakServer {
         stages: Arc<Mutex<Vec<controlfreak_core::timing::StageTiming>>>,
     ) -> Result<CallToolResponse, ErrorData> {
         let tool_name = request.name.to_string();
-        let Some(spec) = catalog::spec(&tool_name) else {
+        // A tool the profile hides gets the same answer as a tool that does not exist, before
+        // admission, arbitration or a lease.
+        let Some(spec) = self.profile.spec(&tool_name) else {
             return Err(ErrorData::invalid_params(
                 format!("unknown ControlFreak tool '{tool_name}'"),
                 Some(json!({ "tool": tool_name })),
@@ -256,6 +275,7 @@ impl ControlFreakServer {
             content["build"] = json!(*self.build);
             content["input_admission"] = json!(if recovery.is_some() { "closed" } else { "open" });
             content["recovery"] = stop::recovery_json(recovery);
+            content["profile"] = self.profile.status_json();
             content["stop_state"] = json!(controlfreak_core::StopRecovery::stop_state(recovery));
             if self.stop.user_stopped() {
                 content["stop_reason"] = json!("user_stop");
@@ -370,7 +390,7 @@ impl ControlFreakServer {
                 let is_switch = request.name == SWITCH_VIRTUAL_DESKTOP;
                 // Parse and check the arguments before taking the desktop: a refused request must
                 // not claim arbitration, arm the idle hold or show the indicator.
-                let run = match prepare(request.arguments) {
+                let run = match prepare(request.arguments, &self.profile) {
                     Ok(run) => run,
                     Err(refusal) => return Ok(*refusal),
                 };
@@ -483,7 +503,11 @@ impl ServerHandler for ControlFreakServer {
                 "controlfreak",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(SERVER_INSTRUCTIONS)
+            .with_instructions(if self.profile.is_full() {
+                SERVER_INSTRUCTIONS.to_owned()
+            } else {
+                format!("{SERVER_INSTRUCTIONS} {RESTRICTED_PROFILE_INSTRUCTIONS}")
+            })
     }
 
     async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
@@ -533,7 +557,9 @@ impl ServerHandler for ControlFreakServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
-        std::future::ready(Ok(ListToolsResult::with_all_items(tools())))
+        std::future::ready(Ok(ListToolsResult::with_all_items(schema::tools_for(
+            &self.profile,
+        ))))
     }
 
     fn call_tool(
@@ -565,7 +591,12 @@ impl ServerHandler for ControlFreakServer {
                 Ok(response) => Ok(response),
                 Err(error) => {
                     let response = tool_execution_error(&error).into();
-                    Ok(if is_mutating_tool(&tool_name) {
+                    // A hidden tool's error stays the unknown-tool error, with no progress fields.
+                    let mutating = server
+                        .profile
+                        .spec(&tool_name)
+                        .is_some_and(ToolSpec::is_mutating);
+                    Ok(if mutating {
                         results::with_progress(
                             response,
                             controlfreak_core::MutationProgress::default(),
@@ -620,8 +651,16 @@ fn join_error(error: &tokio::task::JoinError) -> ErrorData {
 pub async fn serve_stdio(
     backend: Box<dyn PlatformBackend>,
     build: BuildInfo,
+    profile: Profile,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    serve_stdio_inner(Arc::from(backend), SafetyIndicator::ready(), None, build).await
+    serve_stdio_inner(
+        Arc::from(backend),
+        SafetyIndicator::ready(),
+        None,
+        build,
+        profile,
+    )
+    .await
 }
 
 pub async fn serve_stdio_with_indicator_and_arbitrator<F, G>(
@@ -631,6 +670,7 @@ pub async fn serve_stdio_with_indicator_and_arbitrator<F, G>(
     arbitrator: Arc<dyn ActivityArbitrator>,
     stop: controlfreak_core::StopController,
     build: BuildInfo,
+    profile: Profile,
 ) -> Result<(), Box<dyn Error + Send + Sync>>
 where
     F: Fn() -> Result<G, String> + Send + Sync + 'static,
@@ -646,7 +686,14 @@ where
     runtime.stop = stop;
     runtime.environment = Some(Arc::clone(&backend));
     let session_runtime = Arc::new(runtime);
-    serve_stdio_inner(backend, safety_indicator, Some(session_runtime), build).await
+    serve_stdio_inner(
+        backend,
+        safety_indicator,
+        Some(session_runtime),
+        build,
+        profile,
+    )
+    .await
 }
 
 // rmcp drains responses after EOF. Close admission at EOF itself, before that drain.
@@ -713,9 +760,12 @@ async fn serve_stdio_inner(
     safety_indicator: SafetyIndicator,
     session_runtime: Option<Arc<SessionRuntime>>,
     build: BuildInfo,
+    profile: Profile,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let cleanup = ServerCleanup(session_runtime.clone());
-    let mut server = ControlFreakServer::with_indicator(backend, safety_indicator, session_runtime);
+    let profile_json = profile.status_json();
+    let mut server = ControlFreakServer::with_indicator(backend, safety_indicator, session_runtime)
+        .with_profile(profile);
     server.build = Arc::new(build);
     let instance_id = server.diagnostics.instance_id.clone();
     eprintln!(
@@ -726,6 +776,7 @@ async fn serve_stdio_inner(
             "process_id": std::process::id(),
             "version": env!("CARGO_PKG_VERSION"),
             "build": *server.build,
+            "profile": profile_json,
         })
     );
     let (stdin, stdout) = stdio();
