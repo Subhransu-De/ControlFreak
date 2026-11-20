@@ -115,7 +115,7 @@ pub(crate) fn server_security_context(
     privilege::current_security_context(elevated_operation_allowed)
 }
 use capture::{
-    baseline_process_nonce, capture_comparison_frame, capture_display_bounds,
+    ComparisonCapture, baseline_process_nonce, capture_comparison_frame, capture_display_bounds,
     capture_display_image, capture_window_bounds, display_bounds_from_window,
     display_region_bounds, frame_fingerprint, observe_display, observe_foreground,
     recognize_text_fingerprinted, validate_max_width, validate_visual_wait, validate_wait_values,
@@ -606,10 +606,13 @@ impl DisplayBackend for Backend {
             request.width,
             request.height,
         )?;
-        let baseline = capture_comparison_frame(bounds)?;
+        // The baseline and every poll read through one capture and one grabber.
+        let mut capture = ComparisonCapture::new(bounds)?;
+        let mut baseline = Vec::new();
+        capture.read(&mut baseline)?;
         wait_for_change(
             display,
-            bounds,
+            capture,
             &baseline,
             request.timeout_ms,
             request.stable_ms,
@@ -692,7 +695,7 @@ impl DisplayBackend for Backend {
         ensure_baseline_display(&baseline.display, enumerate_displays()?.as_slice())?;
         let result = wait_for_change(
             baseline.display.clone(),
-            baseline.bounds,
+            ComparisonCapture::new(baseline.bounds)?,
             &baseline.frame,
             request.timeout_ms,
             request.stable_ms,
@@ -1240,7 +1243,7 @@ mod tests {
 
     use super::{
         Backend,
-        capture::{encode_png, image_difference, resize_rgba_box, scaled_dimensions, word_union},
+        capture::{encode_png, image_difference, scaled_dimensions, word_union},
         display_region_bounds, frame_fingerprint,
         input::{click_inputs, interpolate, key_chord_inputs, scroll_inputs},
         window_matches,
@@ -1778,15 +1781,6 @@ mod tests {
                 .iter()
                 .all(|input| key_flags(input) & KEYEVENTF_KEYUP == KEYEVENTF_KEYUP)
         );
-    }
-
-    #[test]
-    fn box_downscale_averages_source_pixels() {
-        let source = [
-            0, 0, 0, 255, 100, 0, 0, 255, 0, 100, 0, 255, 100, 100, 0, 255,
-        ];
-
-        assert_eq!(resize_rgba_box(&source, 2, 2, 2), [50, 50, 0, 255]);
     }
 
     #[test]
