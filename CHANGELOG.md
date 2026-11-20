@@ -28,6 +28,11 @@ versioned section and uses that section for the corresponding GitHub Release not
 - A second `notifications/controlfreak/session_stopped` event, `stop_drained`, when work that was running at a user stop has finished.
 - `input.split_character: true` when `type_text` or a `run_actions` `type_text` step stops between the two halves of an emoji or other non-BMP character. The application then holds half a character, so delete it before typing again. A stop, cancel or refusal still never sends the second half.
 
+### Changed
+
+- `tools/list` is 67,493 bytes instead of 104,995 (128,944 to 91,442 for a client that appends the server instructions to every tool). Every tool's `outputSchema` success branch now lists only its top-level fields with their types and allows other fields. Error branches are unchanged and still closed. `controlfreak --print-tools` prints the full contract with every field, and `docs/tools.md` describes it. Tool names, descriptions and input schemas are unchanged.
+- Removed result fields: `downscale_factor` and `resize_method` from every screenshot (compare `image_width` and `image_height` with `source_bounds`), `effect_verification` (always `unverified`) from input results, `retry_action` from `completed` input results (every other status still sends `retry_action: false`), and `owner_instance_id` (always `null`) from `desktop_in_use` details. A completed `click_mouse` result is 108 bytes smaller, and it is sent twice: as structured content and as text.
+
 ## [0.2.3] - 2026-11-18
 
 ### Fixed

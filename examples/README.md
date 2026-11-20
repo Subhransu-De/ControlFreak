@@ -28,7 +28,7 @@ observations. Replace the fixture IDs, coordinates, baseline ID, and expected te
 values observed during that run. Replace `fixture-target` with the returned `target_ref` and
 use that same approved reference throughout the session. End the session before changing targets. Reuse action screenshots when they answer the next question.
 
-A completed action reports accepted input. Its `effect_verification` remains `unverified`.
+A completed action reports accepted input, not that the application did what was asked.
 A visual change also does not prove success. The final observation must establish the intended
 application state. If any step fails, stop the sequence, inspect the result, and end the control
 session after pending actions finish. An agent should use its equivalent of `finally` for cleanup.

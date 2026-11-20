@@ -346,7 +346,6 @@ impl WindowBackend for FakeDesktop {
             png: vec![1, 2, 3],
             image_width: window.bounds.width,
             image_height: window.bounds.height,
-            downscale_factor: 1,
             cursor_marker: false,
             capture_method: "windows_print_window",
         })

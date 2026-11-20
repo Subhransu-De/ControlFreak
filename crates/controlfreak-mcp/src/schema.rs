@@ -56,10 +56,27 @@ fn tool(
         .with_annotations(kind.annotations(title))
 }
 
-/// Tool descriptions and schemas used by both `tools/list` and offline contract export.
+/// Tool descriptions and schemas that `tools/list` publishes.
+///
+/// Every success branch lists only its top-level fields, with shallow types, and allows others:
+/// the full result schemas were most of a list that clients resend with every turn. Error
+/// branches stay complete and closed, because they carry the recovery guidance. [`full_tools`]
+/// keeps the full contract.
+pub fn tools() -> Vec<Tool> {
+    let mut tools = full_tools();
+    for tool in &mut tools {
+        if let Some(schema) = tool.output_schema.as_mut() {
+            *schema = Arc::new(compact_output_schema(schema));
+        }
+    }
+    tools
+}
+
+/// Every tool with its full result contract, closed against extra fields, for `--print-tools`.
+/// Names, descriptions, input schemas and annotations are the same as in [`tools`].
 ///
 /// The list starts with the tools an agent needs first and ends with the emergency stop.
-pub fn tools() -> Vec<Tool> {
+pub fn full_tools() -> Vec<Tool> {
     let mut tools = vec![
         get_server_status_tool(),
         begin_control_session_tool(),
@@ -950,6 +967,17 @@ fn pointer_properties() -> JsonObject {
 fn output_schema(mut branches: Vec<Value>, mutating: bool) -> Arc<JsonObject> {
     branches.push(error_schema(mutating));
     let mut schema = json!({ "type": "object", "anyOf": branches });
+    attach_definitions(&mut schema);
+    strip_lower_bounds(&mut schema);
+    strip_enum_types(&mut schema);
+    match schema {
+        Value::Object(schema) => Arc::new(schema),
+        _ => Arc::default(),
+    }
+}
+
+/// Adds the `$defs` that `schema` references, directly or through another definition.
+fn attach_definitions(schema: &mut Value) {
     let text = schema.to_string();
     let mut needed: Vec<&'static str> = Vec::new();
     let mut pending: Vec<&'static str> = DEFS
@@ -978,12 +1006,93 @@ fn output_schema(mut branches: Vec<Value>, mutating: bool) -> Arc<JsonObject> {
             .collect();
         schema["$defs"] = Value::Object(defs);
     }
-    strip_lower_bounds(&mut schema);
-    strip_enum_types(&mut schema);
+}
+
+/// The published form of a full output schema: each success branch keeps its top-level field
+/// names, required list and shallow types (or its `const`/`enum`) and allows extra fields. The
+/// error branch, always last, is kept as it is.
+fn compact_output_schema(full: &JsonObject) -> JsonObject {
+    let definitions = full.get("$defs").cloned().unwrap_or(Value::Null);
+    let branches = full
+        .get("anyOf")
+        .and_then(Value::as_array)
+        .expect("every output schema is a union of branches");
+    let (error, successes) = branches
+        .split_last()
+        .expect("every output schema ends with its error branch");
+    let mut compact: Vec<Value> = successes
+        .iter()
+        .map(|branch| {
+            let branch = resolve_definition(branch, &definitions);
+            let properties: serde_json::Map<String, Value> = branch["properties"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(name, schema)| (name.clone(), shallow_schema(schema, &definitions)))
+                .collect();
+            let mut compact = json!({
+                "type": "object",
+                "properties": properties,
+                "additionalProperties": true
+            });
+            if let Some(required) = branch.get("required") {
+                compact["required"] = required.clone();
+            }
+            compact
+        })
+        .collect();
+    compact.push(error.clone());
+    let mut schema = json!({ "type": "object", "anyOf": compact });
+    attach_definitions(&mut schema);
     match schema {
-        Value::Object(schema) => Arc::new(schema),
-        _ => Arc::default(),
+        Value::Object(schema) => schema,
+        _ => JsonObject::new(),
     }
+}
+
+fn resolve_definition<'a>(schema: &'a Value, definitions: &'a Value) -> &'a Value {
+    schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|reference| reference.strip_prefix("#/$defs/"))
+        .and_then(|name| definitions.get(name))
+        .unwrap_or(schema)
+}
+
+/// A field's `const` or `enum` when it has one, otherwise its JSON type alone. A union becomes
+/// the union of its members' types, or accepts anything when a member has no single type.
+fn shallow_schema(schema: &Value, definitions: &Value) -> Value {
+    let schema = resolve_definition(schema, definitions);
+    if let Some(value) = schema.get("const") {
+        return json!({ "const": value });
+    }
+    if let Some(values) = schema.get("enum") {
+        return json!({ "enum": values });
+    }
+    if let Some(members) = schema
+        .get("oneOf")
+        .or_else(|| schema.get("anyOf"))
+        .and_then(Value::as_array)
+    {
+        let mut types: Vec<Value> = Vec::new();
+        for member in members {
+            let member = shallow_schema(member, definitions);
+            let member_types = match member.get("type") {
+                Some(Value::Array(types)) => types.clone(),
+                Some(single) => vec![single.clone()],
+                None => return json!({}),
+            };
+            for member_type in member_types {
+                if !types.contains(&member_type) {
+                    types.push(member_type);
+                }
+            }
+        }
+        return json!({ "type": types });
+    }
+    schema
+        .get("type")
+        .map_or_else(|| json!({}), |kind| json!({ "type": kind }))
 }
 
 /// `{"type":"string","enum":[...]}` and `{"enum":[...]}` accept exactly the same values when every
@@ -1074,12 +1183,11 @@ fn error_schema(mutating: bool) -> Value {
             json!({"enum": ["completed_unverified", "not_started", "partially_sent", "unknown"]});
         properties["input"] = def_ref("input");
         properties["observation_status"] = json!({"enum": ["failed", "not_attempted"]});
-        properties["effect_verification"] = json!({"const": "unverified"});
         properties["retry_action"] = json!({"const": false});
         return json!({
             "type": "object",
             "properties": properties,
-            "required": ["status", "input", "observation_status", "effect_verification", "retry_action"],
+            "required": ["status", "input", "observation_status", "retry_action"],
             "additionalProperties": false,
             "anyOf": [{"required": ["error"]}, {"required": ["operation", "warning"]}]
         });
@@ -1139,11 +1247,9 @@ fn action_output_schema_with(include_position: bool, action: &Value) -> Arc<Json
             },
             "status": {"const": "completed"},
             "input": {"$ref": "#/$defs/input", "properties": {"input_outcome": {"const": "input_sent"}}},
-            "observation_status": {"const": "succeeded"},
-            "effect_verification": {"const": "unverified"},
-            "retry_action": {"const": false}
+            "observation_status": {"const": "succeeded"}
         },
-        "required": ["action", "observation", "status", "input", "observation_status", "effect_verification", "retry_action"],
+        "required": ["action", "observation", "status", "input", "observation_status"],
         "additionalProperties": false
     });
     if include_position {
@@ -1165,8 +1271,6 @@ fn image_metadata_schema(subject: Vec<(&str, Value, bool)>) -> Value {
         "capture_method": { "type": "string", "enum": ["windows_print_window", "windows_gdi"] },
         "image_width": { "type": "integer", "minimum": 1 },
         "image_height": { "type": "integer", "minimum": 1 },
-        "downscale_factor": { "type": "integer", "minimum": 1 },
-        "resize_method": { "type": "string", "enum": ["native", "area_average"] },
         "cursor_marker": { "type": "boolean" },
         "observation_id": { "type": "string" }
     });
@@ -1176,8 +1280,6 @@ fn image_metadata_schema(subject: Vec<(&str, Value, bool)>) -> Value {
         "capture_method",
         "image_width",
         "image_height",
-        "downscale_factor",
-        "resize_method",
         "cursor_marker",
     ];
     for (name, schema, is_required) in subject {

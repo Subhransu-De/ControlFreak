@@ -114,7 +114,6 @@ fn screenshot(request_width: Option<u32>) -> DisplayScreenshot {
         png: vec![1, 2, 3],
         image_width: width,
         image_height: 600,
-        downscale_factor: 1,
         cursor_marker: false,
     }
 }
@@ -296,7 +295,6 @@ impl WindowBackend for ContractBackend {
             png: vec![1, 2, 3],
             image_width: request.max_width.map_or(400, |width| width.min(400)),
             image_height: 300,
-            downscale_factor: 1,
             cursor_marker: false,
             capture_method: "windows_print_window",
         })
@@ -435,10 +433,7 @@ fn every_error_the_server_builds_validates_against_every_tool_schema() {
     let session_errors = || {
         let stop = controlfreak_core::StopController::default();
         vec![
-            SessionError::DesktopInUse {
-                owner_instance_id: Some("other".into()),
-                retry_after_ms: 25,
-            },
+            SessionError::DesktopInUse { retry_after_ms: 25 },
             SessionError::ArbitrationUnavailable { reason: "r".into() },
             SessionError::ShuttingDown,
             SessionError::StillClosing,
@@ -452,6 +447,7 @@ fn every_error_the_server_builds_validates_against_every_tool_schema() {
     let mut checked = 0;
     for tool in tools() {
         let validator = validator_for(&tool.name);
+        let full = output_schema_tests::full_validator(&tool.name);
         let mutating = is_mutating_tool(&tool.name);
         let mut results: Vec<CallToolResult> = Vec::new();
         for error in all_platform_errors() {
@@ -487,6 +483,16 @@ fn every_error_the_server_builds_validates_against_every_tool_schema() {
                     tool.name,
                     validator.iter_errors(&content).collect::<Vec<_>>()
                 );
+                assert!(
+                    full.is_valid(&content),
+                    "{} error does not match the full contract: {content}",
+                    tool.name
+                );
+                // Every refused or interrupted input action keeps the safety guidance.
+                if mutating {
+                    assert_eq!(content["retry_action"], false, "{}", tool.name);
+                }
+                assert!(content.get("effect_verification").is_none());
                 checked += 1;
             }
         }
@@ -1313,11 +1319,11 @@ fn click_mouse_defaults_to_the_left_button() {
 #[test]
 fn tool_list_stays_compact() {
     let list = serde_json::to_string(&tools()).unwrap();
-    // Measured with `--print-tools`: 115,810 bytes before the compaction, 99,477 after, and
-    // 103,216 once every input action gained `settle_ms` and reported `observation.settle`. The
-    // limit leaves about 3% of headroom, so a reworded description does not fail this test but
-    // a schema that is pasted into every tool does.
-    assert!(list.len() < 106_000, "tools/list is {} bytes", list.len());
+    // Measured: 115,810 bytes before the first compaction, 99,477 after, 104,995 at 0.2.4, and
+    // 67,493 once every success branch was published shallow (#158). The limit leaves about 3%
+    // of headroom, so a reworded description does not fail this test but a schema that is
+    // pasted into every tool does.
+    assert!(list.len() < 70_000, "tools/list is {} bytes", list.len());
     for tool in tools() {
         let output = Value::Object((*tool.output_schema.unwrap()).clone()).to_string();
         assert!(
@@ -1326,4 +1332,90 @@ fn tool_list_stays_compact() {
             tool.name
         );
     }
+}
+
+/// #158: some clients (Codex does) append the server instructions to every tool description,
+/// so the instructions are paid once per tool as well.
+#[test]
+fn tool_list_with_instructions_in_every_tool_stays_in_budget() {
+    let tools = tools();
+    let total =
+        serde_json::to_string(&tools).unwrap().len() + tools.len() * SERVER_INSTRUCTIONS.len();
+    // Measured: 128,944 bytes at 0.2.4 and 91,442 after #158.
+    assert!(
+        total < 95_000,
+        "tools/list with instructions is {total} bytes"
+    );
+}
+
+/// #158: a completed `click_mouse` result carries no constant or legacy fields.
+#[test]
+fn a_completed_click_result_stays_small() {
+    let display = DisplayInfo {
+        id: r"\.\DISPLAY2".into(),
+        name: r"\.\DISPLAY2".into(),
+        bounds: DisplayBounds {
+            left: -1920,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        },
+        is_primary: false,
+    };
+    let result = PointerActionResult {
+        position: controlfreak_core::MousePosition {
+            display_id: display.id.clone(),
+            local_x: 200,
+            local_y: 110,
+            virtual_x: -1720,
+            virtual_y: 110,
+        },
+        observation: ActionObservation {
+            foreground_window: Some(window("target-00000000-0000-0000-0000-000000000001")),
+            screenshot: Some(DisplayScreenshot {
+                target_ref: Some("target-00000000-0000-0000-0000-000000000001".into()),
+                source_bounds: display.bounds,
+                display,
+                png: vec![1, 2, 3],
+                image_width: 1280,
+                image_height: 720,
+                cursor_marker: true,
+            }),
+            settle: Some(controlfreak_core::SettleReport {
+                outcome: controlfreak_core::SettleOutcome::Settled,
+                elapsed_ms: 180,
+            }),
+        },
+    };
+    let action = json!({"kind": "click", "button": "left", "click_count": 1, "modifiers": []});
+    let sent = MutationControl::default();
+    sent.dispatch_started();
+    sent.dispatch_accepted(2);
+    sent.input_complete();
+    let response = results::with_progress(
+        results::pointer_result(results::Encoded::new(result), &action).into(),
+        sent.progress(),
+    );
+    let CallToolResponse::Complete(result) = response else {
+        panic!("complete result expected");
+    };
+    let mut content = structured(&result);
+    // Observation IDs carry a process-wide counter, so fix the one varying field.
+    content["observation"]["screenshot"]["observation_id"] = json!("obs-0000000000000000-1");
+    let content = content.to_string();
+    for removed in [
+        "downscale_factor",
+        "resize_method",
+        "effect_verification",
+        "retry_action",
+    ] {
+        assert!(!content.contains(removed), "{removed}: {content}");
+    }
+    // Measured on this fixture: 1,292 bytes before #158 and 1,184 after. The result is sent
+    // twice, as structured content and as its text block, so a completed click saves 216 bytes.
+    assert!(
+        content.len() <= 1_292 - 108,
+        "{} bytes: {content}",
+        content.len()
+    );
 }

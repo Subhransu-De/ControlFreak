@@ -108,7 +108,6 @@ fn encoded_image_content_decodes_to_the_capture_png() {
         png: png.clone(),
         image_width: 1,
         image_height: 1,
-        downscale_factor: 1,
         cursor_marker: false,
     }));
     let value = serde_json::to_value(result).unwrap();

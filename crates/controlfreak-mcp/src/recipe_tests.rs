@@ -47,7 +47,6 @@ fn screenshot() -> DisplayScreenshot {
         png: include_bytes!("../../../examples/fixture.png").to_vec(),
         image_width: 200,
         image_height: 100,
-        downscale_factor: 2,
         cursor_marker: false,
     }
 }

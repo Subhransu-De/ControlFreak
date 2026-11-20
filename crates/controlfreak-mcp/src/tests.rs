@@ -92,13 +92,7 @@ impl ActivityArbitrator for ExclusiveArbitrator {
         self.owned
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| ())
-            .map_err(|_| {
-                ArbitrationBusy {
-                    owner_instance_id: Some("other-test-server".to_owned()),
-                    retry_after_ms: 25,
-                }
-                .into()
-            })
+            .map_err(|_| ArbitrationBusy { retry_after_ms: 25 }.into())
     }
 
     fn release(&self) {
@@ -956,7 +950,6 @@ fn pointer_result_contains_post_action_png() {
                 png: b"\x89PNG\r\n\x1a\n".to_vec(),
                 image_width: 1,
                 image_height: 1,
-                downscale_factor: 1,
                 cursor_marker: false,
             }),
             settle: Some(controlfreak_core::SettleReport {
@@ -978,10 +971,9 @@ fn pointer_result_contains_post_action_png() {
         serialized["structuredContent"]["observation"]["settle"],
         serde_json::json!({ "outcome": "still_changing", "elapsed_ms": 2_000 })
     );
-    assert_eq!(
-        serialized["structuredContent"]["observation"]["screenshot"]["downscale_factor"],
-        1
-    );
+    let screenshot = &serialized["structuredContent"]["observation"]["screenshot"];
+    assert!(screenshot.get("downscale_factor").is_none());
+    assert!(screenshot.get("resize_method").is_none());
     assert_eq!(
         serialized["structuredContent"]["observation"]["screenshot"]["source_bounds"]["width"],
         1

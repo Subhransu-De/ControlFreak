@@ -137,7 +137,7 @@ impl Harness {
 }
 
 #[tokio::test]
-async fn busy_desktop_returns_desktop_in_use_with_owner_details() {
+async fn busy_desktop_returns_desktop_in_use_with_retry_details() {
     for (name, arguments) in [begin(), mutate()] {
         let mut harness = harness(Arc::new(AtomicBool::new(true))).await;
         let result = call(&mut harness, name, arguments).await;
@@ -147,7 +147,7 @@ async fn busy_desktop_returns_desktop_in_use_with_owner_details() {
             error["message"],
             "another ControlFreak server owns the desktop"
         );
-        assert_eq!(error["details"]["owner_instance_id"], "other-test-server");
+        assert!(error["details"].get("owner_instance_id").is_none());
         assert_eq!(error["details"]["retry_after_ms"], 25);
         assert_eq!(error["details"]["session_state"], "dormant");
         assert!(error["details"]["remedy"].is_string());

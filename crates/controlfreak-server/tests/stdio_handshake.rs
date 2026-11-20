@@ -66,6 +66,7 @@ fn stdio_handshake_reports_complete_windows_tool_surface() {
         .expect("tools/list response");
     assert_tool_names(tools);
     assert_target_arguments(tools);
+    assert_print_tools_is_the_full_contract(tools);
 
     let display_result = responses
         .iter()
@@ -88,6 +89,44 @@ fn stdio_handshake_reports_complete_windows_tool_surface() {
         .find(|response| response["id"] == 4)
         .expect("server status response");
     assert_server_status(status);
+}
+
+/// `tools/list` publishes open success branches; `--print-tools` prints the same tools with the
+/// full, closed result contract.
+fn assert_print_tools_is_the_full_contract(listed: &Value) {
+    let output = Command::new(env!("CARGO_BIN_EXE_controlfreak"))
+        .arg("--print-tools")
+        .output()
+        .expect("run --print-tools");
+    assert!(output.status.success());
+    let printed: Value = serde_json::from_slice(&output.stdout).expect("--print-tools prints JSON");
+    let printed = printed.as_array().expect("a tool array");
+    let listed = listed["result"]["tools"]
+        .as_array()
+        .expect("tools/list tool array");
+    assert_eq!(printed.len(), listed.len());
+    for (printed, listed) in printed.iter().zip(listed) {
+        let name = &listed["name"];
+        assert_eq!(printed["name"], *name);
+        assert_eq!(printed["inputSchema"], listed["inputSchema"], "{name}");
+        assert_eq!(
+            listed["outputSchema"]["anyOf"][0]["additionalProperties"], true,
+            "{name}"
+        );
+        assert_ne!(printed["outputSchema"], listed["outputSchema"], "{name}");
+    }
+    let click = printed
+        .iter()
+        .find(|tool| tool["name"] == "click_mouse")
+        .expect("click_mouse");
+    assert_eq!(
+        click["outputSchema"]["anyOf"][0]["additionalProperties"],
+        false
+    );
+    assert!(
+        click["outputSchema"]["anyOf"][0]["properties"]["position"].is_object(),
+        "the full contract describes every field"
+    );
 }
 
 fn assert_target_arguments(tools: &Value) {
@@ -231,10 +270,9 @@ fn stdio_capture_display_returns_png_image_content() {
     let source_width = metadata["source_bounds"]["width"].as_u64().unwrap();
     let expected_width = source_width.min(321);
     assert_eq!(metadata["image_width"], expected_width);
-    assert!(matches!(
-        metadata["resize_method"].as_str(),
-        Some("native" | "area_average")
-    ));
+    // The image size and source bounds map points; the legacy scale fields are gone.
+    assert!(metadata.get("resize_method").is_none());
+    assert!(metadata.get("downscale_factor").is_none());
     // Display captures copy the screen; only window captures can report `windows_print_window`.
     assert_eq!(metadata["capture_method"], "windows_gdi");
 

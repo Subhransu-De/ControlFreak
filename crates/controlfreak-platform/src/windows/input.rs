@@ -565,7 +565,7 @@ fn ensure_input_idle(
 /// character: a greeting sent as one burst arrived in Notepad as "Hello,!!!!!!!!!!!". So
 /// every UTF-16 unit goes alone, and `pace` holds the next one back while the application looks
 /// busy. Nothing outside the application can see when it took or translated a keystroke, so
-/// pacing makes this unlikely rather than impossible; `effect_verification` stays `unverified`.
+/// pacing makes this unlikely rather than impossible, and the result never claims the effect.
 ///
 /// The target is validated before every unit, because pacing leaves time for the foreground to
 /// change. That includes the second half of a surrogate pair, whose halves are paced separately

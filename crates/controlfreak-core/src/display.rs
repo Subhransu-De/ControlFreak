@@ -70,7 +70,6 @@ pub struct DisplayScreenshot {
     pub png: Vec<u8>,
     pub image_width: u32,
     pub image_height: u32,
-    pub downscale_factor: u32,
     pub cursor_marker: bool,
 }
 

@@ -76,7 +76,7 @@ use results::{
     window_wait_result,
 };
 use schema::tools;
-pub use schema::tools as tool_definitions;
+pub use schema::{full_tools as full_tool_definitions, tools as tool_definitions};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::{

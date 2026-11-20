@@ -154,7 +154,6 @@ type IndicatorStarter = Arc<dyn Fn() -> Result<IndicatorControl, String> + Send 
 
 #[derive(Debug, Clone)]
 pub struct ArbitrationBusy {
-    pub owner_instance_id: Option<String>,
     pub retry_after_ms: u64,
 }
 
@@ -197,7 +196,6 @@ impl ActivityArbitrator for LocalArbitrator {
 #[derive(Debug)]
 pub(super) enum SessionError {
     DesktopInUse {
-        owner_instance_id: Option<String>,
         retry_after_ms: u64,
     },
     ArbitrationUnavailable {
@@ -218,7 +216,6 @@ impl From<ArbitrationError> for SessionError {
     fn from(error: ArbitrationError) -> Self {
         match error {
             ArbitrationError::Busy(busy) => Self::DesktopInUse {
-                owner_instance_id: busy.owner_instance_id,
                 retry_after_ms: busy.retry_after_ms,
             },
             ArbitrationError::Unavailable { reason } => Self::ArbitrationUnavailable { reason },
@@ -241,15 +238,11 @@ impl SessionError {
 
     pub(super) fn into_tool_result(self, safety_indicator: &SafetyIndicator) -> CallToolResult {
         let (code, message, retryable, details) = match self {
-            Self::DesktopInUse {
-                owner_instance_id,
-                retry_after_ms,
-            } => (
+            Self::DesktopInUse { retry_after_ms } => (
                 "desktop_in_use",
                 "another ControlFreak server owns the desktop".to_owned(),
                 true,
                 json!({
-                    "owner_instance_id": owner_instance_id,
                     "session_state": "dormant",
                     "retry_after_ms": retry_after_ms,
                     "remedy": "wait, or ask the owning client to call end_control_session",

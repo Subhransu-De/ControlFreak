@@ -33,7 +33,6 @@ fn screenshot() -> DisplayScreenshot {
         png: vec![1, 2, 3],
         image_width: 5,
         image_height: 5,
-        downscale_factor: 2,
         cursor_marker: false,
     }
 }
@@ -224,7 +223,6 @@ impl WindowBackend for ObservationBackend {
             png: vec![1, 2, 3],
             image_width: 5,
             image_height: 5,
-            downscale_factor: 2,
             cursor_marker: true,
             capture_method: "windows_print_window",
         })
@@ -259,6 +257,15 @@ fn with(mut base: Value, extra: Value) -> Value {
     base
 }
 
+/// The output schema of `name` in the full contract that `--print-tools` exports.
+pub(super) fn full_validator(name: &str) -> jsonschema::Validator {
+    let tool = full_tool_definitions()
+        .into_iter()
+        .find(|tool| tool.name == name)
+        .unwrap();
+    jsonschema::validator_for(&Value::Object((*tool.output_schema.unwrap()).clone())).unwrap()
+}
+
 #[test]
 fn every_tool_publishes_an_object_output_schema() {
     let missing: Vec<_> = tools()
@@ -275,6 +282,59 @@ fn every_tool_publishes_an_object_output_schema() {
         "tools without an outputSchema: {missing:?}"
     );
     assert_eq!(tools().len(), 27);
+}
+
+/// `tools/list` differs from the full contract only in its open, shallow success branches: the
+/// error branch, names, descriptions, input schemas and annotations are the same byte for byte.
+#[test]
+fn published_schemas_differ_from_the_full_contract_only_in_success_branches() {
+    let compact = tools();
+    let full = full_tool_definitions();
+    assert_eq!(compact.len(), full.len());
+    let output = |tool: &Tool| Value::Object((*tool.output_schema.clone().unwrap()).clone());
+    for (compact, full) in compact.iter().zip(&full) {
+        let name = &compact.name;
+        assert_eq!(compact.name, full.name);
+        assert_eq!(compact.title, full.title, "{name}");
+        assert_eq!(compact.description, full.description, "{name}");
+        assert_eq!(compact.input_schema, full.input_schema, "{name}");
+        assert_eq!(compact.annotations, full.annotations, "{name}");
+        let (published, complete) = (output(compact), output(full));
+        let branches = |schema: &Value| schema["anyOf"].as_array().unwrap().clone();
+        let (published_error, published_success) = branches(&published)
+            .split_last()
+            .map(|(e, s)| (e.clone(), s.to_vec()))
+            .unwrap();
+        let (complete_error, complete_success) = branches(&complete)
+            .split_last()
+            .map(|(e, s)| (e.clone(), s.to_vec()))
+            .unwrap();
+        assert_eq!(published_error, complete_error, "{name}");
+        assert_eq!(published_error["additionalProperties"], false, "{name}");
+        assert_eq!(published_success.len(), complete_success.len(), "{name}");
+        let complete_schema = &complete;
+        for (published, complete) in published_success.iter().zip(&complete_success) {
+            let complete = complete["$ref"].as_str().map_or(complete, |reference| {
+                &complete_schema["$defs"][reference.trim_start_matches("#/$defs/")]
+            });
+            assert_eq!(published["additionalProperties"], true, "{name}");
+            assert_eq!(complete["additionalProperties"], false, "{name}");
+            assert_eq!(published["required"], complete["required"], "{name}");
+            let names = |branch: &Value| {
+                branch["properties"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(names(published), names(complete), "{name}");
+        }
+        assert!(
+            published.to_string().len() < complete.to_string().len(),
+            "{name} publishes no smaller schema"
+        );
+    }
 }
 
 #[test]
@@ -309,12 +369,15 @@ fn screenshot_and_wait_schemas_share_one_image_metadata_definition() {
 
 #[test]
 fn schemas_describe_idle_busy_and_stopped_server_status() {
-    let tool = tools()
+    // The full contract pins every field; the published one keeps its top-level enums.
+    let validator = full_validator(GET_SERVER_STATUS);
+    let published = tools()
         .into_iter()
         .find(|tool| tool.name == GET_SERVER_STATUS)
         .unwrap();
-    let schema = Value::Object((*tool.output_schema.unwrap()).clone());
-    let validator = jsonschema::validator_for(&schema).unwrap();
+    let published =
+        jsonschema::validator_for(&Value::Object((*published.output_schema.unwrap()).clone()))
+            .unwrap();
     let base = json!({
         "status": "ready",
         "safety_indicator": {"status": "dormant", "reason": null},
@@ -379,9 +442,12 @@ fn schemas_describe_idle_busy_and_stopped_server_status() {
         )),
         "no recovery action reopens input from MCP"
     );
+    assert!(published.is_valid(&base));
+    assert!(!published.is_valid(&with(base.clone(), json!({"status": "bogus"}))));
     let mut missing = base;
     missing.as_object_mut().unwrap().remove("input_admission");
     assert!(!validator.is_valid(&missing), "input_admission is required");
+    assert!(!published.is_valid(&missing), "input_admission is required");
 }
 
 #[tokio::test]
@@ -460,6 +526,10 @@ async fn every_observation_and_session_result_validates_against_tools_list() {
         assert!(
             validator.is_valid(content),
             "{name} result does not match its outputSchema: {content}"
+        );
+        assert!(
+            full_validator(name).is_valid(content),
+            "{name} result does not match the full contract: {content}"
         );
         let has_image_block = result["content"]
             .as_array()

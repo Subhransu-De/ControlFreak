@@ -73,13 +73,6 @@ fn screenshot_metadata(screenshot: &DisplayScreenshot) -> Value {
         "capture_method": "windows_gdi",
         "image_width": screenshot.image_width,
         "image_height": screenshot.image_height,
-        "downscale_factor": screenshot.downscale_factor,
-        "resize_method": resize_method(
-            screenshot.source_bounds.width,
-            screenshot.source_bounds.height,
-            screenshot.image_width,
-            screenshot.image_height,
-        ),
         "cursor_marker": screenshot.cursor_marker,
         "observation_id": super::observations::register(
             screenshot.source_bounds,
@@ -88,14 +81,6 @@ fn screenshot_metadata(screenshot: &DisplayScreenshot) -> Value {
             None,
         ),
     })
-}
-
-fn resize_method(source_width: u32, source_height: u32, width: u32, height: u32) -> &'static str {
-    if width == source_width && height == source_height {
-        "native"
-    } else {
-        "area_average"
-    }
 }
 
 pub(super) fn visual_change_result(result: Encoded<VisualChangeResult>) -> CallToolResult {
@@ -140,13 +125,6 @@ pub(super) fn window_screenshot_result(screenshot: Encoded<WindowScreenshot>) ->
             "capture_method": screenshot.capture_method,
             "image_width": screenshot.image_width,
             "image_height": screenshot.image_height,
-            "downscale_factor": screenshot.downscale_factor,
-            "resize_method": resize_method(
-                screenshot.source_bounds.width,
-                screenshot.source_bounds.height,
-                screenshot.image_width,
-                screenshot.image_height,
-            ),
             "cursor_marker": screenshot.cursor_marker,
             "observation_id": super::observations::register(
                 controlfreak_core::DisplayBounds {
@@ -408,9 +386,15 @@ pub(super) fn with_progress(
     } else {
         "not_attempted"
     });
-    metadata["effect_verification"] = json!("unverified");
-    // Even a refusal needs a new decision, not an automatic retry loop.
-    metadata["retry_action"] = json!(false);
+    // Even a refusal needs a new decision, not an automatic retry loop. A completed action has
+    // nothing to retry, so only the other statuses carry the guidance.
+    if status == "completed" {
+        if let Some(metadata) = metadata.as_object_mut() {
+            metadata.remove("retry_action");
+        }
+    } else {
+        metadata["retry_action"] = json!(false);
+    }
     if progress.input_outcome != InputOutcome::NotStarted {
         result.is_error = Some(false);
     }
