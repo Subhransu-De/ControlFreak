@@ -64,7 +64,7 @@ use super::desktop::virtual_desktop_manager;
 use super::indicator::{
     Activity, ButtonState, DibSurface, FADE_IN, FADE_IN_FROM, Monitor, PaintedTab, Painter,
     Palette, READING, StopStatus, TabInputs, TabKind, TabModel, TabView, animations_enabled,
-    enumerate_monitors, spoken, text_scale,
+    enumerate_monitors, read_monitors, spoken, text_scale, usable_monitors,
 };
 use super::win32::{ComApartment, windows_error};
 
@@ -333,6 +333,52 @@ fn record_tab_failure(controller: &StopController, report: &impl Fn(String), err
     );
     controller.stop_with_failure(reason.clone());
     report(reason);
+}
+
+/// Reads the displays for the tab at each settings poll. Windows may report no usable display
+/// for a moment (see [`super::indicator::TopologyGap`]). While no session is owned the tab has
+/// nothing it must show, so it keeps its windows as they are and the next poll reads again;
+/// admission stays open. While a session is owned the tab must be on screen, so the same reading
+/// fails closed.
+struct DisplayWatch<R> {
+    read: R,
+    /// The last reading was a gap, so the tab windows may not match the displays.
+    gap: bool,
+}
+
+impl<R: FnMut() -> io::Result<Vec<Monitor>>> DisplayWatch<R> {
+    const fn new(read: R) -> Self {
+        Self { read, gap: false }
+    }
+
+    /// The displays to put tabs on, or `None` during a gap. The windows are kept through a gap,
+    /// so displays that come back as they were need no new windows.
+    fn poll(&mut self, session_owned: bool) -> io::Result<Option<Vec<Monitor>>> {
+        match usable_monitors((self.read)()?) {
+            Ok(monitors) => {
+                self.gap = false;
+                Ok(Some(monitors))
+            }
+            Err(gap) if !session_owned => {
+                // Logged when the gap starts, not at every poll while it lasts.
+                if !self.gap {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"event": "session_tab_display_gap", "reason": gap.to_string()})
+                    );
+                }
+                self.gap = true;
+                Ok(None)
+            }
+            Err(gap) => Err(gap.into()),
+        }
+    }
+
+    /// A session that starts during a gap reads the displays at once instead of waiting for the
+    /// next poll.
+    const fn must_read_now(&self, session_owned: bool) -> bool {
+        self.gap && session_owned
+    }
 }
 
 /// Installs and removes the low-level keyboard hook on the thread that calls it. A trait so that
@@ -1608,6 +1654,7 @@ fn tab_loop(
         signals.announce_read.swap(false, Ordering::AcqRel),
     ));
     let mut reading_until: Option<Instant> = None;
+    let mut displays = DisplayWatch::new(read_monitors);
     loop {
         // Drain first and read the flag after it, so a shutdown wake-up consumed by the drain is
         // still seen. The wait below is bounded as well.
@@ -1623,15 +1670,23 @@ fn tab_loop(
             reading_until = Some(now + READING);
         }
         let reading = reading_until.is_some_and(|until| now < until);
+        let session_owned = controller.session_active();
         // The Esc hint is offered only while the hook is confirmed installed.
         repaint |= presenter
             .painter
             .set_esc_hint(controller.esc_stop_available());
-        if now >= next_settings || SETTINGS_CHANGED.with(|flag| flag.replace(false)) {
+        if now >= next_settings
+            || SETTINGS_CHANGED.with(|flag| flag.replace(false))
+            || displays.must_read_now(session_owned)
+        {
             let fresh = Settings::read();
             repaint |= fresh != settings;
             settings = fresh;
-            if native.sync_monitors(&enumerate_monitors()?)? {
+            // Ownership is read again here, so a session that ended a moment ago is not held to
+            // the owned rule.
+            if let Some(monitors) = displays.poll(controller.session_active())?
+                && native.sync_monitors(&monitors)?
+            {
                 repaint = true;
                 desktop = None;
             }
@@ -1644,7 +1699,7 @@ fn tab_loop(
         let view = model.view(
             now,
             TabInputs {
-                session_active: controller.session_active(),
+                session_active: session_owned,
                 stop: StopStatus::parse(controller.status()),
                 activity: signals.activity(),
                 actions: signals.actions(),
@@ -2742,6 +2797,80 @@ mod tests {
             "the button is not: a click on it belongs to this process, which the target \
              checks refuse"
         );
+    }
+
+    /// A display somewhere left of the primary one, at a negative origin.
+    const DISPLAY: Monitor = Monitor {
+        left: -1920,
+        top: 0,
+        right: 0,
+        bottom: 1080,
+        dpi: 144,
+    };
+
+    /// A monitor source that returns `readings` in order.
+    fn readings(
+        readings: Vec<Vec<Monitor>>,
+    ) -> DisplayWatch<impl FnMut() -> io::Result<Vec<Monitor>>> {
+        let mut readings = readings.into_iter();
+        DisplayWatch::new(move || Ok(readings.next().expect("one reading per poll")))
+    }
+
+    #[test]
+    fn a_display_gap_while_idle_keeps_the_tab_running_and_the_next_poll_recovers() {
+        let controller = StopController::default();
+        let mut displays = readings(vec![Vec::new(), vec![DISPLAY]]);
+        assert_eq!(
+            displays.poll(controller.session_active()).unwrap(),
+            None,
+            "the tab thread keeps running and waits for the next poll"
+        );
+        assert!(!controller.is_stopped(), "admission stays open");
+        assert_eq!(controller.failure_reason(), None);
+        assert!(
+            !displays.must_read_now(controller.session_active()),
+            "an idle tab waits for its next poll"
+        );
+        assert_eq!(
+            displays.poll(controller.session_active()).unwrap(),
+            Some(vec![DISPLAY]),
+            "the next poll recovers"
+        );
+        assert!(!displays.must_read_now(true), "the gap is over");
+    }
+
+    #[test]
+    fn a_display_gap_during_an_owned_session_still_fails_closed_with_its_reason() {
+        let controller = StopController::default();
+        controller.set_session_active(true);
+        let flat = Monitor {
+            bottom: DISPLAY.top,
+            ..DISPLAY
+        };
+        let error = readings(vec![vec![flat]])
+            .poll(controller.session_active())
+            .unwrap_err();
+        record_tab_failure(&controller, &|_| {}, &error);
+        assert!(controller.is_stopped());
+        let reason = controller.failure_reason().unwrap();
+        assert!(reason.contains("invalid monitor bounds"), "{reason}");
+    }
+
+    #[test]
+    fn a_session_that_starts_during_a_display_gap_reads_at_once_and_fails_closed() {
+        let controller = StopController::default();
+        let mut displays = readings(vec![Vec::new(), Vec::new()]);
+        displays.poll(controller.session_active()).unwrap();
+        controller.set_session_active(true);
+        assert!(
+            displays.must_read_now(controller.session_active()),
+            "the session does not wait for the next poll"
+        );
+        let error = displays.poll(controller.session_active()).unwrap_err();
+        record_tab_failure(&controller, &|_| {}, &error);
+        assert!(controller.is_stopped());
+        let refusal = controller.refusal_message().unwrap();
+        assert!(refusal.contains("no active monitors"), "{refusal}");
     }
 
     #[test]

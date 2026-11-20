@@ -44,8 +44,9 @@ use windows::{
 };
 
 use super::indicator::{
-    DibSurface, FADE_IN, FADE_IN_FROM, LampGeometry, LampTone, Monitor, Palette, Rgb,
-    animations_enabled, enumerate_monitors, lamp_color, lamp_geometry, warning_geometry,
+    DibSurface, FADE_IN, FADE_IN_FROM, LampGeometry, LampTone, Monitor, Palette, Rgb, TopologyGap,
+    animations_enabled, lamp_color, lamp_geometry, read_monitors, usable_monitors,
+    warning_geometry,
 };
 
 const PROTOCOL_PREFIX: &str = "CFP/1";
@@ -160,7 +161,7 @@ pub(crate) fn run(config: HelperConfig) -> io::Result<()> {
         }
 
         if now >= next_topology || TOPOLOGY_DIRTY.swap(false, Ordering::AcqRel) {
-            renderer.sync_topology()?;
+            renderer.sync_topology(false)?;
             next_topology = now + topology_interval(visual.visible);
         }
 
@@ -581,12 +582,34 @@ fn desktop_follow(current: Option<GUID>, foreground: Option<GUID>) -> DesktopFol
     }
 }
 
+/// What a topology poll does with a monitor reading.
+#[derive(Debug, PartialEq, Eq)]
+enum Topology {
+    Monitors(Vec<Monitor>),
+    /// Windows reported no usable display while nothing needs the lamp: it stays hidden and the
+    /// next poll reads again.
+    RetryLater(TopologyGap),
+}
+
+/// A hidden lamp tells the server nothing, so a gap in the reading waits for the next poll
+/// instead of ending the helper. A shown lamp, and a LEVEL acknowledgement, which tells the
+/// server the lamp is visible, need a display, so for them a gap is an error.
+fn lamp_topology(reading: Vec<Monitor>, lamp_needed: bool) -> io::Result<Topology> {
+    match usable_monitors(reading) {
+        Ok(monitors) => Ok(Topology::Monitors(monitors)),
+        Err(gap) if !lamp_needed => Ok(Topology::RetryLater(gap)),
+        Err(gap) => Err(gap.into()),
+    }
+}
+
 struct Renderer {
     manager: IVirtualDesktopManager,
     desktop_id: Option<GUID>,
     monitors: Vec<Monitor>,
     windows: Vec<LampWindow>,
     visible: bool,
+    /// The last reading was a gap, already logged.
+    gap: bool,
     /// Mirrors the Windows "Show animations" setting; re-read on every topology poll.
     animated: bool,
     palette: Palette,
@@ -601,18 +624,35 @@ impl Renderer {
             monitors: Vec::new(),
             windows: Vec::new(),
             visible: false,
+            gap: false,
             animated: animations_enabled(),
             palette: Palette::system(),
             tone: Tone::Normal,
         };
-        renderer.sync_topology()?;
+        renderer.sync_topology(false)?;
         Ok(renderer)
     }
 
-    fn sync_topology(&mut self) -> io::Result<()> {
+    /// Re-reads displays, colours and animation settings. `lamp_needed` is set for a LEVEL
+    /// acknowledgement; a lamp already shown needs its displays too.
+    fn sync_topology(&mut self, lamp_needed: bool) -> io::Result<()> {
         self.animated = animations_enabled();
         self.palette = Palette::system();
-        let monitors = enumerate_monitors()?;
+        let monitors = match lamp_topology(read_monitors()?, lamp_needed || self.visible)? {
+            Topology::Monitors(monitors) => monitors,
+            Topology::RetryLater(gap) => {
+                // Logged when the gap starts, not at every poll while it lasts.
+                if !self.gap {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"event": "desktop_glow_display_gap", "reason": gap.to_string()})
+                    );
+                }
+                self.gap = true;
+                return Ok(());
+            }
+        };
+        self.gap = false;
         if monitors != self.monitors {
             let mut replacement = Vec::with_capacity(monitors.len());
             for monitor in monitors.iter().copied() {
@@ -685,7 +725,8 @@ impl Renderer {
     fn present_level(&mut self, level: Level, opacity: f64) -> io::Result<()> {
         // A LEVEL acknowledgement authorizes the parent to mutate input, so first move the lamp to
         // the foreground desktop where the shell can tell, and give it a non-transparent frame.
-        self.sync_topology()?;
+        // Without a usable display this refuses the acknowledgement.
+        self.sync_topology(true)?;
         self.render(level, opacity)?;
         self.set_visible(true)
     }
@@ -954,7 +995,9 @@ fn pump_messages() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::indicator::{ADMIN_RED, AMBER, Painter, TURQUOISE, TabKind, TabView};
+    use super::super::indicator::{
+        ADMIN_RED, AMBER, Painter, TURQUOISE, TabKind, TabView, enumerate_monitors,
+    };
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::{GetWindowDisplayAffinity, WindowFromPoint};
     use windows::core::Error as WindowsError;
@@ -1109,6 +1152,45 @@ mod tests {
             DesktopFollow::Move(second)
         );
         assert_eq!(usable_desktop::<()>(Ok(second)), Some(second));
+    }
+
+    #[test]
+    fn a_hidden_lamp_waits_out_a_display_gap_but_level_still_needs_a_display() {
+        let display = Monitor {
+            left: -1920,
+            top: -200,
+            right: 0,
+            bottom: 880,
+            dpi: 120,
+        };
+        assert_eq!(
+            lamp_topology(Vec::new(), false).unwrap(),
+            Topology::RetryLater(TopologyGap::NoMonitors),
+            "a hidden lamp keeps the helper running"
+        );
+        let flat = Monitor {
+            right: display.left,
+            ..display
+        };
+        assert_eq!(
+            lamp_topology(vec![display, flat], false).unwrap(),
+            Topology::RetryLater(TopologyGap::InvalidBounds)
+        );
+        assert_eq!(
+            lamp_topology(vec![display], false).unwrap(),
+            Topology::Monitors(vec![display]),
+            "the next poll recovers"
+        );
+        let refused = lamp_topology(Vec::new(), true).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::NotFound);
+        assert!(
+            refused.to_string().contains("no active monitors"),
+            "{refused}"
+        );
+        assert!(
+            lamp_topology(vec![flat], true).is_err(),
+            "LEVEL and a shown lamp refuse invalid bounds as well"
+        );
     }
 
     #[test]
