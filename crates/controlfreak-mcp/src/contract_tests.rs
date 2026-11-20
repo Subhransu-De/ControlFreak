@@ -325,10 +325,14 @@ impl WindowBackend for ContractBackend {
         self.recorded.lock().unwrap().switches += 1;
         self.act(
             control,
+            // A known desktop, then none: what an empty destination desktop may look like.
             VirtualDesktopSwitchResult {
                 direction: request.direction,
                 requested_steps: request.steps,
                 changed: true,
+                before_id: Some("desktop-a".to_owned()),
+                after_id: None,
+                transition: controlfreak_core::VirtualDesktopTransition::Unknown,
                 observation: observation(),
             },
         )
@@ -779,6 +783,17 @@ async fn switch_virtual_desktop_defaults_its_target_and_ends_the_session() {
     )
     .await;
     assert_ne!(switched["isError"], true, "{switched}");
+    // The shortcut was sent, but a missing reading afterwards confirms nothing.
+    let content = &switched["structuredContent"];
+    assert!(
+        validator_for(SWITCH_VIRTUAL_DESKTOP).is_valid(content),
+        "{content}"
+    );
+    assert_eq!(content["input"]["input_outcome"], "input_sent");
+    assert_eq!(content["action"]["transition"], "unknown");
+    assert_eq!(content["action"]["before_id"], "desktop-a");
+    assert_eq!(content["action"]["after_id"], Value::Null);
+    assert_eq!(content["action"]["changed"], true, "kept for compatibility");
     assert_eq!(
         backend.recorded(|r| r.validated.clone()),
         ["target-00000000-0000-0000-0000-000000000001"]

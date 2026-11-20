@@ -215,6 +215,9 @@ pub(super) fn virtual_desktop_switch_result(
             "direction": result.direction,
             "requested_steps": result.requested_steps,
             "changed": result.changed,
+            "before_id": result.before_id,
+            "after_id": result.after_id,
+            "transition": result.transition,
         }),
         None,
     )

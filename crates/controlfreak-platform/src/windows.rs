@@ -984,9 +984,11 @@ impl WindowBackend for Backend {
         }
         let _apartment = initialize_com()?;
         let manager = virtual_desktop_manager()?;
-        let before = current_virtual_desktop_id(&manager);
         let _guard = self.lock_input(control)?;
         ensure_interactive_input_desktop("switch_virtual_desktop")?;
+        // Read under the input lock, so another of this server's actions cannot move the
+        // foreground between this reading and the first shortcut.
+        let before = desktop::foreground_desktop(&manager);
         input::send_desktop_switch_hops(
             request.direction,
             request.steps,
@@ -1006,15 +1008,16 @@ impl WindowBackend for Backend {
         )?;
         control.input_complete();
         target::evidence(control);
-        let after = current_virtual_desktop_id(&manager);
+        let after = desktop::foreground_desktop(&manager);
         let observation = observe_foreground(&request.observation)
             .map_err(|error| post_action_error("switch_virtual_desktop", error.to_string()))?;
-        Ok(VirtualDesktopSwitchResult {
-            direction: request.direction,
-            requested_steps: request.steps,
-            changed: before != after,
+        // A missing reading leaves the transition unknown; the input is still reported as sent.
+        Ok(desktop::desktop_switch_result(
+            request,
+            before,
+            after,
             observation,
-        })
+        ))
     }
 
     fn focus_window_controlled(
