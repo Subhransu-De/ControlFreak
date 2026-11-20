@@ -242,8 +242,10 @@ pub(super) struct ClickTextInput {
     pub(super) query: String,
     #[serde(default)]
     pub(super) case_sensitive: bool,
+    #[serde(default, deserialize_with = "not_null")]
     match_mode: Option<controlfreak_core::TextMatchMode>,
     /// The older name for `match_mode`: `true` is `exact`, `false` is `substring`.
+    #[serde(default, deserialize_with = "not_null")]
     exact_match: Option<bool>,
     #[serde(default = "default_left_button")]
     pub(super) button: MouseButton,
@@ -836,25 +838,85 @@ pub(super) enum ActionStepInput {
 }
 
 /// Every field any step takes. The step's `action` decides which of them it may use.
+///
+/// An omitted field and an explicit `null` stay distinct, as they were for the tagged enum: a
+/// nullable field is [`Given::Null`] for `null`, so a `null` field that the action does not take is
+/// still an unknown field, and a field that is not nullable refuses `null` instead of taking its
+/// default.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StepFields {
     action: StepAction,
-    display_id: Option<String>,
-    x: Option<u32>,
-    y: Option<u32>,
-    observation_id: Option<String>,
-    image_x: Option<u32>,
-    image_y: Option<u32>,
+    #[serde(default, deserialize_with = "present")]
+    display_id: Given<String>,
+    #[serde(default, deserialize_with = "present")]
+    x: Given<u32>,
+    #[serde(default, deserialize_with = "present")]
+    y: Given<u32>,
+    #[serde(default, deserialize_with = "present")]
+    observation_id: Given<String>,
+    #[serde(default, deserialize_with = "present")]
+    image_x: Given<u32>,
+    #[serde(default, deserialize_with = "present")]
+    image_y: Given<u32>,
+    #[serde(default, deserialize_with = "not_null")]
     button: Option<MouseButton>,
+    #[serde(default, deserialize_with = "not_null")]
     click_count: Option<u8>,
+    #[serde(default, deserialize_with = "not_null")]
     modifiers: Option<Vec<Key>>,
+    #[serde(default, deserialize_with = "not_null")]
     delta_x: Option<i32>,
+    #[serde(default, deserialize_with = "not_null")]
     delta_y: Option<i32>,
+    #[serde(default, deserialize_with = "not_null")]
     text: Option<String>,
-    timeout_ms: Option<u32>,
+    #[serde(default, deserialize_with = "present")]
+    timeout_ms: Given<u32>,
+    #[serde(default, deserialize_with = "not_null")]
     keys: Option<Vec<Key>>,
+    #[serde(default, deserialize_with = "not_null")]
     wait_ms: Option<u32>,
+}
+
+/// A nullable step field: omitted, an explicit `null`, or a value.
+#[derive(Default)]
+enum Given<T> {
+    #[default]
+    Omitted,
+    Null,
+    Value(T),
+}
+
+impl<T> Given<T> {
+    const fn is_given(&self) -> bool {
+        !matches!(self, Self::Omitted)
+    }
+
+    fn value(self) -> Option<T> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Omitted | Self::Null => None,
+        }
+    }
+}
+
+/// A nullable field that was given; with `#[serde(default)]`, an omitted one is [`Given::Omitted`].
+fn present<'de, D, T>(deserializer: D) -> Result<Given<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(|value| value.map_or(Given::Null, Given::Value))
+}
+
+/// A field that may be omitted (with `#[serde(default)]`) but not `null`.
+fn not_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -903,19 +965,19 @@ impl StepFields {
     fn into_step<E: serde::de::Error>(self) -> Result<ActionStepInput, E> {
         let allowed = Self::allowed(self.action);
         let given = [
-            ("display_id", self.display_id.is_some()),
-            ("x", self.x.is_some()),
-            ("y", self.y.is_some()),
-            ("observation_id", self.observation_id.is_some()),
-            ("image_x", self.image_x.is_some()),
-            ("image_y", self.image_y.is_some()),
+            ("display_id", self.display_id.is_given()),
+            ("x", self.x.is_given()),
+            ("y", self.y.is_given()),
+            ("observation_id", self.observation_id.is_given()),
+            ("image_x", self.image_x.is_given()),
+            ("image_y", self.image_y.is_given()),
             ("button", self.button.is_some()),
             ("click_count", self.click_count.is_some()),
             ("modifiers", self.modifiers.is_some()),
             ("delta_x", self.delta_x.is_some()),
             ("delta_y", self.delta_y.is_some()),
             ("text", self.text.is_some()),
-            ("timeout_ms", self.timeout_ms.is_some()),
+            ("timeout_ms", self.timeout_ms.is_given()),
             ("keys", self.keys.is_some()),
             ("wait_ms", self.wait_ms.is_some()),
         ];
@@ -927,29 +989,29 @@ impl StepFields {
         }
         Ok(match self.action {
             StepAction::Click => ActionStepInput::Click {
-                display_id: self.display_id,
-                x: self.x,
-                y: self.y,
-                observation_id: self.observation_id,
-                image_x: self.image_x,
-                image_y: self.image_y,
+                display_id: self.display_id.value(),
+                x: self.x.value(),
+                y: self.y.value(),
+                observation_id: self.observation_id.value(),
+                image_x: self.image_x.value(),
+                image_y: self.image_y.value(),
                 button: self.button.unwrap_or_else(default_left_button),
                 click_count: self.click_count.unwrap_or_else(default_click_count),
                 modifiers: self.modifiers.unwrap_or_default(),
             },
             StepAction::Scroll => ActionStepInput::Scroll {
-                display_id: self.display_id,
-                x: self.x,
-                y: self.y,
-                observation_id: self.observation_id,
-                image_x: self.image_x,
-                image_y: self.image_y,
+                display_id: self.display_id.value(),
+                x: self.x.value(),
+                y: self.y.value(),
+                observation_id: self.observation_id.value(),
+                image_x: self.image_x.value(),
+                image_y: self.image_y.value(),
                 delta_x: self.delta_x.unwrap_or_default(),
                 delta_y: self.delta_y.unwrap_or_default(),
             },
             StepAction::TypeText => ActionStepInput::TypeText {
                 text: self.text.ok_or_else(|| E::missing_field("text"))?,
-                timeout_ms: self.timeout_ms,
+                timeout_ms: self.timeout_ms.value(),
             },
             StepAction::PressKeys => ActionStepInput::PressKeys {
                 keys: self.keys.ok_or_else(|| E::missing_field("keys"))?,

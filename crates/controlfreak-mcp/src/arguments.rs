@@ -414,6 +414,69 @@ mod tests {
         );
     }
 
+    /// An explicit `null` is not an omitted field: it never takes a default, and a `null` field
+    /// that the step's action does not take is still unknown.
+    #[test]
+    fn a_null_field_is_refused_rather_than_defaulted() {
+        for (step, path) in [
+            (
+                json!({"action": "click", "x": 1, "y": 1, "button": null}),
+                "steps[0].button",
+            ),
+            (
+                json!({"action": "click", "x": 1, "y": 1, "click_count": null}),
+                "steps[0].click_count",
+            ),
+            (
+                json!({"action": "click", "x": 1, "y": 1, "modifiers": null}),
+                "steps[0].modifiers",
+            ),
+            (
+                json!({"action": "scroll", "x": 1, "y": 1, "delta_y": null}),
+                "steps[0].delta_y",
+            ),
+            (
+                json!({"action": "type_text", "text": null}),
+                "steps[0].text",
+            ),
+            (
+                json!({"action": "wait", "wait_ms": null}),
+                "steps[0].wait_ms",
+            ),
+        ] {
+            let (_, details) =
+                refusal::<RunActionsInput>(json!({"target_ref": TARGET, "steps": [step]}));
+            assert_eq!(details["path"], path, "{details}");
+            assert_eq!(details["problem"], "invalid_type", "{details}");
+            assert_eq!(details["received_kind"], "null", "{details}");
+        }
+        let (_, details) = refusal::<RunActionsInput>(json!({
+            "target_ref": TARGET, "steps": [{"action": "type_text", "text": "a", "x": null}]
+        }));
+        assert_eq!(details["path"], "steps[0].x", "{details}");
+        assert_eq!(details["problem"], "unknown_field", "{details}");
+        assert_eq!(details["received_kind"], "null", "{details}");
+
+        // A nullable field of the step's own action still takes null, as before.
+        let Value::Object(arguments) = json!({"target_ref": TARGET, "steps": [
+            {"action": "click", "x": 1, "y": 1, "display_id": null, "observation_id": null},
+            {"action": "type_text", "text": "a", "timeout_ms": null},
+        ]}) else {
+            unreachable!()
+        };
+        assert!(parse_arguments::<RunActionsInput>(Some(arguments)).is_ok());
+
+        for field in ["match_mode", "exact_match"] {
+            let mut arguments = json!({
+                "target_ref": TARGET, "x": 0, "y": 0, "width": 1, "height": 1, "query": "Save"
+            });
+            arguments[field] = Value::Null;
+            let (_, details) = refusal::<crate::requests::ClickTextInput>(arguments);
+            assert_eq!(details["path"], field, "{details}");
+            assert_eq!(details["received_kind"], "null", "{details}");
+        }
+    }
+
     #[test]
     fn a_key_hint_keeps_its_suggestion_but_not_the_typed_name() {
         let (message, details) = refusal::<PressKeysInput>(
