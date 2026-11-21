@@ -62,6 +62,10 @@ struct State {
     helper: Option<ActivationHelperOutcome>,
     /// The windows' UI Automation provider does not answer.
     accessibility_unavailable: bool,
+    /// What the readiness probe finds. `None` is a backend without a probe.
+    readiness: Option<controlfreak_core::RuntimeReadiness>,
+    /// How many readiness probes ran.
+    probes: u32,
 }
 
 #[derive(Default)]
@@ -290,6 +294,15 @@ impl FakeDesktop {
         self.state().helper = Some(answer);
     }
 
+    /// Makes the readiness probe find `readiness`.
+    pub(super) fn set_readiness(&self, readiness: controlfreak_core::RuntimeReadiness) {
+        self.state().readiness = Some(readiness);
+    }
+
+    pub(super) fn probes(&self) -> u32 {
+        self.state().probes
+    }
+
     pub(super) fn received(&self) -> Vec<Received> {
         self.state().received.clone()
     }
@@ -390,6 +403,11 @@ impl BackendMetadata for FakeDesktop {
     fn permissions(&self) -> Vec<PermissionDescriptor> {
         vec![]
     }
+    fn readiness(&self) -> controlfreak_core::RuntimeReadiness {
+        let mut state = self.state();
+        state.probes += 1;
+        state.readiness.clone().unwrap_or_default()
+    }
     fn validate_target_reference(&self, target: &str) -> Result<(), PlatformError> {
         self.state()
             .resolve(target)
@@ -425,18 +443,17 @@ impl WindowBackend for FakeDesktop {
         request: &WaitForWindowRequest,
     ) -> Result<WindowWaitResult, PlatformError> {
         let state = self.state();
-        let window = state
+        let matches: Vec<WindowInfo> = state
             .windows
             .iter()
             .filter(|window| listed(window))
             .map(|window| info(window, &state))
-            .find(|window| request.window_id.as_ref().is_none_or(|id| *id == window.id));
-        Ok(WindowWaitResult {
-            matched: window.is_some(),
-            timed_out: window.is_none(),
-            elapsed_ms: 0,
-            window,
-        })
+            .filter(|window| request.window_id.as_ref().is_none_or(|id| *id == window.id))
+            .filter(|window| request.matches(window))
+            .collect();
+        let count = matches.len();
+        Ok(WindowWaitResult::from_matches(matches, count, 0)
+            .unwrap_or_else(|| WindowWaitResult::timed_out(0)))
     }
 
     fn capture_window(

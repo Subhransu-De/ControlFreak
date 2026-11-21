@@ -5,6 +5,8 @@ mod arguments;
 mod begin_cancel_tests;
 #[cfg(test)]
 mod bounds_tests;
+#[cfg(test)]
+mod capabilities_tests;
 mod catalog;
 #[cfg(test)]
 mod catalog_tests;
@@ -150,7 +152,7 @@ const FIND_ELEMENTS: &str = "find_elements";
 const PRESS_KEYS: &str = "press_keys";
 const TYPE_TEXT: &str = "type_text";
 
-const SERVER_INSTRUCTIONS: &str = "ControlFreak drives a Windows desktop. Workflow: list_windows (or any screenshot) gives a target_ref; begin_control_session(target_ref) once; focus_window; input tools; end_control_session when done. Input works only while the approved window, or a dialog or menu of its application, is in the foreground; another process needs a new session. x and y are display-local physical pixels, or pass a screenshot's observation_id with image_x and image_y. Each action returns a 1280 px screenshot taken once the window stops changing (see observation.settle); reuse it instead of capturing. Check isError and status; never repeat an action when retry_action=false. stop_desktop_work is an emergency stop that closes input permanently. stop_reason=user_stop or a session_stopped notification means the user ended control: ask before resuming; only the user can reopen input (see recovery).";
+const SERVER_INSTRUCTIONS: &str = "ControlFreak drives a Windows desktop but cannot launch applications or run shell or browser scripts. Workflow: list_windows (or any screenshot) gives a target_ref; begin_control_session(target_ref) once; focus_window; input tools; end_control_session. Input works only while the approved window, or a dialog or menu of its application, is in the foreground; another process needs a new session. x and y are display-local physical pixels, or pass a screenshot's observation_id with image_x and image_y. Each action returns a 1280 px screenshot taken once the window stops changing; reuse it. Check isError and status; never repeat an action when retry_action=false. stop_desktop_work is an emergency stop that closes input permanently. stop_reason=user_stop or a session_stopped notification means the user ended control: ask before resuming; only the user can reopen input (see recovery).";
 
 const RESTRICTED_PROFILE_INSTRUCTIONS: &str = "This server runs a restricted tool profile (get_server_status reports it): only the tools in tools/list exist, so skip workflow steps whose tools are missing.";
 
@@ -186,6 +188,46 @@ fn is_mutating_tool(tool: &str) -> bool {
     catalog::spec(tool).is_some_and(ToolSpec::is_mutating)
 }
 
+/// How long a readiness probe is reused before `get_server_status` probes again. A newly
+/// installed OCR language pack can take as long to reach the OCR helper.
+const READINESS_MAX_AGE: Duration = Duration::from_mins(1);
+
+/// The last readiness probe and when it finished. The server starts one probe at startup, so the
+/// first status call usually finds it done; a status call that finds it missing or older than
+/// [`READINESS_MAX_AGE`] probes again. Concurrent callers share one probe, which the backend
+/// bounds with its own deadline.
+#[derive(Default)]
+struct ReadinessCache(tokio::sync::Mutex<Option<(Instant, controlfreak_core::RuntimeReadiness)>>);
+
+impl ReadinessCache {
+    async fn current(
+        &self,
+        backend: &Arc<dyn PlatformBackend>,
+    ) -> controlfreak_core::RuntimeReadiness {
+        let mut slot = self.0.lock().await;
+        if let Some((probed, readiness)) = slot.as_ref()
+            && probed.elapsed() < READINESS_MAX_AGE
+        {
+            return readiness.clone();
+        }
+        let backend = Arc::clone(backend);
+        // The probe blocks on a helper process, so it runs on a blocking worker.
+        if let Ok(readiness) = tokio::task::spawn_blocking(move || backend.readiness()).await {
+            *slot = Some((Instant::now(), readiness.clone()));
+            return readiness;
+        }
+        // A probe that panicked is not cached; the next call probes again.
+        controlfreak_core::RuntimeReadiness {
+            ocr: controlfreak_core::OcrReadiness::without_languages(
+                controlfreak_core::Readiness::Unavailable {
+                    reason: controlfreak_core::ReadinessReason::OcrRuntimeFailed,
+                },
+            ),
+            ..controlfreak_core::RuntimeReadiness::default()
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ControlFreakServer {
     backend: Arc<dyn PlatformBackend>,
@@ -196,6 +238,8 @@ struct ControlFreakServer {
     build: Arc<BuildInfo>,
     /// The tools this server serves, fixed for its lifetime.
     profile: Arc<Profile>,
+    /// The last readiness probe, reported in `get_server_status.capabilities`.
+    readiness: Arc<ReadinessCache>,
 }
 
 impl ControlFreakServer {
@@ -223,6 +267,7 @@ impl ControlFreakServer {
                 "unknown",
             )),
             profile: Arc::new(Profile::full()),
+            readiness: Arc::default(),
         }
     }
 
@@ -254,7 +299,10 @@ impl ControlFreakServer {
                 self.stop.stop();
                 Ok(CallToolResult::structured(json!({"status": self.stop.status()})).into())
             }
-            Route::Status => self.server_status(request.arguments),
+            Route::Status => {
+                self.server_status_with_capabilities(request.arguments)
+                    .await
+            }
             Route::EndSession => self.end_session(request.arguments).await,
             Route::BeginSession | Route::Observe(_) | Route::Watch(_) | Route::Input(_) => {
                 self.admitted_request(spec, request, context, stages).await
@@ -287,6 +335,46 @@ impl ControlFreakServer {
             return Ok(CallToolResult::structured(content).into());
         }
         Err(ErrorData::internal_error("missing server status", None))
+    }
+
+    /// The `get_server_status` result: [`Self::server_status`] with `capabilities` added.
+    async fn server_status_with_capabilities(
+        &self,
+        arguments: Option<JsonObject>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let mut response = self.server_status(arguments)?;
+        if let CallToolResponse::Complete(result) = &mut response
+            && let Some(content) = result.structured_content.as_mut()
+        {
+            content["capabilities"] = self.capabilities().await;
+        }
+        Ok(response)
+    }
+
+    /// `get_server_status.capabilities`: what the backend implements, the last readiness probe,
+    /// the hard limits, the forbidden tool families and the tools this profile hides.
+    async fn capabilities(&self) -> Value {
+        let mut readiness = self.readiness.current(&self.backend).await;
+        // The lamp starts with a session, so only the session runtime knows whether it can.
+        readiness.helpers.lamp = if self.session_runtime.is_none() {
+            controlfreak_core::Readiness::Unsupported {
+                reason: controlfreak_core::ReadinessReason::NotConfigured,
+            }
+        } else if self.safety_indicator.is_failed() {
+            controlfreak_core::Readiness::Unavailable {
+                reason: controlfreak_core::ReadinessReason::IndicatorFailed,
+            }
+        } else {
+            controlfreak_core::Readiness::Ready
+        };
+        // Read fresh, so it agrees with `features`, which is read fresh too.
+        readiness.helpers.ui_automation = self.backend.ui_automation_readiness();
+        let mut capabilities = json!(controlfreak_core::RuntimeCapabilities::new(
+            self.backend.capabilities(),
+            readiness,
+        ));
+        capabilities["hidden_tools"] = json!(self.profile.hidden_tools());
+        capabilities
     }
 
     async fn end_session(
@@ -771,6 +859,9 @@ async fn serve_stdio_inner(
     let mut server = ControlFreakServer::with_indicator(backend, safety_indicator, session_runtime)
         .with_profile(profile);
     server.build = Arc::new(build);
+    // Probe readiness while the client connects, so the first status call rarely waits for it.
+    let (readiness, probed) = (Arc::clone(&server.readiness), Arc::clone(&server.backend));
+    tokio::spawn(async move { readiness.current(&probed).await });
     let instance_id = server.diagnostics.instance_id.clone();
     eprintln!(
         "{}",

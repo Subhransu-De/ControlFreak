@@ -9,7 +9,9 @@
 //! Inside a helper, `EngineCache` keeps the `OcrEngine` for each language between requests; see
 //! there for when an engine is replaced.
 
-use super::capture::{recognize_text_with_engine, timed_ocr_engine, user_profile_language_key};
+use super::capture::{
+    ocr_languages, recognize_text_with_engine, timed_ocr_engine, user_profile_language_key,
+};
 use super::initialize_com;
 use crate::OcrHelperCommand;
 use controlfreak_core::{MutationControl, OcrRegionRequest, OcrResult, PlatformError};
@@ -52,14 +54,22 @@ enum OcrHelperResponse {
     Error {
         error: PlatformError,
     },
+    /// The answer to a probe.
+    Languages {
+        languages: Vec<String>,
+        default_language: Option<String>,
+    },
 }
 
-/// One request line sent to a helper.
+/// One request line sent to a helper: a recognition, or a probe that lists the installed OCR
+/// languages and reads no pixels.
 #[derive(Debug, Serialize, Deserialize)]
 struct OcrHelperRequest {
     id: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    probe: bool,
     #[serde(flatten)]
-    request: OcrRegionRequest,
+    request: Option<OcrRegionRequest>,
 }
 
 /// One helper reply line: the response plus content-free stage timings measured in the helper.
@@ -118,11 +128,71 @@ pub(super) fn recognize_text_with_helper_fingerprinted(
     request: &OcrRegionRequest,
     control: &MutationControl,
 ) -> Result<(OcrResult, Option<u64>), PlatformError> {
+    match exchange(
+        command,
+        pool,
+        Some(request.clone()),
+        control,
+        OCR_HELPER_TIMEOUT,
+    )? {
+        OcrHelperResponse::Success {
+            result,
+            frame_fingerprint,
+        } => Ok((result, frame_fingerprint)),
+        OcrHelperResponse::Error { error } => Err(error),
+        OcrHelperResponse::Languages { .. } => Err(helper_error(
+            "the isolated OCR process answered a recognition with a probe reply",
+        )),
+    }
+}
+
+/// Why an OCR probe did not list languages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProbeFailure {
+    /// The helper did not answer within the deadline and was terminated.
+    TimedOut,
+    /// The helper could not start, exited or answered with something invalid.
+    Helper,
+    /// The helper answered, but the Windows OCR runtime failed.
+    Runtime,
+}
+
+/// Asks a helper for the installed OCR languages and the default language. The probe reads no
+/// pixels and sends no input, and a helper that does not answer within `timeout` is terminated.
+/// A helper that answered stays warm for the next recognition.
+pub(super) fn probe_languages_with_helper(
+    command: &OcrHelperCommand,
+    pool: &OcrHelperPool,
+    timeout: Duration,
+) -> Result<(Vec<String>, Option<String>), ProbeFailure> {
+    let started = Instant::now();
+    match exchange(command, pool, None, &MutationControl::default(), timeout) {
+        Ok(OcrHelperResponse::Languages {
+            languages,
+            default_language,
+        }) => Ok((languages, default_language)),
+        Ok(OcrHelperResponse::Error { .. }) => Err(ProbeFailure::Runtime),
+        Err(_) if started.elapsed() >= timeout => Err(ProbeFailure::TimedOut),
+        // A recognition reply to a probe is as invalid as no reply.
+        Ok(OcrHelperResponse::Success { .. }) | Err(_) => Err(ProbeFailure::Helper),
+    }
+}
+
+/// Sends one request, a recognition when `request` is set and a probe otherwise, to the warm
+/// helper or a new one, and returns its reply.
+fn exchange(
+    command: &OcrHelperCommand,
+    pool: &OcrHelperPool,
+    request: Option<OcrRegionRequest>,
+    control: &MutationControl,
+    timeout: Duration,
+) -> Result<OcrHelperResponse, PlatformError> {
     control.check("windows_ocr_helper")?;
     let id = pool.next_id.fetch_add(1, Ordering::Relaxed);
     let line = serde_json::to_vec(&OcrHelperRequest {
         id,
-        request: request.clone(),
+        probe: request.is_none(),
+        request,
     })
     .map_err(|error| helper_error(format!("could not encode the OCR request: {error}")))?;
 
@@ -136,22 +206,29 @@ pub(super) fn recognize_text_with_helper_fingerprinted(
         Some(helper) => (helper, true),
         None => (WarmOcrHelper::spawn(command, MAX_OCR_REPLY_BYTES)?, false),
     };
-    let reply = match helper.request(id, &line, control, OCR_HELPER_TIMEOUT) {
+    let started = Instant::now();
+    let reply = match helper.request(id, &line, control, timeout) {
         Ok(reply) => reply,
         // A reused helper can exit while idle just as a request arrives. OCR only reads the
-        // screen, so one retry on a fresh helper cannot repeat a desktop effect.
+        // screen, so one retry on a fresh helper cannot repeat a desktop effect. The retry gets
+        // only what is left of `timeout`.
         Err(failure) if reused && !failure.started && !control.is_cancelled() => {
             drop(helper);
             helper = WarmOcrHelper::spawn(command, MAX_OCR_REPLY_BYTES)?;
             helper
-                .request(id, &line, control, OCR_HELPER_TIMEOUT)
+                .request(
+                    id,
+                    &line,
+                    control,
+                    timeout.saturating_sub(started.elapsed()),
+                )
                 .map_err(|failure| failure.error)?
         }
         Err(failure) => return Err(failure.error),
     };
     helper.served += 1;
     // Only a helper that just succeeded is kept; an error reply may reflect helper-side state.
-    let succeeded = matches!(reply.response, OcrHelperResponse::Success { .. });
+    let succeeded = !matches!(reply.response, OcrHelperResponse::Error { .. });
     if succeeded && helper.served < MAX_REQUESTS_PER_HELPER {
         let mut slot = pool
             .idle
@@ -162,13 +239,7 @@ pub(super) fn recognize_text_with_helper_fingerprinted(
         }
     }
     record_helper_stages(&reply.stages_micros);
-    match reply.response {
-        OcrHelperResponse::Success {
-            result,
-            frame_fingerprint,
-        } => Ok((result, frame_fingerprint)),
-        OcrHelperResponse::Error { error } => Err(error),
-    }
+    Ok(reply.response)
 }
 
 /// A failed request. `started` is false only when the helper produced nothing at all for it, so
@@ -576,7 +647,7 @@ pub(crate) fn serve_ocr_helper(
     // outlive the COM initialization they were created under. `engines` is dropped first.
     let _apartment = initialize_com()?;
     let mut engines = EngineCache::default();
-    serve_ocr_helper_with(
+    serve_requests(
         input,
         output,
         |request, control| {
@@ -585,19 +656,46 @@ pub(crate) fn serve_ocr_helper(
             })
             .map(|(result, fingerprint)| (result, Some(fingerprint)))
         },
+        ocr_languages,
         HELPER_IDLE_EXIT,
+    )
+}
+
+/// Serves recognitions with `recognize` and answers every probe with fixed languages.
+#[cfg(test)]
+fn serve_ocr_helper_with(
+    input: impl Read + Send + 'static,
+    output: impl Write,
+    recognize: impl FnMut(
+        &OcrRegionRequest,
+        &MutationControl,
+    ) -> Result<(OcrResult, Option<u64>), PlatformError>,
+    idle_exit: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_requests(
+        input,
+        output,
+        recognize,
+        || {
+            Ok((
+                vec!["en-US".to_owned(), "de-DE".to_owned()],
+                Some("en-US".to_owned()),
+            ))
+        },
+        idle_exit,
     )
 }
 
 /// Serves request lines until input ends or stays idle for `idle_exit`. Closing input also
 /// cancels the request in progress.
-fn serve_ocr_helper_with(
+fn serve_requests(
     input: impl Read + Send + 'static,
     mut output: impl Write,
     mut recognize: impl FnMut(
         &OcrRegionRequest,
         &MutationControl,
     ) -> Result<(OcrResult, Option<u64>), PlatformError>,
+    mut probe: impl FnMut() -> Result<(Vec<String>, Option<String>), PlatformError>,
     idle_exit: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let current = Arc::new(Mutex::new(None::<MutationControl>));
@@ -636,12 +734,24 @@ fn serve_ocr_helper_with(
             control.cancel();
         }
         controlfreak_core::timing::reset();
-        let response = match recognize(&request.request, &control) {
-            Ok((result, frame_fingerprint)) => OcrHelperResponse::Success {
-                result,
-                frame_fingerprint,
+        let response = match (request.probe, &request.request) {
+            (true, _) => match probe() {
+                Ok((languages, default_language)) => OcrHelperResponse::Languages {
+                    languages,
+                    default_language,
+                },
+                Err(error) => OcrHelperResponse::Error { error },
             },
-            Err(error) => OcrHelperResponse::Error { error },
+            (false, Some(region)) => match recognize(region, &control) {
+                Ok((result, frame_fingerprint)) => OcrHelperResponse::Success {
+                    result,
+                    frame_fingerprint,
+                },
+                Err(error) => OcrHelperResponse::Error { error },
+            },
+            (false, None) => OcrHelperResponse::Error {
+                error: helper_error("the OCR request names no region"),
+            },
         };
         *current
             .lock()
@@ -678,14 +788,15 @@ mod tests {
     fn request_line_in(id: u64, language: Option<&str>) -> Vec<u8> {
         let mut line = serde_json::to_vec(&OcrHelperRequest {
             id,
-            request: OcrRegionRequest {
+            probe: false,
+            request: Some(OcrRegionRequest {
                 display_id: "fixture".into(),
                 x: u32::try_from(id).unwrap_or(0),
                 y: 0,
                 width: 1,
                 height: 1,
                 language: language.map(str::to_owned),
-            },
+            }),
         })
         .unwrap();
         line.push(b'\n');
@@ -940,7 +1051,8 @@ mod tests {
         let command = test_helper("warm_error_test_helper");
         let request = serde_json::from_slice::<OcrHelperRequest>(&request_line(0))
             .unwrap()
-            .request;
+            .request
+            .unwrap();
         let error =
             recognize_text_with_helper(&command, &pool, &request, &MutationControl::default())
                 .unwrap_err();
@@ -984,6 +1096,70 @@ mod tests {
             .to_owned()
     }
 
+    /// Answers probes only after a minute.
+    #[test]
+    #[ignore = "spawned only by warm helper tests"]
+    fn warm_hung_probe_test_helper() {
+        serve_requests(
+            std::io::stdin(),
+            std::io::stdout().lock(),
+            |_, _| Ok((synthetic_result("unused"), None)),
+            || {
+                thread::sleep(Duration::from_mins(1));
+                Ok((Vec::new(), None))
+            },
+            Duration::from_mins(1),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_probe_lists_languages_and_keeps_the_helper_warm_for_recognition() {
+        let pool = OcrHelperPool::default();
+        let command = test_helper("warm_echo_test_helper");
+        let (languages, default_language) =
+            probe_languages_with_helper(&command, &pool, Duration::from_secs(20)).unwrap();
+        assert_eq!(languages, ["en-US", "de-DE"]);
+        assert_eq!(default_language.as_deref(), Some("en-US"));
+        assert!(pool.idle.lock().unwrap().is_some());
+        let request = serde_json::from_slice::<OcrHelperRequest>(&request_line(0))
+            .unwrap()
+            .request
+            .unwrap();
+        let recognized =
+            recognize_text_with_helper(&command, &pool, &request, &MutationControl::default())
+                .unwrap();
+        assert!(language(&recognized).starts_with("pid-"));
+    }
+
+    #[test]
+    fn a_probe_past_its_deadline_times_out_and_retires_the_helper() {
+        let pool = OcrHelperPool::default();
+        let command = test_helper("warm_hung_probe_test_helper");
+        let started = Instant::now();
+        let failure =
+            probe_languages_with_helper(&command, &pool, Duration::from_millis(1_500)).unwrap_err();
+        assert_eq!(failure, ProbeFailure::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(pool.idle.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_probe_reply_is_not_mistaken_for_a_recognition() {
+        let probe = serde_json::to_value(OcrHelperRequest {
+            id: 3,
+            probe: true,
+            request: None,
+        })
+        .unwrap();
+        assert_eq!(probe, serde_json::json!({"id": 3, "probe": true}));
+        let decoded: OcrHelperRequest = serde_json::from_value(probe).unwrap();
+        assert!(decoded.probe && decoded.request.is_none());
+        let recognition: OcrHelperRequest =
+            serde_json::from_slice(request_line(4).trim_ascii_end()).unwrap();
+        assert!(!recognition.probe && recognition.request.is_some());
+    }
+
     #[test]
     fn the_pool_reuses_one_helper_process_across_requests() {
         let pool = OcrHelperPool::default();
@@ -991,7 +1167,8 @@ mod tests {
         let control = MutationControl::default();
         let request = serde_json::from_slice::<OcrHelperRequest>(&request_line(0))
             .unwrap()
-            .request;
+            .request
+            .unwrap();
         let first = recognize_text_with_helper(&command, &pool, &request, &control).unwrap();
         let second = recognize_text_with_helper(&command, &pool, &request, &control).unwrap();
         assert!(language(&first).starts_with("pid-"));
@@ -1006,7 +1183,8 @@ mod tests {
         let control = MutationControl::default();
         let request = serde_json::from_slice::<OcrHelperRequest>(&request_line(0))
             .unwrap()
-            .request;
+            .request
+            .unwrap();
         let first = recognize_text_with_helper(&command, &pool, &request, &control).unwrap();
         {
             let mut slot = pool.idle.lock().unwrap();
@@ -1208,7 +1386,8 @@ pub(super) mod synthetic_benchmarks {
             .map(|id| {
                 let line = serde_json::to_vec(&OcrHelperRequest {
                     id,
-                    request: fixture_request(),
+                    probe: false,
+                    request: Some(fixture_request()),
                 })
                 .unwrap();
                 let (helper, elapsed) = time(|| {

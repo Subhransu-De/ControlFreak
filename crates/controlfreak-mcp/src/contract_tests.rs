@@ -289,12 +289,10 @@ impl WindowBackend for ContractBackend {
             .iter()
             .find(|window| request.window_id.as_ref().is_none_or(|id| *id == window.id))
             .cloned();
-        Ok(controlfreak_core::WindowWaitResult {
-            matched: window.is_some(),
-            timed_out: window.is_none(),
-            elapsed_ms: 0,
-            window,
-        })
+        Ok(window.map_or_else(
+            || controlfreak_core::WindowWaitResult::timed_out(0),
+            |window| controlfreak_core::WindowWaitResult::from_matches(vec![window], 1, 0).unwrap(),
+        ))
     }
     fn capture_window(
         &self,
@@ -1391,6 +1389,7 @@ fn guidance_states_the_foreground_rule_dialogs_and_the_permanent_stop() {
         "stop_desktop_work is an emergency stop that closes input permanently",
         "user_stop",
         "1280",
+        "cannot launch applications or run shell or browser scripts",
     ] {
         assert!(SERVER_INSTRUCTIONS.contains(needed), "missing: {needed}");
     }

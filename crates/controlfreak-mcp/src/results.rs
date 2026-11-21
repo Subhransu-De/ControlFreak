@@ -178,6 +178,8 @@ pub(super) fn window_wait_result(result: &WindowWaitResult) -> CallToolResult {
         "timed_out": result.timed_out,
         "elapsed_ms": result.elapsed_ms,
         "window": result.window,
+        "match_count": result.match_count,
+        "candidates": result.candidates,
     }))
 }
 

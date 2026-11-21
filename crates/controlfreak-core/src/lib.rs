@@ -14,6 +14,7 @@ mod ocr;
 mod outcome;
 mod permission;
 mod platform;
+mod readiness;
 mod report;
 mod security;
 mod stop;
@@ -56,6 +57,10 @@ pub use platform::{
     AccessibilityBackend, BackendIdentity, BackendMetadata, DisplayBackend, DisplayServer,
     KeyboardBackend, OcrBackend, Platform, PlatformBackend, PointerBackend, WindowBackend,
     wait_for_text_with,
+};
+pub use readiness::{
+    ForbiddenFamily, HardLimits, HelperReadiness, MAX_REPORTED_OCR_LANGUAGES, OcrReadiness,
+    Readiness, ReadinessReason, RuntimeCapabilities, RuntimeReadiness,
 };
 pub use report::CapabilityReport;
 pub use security::{IntegrityLevel, SecurityContext};

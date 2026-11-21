@@ -157,6 +157,16 @@ async fn for_each_profile_the_listed_tools_are_exactly_the_callable_tools() {
             profile.status_json(),
             "{name}: {status}"
         );
+        let hidden: Vec<&str> = catalog::CATALOG
+            .iter()
+            .map(|spec| spec.name)
+            .filter(|tool| !listed.iter().any(|served| served == tool))
+            .collect();
+        assert_eq!(
+            status["structuredContent"]["capabilities"]["hidden_tools"],
+            json!(hidden),
+            "{name}: the capability report names the tools the profile hides"
+        );
         assert!(
             output_schema_tests::full_validator(GET_SERVER_STATUS)
                 .is_valid(&status["structuredContent"]),

@@ -43,12 +43,31 @@ fn capability_report_round_trips_with_stable_field_names() {
     let report = TestBackend.report();
     let json = serde_json::to_value(&report).expect("serialize report");
 
-    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["schema_version"], 3);
     assert!(json["security_context"]["elevated"].is_boolean());
     assert!(json["security_context"]["windows_integrity_level"].is_string());
     assert!(json.get("backend").is_some());
     assert!(json.get("capabilities").is_some());
     assert!(json.get("permissions").is_some());
+    // A backend without a probe says so instead of claiming OCR or helpers work.
+    assert_eq!(
+        json["ocr"],
+        serde_json::json!({"state": "unsupported", "reason": "not_implemented", "languages": [], "default_language": null})
+    );
+    assert_eq!(json["helpers"]["ocr"]["state"], "unsupported");
+    assert_eq!(json["limits"]["max_wait_ms"], 30_000);
+    assert_eq!(
+        json["forbidden_families"],
+        serde_json::json!([
+            "application_launch",
+            "shell",
+            "filesystem",
+            "registry",
+            "network",
+            "clipboard",
+            "browser_dom"
+        ])
+    );
 
     // A backend does not know the executable's build; only the server adds it.
     assert!(json.get("build").is_none());
@@ -58,7 +77,7 @@ fn capability_report_round_trips_with_stable_field_names() {
 
     let built = report.with_build(BuildInfo::new("0.2.3", "unknown", None, "unknown"));
     let json = serde_json::to_value(&built).expect("serialize report");
-    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["schema_version"], 3);
     assert_eq!(json["build"]["revision"], "unknown");
     let decoded: CapabilityReport = serde_json::from_value(json).expect("deserialize report");
     assert_eq!(decoded, built);

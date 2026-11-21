@@ -8,6 +8,55 @@ get_server_status output anyOf[0].build.revision required
 get_server_status output anyOf[0].build.schema_version required
 get_server_status output anyOf[0].build.target required
 get_server_status output anyOf[0].build.version required
+get_server_status output anyOf[0].capabilities required
+get_server_status output anyOf[0].capabilities.features required
+get_server_status output anyOf[0].capabilities.features[].capability required
+get_server_status output anyOf[0].capabilities.features[].permission
+get_server_status output anyOf[0].capabilities.features[].reason
+get_server_status output anyOf[0].capabilities.features[].required_permissions required
+get_server_status output anyOf[0].capabilities.features[].state required
+get_server_status output anyOf[0].capabilities.forbidden_families required
+get_server_status output anyOf[0].capabilities.helpers required
+get_server_status output anyOf[0].capabilities.helpers.activation required
+get_server_status output anyOf[0].capabilities.helpers.activation.oneOf[0].state required
+get_server_status output anyOf[0].capabilities.helpers.activation.oneOf[1].reason required
+get_server_status output anyOf[0].capabilities.helpers.activation.oneOf[1].state required
+get_server_status output anyOf[0].capabilities.helpers.lamp required
+get_server_status output anyOf[0].capabilities.helpers.lamp.oneOf[0].state required
+get_server_status output anyOf[0].capabilities.helpers.lamp.oneOf[1].reason required
+get_server_status output anyOf[0].capabilities.helpers.lamp.oneOf[1].state required
+get_server_status output anyOf[0].capabilities.helpers.ocr required
+get_server_status output anyOf[0].capabilities.helpers.ocr.oneOf[0].state required
+get_server_status output anyOf[0].capabilities.helpers.ocr.oneOf[1].reason required
+get_server_status output anyOf[0].capabilities.helpers.ocr.oneOf[1].state required
+get_server_status output anyOf[0].capabilities.helpers.ui_automation required
+get_server_status output anyOf[0].capabilities.helpers.ui_automation.oneOf[0].state required
+get_server_status output anyOf[0].capabilities.helpers.ui_automation.oneOf[1].reason required
+get_server_status output anyOf[0].capabilities.helpers.ui_automation.oneOf[1].state required
+get_server_status output anyOf[0].capabilities.hidden_tools required
+get_server_status output anyOf[0].capabilities.limits required
+get_server_status output anyOf[0].capabilities.limits.max_capture_width required
+get_server_status output anyOf[0].capabilities.limits.max_move_duration_ms required
+get_server_status output anyOf[0].capabilities.limits.max_read_text_bytes required
+get_server_status output anyOf[0].capabilities.limits.max_read_text_chars required
+get_server_status output anyOf[0].capabilities.limits.max_read_text_lines required
+get_server_status output anyOf[0].capabilities.limits.max_run_actions_total_wait_ms required
+get_server_status output anyOf[0].capabilities.limits.max_run_actions_wait_ms required
+get_server_status output anyOf[0].capabilities.limits.max_scroll_delta required
+get_server_status output anyOf[0].capabilities.limits.max_settle_ms required
+get_server_status output anyOf[0].capabilities.limits.max_text_timeout_ms required
+get_server_status output anyOf[0].capabilities.limits.max_text_utf16_units required
+get_server_status output anyOf[0].capabilities.limits.max_wait_ms required
+get_server_status output anyOf[0].capabilities.limits.max_window_wait_candidates required
+get_server_status output anyOf[0].capabilities.limits.max_windows required
+get_server_status output anyOf[0].capabilities.ocr required
+get_server_status output anyOf[0].capabilities.ocr.oneOf[0].default_language required
+get_server_status output anyOf[0].capabilities.ocr.oneOf[0].languages required
+get_server_status output anyOf[0].capabilities.ocr.oneOf[0].state required
+get_server_status output anyOf[0].capabilities.ocr.oneOf[1].default_language required
+get_server_status output anyOf[0].capabilities.ocr.oneOf[1].languages required
+get_server_status output anyOf[0].capabilities.ocr.oneOf[1].reason required
+get_server_status output anyOf[0].capabilities.ocr.oneOf[1].state required
 get_server_status output anyOf[0].dpi_awareness required
 get_server_status output anyOf[0].dpi_awareness.oneOf[0].awareness required
 get_server_status output anyOf[0].dpi_awareness.oneOf[0].reason required
@@ -803,7 +852,9 @@ wait_for_window input target_ref
 wait_for_window input timeout_ms default=5000
 wait_for_window input title_contains
 wait_for_window input window_id
+wait_for_window output anyOf[0].candidates required
 wait_for_window output anyOf[0].elapsed_ms required
+wait_for_window output anyOf[0].match_count required
 wait_for_window output anyOf[0].matched required
 wait_for_window output anyOf[0].timed_out required
 wait_for_window output anyOf[0].window required

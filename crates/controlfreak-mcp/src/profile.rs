@@ -152,6 +152,15 @@ impl Profile {
         CATALOG.iter().filter(|spec| self.serves(spec))
     }
 
+    /// The names of the catalog tools this profile does not serve, in catalog order.
+    pub(super) fn hidden_tools(&self) -> Vec<&'static str> {
+        CATALOG
+            .iter()
+            .filter(|spec| !self.serves(spec))
+            .map(|spec| spec.name)
+            .collect()
+    }
+
     /// Whether a tool named `tool` is served.
     pub(super) fn serves_tool(&self, tool: &str) -> bool {
         self.spec(tool).is_some()

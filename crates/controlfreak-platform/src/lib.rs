@@ -71,11 +71,6 @@ pub fn backend() -> Box<dyn PlatformBackend> {
     Box::new(implementation::Backend::new())
 }
 
-#[cfg(target_os = "windows")]
-pub fn backend_with_security(security_context: SecurityContext) -> Box<dyn PlatformBackend> {
-    Box::new(implementation::Backend::with_security(security_context))
-}
-
 /// The production backend: OCR runs in `ocr_helper`, UI Automation queries run in
 /// `server_executable --uia-helper`, and a refused foreground request in `focus_window` is asked
 /// once more through `server_executable --activation-helper`.

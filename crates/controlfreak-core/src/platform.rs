@@ -6,11 +6,11 @@ use crate::{
     DpiAwarenessStatus, FindElementsRequest, FindElementsResult, FindTextRequest, FindTextResult,
     FocusWindowRequest, KeyChordRequest, KeyboardActionResult, MouseClickRequest, MouseDragRequest,
     MouseMoveRequest, MouseScrollRequest, MutationControl, OcrRegionRequest, OcrResult,
-    PermissionDescriptor, PlatformError, PointerActionResult, PopupWindow, SecurityContext,
-    TextInputRequest, VirtualDesktopList, VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult,
-    VisualBaseline, VisualBaselineRequest, VisualChangeResult, WaitForChangeSinceRequest,
-    WaitForTextRequest, WaitForTextResult, WaitForVisualChangeRequest, WaitForWindowRequest,
-    WindowFocusResult, WindowList, WindowScreenshot, WindowWaitResult,
+    PermissionDescriptor, PlatformError, PointerActionResult, PopupWindow, RuntimeReadiness,
+    SecurityContext, TextInputRequest, VirtualDesktopList, VirtualDesktopSwitchRequest,
+    VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest, VisualChangeResult,
+    WaitForChangeSinceRequest, WaitForTextRequest, WaitForTextResult, WaitForVisualChangeRequest,
+    WaitForWindowRequest, WindowFocusResult, WindowList, WindowScreenshot, WindowWaitResult,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,12 +61,29 @@ pub trait BackendMetadata: Send + Sync + 'static {
         None
     }
 
+    /// Checks whether OCR and the helper processes work now. It blocks for at most a few
+    /// seconds, so call it off async workers. It never captures the screen, reads window content
+    /// or sends input. The default reports that nothing is implemented or configured.
+    fn readiness(&self) -> RuntimeReadiness {
+        RuntimeReadiness::default()
+    }
+
+    /// The UI Automation helper's readiness from what it last showed, without starting it. It is
+    /// cheap, so a server reads it on every report instead of caching it with the probe.
+    fn ui_automation_readiness(&self) -> crate::Readiness {
+        crate::Readiness::Unsupported {
+            reason: crate::ReadinessReason::NotConfigured,
+        }
+    }
+
+    /// The full report, including a fresh [`BackendMetadata::readiness`] probe.
     fn report(&self) -> CapabilityReport {
         CapabilityReport::new(
             self.identity(),
             self.capabilities(),
             self.permissions(),
             self.security_context(),
+            self.readiness(),
         )
     }
 }
