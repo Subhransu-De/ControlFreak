@@ -20,7 +20,7 @@ desktop and run inside a [control session](sessions.md).
 | `capture_window` | Observe | Screenshot of a window's visible frame, without focusing it. The window renders itself (`capture_method` `windows_print_window`), so windows covering it do not appear. The render is bounded: a window that Windows flags as hung is not asked, and one that does not answer within 2 seconds is given up on. The screen rectangle is then copied (`windows_gdi`), which shows whatever covers the window, so `capture_method` says which one you got. Menus, popups and dropdowns are separate windows, so they appear only with `include_popups: true`. That adds the visible menus (`#32768`), drop-down lists (`ComboLBox`) and untitled popups owned by the window, at most 8, that belong to its application by the same rule as input (see Targets); a window of another process never appears. Each popup is cut to the window's display, `source_bounds` is the smallest rectangle around the window and those parts, and parts of it outside them are copied from the screen. Those parts, and a window or popup copied from the screen (`windows_gdi`), show whatever covers them, including other applications. `included_windows` lists the popups, topmost last, with `class_name`, `process_id`, `bounds` and their own `capture_method`, never a title. Every window in one call renders within the same 2 seconds. Without `include_popups` the result has no `included_windows` and is unchanged. Only one render runs at a time: a second `capture_window` call made meanwhile waits for it while it is still rendering, within the same 2 seconds, and copies the screen if that time runs out; if that render was already given up on, the screen is copied at once. Every screenshot result reports `capture_method` as one of `windows_print_window` or `windows_gdi`; display and region captures always report `windows_gdi`. |
 | `list_windows` | Observe | Visible titled windows, including owned dialogs (with an `owner` field), foreground first. At most 200. |
 | `find_elements` | Observe | Controls of one window from UI Automation: role, name, state, patterns and bounds. Read-only, needs no session. See [UI elements](#ui-elements-ui-automation). |
-| `wait_for_window` | Observe | Wait for a window that matches title, class or process. |
+| `wait_for_window` | Observe | Wait for a window that matches title, class or process. Several matches return `match_count` and up to 20 `candidates` and select none. |
 | `list_virtual_desktops` | Observe | Windows grouped by virtual desktop, with the current one marked. Groups at most the 200 windows `list_windows` returns; `truncated: true` means more exist. |
 | `read_text_in_region` | Observe | OCR lines and words with bounds. At most 200 lines, 8000 characters and 128 KiB of lines; see Text (OCR). |
 | `find_text_on_screen` | Observe | Find text with OCR. Discovery only. |
@@ -28,7 +28,7 @@ desktop and run inside a [control session](sessions.md).
 | `capture_visual_baseline` | Observe | Save how a region looks now, for a later wait. |
 | `wait_for_change_since` | Observe | Wait until a region differs from its baseline and settles. |
 | `wait_for_visual_change` | Observe | Wait until a region changes from how it looks now and settles. |
-| `get_server_status` | Observe | Version and `build` identity, privileges, DPI awareness, session and stop state, input admission and the recovery step after a stop, the tool profile, recent operations. |
+| `get_server_status` | Observe | Version and `build` identity, privileges, DPI awareness, session and stop state, input admission and the recovery step after a stop, the tool profile, `capabilities` (OCR and helper readiness, hard limits, forbidden tool families), recent operations. |
 | `begin_control_session` | Session | Reserve the desktop for one approved window. |
 | `end_control_session` | Session | Release the desktop after pending actions finish. Reports `closed`, `closing` or `not_owned`. |
 | `stop_desktop_work` | Session | Emergency stop: cancel all desktop work and close input until the server restarts. |
@@ -52,6 +52,25 @@ The server can start with fewer tools: `--profile observe` serves only the tools
 - `run_actions` checks every step before the first one runs: a click step needs `click_mouse`, a scroll step `scroll_mouse`, a `type_text` step `type_text` and a `press_keys` step `press_keys`. A step whose tool is hidden refuses the whole batch with `invalid_argument` and `status: "not_started"`. A `wait` step needs no tool.
 - `get_server_status` reports `profile`: `name` is `full` or `observe`, and `tool_allowlist` is the `--tools` list in tool-list order, or `null`.
 - The server's MCP instructions add one sentence when a profile hides tools.
+
+## Opening an application
+
+ControlFreak cannot launch applications or run shell or browser scripts (see `capabilities.forbidden_families` in [Capabilities](#capabilities)). The host that runs the agent opens the application, and ControlFreak takes over once its window exists:
+
+1. The host starts the application, for example with its own shell or launcher tool.
+2. `wait_for_window` with `title_contains`, `class_name` or `process_id` waits for the window, up to `timeout_ms`.
+3. `begin_control_session` with the window's `id` as `target_ref` approves it.
+4. `focus_window` brings it to the foreground, then the input tools control it.
+
+`wait_for_window` results:
+
+| Result | `matched` | `timed_out` | `window` | `match_count` | `candidates` |
+| --- | --- | --- | --- | --- | --- |
+| One window matched | `true` | `false` | That window | `1` | `[]` |
+| Several windows matched | `false` | `false` | `null` | How many matched | The first 20, in `list_windows` order |
+| None before the timeout | `false` | `true` | `null` | `0` | `[]` |
+
+Several matches return at once and approve nothing. Pick a candidate by its `id`, or call again with narrower criteria, such as `process_id` from the host's launch.
 
 ## Targets
 
@@ -366,6 +385,45 @@ When an input tool cannot start a session, `error.code` says why:
 
 After a stop, observation tools keep working: `list_displays`, `list_windows`, `list_virtual_desktops`, the captures, `read_text_in_region`, `find_text_on_screen`, `wait_for_text`, `find_elements`, `wait_for_window`, `wait_for_visual_change`, `wait_for_change_since` and `get_server_status`. A wait that is already running is cancelled by the stop. Input tools stay refused.
 
+## Capabilities
+
+`get_server_status.capabilities` tells a client what works before it acts. Reading it sends no input, captures nothing and claims no session. `controlfreak --print-capabilities` prints the same parts at the top level of its report (schema version 3), with `capabilities` for the list that status calls `features`.
+
+| Field | Meaning |
+| --- | --- |
+| `features` | What the backend implements: each `capability` with `state` `supported`, `degraded`, `requires_permission` or `unsupported`. |
+| `ocr` | OCR readiness, with `languages` (the installed OCR language tags, at most 64) and `default_language` (used without `language`, or `null`). |
+| `helpers` | `ocr` (the isolated OCR process), `activation` (the `focus_window` helper), `lamp` (the session lamp) and `ui_automation` (the `find_elements` helper). |
+| `limits` | The hard request limits, such as `max_wait_ms` and `max_capture_width`. |
+| `forbidden_families` | Tool families ControlFreak never offers: `application_launch`, `shell`, `filesystem`, `registry`, `network`, `clipboard`, `browser_dom`. These are a product boundary, not missing features. |
+| `hidden_tools` | Tools the [tool profile](#tool-profiles) hides, in tool-list order. |
+
+`ocr` and each helper have a `state`, and every state except `ready` has a stable `reason`:
+
+| `state` | Meaning |
+| --- | --- |
+| `ready` | Works. |
+| `degraded` | Works with a limitation. |
+| `unavailable` | Offered, but does not work now. It can recover. |
+| `unsupported` | This server build or configuration does not offer it. It does not change while the server runs. |
+
+| `reason` | Meaning |
+| --- | --- |
+| `no_default_ocr_language` | OCR language packs are installed, but none matches a language in the Windows language list. OCR works only with `language`. |
+| `no_ocr_language` | No Windows OCR language pack is installed. |
+| `ocr_runtime_failed` | The Windows OCR runtime failed when it was asked for its languages. |
+| `helper_failed` | The helper process could not start, exited or answered with something invalid. |
+| `probe_timed_out` | The check did not finish within 3 seconds. |
+| `indicator_failed` | The session indicator failed, so sessions are refused. |
+| `not_configured` | The server was started without this helper. |
+| `not_verified` | The helper is configured but has not run yet, so whether it works is not known. |
+| `not_implemented` | The backend has no implementation. |
+
+- OCR is checked by asking the OCR helper for its languages, with a 3-second deadline. The helper reads no pixels for it and stays ready for the next OCR call. The server checks once at startup, and a status call checks again when the last check is older than one minute.
+- `activation` and `lamp` are started only when needed, so `ready` means the server is configured to start them, not that they ran. A failed lamp shows as `unavailable` with `indicator_failed`.
+- `ui_automation` is not started for the report either. It is `degraded` with `not_verified` until the first `find_elements` call, then `ready`, or `unavailable` with `helper_failed` if that helper could not answer.
+- The report contains no path, user name, host name or environment value. A language tag that is not plain BCP-47 (letters, digits and `-`, at most 35 characters) is left out.
+
 ## Build identity
 
 `get_server_status.build`, the `build` object of `controlfreak --print-capabilities` and the lines after the first of `controlfreak --version` report the same build identity, fixed when the executable was compiled:
@@ -385,5 +443,4 @@ A build from a source archive without `.git` takes `revision` from the `CONTROLF
 - Windows 10 version 2004 or later, or Windows 11, on x86-64.
 - UI Automation is read-only. `find_elements` finds controls, and clicks still go through the pointer tools. There are no semantic actions such as invoke, toggle or set value.
 - Protected video and HDR content may not capture correctly.
-- No tools for shell commands, launching applications, files, clipboard, registry, network or
-  elevation.
+- No tools for shell commands, launching applications, files, clipboard, registry, network, browser DOM or elevation. `capabilities.forbidden_families` lists them, and [Opening an application](#opening-an-application) shows the hand-off from the host.

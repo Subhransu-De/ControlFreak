@@ -583,7 +583,7 @@ pub(super) fn wait_for_window() -> Contract {
     properties.insert("is_foreground".to_owned(), json!({ "type": "boolean" }));
     properties.insert("timeout_ms".to_owned(), timeout_property());
     contract(
-        "Wait for a visible top-level window that matches every criterion given: window_id (or target_ref), title_contains, class_name, process_id, is_foreground. At least one is required. A timeout (default 5000 ms, at most 30000) returns matched=false and timed_out=true.",
+        "Wait for a visible top-level window that matches every criterion given: window_id (or target_ref), title_contains, class_name, process_id, is_foreground. At least one is required. Use it after the host opened an application: ControlFreak cannot launch one. A timeout (default 5000 ms, at most 30000) returns matched=false and timed_out=true. If several windows match, it returns at once with matched=false, window=null, match_count and up to 20 candidates, and selects none: pick one by its id, or narrow the criteria.",
         object_schema(properties, &[]),
         output_schema(
             vec![json!({
@@ -592,9 +592,15 @@ pub(super) fn wait_for_window() -> Contract {
                     "matched": { "type": "boolean" },
                     "timed_out": { "type": "boolean" },
                     "elapsed_ms": { "type": "integer", "minimum": 0 },
-                    "window": { "oneOf": [def_ref("window"), { "type": "null" }] }
+                    "window": { "oneOf": [def_ref("window"), { "type": "null" }] },
+                    "match_count": { "type": "integer", "minimum": 0 },
+                    "candidates": {
+                        "type": "array",
+                        "items": def_ref("window"),
+                        "maxItems": controlfreak_core::limits::MAX_WINDOW_WAIT_CANDIDATES
+                    }
                 },
-                "required": ["matched", "timed_out", "elapsed_ms", "window"],
+                "required": ["matched", "timed_out", "elapsed_ms", "window", "match_count", "candidates"],
                 "additionalProperties": false
             })],
             false,
@@ -1462,6 +1468,116 @@ fn profile_schema() -> Value {
     })
 }
 
+/// Every `ReadinessReason` code. A test checks that this list and the enum agree.
+pub(super) const READINESS_REASONS: [&str; 9] = [
+    "not_implemented",
+    "not_configured",
+    "not_verified",
+    "no_ocr_language",
+    "no_default_ocr_language",
+    "ocr_runtime_failed",
+    "helper_failed",
+    "probe_timed_out",
+    "indicator_failed",
+];
+
+fn readiness_schema(extra: &JsonObject) -> Value {
+    let branch = |state: Value, reason: Option<Value>| {
+        let mut properties = extra.clone();
+        properties.insert("state".to_owned(), state);
+        let mut required = vec!["state".to_owned()];
+        if let Some(reason) = reason {
+            properties.insert("reason".to_owned(), reason);
+            required.push("reason".to_owned());
+        }
+        required.extend(extra.keys().cloned());
+        json!({
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": false
+        })
+    };
+    json!({
+        "oneOf": [
+            branch(json!({ "const": "ready" }), None),
+            branch(
+                json!({ "enum": ["degraded", "unavailable", "unsupported"] }),
+                Some(json!({ "enum": READINESS_REASONS })),
+            ),
+        ]
+    })
+}
+
+fn capabilities_schema() -> Value {
+    let helper = readiness_schema(&JsonObject::new());
+    let mut ocr = JsonObject::new();
+    ocr.insert(
+        "languages".to_owned(),
+        json!({
+            "type": "array",
+            "items": { "type": "string", "pattern": "^[A-Za-z0-9-]{1,35}$" },
+            "maxItems": controlfreak_core::MAX_REPORTED_OCR_LANGUAGES
+        }),
+    );
+    ocr.insert(
+        "default_language".to_owned(),
+        json!({ "type": ["string", "null"], "pattern": "^[A-Za-z0-9-]{1,35}$" }),
+    );
+    let limit_names: Vec<String> = serde_json::to_value(controlfreak_core::HardLimits::CURRENT)
+        .ok()
+        .and_then(|limits| {
+            limits
+                .as_object()
+                .map(|limits| limits.keys().cloned().collect())
+        })
+        .unwrap_or_default();
+    let limit_properties: JsonObject = limit_names
+        .iter()
+        .map(|name| (name.clone(), json!({ "type": "integer", "minimum": 1 })))
+        .collect();
+    json!({
+        "type": "object",
+        "properties": {
+            "features": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "capability": { "type": "string" },
+                        "state": { "enum": ["supported", "degraded", "requires_permission", "unsupported"] },
+                        "reason": { "type": "string" },
+                        "permission": { "type": "string" },
+                        "required_permissions": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["capability", "state", "required_permissions"],
+                    "additionalProperties": false
+                }
+            },
+            "ocr": readiness_schema(&ocr),
+            "helpers": {
+                "type": "object",
+                "properties": { "ocr": helper, "activation": helper, "lamp": helper, "ui_automation": helper },
+                "required": ["ocr", "activation", "lamp", "ui_automation"],
+                "additionalProperties": false
+            },
+            "limits": {
+                "type": "object",
+                "properties": limit_properties,
+                "required": limit_names,
+                "additionalProperties": false
+            },
+            "forbidden_families": {
+                "type": "array",
+                "items": { "enum": ["application_launch", "shell", "filesystem", "registry", "network", "clipboard", "browser_dom"] }
+            },
+            "hidden_tools": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["features", "ocr", "helpers", "limits", "forbidden_families", "hidden_tools"],
+        "additionalProperties": false
+    })
+}
+
 fn server_status_output_schema() -> Arc<JsonObject> {
     output_schema(
         vec![json!({
@@ -1544,13 +1660,14 @@ fn server_status_output_schema() -> Arc<JsonObject> {
                 "recovery": { "oneOf": [def_ref("recovery"), { "type": "null" }] },
                 "stop_state": { "enum": ["ready", "draining", "stopped", "cleanup_failed"] },
                 "stop_reason": { "const": "user_stop" },
-                "profile": profile_schema()
+                "profile": profile_schema(),
+                "capabilities": capabilities_schema()
             },
             "required": [
                 "status", "safety_indicator", "session", "version", "build", "instance_id", "process_id",
                 "server_elevated", "windows_integrity_level", "elevated_operation_allowed", "dpi_awareness", "uptime_ms",
                 "operations_started", "operations_completed", "operations_failed", "recent_operations",
-                "backend", "input_admission", "recovery", "stop_state", "profile"
+                "backend", "input_admission", "recovery", "stop_state", "profile", "capabilities"
             ],
             "additionalProperties": false
         })],

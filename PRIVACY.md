@@ -66,6 +66,8 @@ All of this is in memory and is gone when the server exits:
 
 The build identity in `get_server_status`, `--version`, `--print-capabilities` and the `server_started` diagnostic line is fixed at compile time: the version, the Git commit, a dirty marker and the target triple. It contains no build time, path, user name or host name.
 
+The capability report in `get_server_status` and `--print-capabilities` lists the installed OCR language tags, readiness states and request limits. It contains no path, user name, host name or environment value. To check OCR, the server asks the OCR helper for its languages; that check reads no pixels.
+
 The server writes diagnostics to standard error: startup errors and one line per finished tool
 call with the tool name, status and timings. These lines contain no tool arguments, screenshots,
 OCR text, control names, typed text or window titles. Your MCP client decides whether standard error is shown or

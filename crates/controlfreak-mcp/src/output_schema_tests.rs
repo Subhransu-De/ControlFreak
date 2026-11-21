@@ -249,12 +249,10 @@ impl WindowBackend for ObservationBackend {
         &self,
         request: &WaitForWindowRequest,
     ) -> Result<WindowWaitResult, PlatformError> {
-        let matched = request.title_contains.as_deref() != Some("absent");
-        Ok(WindowWaitResult {
-            matched,
-            timed_out: !matched,
-            elapsed_ms: 1,
-            window: matched.then(window),
+        Ok(match request.title_contains.as_deref() {
+            Some("absent") => WindowWaitResult::timed_out(1),
+            Some("two") => WindowWaitResult::from_matches(vec![window(), window()], 2, 1).unwrap(),
+            _ => WindowWaitResult::from_matches(vec![window()], 1, 1).unwrap(),
         })
     }
 }
@@ -442,6 +440,17 @@ fn screenshot_and_wait_schemas_share_one_image_metadata_definition() {
     }
 }
 
+/// The `capabilities` of a status from a backend without a readiness probe.
+fn idle_capabilities() -> Value {
+    let mut capabilities = serde_json::to_value(controlfreak_core::RuntimeCapabilities::new(
+        Vec::new(),
+        controlfreak_core::RuntimeReadiness::default(),
+    ))
+    .unwrap();
+    capabilities["hidden_tools"] = json!([]);
+    capabilities
+}
+
 #[test]
 fn schemas_describe_idle_busy_and_stopped_server_status() {
     // The full contract pins every field; the published one keeps its top-level enums.
@@ -467,7 +476,7 @@ fn schemas_describe_idle_busy_and_stopped_server_status() {
         "backend": {"platform": "windows", "display_server": "dwm", "backend_id": "b"},
         "input_admission": "open",
         "recovery": null,
-        "stop_state": "ready", "profile": {"name": "full", "tool_allowlist": null}
+        "stop_state": "ready", "profile": {"name": "full", "tool_allowlist": null}, "capabilities": idle_capabilities()
     });
     assert!(validator.is_valid(&base));
     let busy = with(
@@ -617,6 +626,7 @@ async fn every_observation_and_session_result_validates_against_tools_list() {
             false,
         ),
         (WAIT_FOR_WINDOW, json!({"title_contains": "absent"}), false),
+        (WAIT_FOR_WINDOW, json!({"title_contains": "two"}), false),
         (END_CONTROL_SESSION, json!({}), false),
         ("stop_desktop_work", json!({}), false),
     ];

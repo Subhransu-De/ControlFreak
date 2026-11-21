@@ -727,20 +727,7 @@ pub(super) fn validate_window_wait(request: &WaitForWindowRequest) -> Result<(),
 
 /// Matches every criterion except `window_id`, which callers resolve to a handle first.
 pub(super) fn window_matches(window: &WindowInfo, request: &WaitForWindowRequest) -> bool {
-    request
-        .title_contains
-        .as_ref()
-        .is_none_or(|title| window.title.to_lowercase().contains(&title.to_lowercase()))
-        && request
-            .class_name
-            .as_ref()
-            .is_none_or(|class| window.class_name.eq_ignore_ascii_case(class))
-        && request
-            .process_id
-            .is_none_or(|process_id| window.process_id == process_id)
-        && request
-            .is_foreground
-            .is_none_or(|foreground| window.is_foreground == foreground)
+    request.matches(window)
 }
 
 pub(super) fn resolve_window_reference(window_id: &str) -> Result<(HWND, u32), PlatformError> {

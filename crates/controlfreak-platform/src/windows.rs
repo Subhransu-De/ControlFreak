@@ -13,17 +13,18 @@ use std::{
 };
 
 use crate::OcrHelperCommand;
-use controlfreak_core::limits::MAX_WINDOWS;
+use controlfreak_core::limits::{MAX_WINDOW_WAIT_CANDIDATES, MAX_WINDOWS};
 use controlfreak_core::{
     ActionObservation, BackendIdentity, BackendMetadata, BaselineFailure, Capability,
     CapabilityDescriptor, CapabilityState, CaptureDisplayRequest, CaptureRegionRequest,
     CaptureWindowRequest, ClickTextRequest, ClickTextResult, DisplayBackend, DisplayBounds,
     DisplayInfo, DisplayScreenshot, DisplayServer, FindTextRequest, FindTextResult,
-    FocusWindowRequest, IncludedWindow, Key, KeyChordRequest, KeyboardActionResult,
-    KeyboardBackend, MouseButton, MouseClickRequest, MouseDragRequest, MouseMoveRequest,
-    MousePosition, MouseScrollRequest, MutationControl, ObservationMode, ObservationOptions,
-    OcrBackend, OcrLine, OcrRegionRequest, OcrResult, OcrWord, PermissionDescriptor, PermissionId,
-    PermissionState, Platform, PlatformError, PointerActionResult, PointerBackend, PopupWindow,
+    FocusWindowRequest, HelperReadiness, IncludedWindow, Key, KeyChordRequest,
+    KeyboardActionResult, KeyboardBackend, MouseButton, MouseClickRequest, MouseDragRequest,
+    MouseMoveRequest, MousePosition, MouseScrollRequest, MutationControl, ObservationMode,
+    ObservationOptions, OcrBackend, OcrLine, OcrReadiness, OcrRegionRequest, OcrResult, OcrWord,
+    PermissionDescriptor, PermissionId, PermissionState, Platform, PlatformError,
+    PointerActionResult, PointerBackend, PopupWindow, Readiness, ReadinessReason, RuntimeReadiness,
     SecurityContext, TextInputRequest, VirtualDesktopList, VirtualDesktopSwitchRequest,
     VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest, VisualChangeResult,
     WaitForChangeSinceRequest, WaitForTextRequest, WaitForTextResult, WaitForVisualChangeRequest,
@@ -164,6 +165,9 @@ const MAX_CHORD_KEYS: usize = 8;
 const MAX_WINDOW_TITLE_UTF16_UNITS: usize = 512;
 const MAX_CLICK_COUNT: u8 = 3;
 const VISUAL_POLL_MS: u64 = 100;
+/// Longest a readiness probe waits for the OCR helper, which includes starting it and loading the
+/// Windows OCR runtime.
+const OCR_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const VISUAL_COMPARE_WIDTH: u32 = 320;
 const MAX_DESKTOP_SWITCH_STEPS: u8 = 10;
 const DESKTOP_SWITCH_SETTLE_MS: u64 = 300;
@@ -566,6 +570,76 @@ impl BackendMetadata for Backend {
 
     fn security_context(&self) -> SecurityContext {
         self.security_context
+    }
+
+    fn ui_automation_readiness(&self) -> Readiness {
+        self.uia_readiness()
+    }
+
+    fn readiness(&self) -> RuntimeReadiness {
+        let unavailable = |reason| Readiness::Unavailable { reason };
+        let not_configured = Readiness::Unsupported {
+            reason: ReadinessReason::NotConfigured,
+        };
+        let (ocr, ocr_helper) = match &self.ocr_helper {
+            Some(command) => {
+                match ocr::probe_languages_with_helper(
+                    command,
+                    &self.ocr_helpers,
+                    OCR_PROBE_TIMEOUT,
+                ) {
+                    Ok((languages, default_language)) => (
+                        OcrReadiness::from_languages(languages, default_language),
+                        Readiness::Ready,
+                    ),
+                    Err(ocr::ProbeFailure::Runtime) => (
+                        OcrReadiness::without_languages(unavailable(
+                            ReadinessReason::OcrRuntimeFailed,
+                        )),
+                        Readiness::Ready,
+                    ),
+                    Err(failure) => {
+                        let reason = if failure == ocr::ProbeFailure::TimedOut {
+                            ReadinessReason::ProbeTimedOut
+                        } else {
+                            ReadinessReason::HelperFailed
+                        };
+                        (
+                            OcrReadiness::without_languages(unavailable(reason)),
+                            unavailable(reason),
+                        )
+                    }
+                }
+            }
+            // OCR then runs in this process, as `recognize_text` does without a helper.
+            None => (
+                capture::ocr_languages().map_or_else(
+                    |_| {
+                        OcrReadiness::without_languages(unavailable(
+                            ReadinessReason::OcrRuntimeFailed,
+                        ))
+                    },
+                    |(languages, default_language)| {
+                        OcrReadiness::from_languages(languages, default_language)
+                    },
+                ),
+                not_configured,
+            ),
+        };
+        RuntimeReadiness {
+            ocr,
+            helpers: HelperReadiness {
+                ocr: ocr_helper,
+                activation: if self.activation_helper.is_some() {
+                    Readiness::Ready
+                } else {
+                    not_configured
+                },
+                // The server starts the lamp and reports it; see `CapabilityReport::with_lamp`.
+                lamp: not_configured,
+                ui_automation: self.uia_readiness(),
+            },
+        }
     }
 
     fn dpi_awareness(&self) -> Option<controlfreak_core::DpiAwarenessStatus> {
@@ -1252,34 +1326,36 @@ impl WindowBackend for Backend {
                 },
                 None => None,
             };
-            let matched = if request.window_id.is_some() && target.is_none() {
-                None
+            let (issued, match_count) = if request.window_id.is_some() && target.is_none() {
+                (Vec::new(), 0)
             } else {
-                enumerate_window_candidates()?
+                let matches: Vec<_> = enumerate_window_candidates()?
                     .0
                     .into_iter()
                     .filter(|candidate| target.is_none_or(|hwnd| hwnd == candidate.hwnd))
                     .filter(|candidate| window_matches(&candidate.window, request))
-                    // A match can vanish before its reference is issued; try the next one.
-                    .map(issue_candidate)
-                    .find_map(Result::transpose)
-                    .transpose()?
+                    .collect();
+                // A match can vanish before its reference is issued; it no longer counts.
+                // References are issued only for the candidates a result can list.
+                let mut match_count = matches.len();
+                let mut issued = Vec::new();
+                for candidate in matches {
+                    if issued.len() == MAX_WINDOW_WAIT_CANDIDATES {
+                        break;
+                    }
+                    match issue_candidate(candidate)? {
+                        Some(window) => issued.push(window),
+                        None => match_count -= 1,
+                    }
+                }
+                (issued, match_count)
             };
-            if let Some(window) = matched {
-                return Ok(WindowWaitResult {
-                    matched: true,
-                    timed_out: false,
-                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    window: Some(window),
-                });
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if let Some(result) = WindowWaitResult::from_matches(issued, match_count, elapsed_ms) {
+                return Ok(result);
             }
             if Instant::now() >= deadline {
-                return Ok(WindowWaitResult {
-                    matched: false,
-                    timed_out: true,
-                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    window: None,
-                });
+                return Ok(WindowWaitResult::timed_out(elapsed_ms));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             control.wait(
@@ -1345,6 +1421,29 @@ impl Backend {
             AccessibilityState::Answered => CapabilityState::Supported,
             AccessibilityState::Failed(reason) => CapabilityState::Degraded {
                 reason: reason.clone(),
+            },
+        }
+    }
+
+    /// The UI Automation helper's readiness, from what its last query showed. Reporting it never
+    /// starts the helper.
+    fn uia_readiness(&self) -> Readiness {
+        if self.uia_helper.is_none() {
+            return Readiness::Unsupported {
+                reason: ReadinessReason::NotConfigured,
+            };
+        }
+        match &*self
+            .accessibility
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            AccessibilityState::NotAsked => Readiness::Degraded {
+                reason: ReadinessReason::NotVerified,
+            },
+            AccessibilityState::Answered => Readiness::Ready,
+            AccessibilityState::Failed(_) => Readiness::Unavailable {
+                reason: ReadinessReason::HelperFailed,
             },
         }
     }

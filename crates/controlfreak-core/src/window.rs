@@ -121,12 +121,88 @@ pub struct WaitForWindowRequest {
     pub timeout_ms: u32,
 }
 
+impl WaitForWindowRequest {
+    /// Whether `window` meets every criterion except `window_id`, which names a handle and is
+    /// resolved by the backend.
+    #[must_use]
+    pub fn matches(&self, window: &WindowInfo) -> bool {
+        self.title_contains
+            .as_ref()
+            .is_none_or(|title| window.title.to_lowercase().contains(&title.to_lowercase()))
+            && self
+                .class_name
+                .as_ref()
+                .is_none_or(|class| window.class_name.eq_ignore_ascii_case(class))
+            && self
+                .process_id
+                .is_none_or(|process_id| window.process_id == process_id)
+            && self
+                .is_foreground
+                .is_none_or(|foreground| window.is_foreground == foreground)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowWaitResult {
+    /// One window matched and is `window`.
     pub matched: bool,
     pub timed_out: bool,
     pub elapsed_ms: u64,
     pub window: Option<WindowInfo>,
+    /// How many windows matched on the last check.
+    pub match_count: usize,
+    /// When more than one window matched: the first of them, at most
+    /// [`crate::limits::MAX_WINDOW_WAIT_CANDIDATES`], and none is selected. Empty otherwise.
+    pub candidates: Vec<WindowInfo>,
+}
+
+impl WindowWaitResult {
+    /// The result of a check that found `match_count` matching windows, of which `issued` are the
+    /// first ones with a reference, in order. `None` when nothing matched, so the wait goes on.
+    /// More than one match selects none: the caller picks a candidate.
+    #[must_use]
+    pub fn from_matches(
+        mut issued: Vec<WindowInfo>,
+        match_count: usize,
+        elapsed_ms: u64,
+    ) -> Option<Self> {
+        let match_count = match_count.max(issued.len());
+        match match_count {
+            0 => None,
+            1 => Some(Self {
+                matched: true,
+                timed_out: false,
+                elapsed_ms,
+                window: Some(issued.pop()?),
+                match_count,
+                candidates: Vec::new(),
+            }),
+            _ => {
+                issued.truncate(crate::limits::MAX_WINDOW_WAIT_CANDIDATES);
+                Some(Self {
+                    matched: false,
+                    timed_out: false,
+                    elapsed_ms,
+                    window: None,
+                    match_count,
+                    candidates: issued,
+                })
+            }
+        }
+    }
+
+    /// No window matched before the deadline.
+    #[must_use]
+    pub const fn timed_out(elapsed_ms: u64) -> Self {
+        Self {
+            matched: false,
+            timed_out: true,
+            elapsed_ms,
+            window: None,
+            match_count: 0,
+            candidates: Vec::new(),
+        }
+    }
 }
 
 /// Visible windows in foreground-then-title order, capped by the backend.
@@ -135,4 +211,56 @@ pub struct WindowList {
     pub windows: Vec<WindowInfo>,
     /// More eligible windows existed than the backend returned.
     pub truncated: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(id: &str) -> WindowInfo {
+        WindowInfo {
+            id: id.to_owned(),
+            title: "Untitled - Notepad".to_owned(),
+            class_name: "Notepad".to_owned(),
+            process_id: 7,
+            bounds: WindowBounds {
+                left: 0,
+                top: 0,
+                width: 10,
+                height: 10,
+            },
+            display_id: "d".to_owned(),
+            is_foreground: false,
+            is_minimized: false,
+            owner: None,
+        }
+    }
+
+    #[test]
+    fn one_match_is_selected_and_several_select_none() {
+        assert_eq!(WindowWaitResult::from_matches(Vec::new(), 0, 1), None);
+
+        let single = WindowWaitResult::from_matches(vec![window("a")], 1, 1).unwrap();
+        assert!(single.matched && !single.timed_out);
+        assert_eq!(single.window, Some(window("a")));
+        assert_eq!(single.match_count, 1);
+        assert!(single.candidates.is_empty());
+
+        let two = WindowWaitResult::from_matches(vec![window("a"), window("b")], 2, 1).unwrap();
+        assert!(!two.matched && !two.timed_out);
+        assert_eq!(two.window, None);
+        assert_eq!(two.match_count, 2);
+        assert_eq!(two.candidates, vec![window("a"), window("b")]);
+    }
+
+    #[test]
+    fn ambiguous_candidates_are_bounded_but_the_count_is_not() {
+        let many: Vec<_> = (0..30).map(|index| window(&index.to_string())).collect();
+        let result = WindowWaitResult::from_matches(many, 45, 1).unwrap();
+        assert_eq!(result.match_count, 45);
+        assert_eq!(
+            result.candidates.len(),
+            crate::limits::MAX_WINDOW_WAIT_CANDIDATES
+        );
+    }
 }

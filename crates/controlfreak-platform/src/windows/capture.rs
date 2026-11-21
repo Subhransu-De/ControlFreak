@@ -1456,6 +1456,27 @@ pub(super) fn user_profile_language_key() -> Result<String, PlatformError> {
     Ok(tags.join(","))
 }
 
+/// The installed OCR language tags and the tag of the engine OCR uses without `language`, or
+/// `None` when no language in the Windows language list has an OCR pack. Reads no pixels.
+pub(super) fn ocr_languages() -> Result<(Vec<String>, Option<String>), PlatformError> {
+    let available = OcrEngine::AvailableRecognizerLanguages().map_err(ocr_error)?;
+    let mut languages = Vec::new();
+    for index in 0..available.Size().map_err(ocr_error)? {
+        let language = available.GetAt(index).map_err(ocr_error)?;
+        languages.push(language.LanguageTag().map_err(ocr_error)?.to_string());
+    }
+    let default_language = ocr_engine(None)
+        .and_then(|engine| {
+            engine
+                .RecognizerLanguage()
+                .and_then(|language| language.LanguageTag())
+                .map_err(ocr_error)
+        })
+        .ok()
+        .map(|tag| tag.to_string());
+    Ok((languages, default_language))
+}
+
 fn ocr_engine(language: Option<&str>) -> Result<OcrEngine, PlatformError> {
     let Some(tag) = language else {
         return OcrEngine::TryCreateFromUserProfileLanguages().map_err(ocr_error);

@@ -462,12 +462,14 @@ fn platform_backend(
 
 fn print_capabilities(allow_elevated: bool) -> Result<(), Box<dyn Error + Send + Sync>> {
     let security_context = controlfreak_platform::server_security_context(allow_elevated)?;
-    let backend: Box<dyn PlatformBackend> =
-        controlfreak_platform::backend_with_security(security_context);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&backend.report().with_build(build_info()))?
-    );
+    // The same helpers as the server, so the report probes OCR the way the server runs it.
+    let backend = platform_backend(security_context)?;
+    // The server starts the session lamp with every session; this process starts none.
+    let report = backend
+        .report()
+        .with_build(build_info())
+        .with_lamp(controlfreak_core::Readiness::Ready);
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 

@@ -202,9 +202,39 @@ fn capability_report_matches_the_target_platform() {
 
     assert!(output.status.success());
     let report: Value = serde_json::from_slice(&output.stdout).expect("valid capability JSON");
-    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["schema_version"], 3);
     assert!(report["security_context"]["elevated"].is_boolean());
     assert!(report["security_context"]["windows_integrity_level"].is_string());
+    // #9: the CLI lists the forbidden families apart from unsupported capabilities.
+    assert_eq!(
+        report["forbidden_families"],
+        serde_json::json!([
+            "application_launch",
+            "shell",
+            "filesystem",
+            "registry",
+            "network",
+            "clipboard",
+            "browser_dom"
+        ])
+    );
+    assert_eq!(report["limits"]["max_wait_ms"], 30_000);
+    // #23: OCR is probed through the helper the server uses. The machine decides whether OCR
+    // languages are installed, but every state is one of the four with its list of tags.
+    assert!(
+        ["ready", "degraded", "unavailable", "unsupported"]
+            .contains(&report["ocr"]["state"].as_str().unwrap_or_default()),
+        "{}",
+        report["ocr"]
+    );
+    assert!(report["ocr"]["languages"].is_array());
+    assert_eq!(report["helpers"]["activation"]["state"], "ready");
+    assert_eq!(report["helpers"]["lamp"]["state"], "ready");
+    // The report never starts the UI Automation helper, so a fresh process has not verified it.
+    assert_eq!(
+        report["helpers"]["ui_automation"],
+        serde_json::json!({"state": "degraded", "reason": "not_verified"})
+    );
     let supported_count = report["capabilities"]
         .as_array()
         .expect("capability array")

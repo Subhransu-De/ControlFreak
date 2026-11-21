@@ -59,3 +59,5 @@ pub const MAX_ELEMENT_TIMEOUT_MS: u32 = 10_000;
 pub const DEFAULT_ELEMENT_TIMEOUT_MS: u32 = 3_000;
 /// Longest `name` filter a `find_elements` query accepts, in characters.
 pub(crate) const MAX_ELEMENT_NAME_FILTER_CHARS: usize = 256;
+/// Most candidates one ambiguous `wait_for_window` result lists.
+pub const MAX_WINDOW_WAIT_CANDIDATES: usize = 20;
