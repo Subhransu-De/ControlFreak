@@ -19,13 +19,14 @@
 use controlfreak_core::{
     AccessibilityBackend, ActionObservation, ActivationHelperOutcome, BackendIdentity,
     BackendMetadata, CapabilityDescriptor, CaptureWindowRequest, DisplayBackend, DisplayBounds,
-    DisplayInfo, DisplayLayout, ElementBounds, ElementInfo, ElementPattern, ElementQueryCounts,
-    ElementQueryStatus, ElementRole, FindElementsRequest, FindElementsResult, FocusWindowRequest,
-    ForegroundWindow, IncludedWindow, KeyChordRequest, KeyboardActionResult, KeyboardBackend,
-    MouseClickRequest, MousePosition, MutationControl, OcrBackend, PermissionDescriptor, Platform,
-    PlatformError, PointerActionResult, PointerBackend, PopupWindow, TextInputRequest,
-    UnlistedWindow, WaitForWindowRequest, WindowBackend, WindowBounds, WindowFocusResult,
-    WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
+    DisplayInfo, DisplayLayout, ElementAction, ElementActionRequest, ElementActionResult,
+    ElementBounds, ElementInfo, ElementPattern, ElementQueryCounts, ElementQueryStatus,
+    ElementRole, FindElementsRequest, FindElementsResult, FocusWindowRequest, ForegroundWindow,
+    IncludedWindow, KeyChordRequest, KeyboardActionResult, KeyboardBackend, MouseClickRequest,
+    MousePosition, MutationControl, OcrBackend, PermissionDescriptor, Platform, PlatformError,
+    PointerActionResult, PointerBackend, PopupWindow, TextInputRequest, UnlistedWindow,
+    WaitForWindowRequest, WindowBackend, WindowBounds, WindowFocusResult, WindowInfo, WindowList,
+    WindowScreenshot, WindowWaitResult,
 };
 use std::sync::Mutex;
 
@@ -36,6 +37,18 @@ pub(super) enum Received {
     Keys { window: u32, keys: Vec<String> },
     Text { window: u32, text: String },
     Focus { window: u32 },
+    Element { window: u32, action: ElementAction },
+}
+
+/// How the fake UI Automation provider handles an element action.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ActionProvider {
+    #[default]
+    Answers,
+    /// The pattern call does not return: the helper gives up and the effect is unknown.
+    Hangs,
+    /// The pattern call blocks until the work is stopped or cancelled.
+    BlocksUntilStopped,
 }
 
 #[derive(Clone)]
@@ -62,6 +75,7 @@ struct State {
     helper: Option<ActivationHelperOutcome>,
     /// The windows' UI Automation provider does not answer.
     accessibility_unavailable: bool,
+    action_provider: ActionProvider,
     /// What the readiness probe finds. `None` is a backend without a probe.
     readiness: Option<controlfreak_core::RuntimeReadiness>,
     /// How many readiness probes ran.
@@ -237,6 +251,11 @@ impl FakeDesktop {
     /// Makes every window's UI Automation provider stop answering.
     pub(super) fn stop_accessibility(&self) {
         self.state().accessibility_unavailable = true;
+    }
+
+    /// Sets how the provider handles the next element actions.
+    pub(super) fn set_action_provider(&self, provider: ActionProvider) {
+        self.state().action_provider = provider;
     }
 
     /// Opens an untitled popup at `bounds`, owned by `owner` but in process `process_id`, in the
@@ -700,6 +719,65 @@ impl AccessibilityBackend for FakeDesktop {
                 ..ElementQueryCounts::default()
             },
             elements,
+        })
+    }
+
+    /// Admission as for input, then the semantic-action rules of the Windows backend: the
+    /// approved window itself is in front, and the reference names its `Ping` button, the only
+    /// element with the invoke pattern.
+    fn act_on_element_controlled(
+        &self,
+        request: &ElementActionRequest,
+        control: &MutationControl,
+    ) -> Result<ElementActionResult, PlatformError> {
+        request.validate()?;
+        let window = self.admit(control, "act_on_element")?;
+        let approved = control.approved_target().unwrap_or_default();
+        let state = self.state();
+        let target = state.resolve(&approved).ok_or_else(unknown_reference)?.key;
+        if window != target {
+            return Err(PlatformError::refused(
+                controlfreak_core::RefusalCause::NotForeground,
+                "a semantic action needs the approved window itself in the foreground",
+            ));
+        }
+        if request.element_ref != format!("element-{target:x}-1") {
+            return Err(PlatformError::InvalidArgument {
+                argument: "element_ref".into(),
+                reason: "unknown or expired element reference".into(),
+            });
+        }
+        if request.action != ElementAction::Invoke {
+            return Err(PlatformError::InvalidArgument {
+                argument: "action".into(),
+                reason: "the element does not support this action's pattern".into(),
+            });
+        }
+        let provider = state.action_provider;
+        drop(state);
+        control.dispatch_started();
+        match provider {
+            ActionProvider::Answers => {}
+            ActionProvider::Hangs => {
+                return Err(PlatformError::failed(
+                    controlfreak_core::FailureCause::AccessibilityUnavailable,
+                    "act_on_element",
+                    "the provider did not answer; the action may or may not have happened",
+                ));
+            }
+            ActionProvider::BlocksUntilStopped => loop {
+                control.wait("act_on_element", std::time::Duration::from_millis(10))?;
+            },
+        }
+        self.state().received.push(Received::Element {
+            window,
+            action: request.action,
+        });
+        control.dispatch_accepted(0);
+        control.input_complete();
+        control.target_foreground(true);
+        Ok(ElementActionResult {
+            observation: observe(&self.state(), control),
         })
     }
 }

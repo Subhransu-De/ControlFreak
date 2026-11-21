@@ -518,7 +518,7 @@ fn every_error_the_server_builds_validates_against_every_tool_schema() {
             }
         }
     }
-    assert!(checked > 28 * 15, "{checked}");
+    assert!(checked > 29 * 15, "{checked}");
 }
 
 /// The same check over the real transport, so the wire form and the schema agree.
@@ -662,7 +662,7 @@ async fn a_server_without_per_monitor_dpi_awareness_says_so() {
 #[test]
 fn every_tool_has_a_title_and_honest_annotations() {
     let all = tools();
-    assert_eq!(all.len(), 28);
+    assert_eq!(all.len(), 29);
     assert_eq!(all.last().unwrap().name, STOP_DESKTOP_WORK);
     for tool in &all {
         let title = tool.title.as_deref().unwrap_or_default();
@@ -1484,7 +1484,9 @@ fn tool_list_stays_compact() {
     // of headroom, so a reworded description does not fail this test but a schema that is
     // pasted into every tool does. Main had grown to 69,323 bytes when find_elements (#11) added
     // 1,649 for a 28th tool, so the limit moved from 70,000 to keep that headroom.
-    assert!(list.len() < 72_500, "tools/list is {} bytes", list.len());
+    // act_on_element (#11), the 29th tool, added 3,428 (75,478 in all), most of it the shared
+    // action observation options, so the limit moved from 72,500.
+    assert!(list.len() < 78_000, "tools/list is {} bytes", list.len());
     for tool in tools() {
         let output = Value::Object((*tool.output_schema.unwrap()).clone()).to_string();
         assert!(
@@ -1503,9 +1505,10 @@ fn tool_list_with_instructions_in_every_tool_stays_in_budget() {
     let total =
         serde_json::to_string(&tools).unwrap().len() + tools.len() * SERVER_INSTRUCTIONS.len();
     // Measured: 128,944 bytes at 0.2.4, 91,442 after #158, and 95,668 with find_elements (#11),
-    // the 28th tool, which also pays the instructions once more.
+    // the 28th tool, which also pays the instructions once more, and 101,259 with act_on_element
+    // (#11), the 29th.
     assert!(
-        total < 97_500,
+        total < 104_500,
         "tools/list with instructions is {total} bytes"
     );
 }

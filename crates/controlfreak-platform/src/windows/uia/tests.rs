@@ -27,6 +27,14 @@ struct FakeTree {
     calls: Mutex<Vec<usize>>,
     /// The window is gone: the root fails.
     root_gone: bool,
+    /// The actions performed, by node.
+    acted: Mutex<Vec<(usize, ElementAction)>>,
+    /// Every pattern call blocks this long (a provider that hangs in the action).
+    act_hang: Option<Duration>,
+    /// Every pattern call fails this way.
+    act_error: Option<ActError>,
+    /// The last check before the pattern call refuses it this way.
+    not_in_front: Option<PlatformError>,
 }
 
 fn facts(id: i32, control_type: i32, name: &str) -> NodeFacts {
@@ -67,6 +75,10 @@ impl FakeTree {
             parents,
             calls: Mutex::new(Vec::new()),
             root_gone: false,
+            acted: Mutex::new(Vec::new()),
+            act_hang: None,
+            act_error: None,
+            not_in_front: None,
         }
     }
 
@@ -138,6 +150,52 @@ impl Tree for FakeTree {
         Ok(self
             .sibling_of(*node)
             .map(|sibling| (sibling, self.nodes[sibling].facts.clone())))
+    }
+
+    fn find_all(
+        &self,
+        hwnd: usize,
+        runtime_id: &[i32],
+    ) -> Result<Vec<(usize, NodeFacts)>, TreeError> {
+        assert_eq!(hwnd, HWND);
+        if self.root_gone {
+            return Err(TreeError::Gone("window destroyed".into()));
+        }
+        // Like FindAll with a subtree scope: node 0 and its descendants only.
+        let mut found = Vec::new();
+        let mut pending = vec![0];
+        while let Some(index) = pending.pop() {
+            if self.nodes[index].facts.runtime_id == runtime_id {
+                found.push((index, self.nodes[index].facts.clone()));
+            }
+            pending.extend(&self.nodes[index].children);
+        }
+        Ok(found)
+    }
+
+    fn act(
+        &self,
+        node: &usize,
+        action: ElementAction,
+        ready: &dyn Fn() -> Result<(), PlatformError>,
+    ) -> Result<(), ActError> {
+        if let Some(ActError::Refused(reason)) = &self.act_error {
+            return Err(ActError::Refused(reason.clone()));
+        }
+        ready().map_err(ActError::NotReady)?;
+        if let Some(hang) = self.act_hang {
+            thread::sleep(hang);
+        }
+        if let Some(error) = &self.act_error {
+            return Err(error.clone());
+        }
+        self.acted.lock().unwrap().push((*node, action));
+        Ok(())
+    }
+
+    fn in_front(&self, hwnd: usize, pid: u32) -> Result<(), PlatformError> {
+        assert_eq!((hwnd, pid), (HWND, PID));
+        self.not_in_front.clone().map_or(Ok(()), Err)
     }
 }
 
@@ -408,11 +466,11 @@ fn the_deadline_stops_a_slow_walk_with_what_it_read() {
 }
 
 fn request_line(id: u64, query: &WalkQuery) -> Vec<u8> {
-    let mut line = serde_json::to_vec(&UiaHelperRequest {
-        id,
-        query: query.clone(),
-    })
-    .unwrap();
+    job_line(id, HelperJob::Walk(query.clone()))
+}
+
+fn job_line(id: u64, job: HelperJob) -> Vec<u8> {
+    let mut line = serde_json::to_vec(&UiaHelperRequest { id, job }).unwrap();
     line.push(b'\n');
     line
 }
@@ -562,6 +620,21 @@ impl Tree for HungRoot {
     fn next_sibling(&self, (): &()) -> Result<Option<((), NodeFacts)>, TreeError> {
         Ok(None)
     }
+    fn find_all(&self, _: usize, _: &[i32]) -> Result<Vec<((), NodeFacts)>, TreeError> {
+        thread::sleep(Duration::from_secs(5));
+        Err(TreeError::Failed("late".into()))
+    }
+    fn act(
+        &self,
+        (): &(),
+        _: ElementAction,
+        _: &dyn Fn() -> Result<(), PlatformError>,
+    ) -> Result<(), ActError> {
+        panic!("an element that was never found was acted on")
+    }
+    fn in_front(&self, _: usize, _: u32) -> Result<(), PlatformError> {
+        Ok(())
+    }
 }
 
 #[test]
@@ -607,7 +680,9 @@ fn a_client_that_cannot_start_fails_every_request_without_an_empty_tree() {
             UiaHelperResponse::Error {
                 error: PlatformError::Failed { reason, .. },
             } => assert!(reason.starts_with(CLIENT_START_FAILED)),
-            UiaHelperResponse::Success { .. } => panic!("an unavailable client returned a tree"),
+            UiaHelperResponse::Success { .. } | UiaHelperResponse::Acted => {
+                panic!("an unavailable client returned a tree")
+            }
             UiaHelperResponse::Error { error } => panic!("{error:?}"),
         }
     }
@@ -830,4 +905,469 @@ fn invalid_limits_are_refused_before_the_provider_is_asked() {
         Err(PlatformError::InvalidArgument { .. })
     ));
     assert!(environment.tree.calls.lock().unwrap().is_empty());
+}
+
+// Semantic actions.
+
+/// The first `Approve` button, node 7.
+const APPROVE: [i32; 2] = [42, 7];
+
+fn act_query(runtime_id: &[i32], action: ElementAction) -> ActQuery {
+    ActQuery {
+        hwnd: HWND,
+        pid: PID,
+        runtime_id: runtime_id.to_vec(),
+        action,
+        timeout_ms: 2_000,
+    }
+}
+
+/// Runs `perform` with an open request and returns its result and whether it dispatched.
+fn act(tree: &FakeTree, query: &ActQuery) -> (Result<(), PlatformError>, bool) {
+    let dispatched = AtomicBool::new(false);
+    let result = perform(tree, query, &AtomicBool::new(false), &dispatched);
+    (result, dispatched.load(Ordering::SeqCst))
+}
+
+fn refused_argument(result: &Result<(), PlatformError>) -> &str {
+    match result {
+        Err(PlatformError::InvalidArgument { argument, .. }) => argument,
+        other => panic!("expected an argument refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_action_finds_its_element_again_and_acts_on_it_once() {
+    let tree = FakeTree::normal();
+    let (result, dispatched) = act(&tree, &act_query(&APPROVE, ElementAction::Invoke));
+    result.unwrap();
+    assert!(dispatched);
+    assert_eq!(*tree.acted.lock().unwrap(), [(7, ElementAction::Invoke)]);
+}
+
+#[test]
+fn a_stale_ambiguous_foreign_or_unsuitable_element_is_refused_without_acting() {
+    let gone = FakeTree::normal();
+    let (result, dispatched) = act(&gone, &act_query(&[42, 99], ElementAction::Invoke));
+    assert_eq!(refused_argument(&result), "element_ref");
+    assert!(!dispatched);
+
+    // A provider that gives two elements the same runtime ID makes the reference ambiguous.
+    let mut nodes = FakeTree::normal().nodes;
+    nodes.push(node(facts(7, 50000, "Approve"), vec![]));
+    nodes[2].children.push(11);
+    let twice = FakeTree::new(nodes);
+    let (result, _) = act(&twice, &act_query(&APPROVE, ElementAction::Invoke));
+    assert_eq!(refused_argument(&result), "element_ref");
+
+    let mut foreign = FakeTree::normal();
+    foreign.nodes[7].facts.process_id = OTHER_PID;
+    let (result, _) = act(&foreign, &act_query(&APPROVE, ElementAction::Invoke));
+    assert_eq!(refused_argument(&result), "element_ref");
+
+    let mut disabled = FakeTree::normal();
+    disabled.nodes[7].facts.enabled = false;
+    let (result, _) = act(&disabled, &act_query(&APPROVE, ElementAction::Invoke));
+    assert_eq!(refused_argument(&result), "element_ref");
+
+    // The button has only the invoke pattern.
+    let plain = FakeTree::normal();
+    for action in [
+        ElementAction::Toggle,
+        ElementAction::Expand,
+        ElementAction::Collapse,
+    ] {
+        let (result, dispatched) = act(&plain, &act_query(&APPROVE, action));
+        assert_eq!(refused_argument(&result), "action");
+        assert!(!dispatched);
+    }
+    for tree in [gone, twice, foreign, disabled, plain] {
+        assert!(tree.acted.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn a_closed_window_or_a_closed_request_is_not_acted_on() {
+    let mut closed_window = FakeTree::normal();
+    closed_window.root_gone = true;
+    let (result, dispatched) = act(&closed_window, &act_query(&APPROVE, ElementAction::Invoke));
+    assert!(matches!(
+        result,
+        Err(PlatformError::TargetInvalidated { .. })
+    ));
+    assert!(!dispatched);
+
+    let tree = FakeTree::normal();
+    let dispatched = AtomicBool::new(false);
+    let result = perform(
+        &tree,
+        &act_query(&APPROVE, ElementAction::Invoke),
+        &AtomicBool::new(true),
+        &dispatched,
+    );
+    assert_eq!(result.unwrap_err().reason_code(), Some("cancelled"));
+    assert!(!dispatched.load(Ordering::SeqCst));
+    assert!(tree.acted.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_missing_pattern_did_nothing_but_a_failed_call_is_unknown() {
+    let mut missing = FakeTree::normal();
+    missing.act_error = Some(ActError::Refused("no pattern".into()));
+    let (result, dispatched) = act(&missing, &act_query(&APPROVE, ElementAction::Invoke));
+    assert_eq!(refused_argument(&result), "action");
+    assert!(!dispatched, "no pattern, no call");
+
+    let mut failed = FakeTree::normal();
+    failed.act_error = Some(ActError::Unknown("RPC failed".into()));
+    let (result, dispatched) = act(&failed, &act_query(&APPROVE, ElementAction::Invoke));
+    assert_eq!(
+        result.unwrap_err().reason_code(),
+        Some("accessibility_unavailable")
+    );
+    assert!(dispatched, "a failed call may have acted");
+}
+
+/// The server checked the foreground before the request, but finding the element takes time:
+/// the helper checks again right before the call, and a window that left the front is not acted
+/// on.
+#[test]
+fn a_window_that_left_the_front_while_the_element_was_found_is_not_acted_on() {
+    let mut tree = FakeTree::normal();
+    tree.not_in_front = Some(PlatformError::refused(
+        controlfreak_core::RefusalCause::NotForeground,
+        "another window is in front",
+    ));
+    let (result, dispatched) = act(&tree, &act_query(&APPROVE, ElementAction::Invoke));
+    assert_eq!(result.unwrap_err().reason_code(), Some("not_foreground"));
+    assert!(!dispatched);
+    assert!(tree.acted.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_helper_whose_pattern_call_failed_retires() {
+    let mut tree = FakeTree::normal();
+    tree.act_error = Some(ActError::Unknown("UIA_E_TIMEOUT".into()));
+    let replies = serve_lines(
+        &[job_line(
+            1,
+            HelperJob::Act(act_query(&APPROVE, ElementAction::Invoke)),
+        )],
+        1,
+        move || Ok(tree),
+    );
+    assert!(replies[0].dispatched && replies[0].retire);
+    assert!(matches!(
+        replies[0].response,
+        UiaHelperResponse::Error { .. }
+    ));
+}
+
+#[test]
+fn the_helper_acts_and_keeps_serving() {
+    let replies = serve_lines(
+        &[
+            job_line(
+                1,
+                HelperJob::Act(act_query(&APPROVE, ElementAction::Invoke)),
+            ),
+            request_line(2, &query()),
+        ],
+        2,
+        || Ok(FakeTree::normal()),
+    );
+    assert!(matches!(replies[0].response, UiaHelperResponse::Acted));
+    assert!(replies[0].dispatched && replies[0].keeps_helper());
+    assert!(matches!(
+        replies[1].response,
+        UiaHelperResponse::Success { .. }
+    ));
+}
+
+#[test]
+fn a_provider_that_hangs_in_the_action_is_answered_as_unknown_and_retires_the_helper() {
+    let mut tree = FakeTree::normal();
+    tree.act_hang = Some(Duration::from_secs(5));
+    let hung = ActQuery {
+        timeout_ms: 200,
+        ..act_query(&APPROVE, ElementAction::Invoke)
+    };
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    writer
+        .write_all(&job_line(1, HelperJob::Act(hung)))
+        .unwrap();
+    let mut output = Vec::new();
+    let started = Instant::now();
+    serve_uia_helper_with(
+        reader,
+        &mut output,
+        move || Ok(tree),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let reply = replies(&output).remove(0);
+    assert!(reply.retire && !reply.keeps_helper());
+    assert!(
+        reply.dispatched,
+        "the pattern call was made, so the effect is unknown"
+    );
+    assert!(matches!(
+        reply.response,
+        UiaHelperResponse::Error {
+            error: PlatformError::Failed {
+                cause: FailureCause::AccessibilityUnavailable,
+                ..
+            }
+        }
+    ));
+    drop(writer);
+}
+
+#[test]
+fn a_provider_that_hangs_before_the_action_says_nothing_was_done() {
+    let hung = ActQuery {
+        timeout_ms: 100,
+        ..act_query(&APPROVE, ElementAction::Invoke)
+    };
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    writer
+        .write_all(&job_line(1, HelperJob::Act(hung)))
+        .unwrap();
+    let mut output = Vec::new();
+    serve_uia_helper_with(
+        reader,
+        &mut output,
+        || Ok(HungRoot),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    let reply = replies(&output).remove(0);
+    assert!(reply.retire);
+    assert!(!reply.dispatched);
+    assert!(matches!(reply.response, UiaHelperResponse::Error { .. }));
+    drop(writer);
+}
+
+/// The desktop checks and the helper of an action, scripted. `act` runs `perform` on the tree,
+/// as the helper would, unless `outcome` scripts the helper's answer.
+struct FakeActions {
+    tree: FakeTree,
+    refusal: Option<PlatformError>,
+    scope: Scope,
+    outcome: Option<(PlatformError, bool)>,
+    sent: Mutex<u32>,
+}
+
+impl FakeActions {
+    fn new() -> Self {
+        Self {
+            tree: FakeTree::normal(),
+            refusal: None,
+            scope: scope(7),
+            outcome: None,
+            sent: Mutex::new(0),
+        }
+    }
+
+    fn sent(&self) -> u32 {
+        *self.sent.lock().unwrap()
+    }
+}
+
+impl ActionEnvironment for FakeActions {
+    fn validate(&self, control: &MutationControl) -> Result<(), PlatformError> {
+        control.check(ACTION)?;
+        self.refusal.clone().map_or(Ok(()), Err)
+    }
+
+    fn scope(&self, _: &str) -> Result<Scope, PlatformError> {
+        Ok(self.scope.clone())
+    }
+
+    fn act(
+        &self,
+        query: &ActQuery,
+        _: &MutationControl,
+        sending: &dyn Fn(),
+    ) -> Result<(), ActFailure> {
+        sending();
+        *self.sent.lock().unwrap() += 1;
+        if let Some((error, dispatched)) = &self.outcome {
+            return Err(ActFailure {
+                error: error.clone(),
+                dispatched: *dispatched,
+            });
+        }
+        let (result, dispatched) = act(&self.tree, query);
+        result.map_err(|error| ActFailure { error, dispatched })
+    }
+}
+
+fn session(target: &str) -> MutationControl {
+    let control = MutationControl::default();
+    control.bind_target(target).unwrap();
+    control
+}
+
+/// An element reference for the first `Approve` button of `target-a`, issued as
+/// `find_elements` issues it.
+fn approve_ref(refs: &ElementRefs) -> String {
+    refs.issue("target-a", &scope(7), &APPROVE)
+}
+
+fn action_request(element_ref: &str) -> ElementActionRequest {
+    ElementActionRequest {
+        target_ref: "target-a".into(),
+        element_ref: element_ref.to_owned(),
+        action: ElementAction::Invoke,
+        observation: controlfreak_core::ObservationOptions::default(),
+    }
+}
+
+#[test]
+fn an_action_in_the_session_window_is_delivered_once() {
+    let environment = FakeActions::new();
+    let refs = ElementRefs::default();
+    let control = session("target-a");
+    act_on_element(
+        &action_request(&approve_ref(&refs)),
+        &control,
+        &environment,
+        &refs,
+    )
+    .unwrap();
+    assert_eq!(environment.sent(), 1);
+    assert_eq!(
+        *environment.tree.acted.lock().unwrap(),
+        [(7, ElementAction::Invoke)]
+    );
+    assert_eq!(
+        control.progress().input_outcome,
+        controlfreak_core::InputOutcome::PartiallySent,
+        "accepted; the settle wait that follows completes it"
+    );
+}
+
+#[test]
+fn an_action_is_refused_before_anything_is_sent() {
+    let refs = ElementRefs::default();
+    let element = approve_ref(&refs);
+    let mut background = FakeActions::new();
+    background.refusal = Some(PlatformError::refused(
+        controlfreak_core::RefusalCause::NotForeground,
+        "the window is not in front",
+    ));
+    let mut restarted = FakeActions::new();
+    restarted.scope = scope(8);
+    let mut other_window = FakeActions::new();
+    other_window.scope.hwnd = HWND + 1;
+    let cancelled = session("target-a");
+    cancelled.cancel();
+    let cases = [
+        (
+            "background",
+            background,
+            session("target-a"),
+            element.as_str(),
+        ),
+        (
+            "no session target",
+            FakeActions::new(),
+            MutationControl::default(),
+            element.as_str(),
+        ),
+        (
+            "another target",
+            FakeActions::new(),
+            session("target-b"),
+            element.as_str(),
+        ),
+        (
+            "another process instance",
+            restarted,
+            session("target-a"),
+            element.as_str(),
+        ),
+        (
+            "another window",
+            other_window,
+            session("target-a"),
+            element.as_str(),
+        ),
+        (
+            "unknown element",
+            FakeActions::new(),
+            session("target-a"),
+            "element-made-up",
+        ),
+        ("cancelled", FakeActions::new(), cancelled, element.as_str()),
+    ];
+    for (case, environment, control, element) in cases {
+        let error =
+            act_on_element(&action_request(element), &control, &environment, &refs).unwrap_err();
+        assert_eq!(environment.sent(), 0, "{case}: {error:?}");
+        assert!(environment.tree.acted.lock().unwrap().is_empty(), "{case}");
+        assert_eq!(
+            control.progress().input_outcome,
+            controlfreak_core::InputOutcome::NotStarted,
+            "{case}"
+        );
+        match case {
+            "background" => assert_eq!(error.reason_code(), Some("not_foreground")),
+            "no session target" | "another target" => assert!(
+                matches!(error, PlatformError::TargetInvalidated { .. }),
+                "{case}: {error:?}"
+            ),
+            "cancelled" => assert_eq!(error.reason_code(), Some("cancelled")),
+            _ => assert!(
+                matches!(&error, PlatformError::InvalidArgument { argument, .. } if argument == "element_ref"),
+                "{case}: {error:?}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn an_element_gone_from_the_window_is_refused_by_the_helper_as_not_sent() {
+    let mut environment = FakeActions::new();
+    environment.tree.nodes[7].facts.runtime_id = vec![42, 700];
+    let refs = ElementRefs::default();
+    let control = session("target-a");
+    let error = act_on_element(
+        &action_request(&approve_ref(&refs)),
+        &control,
+        &environment,
+        &refs,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, PlatformError::InvalidArgument { argument, .. } if argument == "element_ref")
+    );
+    assert_eq!(environment.sent(), 1);
+    assert_eq!(
+        control.progress().input_outcome,
+        controlfreak_core::InputOutcome::NotStarted
+    );
+}
+
+#[test]
+fn a_helper_that_may_have_acted_leaves_delivery_unknown() {
+    let mut environment = FakeActions::new();
+    environment.outcome = Some((action_failed("the provider did not answer".into()), true));
+    let refs = ElementRefs::default();
+    let control = session("target-a");
+    let error = act_on_element(
+        &action_request(&approve_ref(&refs)),
+        &control,
+        &environment,
+        &refs,
+    )
+    .unwrap_err();
+    assert_eq!(error.reason_code(), Some("accessibility_unavailable"));
+    assert!(!error.retryable());
+    assert_eq!(
+        control.progress().input_outcome,
+        controlfreak_core::InputOutcome::Unknown
+    );
 }

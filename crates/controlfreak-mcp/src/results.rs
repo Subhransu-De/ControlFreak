@@ -60,6 +60,7 @@ macro_rules! observed_result {
 observed_result!(
     PointerActionResult,
     KeyboardActionResult,
+    ElementActionResult,
     ClickTextResult,
     WindowFocusResult,
     VirtualDesktopSwitchResult
@@ -378,6 +379,17 @@ pub(super) fn window_focus_result(result: Encoded<WindowFocusResult>) -> CallToo
 
 pub(super) fn keyboard_result(
     result: Encoded<KeyboardActionResult>,
+    action: &Value,
+) -> CallToolResult {
+    let Encoded {
+        value: result,
+        base64,
+    } = result;
+    action_result(&result.observation, base64, action, None)
+}
+
+pub(super) fn element_action_result(
+    result: Encoded<ElementActionResult>,
     action: &Value,
 ) -> CallToolResult {
     let Encoded {

@@ -29,8 +29,8 @@ use windows::Win32::{
         WindowsAndMessaging::{
             EVENT_OBJECT_DESTROY, EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_FOREGROUND,
             FindWindowExW, GA_ROOT, GA_ROOTOWNER, GW_OWNER, GetAncestor, GetClassNameW,
-            GetMessageW, GetWindow, GetWindowRect, GetWindowThreadProcessId, IsWindow, MSG,
-            OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WindowFromPoint,
+            GetMessageW, GetWindow, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow,
+            MSG, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WindowFromPoint,
         },
     },
 };
@@ -1185,6 +1185,27 @@ fn cached_integrity(operation: &str, hwnd: HWND) -> Result<(), PlatformError> {
                 cache.remember_integrity(key, pid, now);
             }
         });
+    }
+    Ok(())
+}
+
+/// The foreground rule of semantic actions, after `validate`: the approved window itself holds
+/// the foreground and is not minimized. A dialog or popup of its process in front, which pointer
+/// input accepts, is refused: a semantic action has no hit test to confirm what the user sees,
+/// so it acts only on the window that is in front. The session is kept.
+pub(super) fn ensure_target_in_front(control: &MutationControl) -> Result<(), PlatformError> {
+    let id = control
+        .approved_target()
+        .ok_or_else(|| invalid("an approved target reference is required"))?;
+    let hwnd = HWND(lookup(&id)?.identity.hwnd as *mut std::ffi::c_void);
+    // SAFETY: IsIconic only inspects a borrowed handle; a stale one reads as not minimized and
+    // is then refused by the foreground comparison or the identity checks.
+    let minimized = unsafe { IsIconic(hwnd) }.as_bool();
+    if minimized || desktop::foreground_window_handle() != hwnd {
+        return Err(refused(
+            RefusalCause::NotForeground,
+            "a semantic action needs the approved window itself in the foreground and not minimized; call focus_window on it",
+        ));
     }
     Ok(())
 }

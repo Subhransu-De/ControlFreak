@@ -700,6 +700,7 @@ fn assert_tool_names(tools: &Value) {
             "scroll_mouse",
             "press_keys",
             "type_text",
+            "act_on_element",
             "run_actions",
             "stop_desktop_work"
         ]

@@ -693,6 +693,31 @@ pub(super) struct PressKeysInput {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct ActOnElementInput {
+    target_ref: String,
+    element_ref: String,
+    action: controlfreak_core::ElementAction,
+    #[serde(default)]
+    observation: ObservationInput,
+}
+
+impl ActOnElementInput {
+    pub(super) fn into_request(
+        self,
+    ) -> Result<controlfreak_core::ElementActionRequest, PlatformError> {
+        let request = controlfreak_core::ElementActionRequest {
+            target_ref: self.target_ref,
+            element_ref: self.element_ref,
+            action: self.action,
+            observation: self.observation.into(),
+        };
+        request.validate()?;
+        Ok(request)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct TypeTextInput {
     pub(super) target_ref: String,
     pub(super) text: String,

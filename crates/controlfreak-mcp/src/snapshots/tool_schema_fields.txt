@@ -1394,6 +1394,83 @@ type_text output $defs.window.is_minimized required
 type_text output $defs.window.owner
 type_text output $defs.window.process_id required
 type_text output $defs.window.title required
+act_on_element input action required
+act_on_element input element_ref required
+act_on_element input observation
+act_on_element input observation.include_cursor default=true
+act_on_element input observation.max_width
+act_on_element input observation.mode default="screenshot"
+act_on_element input observation.region
+act_on_element input observation.region.display_id
+act_on_element input observation.region.height required
+act_on_element input observation.region.width required
+act_on_element input observation.region.x required
+act_on_element input observation.region.y required
+act_on_element input observation.settle_ms
+act_on_element input target_ref required
+act_on_element output anyOf[0].action required
+act_on_element output anyOf[0].input required
+act_on_element output anyOf[0].input.input_outcome
+act_on_element output anyOf[0].observation required
+act_on_element output anyOf[0].observation.foreground_window required
+act_on_element output anyOf[0].observation.foreground_window.oneOf[1].class_name required
+act_on_element output anyOf[0].observation.foreground_window.oneOf[1].id required
+act_on_element output anyOf[0].observation.foreground_window.oneOf[1].process_id required
+act_on_element output anyOf[0].observation.foreground_window.oneOf[1].same_process_as_target required
+act_on_element output anyOf[0].observation.screenshot required
+act_on_element output anyOf[0].observation.settle
+act_on_element output anyOf[0].observation.settle.elapsed_ms
+act_on_element output anyOf[0].observation.settle.outcome
+act_on_element output anyOf[0].observation_status required
+act_on_element output anyOf[0].status required
+act_on_element output anyOf[1].details
+act_on_element output anyOf[1].error
+act_on_element output anyOf[1].error.code required
+act_on_element output anyOf[1].error.details
+act_on_element output anyOf[1].error.message required
+act_on_element output anyOf[1].error.reason
+act_on_element output anyOf[1].error.retryable
+act_on_element output anyOf[1].input required
+act_on_element output anyOf[1].observation_status required
+act_on_element output anyOf[1].operation
+act_on_element output anyOf[1].retry_action required
+act_on_element output anyOf[1].status required
+act_on_element output anyOf[1].warning
+act_on_element output $defs.bounds.height required
+act_on_element output $defs.bounds.left required
+act_on_element output $defs.bounds.top required
+act_on_element output $defs.bounds.width required
+act_on_element output $defs.display.bounds required
+act_on_element output $defs.display.id required
+act_on_element output $defs.display.is_primary required
+act_on_element output $defs.display.name required
+act_on_element output $defs.input.activation_attempts
+act_on_element output $defs.input.activation_elapsed_ms
+act_on_element output $defs.input.activation_helper
+act_on_element output $defs.input.cleanup required
+act_on_element output $defs.input.input_outcome required
+act_on_element output $defs.input.sent_events required
+act_on_element output $defs.input.split_character
+act_on_element output $defs.input.target_remained_foreground
+act_on_element output $defs.screenshot.byte_length required
+act_on_element output $defs.screenshot.capture_method required
+act_on_element output $defs.screenshot.cursor_marker required
+act_on_element output $defs.screenshot.display required
+act_on_element output $defs.screenshot.image_height required
+act_on_element output $defs.screenshot.image_width required
+act_on_element output $defs.screenshot.mime_type required
+act_on_element output $defs.screenshot.observation_id
+act_on_element output $defs.screenshot.source_bounds required
+act_on_element output $defs.screenshot.target_ref
+act_on_element output $defs.window.bounds required
+act_on_element output $defs.window.class_name required
+act_on_element output $defs.window.display_id required
+act_on_element output $defs.window.id required
+act_on_element output $defs.window.is_foreground required
+act_on_element output $defs.window.is_minimized required
+act_on_element output $defs.window.owner
+act_on_element output $defs.window.process_id required
+act_on_element output $defs.window.title required
 run_actions input observation
 run_actions input observation.include_cursor default=true
 run_actions input observation.max_width

@@ -4,20 +4,22 @@
 //! builder, and documenting it in docs/tools.md (a test compares that table with this one).
 
 use super::{
-    BEGIN_CONTROL_SESSION, CAPTURE_DISPLAY, CAPTURE_REGION, CAPTURE_VISUAL_BASELINE,
-    CAPTURE_WINDOW, CLICK_MOUSE, CLICK_TEXT, DRAG_MOUSE, END_CONTROL_SESSION, FIND_ELEMENTS,
-    FIND_TEXT_ON_SCREEN, FOCUS_WINDOW, GET_SERVER_STATUS, InputPrepare, LIST_DISPLAYS,
-    LIST_VIRTUAL_DESKTOPS, LIST_WINDOWS, MOVE_MOUSE, PRESS_KEYS, READ_TEXT_IN_REGION, RUN_ACTIONS,
-    SCROLL_MOUSE, STOP_DESKTOP_WORK, SWITCH_VIRTUAL_DESKTOP, TYPE_TEXT, ToolHandler,
-    WAIT_FOR_CHANGE_SINCE, WAIT_FOR_TEXT, WAIT_FOR_VISUAL_CHANGE, WAIT_FOR_WINDOW,
+    ACT_ON_ELEMENT, BEGIN_CONTROL_SESSION, CAPTURE_DISPLAY, CAPTURE_REGION,
+    CAPTURE_VISUAL_BASELINE, CAPTURE_WINDOW, CLICK_MOUSE, CLICK_TEXT, DRAG_MOUSE,
+    END_CONTROL_SESSION, FIND_ELEMENTS, FIND_TEXT_ON_SCREEN, FOCUS_WINDOW, GET_SERVER_STATUS,
+    InputPrepare, LIST_DISPLAYS, LIST_VIRTUAL_DESKTOPS, LIST_WINDOWS, MOVE_MOUSE, PRESS_KEYS,
+    READ_TEXT_IN_REGION, RUN_ACTIONS, SCROLL_MOUSE, STOP_DESKTOP_WORK, SWITCH_VIRTUAL_DESKTOP,
+    TYPE_TEXT, ToolHandler, WAIT_FOR_CHANGE_SINCE, WAIT_FOR_TEXT, WAIT_FOR_VISUAL_CHANGE,
+    WAIT_FOR_WINDOW,
     handlers::{
         call_capture_display, call_capture_region, call_capture_visual_baseline,
         call_capture_window, call_find_elements, call_find_text_on_screen, call_list_displays,
         call_list_virtual_desktops, call_list_windows, call_read_text_in_region,
         call_wait_for_change_since, call_wait_for_text, call_wait_for_visual_change,
-        call_wait_for_window, prepare_click_mouse, prepare_click_text, prepare_drag_mouse,
-        prepare_focus_window, prepare_move_mouse, prepare_press_keys, prepare_run_actions,
-        prepare_scroll_mouse, prepare_switch_virtual_desktop, prepare_type_text,
+        call_wait_for_window, prepare_act_on_element, prepare_click_mouse, prepare_click_text,
+        prepare_drag_mouse, prepare_focus_window, prepare_move_mouse, prepare_press_keys,
+        prepare_run_actions, prepare_scroll_mouse, prepare_switch_virtual_desktop,
+        prepare_type_text,
     },
     schema::{self, Contract},
 };
@@ -335,6 +337,16 @@ pub(super) static CATALOG: &[ToolSpec] = &[
         target_ref: TargetRef::Required,
         reads_screen: false,
         schema: schema::type_text,
+    },
+    ToolSpec {
+        name: ACT_ON_ELEMENT,
+        title: "Act on element",
+        // A semantic action changes the window: it runs under the lease like pointer input.
+        route: Route::Input(prepare_act_on_element),
+        idempotent: false,
+        target_ref: TargetRef::Required,
+        reads_screen: false,
+        schema: schema::act_on_element,
     },
     ToolSpec {
         name: RUN_ACTIONS,

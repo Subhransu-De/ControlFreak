@@ -1422,7 +1422,7 @@ impl Backend {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
         {
             AccessibilityState::NotAsked => CapabilityState::Degraded {
-                reason: "not verified yet: the UI Automation helper starts with the first find_elements call".to_owned(),
+                reason: "not verified yet: the UI Automation helper starts with the first find_elements or act_on_element call".to_owned(),
             },
             AccessibilityState::Answered => CapabilityState::Supported,
             AccessibilityState::Failed(reason) => CapabilityState::Degraded {
@@ -1431,8 +1431,19 @@ impl Backend {
         }
     }
 
-    /// The UI Automation helper's readiness, from what its last query showed. Reporting it never
-    /// starts the helper.
+    /// Records whether the UI Automation helper answered a query or an action.
+    fn record_accessibility(&self, outcome: Result<(), String>) {
+        *self
+            .accessibility
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = match outcome {
+            Ok(()) => AccessibilityState::Answered,
+            Err(reason) => AccessibilityState::Failed(reason),
+        };
+    }
+
+    /// The UI Automation helper's readiness, from what its last query or action showed.
+    /// Reporting it never starts the helper.
     fn uia_readiness(&self) -> Readiness {
         if self.uia_helper.is_none() {
             return Readiness::Unsupported {
@@ -1469,21 +1480,36 @@ impl controlfreak_core::AccessibilityBackend for Backend {
             });
         };
         ensure_dpi_awareness()?;
-        let record = |outcome: Result<(), String>| {
-            *self
-                .accessibility
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = match outcome {
-                Ok(()) => AccessibilityState::Answered,
-                Err(reason) => AccessibilityState::Failed(reason),
-            };
-        };
+        let record = |outcome: Result<(), String>| self.record_accessibility(outcome);
         let environment = uia::HelperEnvironment {
             command,
             pool: &self.uia_helpers,
             answered: &record,
         };
         uia::find_elements(request, control, &environment, &self.element_refs)
+    }
+
+    fn act_on_element_controlled(
+        &self,
+        request: &controlfreak_core::ElementActionRequest,
+        control: &MutationControl,
+    ) -> Result<controlfreak_core::ElementActionResult, PlatformError> {
+        let _timer = controlfreak_core::timing::start("act_on_element");
+        let Some(command) = &self.uia_helper else {
+            return Err(PlatformError::Unsupported {
+                operation: "act_on_element".to_owned(),
+                reason: "this backend has no UI Automation helper".to_owned(),
+            });
+        };
+        let record = |outcome: Result<(), String>| self.record_accessibility(outcome);
+        let environment = uia::ActionHelper {
+            helper: uia::HelperEnvironment {
+                command,
+                pool: &self.uia_helpers,
+                answered: &record,
+            },
+        };
+        self.perform_element_action(request, control, &environment)
     }
 }
 
@@ -2315,5 +2341,32 @@ mod tests {
                 "{result:?}"
             );
         }
+    }
+
+    /// A semantic action is refused without an approved target before any helper starts: the
+    /// helper command names no program.
+    #[test]
+    fn an_element_action_refuses_an_unapproved_target_before_the_helper() {
+        use controlfreak_core::{
+            AccessibilityBackend, ElementAction, ElementActionRequest, ObservationMode,
+        };
+        let result = Backend::new()
+            .with_uia_helper(crate::OcrHelperCommand::new("no-helper-is-started"))
+            .act_on_element_controlled(
+                &ElementActionRequest {
+                    target_ref: "target-synthetic".into(),
+                    element_ref: "element-synthetic".into(),
+                    action: ElementAction::Invoke,
+                    observation: ObservationOptions {
+                        mode: ObservationMode::None,
+                        ..ObservationOptions::default()
+                    },
+                },
+                &controlfreak_core::MutationControl::default(),
+            );
+        assert!(
+            matches!(result, Err(PlatformError::TargetInvalidated { .. })),
+            "{result:?}"
+        );
     }
 }

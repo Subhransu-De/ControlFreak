@@ -23,8 +23,9 @@ pub mod timing;
 mod window;
 
 pub use accessibility::{
-    ElementBounds, ElementInfo, ElementPattern, ElementQueryCounts, ElementQueryLimit,
-    ElementQueryStatus, ElementRole, FindElementsRequest, FindElementsResult,
+    ElementAction, ElementActionRequest, ElementActionResult, ElementBounds, ElementInfo,
+    ElementPattern, ElementQueryCounts, ElementQueryLimit, ElementQueryStatus, ElementRole,
+    FindElementsRequest, FindElementsResult,
 };
 pub use build_info::{BUILD_INFO_SCHEMA_VERSION, BuildInfo, UNKNOWN_REVISION};
 pub use capability::{Capability, CapabilityDescriptor, CapabilityState};

@@ -354,7 +354,7 @@ fn every_tool_publishes_an_object_output_schema() {
         missing.is_empty(),
         "tools without an outputSchema: {missing:?}"
     );
-    assert_eq!(tools().len(), 28);
+    assert_eq!(tools().len(), 29);
 }
 
 /// `tools/list` differs from the full contract only in its open, shallow success branches: the
@@ -569,7 +569,7 @@ async fn every_observation_and_session_result_validates_against_tools_list() {
     )
     .await;
     let listed = listed["result"]["tools"].as_array().unwrap().clone();
-    assert_eq!(listed.len(), 28);
+    assert_eq!(listed.len(), 29);
     assert!(
         listed
             .iter()

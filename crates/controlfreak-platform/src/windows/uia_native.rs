@@ -4,7 +4,8 @@
 //! joined the multithreaded apartment, and is never shared with another thread.
 
 use super::desktop::{ComApartment, initialize_com};
-use super::uia::{NodeFacts, Tree, TreeError};
+use super::uia::{ActError, NodeFacts, Tree, TreeError};
+use controlfreak_core::ElementAction;
 use windows::Win32::{
     Foundation::{HWND, RECT},
     System::{
@@ -16,10 +17,11 @@ use windows::Win32::{
     },
     UI::Accessibility::{
         CUIAutomation, CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest,
-        IUIAutomationElement, IUIAutomationTreeWalker, TreeScope_Subtree,
+        IUIAutomationElement, IUIAutomationExpandCollapsePattern, IUIAutomationInvokePattern,
+        IUIAutomationTogglePattern, IUIAutomationTreeWalker, TreeScope_Subtree,
         UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId, UIA_E_ELEMENTNOTAVAILABLE,
-        UIA_EditControlTypeId, UIA_HasKeyboardFocusPropertyId,
-        UIA_IsDockPatternAvailablePropertyId, UIA_IsEnabledPropertyId,
+        UIA_EditControlTypeId, UIA_ExpandCollapsePatternId, UIA_HasKeyboardFocusPropertyId,
+        UIA_InvokePatternId, UIA_IsDockPatternAvailablePropertyId, UIA_IsEnabledPropertyId,
         UIA_IsExpandCollapsePatternAvailablePropertyId, UIA_IsGridItemPatternAvailablePropertyId,
         UIA_IsGridPatternAvailablePropertyId, UIA_IsInvokePatternAvailablePropertyId,
         UIA_IsItemContainerPatternAvailablePropertyId, UIA_IsKeyboardFocusablePropertyId,
@@ -32,7 +34,9 @@ use windows::Win32::{
         UIA_IsTransformPatternAvailablePropertyId, UIA_IsValuePatternAvailablePropertyId,
         UIA_IsVirtualizedItemPatternAvailablePropertyId, UIA_IsWindowPatternAvailablePropertyId,
         UIA_NamePropertyId, UIA_PROPERTY_ID, UIA_ProcessIdPropertyId, UIA_RuntimeIdPropertyId,
+        UIA_TogglePatternId,
     },
+    UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, IsIconic},
 };
 use windows::core::Interface;
 
@@ -183,6 +187,106 @@ impl Tree for UiaClient {
             self.walker
                 .GetNextSiblingElementBuildCache(node, &self.cache)
         })
+    }
+
+    fn find_all(
+        &self,
+        hwnd: usize,
+        runtime_id: &[i32],
+    ) -> Result<Vec<(Self::Node, NodeFacts)>, TreeError> {
+        // SAFETY: As in `root`: a stale handle is reported as an error.
+        let window = unsafe {
+            self.automation
+                .ElementFromHandleBuildCache(HWND(hwnd as *mut core::ffi::c_void), &self.cache)
+        }
+        .map_err(|error| tree_error(&error))?;
+        let condition = runtime_id_condition(&self.automation, runtime_id)?;
+        // SAFETY: Live interfaces; the subtree scope keeps the search inside the window, and the
+        // cache request fetches the facts of every match in the same round trip.
+        let found =
+            match unsafe { window.FindAllBuildCache(TreeScope_Subtree, &condition, &self.cache) } {
+                Ok(found) => found,
+                // A null array is how UI Automation says nothing matched.
+                Err(error) if error.code().is_ok() => return Ok(Vec::new()),
+                Err(error) => return Err(TreeError::Failed(error.to_string())),
+            };
+        // SAFETY: A live array returned above; indexes stay below its length.
+        let length = unsafe { found.Length() }.map_err(|error| tree_error(&error))?;
+        (0..length)
+            .map(|index| {
+                // SAFETY: As above.
+                let element =
+                    unsafe { found.GetElement(index) }.map_err(|error| tree_error(&error))?;
+                let facts = facts(&element)?;
+                Ok((element, facts))
+            })
+            .collect()
+    }
+
+    fn act(
+        &self,
+        node: &Self::Node,
+        action: ElementAction,
+        ready: &dyn Fn() -> Result<(), controlfreak_core::PlatformError>,
+    ) -> Result<(), ActError> {
+        /// The pattern interface, obtained before the last check so that a provider that is slow
+        /// to hand it out cannot delay the call past that check.
+        enum Pattern {
+            Invoke(IUIAutomationInvokePattern),
+            Toggle(IUIAutomationTogglePattern),
+            ExpandCollapse(IUIAutomationExpandCollapsePattern),
+        }
+        let missing = |error: windows::core::Error| ActError::Refused(error.to_string());
+        // SAFETY: `node` is a live element of this thread; each call returns a new owned pattern
+        // interface or an error, and a null pattern is reported as an error.
+        let pattern = unsafe {
+            match action {
+                ElementAction::Invoke => Pattern::Invoke(
+                    node.GetCurrentPatternAs(UIA_InvokePatternId)
+                        .map_err(missing)?,
+                ),
+                ElementAction::Toggle => Pattern::Toggle(
+                    node.GetCurrentPatternAs(UIA_TogglePatternId)
+                        .map_err(missing)?,
+                ),
+                ElementAction::Expand | ElementAction::Collapse => Pattern::ExpandCollapse(
+                    node.GetCurrentPatternAs(UIA_ExpandCollapsePatternId)
+                        .map_err(missing)?,
+                ),
+            }
+        };
+        ready().map_err(ActError::NotReady)?;
+        // SAFETY: Plain methods on the live pattern interface obtained above.
+        let called = unsafe {
+            match (&pattern, action) {
+                (Pattern::Invoke(pattern), _) => pattern.Invoke(),
+                (Pattern::Toggle(pattern), _) => pattern.Toggle(),
+                (Pattern::ExpandCollapse(pattern), ElementAction::Collapse) => pattern.Collapse(),
+                (Pattern::ExpandCollapse(pattern), _) => pattern.Expand(),
+            }
+        };
+        // Whatever the call returned, the provider may have changed the element before it
+        // failed, so the effect of a failed call is unknown.
+        called.map_err(|error| ActError::Unknown(error.to_string()))
+    }
+
+    fn in_front(&self, hwnd: usize, pid: u32) -> Result<(), controlfreak_core::PlatformError> {
+        super::environment::ensure_interactive_input_desktop("act_on_element")?;
+        let window = HWND(hwnd as *mut core::ffi::c_void);
+        let mut owner = 0;
+        // SAFETY: These calls only read state of a window handle value; `owner` is writable for
+        // the synchronous call, and a stale handle reads as no owner and not minimized.
+        let (foreground, minimized) = unsafe {
+            GetWindowThreadProcessId(window, Some(&raw mut owner));
+            (GetForegroundWindow(), IsIconic(window).as_bool())
+        };
+        if foreground != window || minimized || owner != pid {
+            return Err(controlfreak_core::PlatformError::refused(
+                controlfreak_core::RefusalCause::NotForeground,
+                "the approved window is no longer in front and not minimized, so nothing was done; call focus_window on it",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -372,9 +476,13 @@ fn rect_of(rect: RECT) -> Option<[i32; 4]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::windows::uia::{HelperEnvironment, QueryEnvironment, Snapshot, WalkQuery, walk};
+    use crate::windows::uia::{
+        ActQuery, ActionEnvironment, ActionHelper, HelperEnvironment, QueryEnvironment, Snapshot,
+        WalkQuery, perform, walk,
+    };
     use crate::windows::uia_process::HelperPool;
     use controlfreak_core::{ElementPattern, ElementQueryLimit, ElementRole, MutationControl};
+    use std::sync::atomic::AtomicBool;
     use std::{
         sync::{Mutex, mpsc},
         thread,
@@ -386,12 +494,15 @@ mod tests {
             UI::WindowsAndMessaging::{
                 BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
                 MSG, PM_REMOVE, PeekMessageW, RegisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE,
-                WNDCLASSW, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW,
-                WS_VISIBLE,
+                WM_COMMAND, WNDCLASSW, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+                WS_OVERLAPPEDWINDOW, WS_VISIBLE,
             },
         },
         core::w,
     };
+
+    /// Button notifications (`WM_COMMAND`) the fixture windows received.
+    static COMMANDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
     unsafe extern "system" fn fixture_procedure(
         hwnd: HWND,
@@ -399,6 +510,9 @@ mod tests {
         wparam: windows::Win32::Foundation::WPARAM,
         lparam: windows::Win32::Foundation::LPARAM,
     ) -> windows::Win32::Foundation::LRESULT {
+        if message == WM_COMMAND {
+            COMMANDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         // SAFETY: Forwards the arguments Windows passed to this procedure unchanged.
         unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
     }
@@ -557,9 +671,106 @@ mod tests {
             .expect("the button by runtime ID");
         assert_eq!(found.name, "Ping");
 
+        // An action finds it the same way, once. The window is this test's own, off every
+        // display and never activated, so the real last check refuses it before the call.
+        let pressed = COMMANDS.load(std::sync::atomic::Ordering::SeqCst);
+        let action = ActQuery {
+            hwnd: query.hwnd,
+            pid: query.pid,
+            runtime_id: snapshot.elements[0].runtime_id.clone(),
+            action: ElementAction::Invoke,
+            timeout_ms: 5_000,
+        };
+        let dispatched = AtomicBool::new(false);
+        let refused = perform(&client, &action, &AtomicBool::new(false), &dispatched).unwrap_err();
+        assert_eq!(refused.reason_code(), Some("not_foreground"));
+        assert!(!dispatched.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(COMMANDS.load(std::sync::atomic::Ordering::SeqCst), pressed);
+
+        // With only that check passed over, the real pattern call presses the button. Nothing
+        // here makes the window the foreground window.
+        let in_front_for_test = InFront(&client);
+        perform(
+            &in_front_for_test,
+            &action,
+            &AtomicBool::new(false),
+            &dispatched,
+        )
+        .expect("invoke");
+        assert!(dispatched.load(std::sync::atomic::Ordering::SeqCst));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while COMMANDS.load(std::sync::atomic::Ordering::SeqCst) == pressed {
+            assert!(
+                Instant::now() < deadline,
+                "the button never reported a press"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        // The button has no toggle pattern, so nothing is sent for a toggle.
+        let toggle = ActQuery {
+            action: ElementAction::Toggle,
+            ..action
+        };
+        let dispatched = AtomicBool::new(false);
+        assert!(
+            perform(
+                &in_front_for_test,
+                &toggle,
+                &AtomicBool::new(false),
+                &dispatched
+            )
+            .is_err()
+        );
+        assert!(!dispatched.load(std::sync::atomic::Ordering::SeqCst));
+
         fixture.close();
         // A closed window has no tree to read.
         assert!(client.root(query.hwnd, None).is_err());
+    }
+
+    /// The real client with its foreground check passed over, so a test can reach the real
+    /// pattern call on a window that is never activated.
+    struct InFront<'a>(&'a UiaClient);
+
+    impl Tree for InFront<'_> {
+        type Node = IUIAutomationElement;
+        fn root(
+            &self,
+            hwnd: usize,
+            within: Option<&[i32]>,
+        ) -> Result<(Self::Node, NodeFacts), TreeError> {
+            self.0.root(hwnd, within)
+        }
+        fn first_child(
+            &self,
+            node: &Self::Node,
+        ) -> Result<Option<(Self::Node, NodeFacts)>, TreeError> {
+            self.0.first_child(node)
+        }
+        fn next_sibling(
+            &self,
+            node: &Self::Node,
+        ) -> Result<Option<(Self::Node, NodeFacts)>, TreeError> {
+            self.0.next_sibling(node)
+        }
+        fn find_all(
+            &self,
+            hwnd: usize,
+            runtime_id: &[i32],
+        ) -> Result<Vec<(Self::Node, NodeFacts)>, TreeError> {
+            self.0.find_all(hwnd, runtime_id)
+        }
+        fn act(
+            &self,
+            node: &Self::Node,
+            action: ElementAction,
+            ready: &dyn Fn() -> Result<(), controlfreak_core::PlatformError>,
+        ) -> Result<(), ActError> {
+            self.0.act(node, action, ready)
+        }
+        fn in_front(&self, _: usize, _: u32) -> Result<(), controlfreak_core::PlatformError> {
+            Ok(())
+        }
     }
 
     /// Serves real UI Automation queries; started only as a child of the helper test below.
@@ -589,11 +800,35 @@ mod tests {
             answered: &record,
         };
         let control = MutationControl::default();
+        let mut runtime_id = Vec::new();
         for _ in 0..2 {
             let snapshot = environment.walk(&fixture.query(), &control).unwrap();
             assert_one_ping_button(&snapshot);
+            runtime_id.clone_from(&snapshot.elements[0].runtime_id);
         }
         assert_eq!(*answers.lock().unwrap(), [Ok(()), Ok(())]);
+        assert!(pool.idle.lock().unwrap().is_some(), "the helper stays warm");
+
+        // The same warm helper finds the button for an action request, then checks the window
+        // itself right before the call. The fixture is never in front, so the helper answers
+        // that it did not act, and stays warm.
+        let actions = ActionHelper {
+            helper: environment,
+        };
+        let sent = std::cell::Cell::new(0);
+        let query = ActQuery {
+            hwnd: fixture.window.0 as usize,
+            pid: std::process::id(),
+            runtime_id,
+            action: ElementAction::Invoke,
+            timeout_ms: 5_000,
+        };
+        let failure = actions
+            .act(&query, &control, &|| sent.set(sent.get() + 1))
+            .expect_err("the fixture is not in front");
+        assert_eq!(sent.get(), 1);
+        assert_eq!(failure.error.reason_code(), Some("not_foreground"));
+        assert!(!failure.dispatched, "{failure:?}");
         assert!(pool.idle.lock().unwrap().is_some(), "the helper stays warm");
     }
 }

@@ -1,17 +1,19 @@
-//! Read-only accessibility queries: the controls a window exposes through UI Automation.
+//! Accessibility queries and semantic actions: the controls a window exposes through UI
+//! Automation.
 //!
 //! A query reads one window's subtree and returns, for each matching control, its role, name,
 //! state, supported patterns and bounds in display-local physical pixels, plus a short-lived
-//! opaque element reference. The reference only scopes a later query (`within`); no input tool
-//! accepts it, so clicks still go through the pointer tools and their checks.
+//! opaque element reference. The reference scopes a later query (`within`) and names the element
+//! of a semantic action (invoke, toggle, expand or collapse). An action is a desktop mutation and
+//! runs inside a control session like pointer input.
 
 use serde::{Deserialize, Serialize};
 
-use crate::PlatformError;
 use crate::limits::{
     MAX_ELEMENT_DEPTH, MAX_ELEMENT_NAME_FILTER_CHARS, MAX_ELEMENT_TIMEOUT_MS, MAX_ELEMENTS,
     MIN_ELEMENT_TIMEOUT_MS,
 };
+use crate::{ActionObservation, ObservationOptions, PlatformError};
 
 /// Declares the roles once, so the enum, its wire names and `ElementRole::ALL` cannot drift.
 macro_rules! roles {
@@ -85,8 +87,8 @@ roles! {
 }
 
 /// A UI Automation control pattern the element reports as available. A pattern says what the
-/// control can do; this server reads it only to describe the control and performs no pattern
-/// action.
+/// control can do. The server performs only the patterns of [`ElementAction`]; every other
+/// pattern only describes the control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ElementPattern {
@@ -136,6 +138,70 @@ impl ElementPattern {
         Self::VirtualizedItem,
         Self::ItemContainer,
     ];
+}
+
+/// A semantic action on one element, performed through its UI Automation control pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElementAction {
+    /// `Invoke` of the invoke pattern, such as pressing a button.
+    Invoke,
+    /// `Toggle` of the toggle pattern, such as a check box.
+    Toggle,
+    /// `Expand` of the expand-collapse pattern, such as opening a combo box or a tree item.
+    Expand,
+    /// `Collapse` of the expand-collapse pattern.
+    Collapse,
+}
+
+impl ElementAction {
+    /// The pattern the element must support for this action.
+    #[must_use]
+    pub const fn pattern(self) -> ElementPattern {
+        match self {
+            Self::Invoke => ElementPattern::Invoke,
+            Self::Toggle => ElementPattern::Toggle,
+            Self::Expand | Self::Collapse => ElementPattern::ExpandCollapse,
+        }
+    }
+}
+
+/// One semantic action on an element that `find_elements` returned for the session's window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElementActionRequest {
+    /// The session's approved window; the element reference must have been issued for it.
+    pub target_ref: String,
+    pub element_ref: String,
+    pub action: ElementAction,
+    pub observation: ObservationOptions,
+}
+
+impl ElementActionRequest {
+    /// Checks the references before the desktop is touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArgument` naming an empty reference.
+    pub fn validate(&self) -> Result<(), PlatformError> {
+        for (argument, value) in [
+            ("target_ref", &self.target_ref),
+            ("element_ref", &self.element_ref),
+        ] {
+            if value.is_empty() {
+                return Err(PlatformError::InvalidArgument {
+                    argument: argument.to_owned(),
+                    reason: "must not be empty".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The evidence after a semantic action, as after keyboard input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementActionResult {
+    pub observation: ActionObservation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,7 +289,8 @@ pub struct ElementBounds {
 )]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElementInfo {
-    /// Opaque, short-lived and bound to the query's `target_ref`; usable only as `within`.
+    /// Opaque, short-lived and bound to the query's `target_ref`: the root of a later query
+    /// (`within`), or the element of a semantic action.
     pub element_ref: String,
     pub role: ElementRole,
     /// The accessible name, empty when the element has none or is a password field.
@@ -362,6 +429,36 @@ mod tests {
                 }
                 other => panic!("{argument}: {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn an_action_names_its_pattern_and_needs_both_references() {
+        assert_eq!(ElementAction::Toggle.pattern(), ElementPattern::Toggle);
+        assert_eq!(
+            ElementAction::Collapse.pattern(),
+            ElementPattern::ExpandCollapse
+        );
+        let request = ElementActionRequest {
+            target_ref: "target-1".into(),
+            element_ref: "element-1".into(),
+            action: ElementAction::Invoke,
+            observation: ObservationOptions::default(),
+        };
+        request.validate().unwrap();
+        let no_target = ElementActionRequest {
+            target_ref: String::new(),
+            ..request.clone()
+        };
+        let no_element = ElementActionRequest {
+            element_ref: String::new(),
+            ..request
+        };
+        for (argument, request) in [("target_ref", no_target), ("element_ref", no_element)] {
+            assert!(matches!(
+                request.validate(),
+                Err(PlatformError::InvalidArgument { argument: named, .. }) if named == argument
+            ));
         }
     }
 
