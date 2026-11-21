@@ -452,7 +452,8 @@ mod tests {
 
         drop(store);
 
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Far above scheduling delay and far below TTL, so a sweeper that waits for the next expiry fails.
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert!(frame.upgrade().is_none());
     }
 }

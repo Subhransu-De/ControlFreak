@@ -91,22 +91,28 @@ fn call(name: &str) -> Value {
     }
 }
 
-fn connect() -> Result<McpClient, String> {
+/// The fake server replies at once, so this limit only has to absorb scheduling delay on a busy machine.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// The `hangs` task waits for its call to time out, so it gets a short limit of its own.
+const HANG_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn connect(timeout: Duration) -> Result<McpClient, String> {
     let (client_reads, server_writes) = std::io::pipe().map_err(|e| e.to_string())?;
     let (server_reads, client_writes) = std::io::pipe().map_err(|e| e.to_string())?;
     thread::spawn(move || fake_server(server_reads, server_writes));
-    McpClient::connect(
-        client_reads,
-        client_writes,
-        None,
-        Duration::from_millis(500),
-    )
-    .map_err(|error| error.to_string())
+    McpClient::connect(client_reads, client_writes, None, timeout)
+        .map_err(|error| error.to_string())
 }
 
 fn environment() -> Environment {
     Environment {
-        launch_server: Box::new(|_log| connect()),
+        // The runner names each server log `<suite>-<task>-<pid>`; only `hangs` needs the short limit.
+        launch_server: Box::new(|log| {
+            let hangs = log
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("fake-hangs-"));
+            connect(if hangs { HANG_TIMEOUT } else { REPLY_TIMEOUT })
+        }),
         open_window: Box::new(|spec, _, _| Err(format!("no desktop in tests: {}", spec.key))),
         helper: Box::new(|args| Err(format!("no fixture in tests: {args:?}"))),
     }
@@ -246,6 +252,11 @@ fn strict_turns_blocked_into_failure() {
     )
     .expect("run");
     assert_eq!(relaxed.records.len(), 1);
+    assert_eq!(
+        relaxed.records[0].outcome,
+        Outcome::Blocked(vec![Capability::Ocr]),
+        "the relaxed run blocks on the missing OCR capability"
+    );
     assert!(relaxed.succeeded(), "BLOCKED alone passes without --strict");
     let strict = runner::run(
         &only_blocked,
