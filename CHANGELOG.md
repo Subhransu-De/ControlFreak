@@ -9,6 +9,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+## [0.3.0] - 2026-11-21
+
 ### Fixed
 
 - After a user stop, agents are told how to get input back: the user restarts ControlFreak from the MCP client. The refusal says so, and the refusal, `get_server_status`, `end_control_session` and the stop notification carry the same `recovery` step (`wait_for_drain`, `restart_client` or `resolve_held_input`). The stop latch is unchanged: no tool reopens input.
