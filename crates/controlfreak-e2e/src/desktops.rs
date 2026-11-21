@@ -11,6 +11,14 @@ use std::{
 
 /// How long the shell may take to record a desktop change after its shortcut.
 const SHELL_TIMEOUT: Duration = Duration::from_secs(5);
+/// The shell animates a desktop switch after it records it, and may drop a switch shortcut that
+/// arrives meanwhile.
+const SWITCH_ANIMATION: Duration = Duration::from_secs(1);
+
+/// Waits out the animation of the last desktop switch before the next shortcut.
+pub(crate) fn settle() {
+    thread::sleep(SWITCH_ANIMATION);
+}
 
 /// The shell's current desktop and its desktops in order, as GUIDs in the server's format.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +128,7 @@ pub(crate) fn create(
 /// of `start` with `created` gone. Ctrl+Win+F4 closes whatever desktop is current, so it is sent
 /// only once `created` is current; from `start`'s desktop that is one step right.
 pub(crate) fn remove(cx: &mut Ctx<'_>, start: &Desktops, created: &str) -> Result<(), Failure> {
+    settle();
     if !read(cx)?.is_current(created) {
         shortcut(cx, "right")?;
         let (now, reached) = wait(cx, |now| now.is_current(created))?;
@@ -128,6 +137,7 @@ pub(crate) fn remove(cx: &mut Ctx<'_>, start: &Desktops, created: &str) -> Resul
                 "left the added desktop {created} in place: cannot make it current, now {now:?}"
             )));
         }
+        settle();
     }
     shortcut(cx, "close")?;
     let (now, restored) = wait(cx, |now| {

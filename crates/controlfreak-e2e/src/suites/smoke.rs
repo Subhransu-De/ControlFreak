@@ -803,12 +803,24 @@ fn switch_to_created_desktop(
             "the added desktop {created} is not right of the starting one: {start:?}, now {now:?}"
         )));
     };
-    desktops::shortcut(cx, "left")?;
-    let (_, back) = desktops::wait(cx, |now| now.current.as_deref() == Some(origin.as_str()))?;
+    desktops::settle();
+    snapshot(cx, id, "added")?;
+    // The shell can drop a switch shortcut while it is still animating one, so this is retried
+    // once.
+    let mut back = false;
+    for attempt in 1..=2 {
+        desktops::shortcut(cx, "left")?;
+        back = desktops::wait(cx, |now| now.current.as_deref() == Some(origin.as_str()))?.1;
+        snapshot(cx, id, &format!("left-{attempt}"))?;
+        if back {
+            break;
+        }
+    }
     ensure!(
         back,
         "Ctrl+Win+Left did not return to the starting desktop {origin}"
     );
+    desktops::settle();
     cx.begin(id)?;
     cx.focus(id)?;
     let result = cx.call(
@@ -820,26 +832,11 @@ fn switch_to_created_desktop(
     let front = &switched["observation"]["foreground_window"];
     // The shell's record and the window's own desktop, both independent of the foreground window.
     let (shell, reached) = desktops::wait(cx, |now| now.current.as_deref() == Some(created))?;
-    let listed = cx.ok("list_virtual_desktops", json!({}))?;
-    let fixture_desktop = listed["desktops"].as_array().and_then(|all| {
-        all.iter().find(|desktop| {
-            desktop["windows"]
-                .as_array()
-                .is_some_and(|windows| windows.iter().any(|window| window["id"] == id))
-        })
-    });
-    // The desktops `list_virtual_desktops` marks current, with how many windows each lists.
-    let listed_current: Vec<serde_json::Value> = listed["desktops"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|d| d["is_current"] == true)
-        .map(|d| json!([d["id"], d["windows"].as_array().map_or(0, Vec::len)]))
-        .collect();
+    let (_, fixture_is_current) = snapshot(cx, id, "switched")?;
     cx.note(format!(
         "evidence switch is_error={} input_outcome={} before_id={} after_id={} transition={} \
          changed={} foreground={front} shell_start={origin} shell_created={created} \
-         shell_after={} fixture_desktop={} fixture_desktop_is_current={} listed_current={}",
+         shell_after={} fixture_desktop_is_current={fixture_is_current}",
         result.is_error,
         switched["input"]["input_outcome"],
         action["before_id"],
@@ -847,9 +844,6 @@ fn switch_to_created_desktop(
         action["transition"],
         action["changed"],
         shell.current.as_deref().unwrap_or("none"),
-        fixture_desktop.map_or(serde_json::Value::Null, |d| d["id"].clone()),
-        fixture_desktop.map_or(serde_json::Value::Null, |d| d["is_current"].clone()),
-        serde_json::Value::from(listed_current),
     ));
     ensure!(
         !result.is_error,
@@ -860,14 +854,48 @@ fn switch_to_created_desktop(
         "the shell never recorded the added desktop {created} as current: {shell:?}"
     );
     ensure!(
-        fixture_desktop.is_some_and(|d| d["is_current"] == false),
-        "the fixture's desktop is still current after the switch: {listed}"
+        fixture_is_current == false,
+        "the fixture's desktop is still current after the switch"
     );
     ensure!(
         action["before_id"] == origin.as_str(),
         "before_id is not the starting desktop {origin}: {switched}"
     );
     Ok(())
+}
+
+/// Notes the shell's desktops and what `list_virtual_desktops` reports for the fixture window
+/// `id`: its desktop's `is_current`, read from the window itself rather than the foreground.
+/// Returns that reading, `null` when the fixture's desktop is not listed.
+fn snapshot(
+    cx: &mut Ctx<'_>,
+    id: &str,
+    label: &str,
+) -> Result<(desktops::Desktops, serde_json::Value), Failure> {
+    let shell = desktops::read(cx)?;
+    let listed = cx.ok("list_virtual_desktops", json!({}))?;
+    let all = listed["desktops"].as_array().cloned().unwrap_or_default();
+    let fixture_is_current = all
+        .iter()
+        .find(|desktop| {
+            desktop["windows"]
+                .as_array()
+                .is_some_and(|windows| windows.iter().any(|window| window["id"] == id))
+        })
+        .map_or(serde_json::Value::Null, |desktop| {
+            desktop["is_current"].clone()
+        });
+    let listed_current: Vec<serde_json::Value> = all
+        .iter()
+        .filter(|desktop| desktop["is_current"] == true)
+        .map(|desktop| desktop["id"].clone())
+        .collect();
+    cx.note(format!(
+        "desktops {label}: shell {shell:?}, fixture_desktop_is_current={fixture_is_current}, \
+         listed_current={}",
+        serde_json::Value::from(listed_current)
+    ));
+    Ok((shell, fixture_is_current))
 }
 
 /// Runs the fixture helper with `args` until it succeeds, for at most 20 seconds, and returns its
