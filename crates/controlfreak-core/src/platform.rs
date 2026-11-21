@@ -6,11 +6,11 @@ use crate::{
     DpiAwarenessStatus, FindElementsRequest, FindElementsResult, FindTextRequest, FindTextResult,
     FocusWindowRequest, KeyChordRequest, KeyboardActionResult, MouseClickRequest, MouseDragRequest,
     MouseMoveRequest, MouseScrollRequest, MutationControl, OcrRegionRequest, OcrResult,
-    PermissionDescriptor, PlatformError, PointerActionResult, SecurityContext, TextInputRequest,
-    VirtualDesktopList, VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult, VisualBaseline,
-    VisualBaselineRequest, VisualChangeResult, WaitForChangeSinceRequest, WaitForTextRequest,
-    WaitForTextResult, WaitForVisualChangeRequest, WaitForWindowRequest, WindowFocusResult,
-    WindowList, WindowScreenshot, WindowWaitResult,
+    PermissionDescriptor, PlatformError, PointerActionResult, PopupWindow, SecurityContext,
+    TextInputRequest, VirtualDesktopList, VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult,
+    VisualBaseline, VisualBaselineRequest, VisualChangeResult, WaitForChangeSinceRequest,
+    WaitForTextRequest, WaitForTextResult, WaitForVisualChangeRequest, WaitForWindowRequest,
+    WindowFocusResult, WindowList, WindowScreenshot, WindowWaitResult,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,6 +361,15 @@ pub trait WindowBackend {
         Err(PlatformError::unsupported(
             "capture_window",
             "the active platform backend has no window-capture implementation",
+        ))
+    }
+
+    /// The popups `capture_window` with `include_popups` would show for the window now, so an
+    /// image point in a popup can be refused once that popup is gone.
+    fn window_popups(&self, _window_id: &str) -> Result<Vec<PopupWindow>, PlatformError> {
+        Err(PlatformError::unsupported(
+            "capture_window",
+            "the active platform backend has no window-popup discovery implementation",
         ))
     }
 

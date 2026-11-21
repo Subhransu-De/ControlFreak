@@ -720,6 +720,7 @@ focus_window output $defs.window.owner
 focus_window output $defs.window.process_id required
 focus_window output $defs.window.title required
 capture_window input include_cursor default=true
+capture_window input include_popups default=false
 capture_window input max_width default=1280
 capture_window input native default=false
 capture_window input target_ref
@@ -748,6 +749,11 @@ capture_window output $defs.window_screenshot.capture_method required
 capture_window output $defs.window_screenshot.cursor_marker required
 capture_window output $defs.window_screenshot.image_height required
 capture_window output $defs.window_screenshot.image_width required
+capture_window output $defs.window_screenshot.included_windows
+capture_window output $defs.window_screenshot.included_windows[].bounds required
+capture_window output $defs.window_screenshot.included_windows[].capture_method required
+capture_window output $defs.window_screenshot.included_windows[].class_name required
+capture_window output $defs.window_screenshot.included_windows[].process_id required
 capture_window output $defs.window_screenshot.mime_type required
 capture_window output $defs.window_screenshot.observation_id
 capture_window output $defs.window_screenshot.source_bounds required

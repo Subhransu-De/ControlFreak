@@ -456,8 +456,15 @@ pub(super) fn capture_window() -> Contract {
     let mut properties = JsonObject::new();
     add_window_id(&mut properties);
     add_capture_options(&mut properties);
+    properties.insert(
+        "include_popups".to_owned(),
+        json!({
+            "type": "boolean", "default": false,
+            "description": "Also show the open menus, drop-down lists and untitled popups of the window's own application. source_bounds then covers them too, and included_windows lists them."
+        }),
+    );
     contract(
-        "Capture one window as PNG without focusing it. window_id (or its alias target_ref) comes from list_windows, and must be fresh. Restore minimized windows first. Width defaults to 1280 (max_width changes it, native=true keeps full resolution). Menus and popups are separate windows and do not appear: use an action's screenshot or capture_display.",
+        "Capture one window as PNG without focusing it. window_id (or its alias target_ref) comes from list_windows, and must be fresh. Restore minimized windows first. Width defaults to 1280 (max_width changes it, native=true keeps full resolution). Menus and popups are separate windows: they appear only with include_popups=true.",
         object_schema(properties, &[]),
         output_schema(vec![window_screenshot_schema()], false),
     )
@@ -1343,6 +1350,25 @@ fn window_screenshot_body() -> Value {
     image_metadata_schema(vec![
         ("window", def_ref("window"), true),
         ("source_bounds", def_ref("bounds"), true),
+        (
+            "included_windows",
+            json!({
+                "type": "array",
+                "description": "Only with include_popups: the popups in the image, topmost last. Titles are never reported.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "class_name": { "type": "string" },
+                        "process_id": { "type": "integer", "minimum": 1 },
+                        "bounds": def_ref("bounds"),
+                        "capture_method": { "type": "string", "enum": ["windows_print_window", "windows_gdi"] }
+                    },
+                    "required": ["class_name", "process_id", "bounds", "capture_method"],
+                    "additionalProperties": false
+                }
+            }),
+            false,
+        ),
     ])
 }
 

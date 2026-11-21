@@ -2017,6 +2017,41 @@ mod tests {
         ));
     }
 
+    /// `capture_window` with `include_popups` shows a popup only when this rule accepts it.
+    #[test]
+    fn popups_shown_with_a_window_capture_follow_the_same_process_rule() {
+        let target = target_facts();
+        for class in [POPUP_MENU_CLASS, "ComboLBox", ""] {
+            // Another process's menu, list or popup is never part of the target, whoever owns it.
+            for shell_host in [false, true] {
+                assert!(!accepts_same_process(
+                    &target,
+                    shell_host,
+                    &facts(7, 3, class, 1)
+                ));
+            }
+            // An ordinary application's popups of every kind are.
+            assert!(accepts_same_process(&target, false, &facts(7, 2, class, 7)));
+        }
+        // A shell host keeps its narrow rule: its menus, and its other popups only in the
+        // target's owner chain, so a File Explorer capture never shows the taskbar's lists.
+        assert!(accepts_same_process(
+            &target,
+            true,
+            &facts(7, 2, POPUP_MENU_CLASS, 7)
+        ));
+        assert!(!accepts_same_process(
+            &target,
+            true,
+            &facts(7, 2, "ComboLBox", 7)
+        ));
+        assert!(accepts_same_process(
+            &target,
+            true,
+            &facts(7, 2, "ComboLBox", 1)
+        ));
+    }
+
     #[test]
     fn foreground_changes_keep_references_and_desktop_switches_do_not() {
         // The WinEvent callback no longer touches references on a foreground change; this

@@ -736,14 +736,19 @@ fn render_within<T: Send + 'static>(
 
 /// `print_window_rgba` with the bounds described on [`PRINT_WINDOW_DEADLINE`].
 fn print_window_bounded(hwnd: HWND, visible: DisplayBounds) -> Option<Vec<u8>> {
+    print_window_within(hwnd, visible, PRINT_WINDOW_DEADLINE)
+}
+
+/// `print_window_rgba` for a window that is not flagged as hung, waiting at most `deadline`.
+fn print_window_within(hwnd: HWND, visible: DisplayBounds, deadline: Duration) -> Option<Vec<u8>> {
     // SAFETY: IsHungAppWindow only reads the window's responsiveness state for a handle value.
-    if unsafe { IsHungAppWindow(hwnd) }.as_bool() {
+    if deadline.is_zero() || unsafe { IsHungAppWindow(hwnd) }.as_bool() {
         return None;
     }
     // A raw handle value crosses the thread boundary; the worker re-validates it through the
     // window APIs, which fail for a handle that no longer exists.
     let raw = hwnd.0 as isize;
-    render_within(PRINT_WINDOW_DEADLINE, &RENDER_SLOT, move || {
+    render_within(deadline, &RENDER_SLOT, move || {
         print_window_rgba(HWND(raw as *mut c_void), visible)
     })
 }
@@ -793,6 +798,185 @@ pub(super) fn capture_window_bounds(
         cursor_marker,
         capture_method,
     })
+}
+
+/// The part of `bounds` on `display`, or `None` when none of it is.
+pub(super) fn clip_to_display(
+    bounds: DisplayBounds,
+    display: DisplayBounds,
+) -> Option<DisplayBounds> {
+    let edges = |bounds: DisplayBounds| {
+        let (left, top) = (i64::from(bounds.left), i64::from(bounds.top));
+        (
+            left,
+            top,
+            left + i64::from(bounds.width),
+            top + i64::from(bounds.height),
+        )
+    };
+    let (left, top, right, bottom) = edges(bounds);
+    let (display_left, display_top, display_right, display_bottom) = edges(display);
+    let (left, top) = (left.max(display_left), top.max(display_top));
+    let (right, bottom) = (right.min(display_right), bottom.min(display_bottom));
+    (left < right && top < bottom).then(|| DisplayBounds {
+        left: i32::try_from(left).unwrap_or(i32::MAX),
+        top: i32::try_from(top).unwrap_or(i32::MAX),
+        width: u32::try_from(right - left).unwrap_or(u32::MAX),
+        height: u32::try_from(bottom - top).unwrap_or(u32::MAX),
+    })
+}
+
+/// The smallest rectangle that contains `window` and every one of `parts`.
+pub(super) fn union_bounds(window: DisplayBounds, parts: &[DisplayBounds]) -> DisplayBounds {
+    let edges = |bounds: &DisplayBounds| {
+        let (left, top) = (i64::from(bounds.left), i64::from(bounds.top));
+        (
+            left,
+            top,
+            left + i64::from(bounds.width),
+            top + i64::from(bounds.height),
+        )
+    };
+    let (left, top, right, bottom) = parts.iter().map(edges).fold(
+        edges(&window),
+        |(left, top, right, bottom), (part_left, part_top, part_right, part_bottom)| {
+            (
+                left.min(part_left),
+                top.min(part_top),
+                right.max(part_right),
+                bottom.max(part_bottom),
+            )
+        },
+    );
+    DisplayBounds {
+        left: i32::try_from(left).unwrap_or(i32::MIN),
+        top: i32::try_from(top).unwrap_or(i32::MIN),
+        width: u32::try_from(right - left).unwrap_or(u32::MAX),
+        height: u32::try_from(bottom - top).unwrap_or(u32::MAX),
+    }
+}
+
+/// Byte offset of the RGBA row start of `part` inside `area`, its row length and row count, or
+/// `None` when `part` is not inside `area`.
+fn part_layout(area: DisplayBounds, part: DisplayBounds) -> Option<(usize, usize, usize, usize)> {
+    let x = i64::from(part.left) - i64::from(area.left);
+    let y = i64::from(part.top) - i64::from(area.top);
+    if x < 0
+        || y < 0
+        || x + i64::from(part.width) > i64::from(area.width)
+        || y + i64::from(part.height) > i64::from(area.height)
+    {
+        return None;
+    }
+    let stride = usize::try_from(area.width).ok()? * 4;
+    let start = usize::try_from(y).ok()? * stride + usize::try_from(x).ok()? * 4;
+    let row = usize::try_from(part.width).ok()? * 4;
+    Some((start, stride, row, usize::try_from(part.height).ok()?))
+}
+
+/// Writes the RGBA pixels of `part` over the same place in an RGBA frame of `area`. Nothing is
+/// written, and `false` returned, when `part` is not inside `area` or the sizes do not match.
+fn paste_rgba(frame: &mut [u8], area: DisplayBounds, pixels: &[u8], part: DisplayBounds) -> bool {
+    let Some((start, stride, row, rows)) = part_layout(area, part) else {
+        return false;
+    };
+    if pixels.len() != row * rows
+        || frame.len() != stride * usize::try_from(area.height).unwrap_or(0)
+    {
+        return false;
+    }
+    for (index, line) in pixels.chunks_exact(row).enumerate() {
+        let offset = start + index * stride;
+        frame[offset..offset + row].copy_from_slice(line);
+    }
+    true
+}
+
+/// The RGBA pixels of `part` cut from an RGBA frame of `area`.
+fn cut_rgba(frame: &[u8], area: DisplayBounds, part: DisplayBounds) -> Option<Vec<u8>> {
+    let (start, stride, row, rows) = part_layout(area, part)?;
+    if frame.len() != stride * usize::try_from(area.height).ok()? {
+        return None;
+    }
+    let mut pixels = Vec::with_capacity(row * rows);
+    for index in 0..rows {
+        let offset = start + index * stride;
+        pixels.extend_from_slice(&frame[offset..offset + row]);
+    }
+    Some(pixels)
+}
+
+/// Builds the image of a window with its popups from a screen copy of `area`: the window's own
+/// rendering over its rectangle, then each popup's own rendering over its part, bottom first.
+/// A window or popup that did not render keeps the screen pixels of its rectangle, and its
+/// capture method says `windows_gdi`. Parts of `area` outside them are the screen copy. Popups
+/// are rendered and pasted one at a time, so only one popup render is held at once.
+fn compose_with_popups(
+    screen: &[u8],
+    area: DisplayBounds,
+    window: (Option<Vec<u8>>, DisplayBounds),
+    popups: impl IntoIterator<Item = (Option<Vec<u8>>, DisplayBounds)>,
+) -> (Vec<u8>, &'static str, Vec<&'static str>) {
+    let mut frame = screen.to_vec();
+    let paste = |frame: &mut Vec<u8>, rendered: Option<Vec<u8>>, part: DisplayBounds| {
+        match rendered {
+            Some(pixels) if paste_rgba(frame, area, &pixels, part) => CAPTURE_METHOD_PRINT_WINDOW,
+            // The window may have been drawn over this part; put the screen back.
+            _ => {
+                if let Some(pixels) = cut_rgba(screen, area, part) {
+                    paste_rgba(frame, area, &pixels, part);
+                }
+                CAPTURE_METHOD_SCREEN
+            }
+        }
+    };
+    let window_method = paste(&mut frame, window.0, window.1);
+    let popup_methods = popups
+        .into_iter()
+        .map(|(rendered, part)| paste(&mut frame, rendered, part))
+        .collect();
+    (frame, window_method, popup_methods)
+}
+
+/// Captures `hwnd` with its popups over `area`, the union of `window` and the popups' parts
+/// on the window's display. Every window renders itself as `capture_window_bounds` does, within
+/// one shared render deadline; see [`compose_with_popups`] for the rest of the image. Returns
+/// the capture method of each popup in the order given.
+pub(super) fn capture_window_with_popups(
+    hwnd: HWND,
+    window: DisplayBounds,
+    popups: &[(HWND, DisplayBounds)],
+    area: DisplayBounds,
+    max_width: Option<u32>,
+    include_cursor_marker: bool,
+) -> Result<(WindowCapture, Vec<&'static str>), PlatformError> {
+    let screen = timing::time("capture_gdi", || capture_rgba(area))?;
+    let started = Instant::now();
+    let remaining = || PRINT_WINDOW_DEADLINE.saturating_sub(started.elapsed());
+    let printed = timing::time("capture_print_window", || {
+        print_window_within(hwnd, window, remaining())
+    });
+    // Lazy, so each popup is rendered just before it is pasted and freed right after.
+    let rendered = popups.iter().map(|&(popup, part)| {
+        let pixels = timing::time("capture_print_popup", || {
+            print_window_within(popup, part, remaining())
+        });
+        (pixels, part)
+    });
+    let (rgba, capture_method, popup_methods) =
+        compose_with_popups(&screen, area, (printed, window), rendered);
+    let (png, image_width, image_height, cursor_marker) =
+        finish_image(rgba, area, max_width, include_cursor_marker)?;
+    Ok((
+        WindowCapture {
+            png,
+            image_width,
+            image_height,
+            cursor_marker,
+            capture_method,
+        },
+        popup_methods,
+    ))
 }
 
 fn capture_bounds(
@@ -2297,6 +2481,115 @@ mod window_capture_tests {
         }
         // A frame of the wrong length is never trusted.
         assert!(crop_bgra_to_rgba(&frame[..40], 4, 3, 0, 0, 2, 2).is_none());
+    }
+
+    fn rect(left: i32, top: i32, width: u32, height: u32) -> DisplayBounds {
+        DisplayBounds {
+            left,
+            top,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn popups_are_clipped_to_the_display_and_the_area_is_their_union_with_the_window() {
+        // A display left of the primary one, at a negative origin.
+        let display = rect(-1920, 0, 1920, 1080);
+        assert_eq!(
+            clip_to_display(rect(-100, 1000, 300, 200), display),
+            Some(rect(-100, 1000, 100, 80))
+        );
+        assert_eq!(
+            clip_to_display(rect(-1800, 50, 200, 100), display),
+            Some(rect(-1800, 50, 200, 100))
+        );
+        assert_eq!(clip_to_display(rect(0, 50, 200, 100), display), None);
+        assert_eq!(clip_to_display(rect(-1920, 1080, 10, 10), display), None);
+        let window = rect(-1500, 100, 800, 600);
+        // A menu below and right of the window, and a drop-down above it.
+        let parts = [rect(-800, 650, 200, 300), rect(-1400, 40, 100, 80)];
+        assert_eq!(union_bounds(window, &parts), rect(-1500, 40, 900, 910));
+        assert_eq!(union_bounds(window, &[]), window);
+    }
+
+    /// An RGBA frame of `area` filled with one value per channel.
+    fn flat(area: DisplayBounds, value: u8) -> Vec<u8> {
+        vec![value; usize::try_from(area.width * area.height * 4).unwrap()]
+    }
+
+    fn pixel(frame: &[u8], area: DisplayBounds, x: i32, y: i32) -> u8 {
+        let index = usize::try_from(
+            (i64::from(y - area.top) * i64::from(area.width) + i64::from(x - area.left)) * 4,
+        )
+        .unwrap();
+        frame[index]
+    }
+
+    #[test]
+    fn a_window_with_popups_is_composed_from_their_renders_over_the_screen() {
+        // The window is 0..4 x 0..3; a menu at (3, 1) to (6, 3) overlaps its right edge.
+        let area = rect(0, 0, 6, 3);
+        let window = rect(0, 0, 4, 3);
+        let menu = rect(3, 1, 3, 2);
+        let screen = flat(area, 1);
+        let (frame, window_method, popup_methods) = compose_with_popups(
+            &screen,
+            area,
+            (Some(flat(window, 2)), window),
+            vec![(Some(flat(menu, 3)), menu)],
+        );
+        assert_eq!(window_method, CAPTURE_METHOD_PRINT_WINDOW);
+        assert_eq!(popup_methods, [CAPTURE_METHOD_PRINT_WINDOW]);
+        assert_eq!(pixel(&frame, area, 0, 0), 2, "the window");
+        assert_eq!(
+            pixel(&frame, area, 3, 1),
+            3,
+            "the menu is drawn over the window"
+        );
+        assert_eq!(pixel(&frame, area, 5, 0), 1, "outside both: the screen");
+
+        // A menu that does not render keeps the screen pixels, also where the window's own
+        // rendering would have covered it, and says so.
+        let (frame, window_method, popup_methods) = compose_with_popups(
+            &screen,
+            area,
+            (Some(flat(window, 2)), window),
+            vec![(None, menu)],
+        );
+        assert_eq!(window_method, CAPTURE_METHOD_PRINT_WINDOW);
+        assert_eq!(popup_methods, [CAPTURE_METHOD_SCREEN]);
+        assert_eq!(pixel(&frame, area, 3, 1), 1);
+        assert_eq!(pixel(&frame, area, 2, 1), 2);
+
+        // A window that does not render is the screen copy; a render of the wrong size is
+        // never pasted.
+        let (frame, window_method, popup_methods) = compose_with_popups(
+            &screen,
+            area,
+            (None, window),
+            vec![(Some(flat(rect(0, 0, 1, 1), 3)), menu)],
+        );
+        assert_eq!(window_method, CAPTURE_METHOD_SCREEN);
+        assert_eq!(popup_methods, [CAPTURE_METHOD_SCREEN]);
+        assert!(frame.iter().all(|value| *value == 1));
+    }
+
+    #[test]
+    fn parts_outside_the_frame_are_neither_pasted_nor_cut() {
+        let area = rect(10, 10, 4, 4);
+        let mut frame = flat(area, 0);
+        for part in [rect(9, 10, 2, 2), rect(13, 13, 2, 1), rect(10, 14, 1, 1)] {
+            assert!(
+                !paste_rgba(&mut frame, area, &flat(part, 9), part),
+                "{part:?}"
+            );
+            assert!(cut_rgba(&frame, area, part).is_none(), "{part:?}");
+        }
+        assert!(frame.iter().all(|value| *value == 0));
+        let inside = rect(12, 11, 2, 3);
+        assert!(paste_rgba(&mut frame, area, &flat(inside, 9), inside));
+        assert_eq!(cut_rgba(&frame, area, inside).unwrap(), flat(inside, 9));
     }
 
     #[test]

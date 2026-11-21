@@ -123,34 +123,53 @@ pub(super) fn window_screenshot_result(screenshot: Encoded<WindowScreenshot>) ->
         value: screenshot,
         base64,
     } = screenshot;
-    image_result(
-        base64,
-        json!({
-            "window": screenshot.window,
-            "source_bounds": screenshot.source_bounds,
-            "mime_type": "image/png",
-            "byte_length": screenshot.png.len(),
-            "capture_method": screenshot.capture_method,
-            "image_width": screenshot.image_width,
-            "image_height": screenshot.image_height,
-            "cursor_marker": screenshot.cursor_marker,
-            "observation_id": super::observations::register(
-                controlfreak_core::DisplayBounds {
-                    left: screenshot.source_bounds.left,
-                    top: screenshot.source_bounds.top,
-                    width: screenshot.source_bounds.width,
-                    height: screenshot.source_bounds.height,
-                },
-                screenshot.image_width,
-                screenshot.image_height,
-                screenshot.display_layout.clone(),
-                Some(super::observations::ShownWindow {
-                    id: screenshot.window.id.clone(),
-                    bounds: screenshot.window.bounds,
-                }),
-            ),
-        }),
-    )
+    let popups: Vec<_> = screenshot
+        .included_windows
+        .iter()
+        .flatten()
+        .map(|included| included.window.clone())
+        .collect();
+    let mut metadata = json!({
+        "window": screenshot.window,
+        "source_bounds": screenshot.source_bounds,
+        "mime_type": "image/png",
+        "byte_length": screenshot.png.len(),
+        "capture_method": screenshot.capture_method,
+        "image_width": screenshot.image_width,
+        "image_height": screenshot.image_height,
+        "cursor_marker": screenshot.cursor_marker,
+        "observation_id": super::observations::register(
+            controlfreak_core::DisplayBounds {
+                left: screenshot.source_bounds.left,
+                top: screenshot.source_bounds.top,
+                width: screenshot.source_bounds.width,
+                height: screenshot.source_bounds.height,
+            },
+            screenshot.image_width,
+            screenshot.image_height,
+            screenshot.display_layout.clone(),
+            Some(super::observations::ShownWindow {
+                id: screenshot.window.id.clone(),
+                bounds: screenshot.window.bounds,
+                popups,
+            }),
+        ),
+    });
+    // Only a capture that asked for popups reports them, so other results are unchanged.
+    if let Some(included) = &screenshot.included_windows {
+        metadata["included_windows"] = included
+            .iter()
+            .map(|included| {
+                json!({
+                    "class_name": included.window.class_name,
+                    "process_id": included.window.process_id,
+                    "bounds": included.window.bounds,
+                    "capture_method": included.capture_method,
+                })
+            })
+            .collect();
+    }
+    image_result(base64, metadata)
 }
 
 pub(super) fn window_wait_result(result: &WindowWaitResult) -> CallToolResult {

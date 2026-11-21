@@ -319,6 +319,7 @@ impl WindowBackend for ContractBackend {
             image_height: 300,
             cursor_marker: false,
             capture_method: "windows_print_window",
+            included_windows: None,
         })
     }
     fn focus_window_controlled(

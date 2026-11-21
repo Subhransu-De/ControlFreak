@@ -65,7 +65,7 @@ pub use stop::{
 };
 pub use text_matching::{discover_text, select_text_candidate, validate_text_discovery};
 pub use window::{
-    CaptureWindowRequest, FocusWindowRequest, ForegroundWindow, UnlistedWindow,
-    WaitForWindowRequest, WindowBounds, WindowFocusResult, WindowInfo, WindowList,
+    CaptureWindowRequest, FocusWindowRequest, ForegroundWindow, IncludedWindow, PopupWindow,
+    UnlistedWindow, WaitForWindowRequest, WindowBounds, WindowFocusResult, WindowInfo, WindowList,
     WindowScreenshot, WindowWaitResult,
 };
