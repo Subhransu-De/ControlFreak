@@ -160,6 +160,8 @@ impl WindowBackend for BoundsBackend {
 }
 
 impl PointerBackend for BoundsBackend {}
+impl controlfreak_core::AccessibilityBackend for BoundsBackend {}
+
 impl KeyboardBackend for BoundsBackend {}
 
 /// Calls `name` and checks the result against both published schemas and its own text block.

@@ -8,8 +8,8 @@ in this repository.
 
 - ControlFreak runs on your computer. It has no account, no telemetry, no analytics, no update
   check and no network code.
-- It sends screenshots, text read by OCR and window information to the MCP client that started
-  it, such as Claude Code or Codex. What that client does next, including sending it to an AI
+- It sends screenshots, text read by OCR, the names of controls and window information to the MCP
+  client that started it, such as Claude Code or Codex. What that client does next, including sending it to an AI
   model provider, is decided by the client and its provider, not by ControlFreak.
 - It keeps short-lived data in memory only, and writes no files unless you turn on its error log.
 - The setup program changes the MCP configuration of the clients you select, and keeps backups of
@@ -23,6 +23,12 @@ The server reads desktop information only when the connected client calls a tool
   Actions return a screenshot by default so the client can see the result.
 - **Text on the screen**, read by the Windows OCR engine on your computer, for
   `read_text_in_region`, `find_text_on_screen`, `wait_for_text` and `click_text`.
+- **Controls of one window**, read through Windows UI Automation for `find_elements`: each
+  control's role, accessible name, enabled and focus state, supported patterns and position.
+  Only the window the client names is read, and only controls of that window's own process. The
+  name of a password field is withheld, and no control's value or text content is read. The
+  names are what the application exposes to screen readers, so they can include document
+  titles, list entries or other visible text.
 - **Window information**: titles, class names, process IDs, positions and integrity levels of
   top-level windows, for `list_windows`, `wait_for_window` and the safety checks before each input
   action. Each action result also names the window in front afterwards. When that window has no
@@ -52,6 +58,9 @@ All of this is in memory and is gone when the server exits:
 
 - Up to 16 visual baselines, for the visual-change waits. Each holds screen pixels and is removed from memory 5 minutes after it was captured, even if the server is idle. A `wait_for_change_since` call that started before then keeps the baseline until it ends, at most 30 seconds later. The IDs of the last 64 expired or evicted baselines are kept with the reason they went, and no pixels, so a late request can be told why it was refused.
 - The geometry of up to 64 recent screenshots (position and size only, no pixels), so the client can click a point in a screenshot. Each one cannot be used after 5 minutes and is removed at the next screenshot.
+- Element references from `find_elements`: up to 4,096, each the window's reference, its process
+  identity and the control's UI Automation ID, without its name. Each one cannot be used 2 minutes
+  after it was issued.
 - Target references for recently listed windows. Each one cannot be used 5 minutes after the window was last observed and is removed the next time the server observes windows.
 - The timings and status of the last 32 tool calls, for `get_server_status`.
 
@@ -59,7 +68,7 @@ The build identity in `get_server_status`, `--version`, `--print-capabilities` a
 
 The server writes diagnostics to standard error: startup errors and one line per finished tool
 call with the tool name, status and timings. These lines contain no tool arguments, screenshots,
-OCR text, typed text or window titles. Your MCP client decides whether standard error is shown or
+OCR text, control names, typed text or window titles. Your MCP client decides whether standard error is shown or
 saved to a log.
 
 The server writes no files by default. If you set the `CONTROLFREAK_GLOW_ERROR_LOG` environment

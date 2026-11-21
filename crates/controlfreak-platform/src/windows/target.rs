@@ -673,6 +673,28 @@ pub(super) fn resolve(id: &str) -> Result<(HWND, u32), PlatformError> {
     Ok((hwnd, reference.identity.pid))
 }
 
+/// What a read-only accessibility query of reference `id` may read: the live window, the
+/// process instance that owns it, and the processes whose elements count as part of it. Those
+/// are the target's own process and, for a packaged app's `ApplicationFrameHost.exe` frame, the
+/// process of the content window hosted inside that frame, by the same rule as pointer input.
+pub(super) fn observation_scope(id: &str) -> Result<super::uia::Scope, PlatformError> {
+    let (hwnd, pid) = resolve(id)?;
+    let reference = lookup(id)?;
+    let mut allowed_pids = vec![pid];
+    if reference.identity.app_frame_host
+        && let Some(hosted) = hosted_content_pid(hwnd)
+        && hosted != pid
+    {
+        allowed_pids.push(hosted);
+    }
+    Ok(super::uia::Scope {
+        hwnd: reference.identity.hwnd,
+        pid,
+        created: reference.identity.created,
+        allowed_pids,
+    })
+}
+
 /// Marks the reference as in use by a session when the target, or a window of its own process,
 /// holds the foreground. An armed reference is the last to be evicted. Not holding the
 /// foreground neither arms nor retires it; each action decides again from the live foreground.

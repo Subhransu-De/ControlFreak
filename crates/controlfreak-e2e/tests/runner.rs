@@ -278,5 +278,5 @@ fn the_built_in_suites_list_without_a_desktop() {
     let out = tempfile::tempdir().expect("temp dir");
     let selected = runner::select(&all, &plan(false, out.path())).expect("select");
     let count: usize = selected.iter().map(|(_, tasks)| tasks.len()).sum();
-    assert_eq!(count, 22);
+    assert_eq!(count, 23);
 }

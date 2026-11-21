@@ -17,13 +17,15 @@
 //!   as `focus_window` asks the helper once after Windows refuses the server's own request.
 
 use controlfreak_core::{
-    ActionObservation, ActivationHelperOutcome, BackendIdentity, BackendMetadata,
-    CapabilityDescriptor, CaptureWindowRequest, DisplayBackend, DisplayBounds, DisplayInfo,
-    DisplayLayout, FocusWindowRequest, ForegroundWindow, KeyChordRequest, KeyboardActionResult,
-    KeyboardBackend, MouseClickRequest, MousePosition, MutationControl, OcrBackend,
-    PermissionDescriptor, Platform, PlatformError, PointerActionResult, PointerBackend,
-    TextInputRequest, UnlistedWindow, WaitForWindowRequest, WindowBackend, WindowBounds,
-    WindowFocusResult, WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
+    AccessibilityBackend, ActionObservation, ActivationHelperOutcome, BackendIdentity,
+    BackendMetadata, CapabilityDescriptor, CaptureWindowRequest, DisplayBackend, DisplayBounds,
+    DisplayInfo, DisplayLayout, ElementBounds, ElementInfo, ElementPattern, ElementQueryCounts,
+    ElementQueryStatus, ElementRole, FindElementsRequest, FindElementsResult, FocusWindowRequest,
+    ForegroundWindow, KeyChordRequest, KeyboardActionResult, KeyboardBackend, MouseClickRequest,
+    MousePosition, MutationControl, OcrBackend, PermissionDescriptor, Platform, PlatformError,
+    PointerActionResult, PointerBackend, TextInputRequest, UnlistedWindow, WaitForWindowRequest,
+    WindowBackend, WindowBounds, WindowFocusResult, WindowInfo, WindowList, WindowScreenshot,
+    WindowWaitResult,
 };
 use std::sync::Mutex;
 
@@ -58,6 +60,8 @@ struct State {
     focus_refusals: u32,
     /// What the activation helper answers after such a refusal. `None` is a server without one.
     helper: Option<ActivationHelperOutcome>,
+    /// The windows' UI Automation provider does not answer.
+    accessibility_unavailable: bool,
 }
 
 #[derive(Default)]
@@ -204,6 +208,11 @@ impl FakeDesktop {
             },
             open: true,
         })
+    }
+
+    /// Makes every window's UI Automation provider stop answering.
+    pub(super) fn stop_accessibility(&self) {
+        self.state().accessibility_unavailable = true;
     }
 
     /// Changes the window's size. Its reference stays, as for the same window on Windows.
@@ -523,6 +532,84 @@ impl KeyboardBackend for FakeDesktop {
         Self::deliver(control, 2);
         Ok(KeyboardActionResult {
             observation: observe(&self.state(), control),
+        })
+    }
+}
+
+/// Each window exposes itself and one `Ping` button at its top-left corner. Element references
+/// name the window and the element, so the same element keeps its reference.
+impl AccessibilityBackend for FakeDesktop {
+    fn find_elements_controlled(
+        &self,
+        request: &FindElementsRequest,
+        control: &MutationControl,
+    ) -> Result<FindElementsResult, PlatformError> {
+        control.check("find_elements")?;
+        request.validate()?;
+        let state = self.state();
+        let window = state
+            .resolve(&request.target_ref)
+            .ok_or_else(unknown_reference)?;
+        if state.accessibility_unavailable {
+            return Err(PlatformError::failed(
+                controlfreak_core::FailureCause::AccessibilityUnavailable,
+                "find_elements",
+                "the window's UI Automation provider did not answer",
+            ));
+        }
+        let element = |index: u32, role, name: &str, depth, bounds: WindowBounds| ElementInfo {
+            element_ref: format!("element-{:x}-{index}", window.key),
+            role,
+            name: name.to_owned(),
+            name_truncated: false,
+            password: false,
+            depth,
+            enabled: true,
+            focusable: index > 0,
+            focused: false,
+            offscreen: false,
+            bounds: Some(ElementBounds {
+                display_id: "fake".into(),
+                x: bounds.left,
+                y: bounds.top,
+                width: bounds.width,
+                height: bounds.height,
+            }),
+            patterns: if index > 0 {
+                vec![ElementPattern::Invoke]
+            } else {
+                vec![ElementPattern::Window]
+            },
+        };
+        let button = WindowBounds {
+            left: window.bounds.left + 10,
+            top: window.bounds.top + 10,
+            width: 80,
+            height: 24,
+        };
+        let elements = [
+            element(0, ElementRole::Window, &window.title, 0, window.bounds),
+            element(1, ElementRole::Button, "Ping", 1, button),
+        ]
+        .into_iter()
+        .filter(|candidate| {
+            request.role.is_none_or(|role| candidate.role == role)
+                && request
+                    .name
+                    .as_ref()
+                    .is_none_or(|name| candidate.name.to_lowercase().contains(&name.to_lowercase()))
+        })
+        .take(usize::try_from(request.max_elements).unwrap_or(usize::MAX))
+        .collect();
+        Ok(FindElementsResult {
+            status: ElementQueryStatus::Complete,
+            truncated: false,
+            limits_reached: Vec::new(),
+            counts: ElementQueryCounts {
+                visited: 2,
+                ..ElementQueryCounts::default()
+            },
+            elements,
         })
     }
 }

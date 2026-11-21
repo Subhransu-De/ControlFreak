@@ -56,6 +56,7 @@ are served in every profile. An invalid value stops the server at startup.";
 enum Command {
     Serve,
     OcrHelper,
+    UiaHelper,
     PrintCapabilities,
     PrintTools,
     Help,
@@ -124,6 +125,7 @@ async fn try_main() -> Result<(), Box<dyn Error + Send + Sync>> {
     match options.command {
         Command::Serve => run_server(options.allow_elevated, options.profile).await,
         Command::OcrHelper => run_ocr_helper(),
+        Command::UiaHelper => run_uia_helper(),
         Command::PrintCapabilities => print_capabilities(options.allow_elevated),
         Command::PrintTools => {
             println!(
@@ -197,6 +199,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> io::Result<Opti
         }
         let next = match argument.as_str() {
             "--ocr-helper" => Command::OcrHelper,
+            "--uia-helper" => Command::UiaHelper,
             "--print-capabilities" => Command::PrintCapabilities,
             "--print-tools" => Command::PrintTools,
             "--help" | "-h" => Command::Help,
@@ -219,7 +222,11 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> io::Result<Opti
     if allow_elevated
         && matches!(
             command,
-            Command::OcrHelper | Command::PrintTools | Command::Help | Command::Version
+            Command::OcrHelper
+                | Command::UiaHelper
+                | Command::PrintTools
+                | Command::Help
+                | Command::Version
         )
     {
         return Err(io::Error::new(
@@ -435,6 +442,10 @@ fn ensure_started<T, E>(
 
 fn run_ocr_helper() -> Result<(), Box<dyn Error + Send + Sync>> {
     controlfreak_platform::serve_ocr_helper(io::stdin(), io::stdout().lock())
+}
+
+fn run_uia_helper() -> Result<(), Box<dyn Error + Send + Sync>> {
+    controlfreak_platform::serve_uia_helper(io::stdin(), io::stdout().lock())
 }
 
 fn platform_backend(

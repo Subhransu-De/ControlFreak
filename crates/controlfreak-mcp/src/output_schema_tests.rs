@@ -259,6 +259,63 @@ impl WindowBackend for ObservationBackend {
 }
 
 impl PointerBackend for ObservationBackend {}
+/// A partial walk with a password field and an element without on-screen bounds.
+impl controlfreak_core::AccessibilityBackend for ObservationBackend {
+    fn find_elements_controlled(
+        &self,
+        _: &controlfreak_core::FindElementsRequest,
+        _: &controlfreak_core::MutationControl,
+    ) -> Result<controlfreak_core::FindElementsResult, PlatformError> {
+        use controlfreak_core::{
+            ElementBounds, ElementInfo, ElementPattern, ElementQueryCounts, ElementQueryLimit,
+            ElementQueryStatus, ElementRole,
+        };
+        let element = |role, name: &str| ElementInfo {
+            element_ref: "element-0-1".into(),
+            role,
+            name: name.into(),
+            name_truncated: false,
+            password: false,
+            depth: 1,
+            enabled: true,
+            focusable: true,
+            focused: false,
+            offscreen: false,
+            bounds: Some(ElementBounds {
+                display_id: "synthetic".into(),
+                x: -5,
+                y: 2,
+                width: 4,
+                height: 3,
+            }),
+            patterns: vec![ElementPattern::Invoke, ElementPattern::Value],
+        };
+        Ok(controlfreak_core::FindElementsResult {
+            status: ElementQueryStatus::Partial,
+            truncated: true,
+            limits_reached: vec![ElementQueryLimit::Timeout],
+            counts: ElementQueryCounts {
+                visited: 3,
+                provider_errors: 1,
+                skipped_other_process: 1,
+            },
+            elements: vec![
+                element(ElementRole::Button, "Approve"),
+                ElementInfo {
+                    password: true,
+                    ..element(ElementRole::Edit, "")
+                },
+                ElementInfo {
+                    name_truncated: true,
+                    offscreen: true,
+                    bounds: None,
+                    ..element(ElementRole::Unknown, "x")
+                },
+            ],
+        })
+    }
+}
+
 impl KeyboardBackend for ObservationBackend {}
 
 const BASELINE_ID: &str = "vb-00000000000000000000000000000000-0000000000000000";
@@ -298,7 +355,7 @@ fn every_tool_publishes_an_object_output_schema() {
         missing.is_empty(),
         "tools without an outputSchema: {missing:?}"
     );
-    assert_eq!(tools().len(), 27);
+    assert_eq!(tools().len(), 28);
 }
 
 /// `tools/list` differs from the full contract only in its open, shallow success branches: the
@@ -502,7 +559,7 @@ async fn every_observation_and_session_result_validates_against_tools_list() {
     )
     .await;
     let listed = listed["result"]["tools"].as_array().unwrap().clone();
-    assert_eq!(listed.len(), 27);
+    assert_eq!(listed.len(), 28);
     assert!(
         listed
             .iter()
@@ -547,6 +604,11 @@ async fn every_observation_and_session_result_validates_against_tools_list() {
             CAPTURE_WINDOW,
             json!({"window_id":"target-00000000-0000-0000-0000-000000000003"}),
             true,
+        ),
+        (
+            FIND_ELEMENTS,
+            json!({"target_ref": "target-00000000-0000-0000-0000-000000000003"}),
+            false,
         ),
         (
             WAIT_FOR_WINDOW,

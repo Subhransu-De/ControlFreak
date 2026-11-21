@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod accessibility;
 mod build_info;
 mod capability;
 mod desktop;
@@ -20,6 +21,10 @@ mod text_matching;
 pub mod timing;
 mod window;
 
+pub use accessibility::{
+    ElementBounds, ElementInfo, ElementPattern, ElementQueryCounts, ElementQueryLimit,
+    ElementQueryStatus, ElementRole, FindElementsRequest, FindElementsResult,
+};
 pub use build_info::{BUILD_INFO_SCHEMA_VERSION, BuildInfo, UNKNOWN_REVISION};
 pub use capability::{Capability, CapabilityDescriptor, CapabilityState};
 pub use desktop::{
@@ -48,8 +53,9 @@ pub use ocr::{
 pub use outcome::{ActivationHelperOutcome, CleanupStatus, InputOutcome, MutationProgress};
 pub use permission::{PermissionDescriptor, PermissionId, PermissionState};
 pub use platform::{
-    BackendIdentity, BackendMetadata, DisplayBackend, DisplayServer, KeyboardBackend, OcrBackend,
-    Platform, PlatformBackend, PointerBackend, WindowBackend, wait_for_text_with,
+    AccessibilityBackend, BackendIdentity, BackendMetadata, DisplayBackend, DisplayServer,
+    KeyboardBackend, OcrBackend, Platform, PlatformBackend, PointerBackend, WindowBackend,
+    wait_for_text_with,
 };
 pub use report::CapabilityReport;
 pub use security::{IntegrityLevel, SecurityContext};

@@ -199,6 +199,8 @@ impl BackendMetadata for Environment {
     }
 }
 impl DisplayBackend for Environment {}
+impl controlfreak_core::AccessibilityBackend for Environment {}
+
 impl KeyboardBackend for Environment {}
 impl OcrBackend for Environment {}
 impl PointerBackend for Environment {}

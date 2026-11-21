@@ -181,6 +181,9 @@ pub enum FailureCause {
     /// The server process is not per-monitor DPI aware, so Windows would virtualize window and
     /// pointer coordinates on a scaled display. Process awareness is fixed for its lifetime.
     DpiAwarenessUnsupported,
+    /// The UI Automation provider of the window could not be asked, or did not answer before
+    /// anything was read. An empty tree is never reported in its place.
+    AccessibilityUnavailable,
 }
 
 impl FailureCause {
@@ -199,6 +202,7 @@ impl FailureCause {
             Self::TargetNotResponding => "target_not_responding",
             Self::DeadlineReached => "deadline_reached",
             Self::DpiAwarenessUnsupported => "dpi_awareness_unsupported",
+            Self::AccessibilityUnavailable => "accessibility_unavailable",
         }
     }
 
@@ -350,6 +354,11 @@ mod tests {
             (
                 PlatformError::failed(FailureCause::TargetNotResponding, "type_text", "x"),
                 "target_not_responding",
+                false,
+            ),
+            (
+                PlatformError::failed(FailureCause::AccessibilityUnavailable, "find_elements", "x"),
+                "accessibility_unavailable",
                 false,
             ),
             (

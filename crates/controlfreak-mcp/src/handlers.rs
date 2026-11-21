@@ -13,17 +13,18 @@ use super::{
     Arc, CallToolResponse, CallToolResult, CaptureDisplayInput, CaptureDisplayRequest,
     CaptureRegionInput, CaptureRegionRequest, CaptureWindowInput, CarriesPng, ClickMouseInput,
     ClickTextInput, ClickTextRequest, Diagnostics, DragMouseInput, Encoded, ErrorData,
-    FindTextInput, FocusWindowInput, FocusWindowRequest, InputRun, JsonObject, KeyChordRequest,
-    MouseClickRequest, MouseDragRequest, MouseMoveRequest, MouseScrollRequest, MoveMouseInput,
-    NoArguments, OcrRegionInput, OcrRegionRequest, OperationLease, Ordering, PlatformBackend,
-    PreparedInput, PressKeysInput, SafetyIndicator, ScrollMouseInput, SessionRuntime,
-    SwitchVirtualDesktopInput, TextInputRequest, TypeTextInput, Value, VirtualDesktopSwitchRequest,
-    VisualBaselineInput, VisualBaselineRequest, WaitForChangeSinceInput, WaitForTextInput,
-    WaitForVisualChangeInput, WaitForVisualChangeRequest, WaitForWindowInput, click_text_result,
-    join_error, json, keyboard_result, parse_arguments, pointer_result, read_text_result,
-    screenshot_result, tool_error, tool_execution_error, virtual_desktop_list_result,
-    virtual_desktop_switch_result, visual_baseline_result, visual_change_result,
-    window_focus_result, window_screenshot_result, window_wait_result,
+    FindElementsInput, FindTextInput, FocusWindowInput, FocusWindowRequest, InputRun, JsonObject,
+    KeyChordRequest, MouseClickRequest, MouseDragRequest, MouseMoveRequest, MouseScrollRequest,
+    MoveMouseInput, NoArguments, OcrRegionInput, OcrRegionRequest, OperationLease, Ordering,
+    PlatformBackend, PreparedInput, PressKeysInput, SafetyIndicator, ScrollMouseInput,
+    SessionRuntime, SwitchVirtualDesktopInput, TextInputRequest, TypeTextInput, Value,
+    VirtualDesktopSwitchRequest, VisualBaselineInput, VisualBaselineRequest,
+    WaitForChangeSinceInput, WaitForTextInput, WaitForVisualChangeInput,
+    WaitForVisualChangeRequest, WaitForWindowInput, click_text_result, join_error, json,
+    keyboard_result, parse_arguments, pointer_result, read_text_result, screenshot_result,
+    tool_error, tool_execution_error, virtual_desktop_list_result, virtual_desktop_switch_result,
+    visual_baseline_result, visual_change_result, window_focus_result, window_screenshot_result,
+    window_wait_result,
 };
 
 pub(super) async fn run_platform_operation<T, F>(
@@ -784,6 +785,29 @@ pub(super) async fn call_wait_for_window(
     .await?;
     match result {
         Ok(result) => Ok(window_wait_result(&result).into()),
+        Err(error) => Ok(tool_error(&error).into()),
+    }
+}
+
+/// Reads the controls of one window through UI Automation. Read-only: it claims no session, and
+/// the element references it returns are accepted only by a later `find_elements`.
+pub(super) async fn call_find_elements(
+    backend: Arc<dyn PlatformBackend>,
+    arguments: Option<JsonObject>,
+    operation_lease: Option<OperationLease>,
+) -> Result<CallToolResponse, ErrorData> {
+    let request = match parse_arguments::<FindElementsInput>(arguments)?.into_request() {
+        Ok(request) => request,
+        Err(error) => return Ok(tool_error(&error).into()),
+    };
+    let control =
+        super::stop::current().map_or_else(MutationControl::default, |work| work.control.clone());
+    let result = run_platform_operation(operation_lease, move || {
+        backend.find_elements_controlled(&request, &control)
+    })
+    .await?;
+    match result {
+        Ok(result) => Ok(CallToolResult::structured(json!(result)).into()),
         Err(error) => Ok(tool_error(&error).into()),
     }
 }

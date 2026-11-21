@@ -752,6 +752,44 @@ capture_window output $defs.window_screenshot.mime_type required
 capture_window output $defs.window_screenshot.observation_id
 capture_window output $defs.window_screenshot.source_bounds required
 capture_window output $defs.window_screenshot.window required
+find_elements input max_depth default=32
+find_elements input max_elements default=100
+find_elements input name
+find_elements input role
+find_elements input target_ref required
+find_elements input timeout_ms default=3000
+find_elements input within
+find_elements output anyOf[0].counts required
+find_elements output anyOf[0].counts.provider_errors required
+find_elements output anyOf[0].counts.skipped_other_process required
+find_elements output anyOf[0].counts.visited required
+find_elements output anyOf[0].elements required
+find_elements output anyOf[0].elements[].bounds required
+find_elements output anyOf[0].elements[].bounds.oneOf[0].display_id required
+find_elements output anyOf[0].elements[].bounds.oneOf[0].height required
+find_elements output anyOf[0].elements[].bounds.oneOf[0].width required
+find_elements output anyOf[0].elements[].bounds.oneOf[0].x required
+find_elements output anyOf[0].elements[].bounds.oneOf[0].y required
+find_elements output anyOf[0].elements[].depth required
+find_elements output anyOf[0].elements[].element_ref required
+find_elements output anyOf[0].elements[].enabled required
+find_elements output anyOf[0].elements[].focusable required
+find_elements output anyOf[0].elements[].focused required
+find_elements output anyOf[0].elements[].name required
+find_elements output anyOf[0].elements[].name_truncated
+find_elements output anyOf[0].elements[].offscreen required
+find_elements output anyOf[0].elements[].password
+find_elements output anyOf[0].elements[].patterns required
+find_elements output anyOf[0].elements[].role required
+find_elements output anyOf[0].limits_reached required
+find_elements output anyOf[0].status required
+find_elements output anyOf[0].truncated required
+find_elements output anyOf[1].error required
+find_elements output anyOf[1].error.code required
+find_elements output anyOf[1].error.details
+find_elements output anyOf[1].error.message required
+find_elements output anyOf[1].error.reason
+find_elements output anyOf[1].error.retryable
 wait_for_window input class_name
 wait_for_window input is_foreground
 wait_for_window input process_id

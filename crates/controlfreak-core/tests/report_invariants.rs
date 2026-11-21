@@ -31,6 +31,7 @@ impl OcrBackend for TestBackend {}
 impl PointerBackend for TestBackend {}
 impl WindowBackend for TestBackend {}
 impl KeyboardBackend for TestBackend {}
+impl controlfreak_core::AccessibilityBackend for TestBackend {}
 
 #[test]
 fn platform_backend_is_object_safe() {

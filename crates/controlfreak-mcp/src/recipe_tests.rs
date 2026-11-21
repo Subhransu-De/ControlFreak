@@ -254,6 +254,8 @@ impl PointerBackend for Fixture {
     }
 }
 
+impl controlfreak_core::AccessibilityBackend for Fixture {}
+
 impl KeyboardBackend for Fixture {
     fn type_text_controlled(
         &self,

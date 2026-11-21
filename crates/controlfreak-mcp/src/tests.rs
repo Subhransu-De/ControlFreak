@@ -854,6 +854,7 @@ fn tool_surface_includes_windows_and_keyboard() {
             "list_windows",
             "focus_window",
             "capture_window",
+            "find_elements",
             "wait_for_window",
             "move_mouse",
             "click_mouse",

@@ -43,3 +43,19 @@ pub const MAX_READ_TEXT_CHARS: usize = 8_000;
 /// Most bytes the serialized `lines` of one `read_text_in_region` result take. Each word repeats
 /// its text with a box, so this bounds the structured result the characters do not.
 pub const MAX_READ_TEXT_BYTES: usize = 128 * 1024;
+/// Deepest `max_depth` a `find_elements` query accepts, in levels below its root.
+pub const MAX_ELEMENT_DEPTH: u32 = 64;
+/// `max_depth` of a `find_elements` query that gives none.
+pub const DEFAULT_ELEMENT_DEPTH: u32 = 32;
+/// Most elements one `find_elements` result may hold.
+pub const MAX_ELEMENTS: u32 = 500;
+/// `max_elements` of a `find_elements` query that gives none.
+pub const DEFAULT_ELEMENTS: u32 = 100;
+/// Shortest `timeout_ms` a `find_elements` query accepts.
+pub const MIN_ELEMENT_TIMEOUT_MS: u32 = 100;
+/// Longest `timeout_ms` a `find_elements` query accepts.
+pub const MAX_ELEMENT_TIMEOUT_MS: u32 = 10_000;
+/// `timeout_ms` of a `find_elements` query that gives none.
+pub const DEFAULT_ELEMENT_TIMEOUT_MS: u32 = 3_000;
+/// Longest `name` filter a `find_elements` query accepts, in characters.
+pub(crate) const MAX_ELEMENT_NAME_FILTER_CHARS: usize = 256;
