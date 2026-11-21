@@ -12,6 +12,10 @@ const BUILTIN: &[(&str, &str)] = &[
     ("busy-app", include_str!("../scenes/busy-app.toml")),
     ("clipped", include_str!("../scenes/clipped.toml")),
     ("with-popup", include_str!("../scenes/with-popup.toml")),
+    (
+        "empty-desktop",
+        include_str!("../scenes/empty-desktop.toml"),
+    ),
 ];
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

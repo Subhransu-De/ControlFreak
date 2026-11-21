@@ -19,6 +19,7 @@ const DEFAULT_BUDGET: Duration = Duration::from_secs(30);
 pub enum Capability {
     Ocr,
     TaskbarForeground,
+    VirtualDesktops,
 }
 
 impl Capability {
@@ -26,6 +27,7 @@ impl Capability {
         match self {
             Self::Ocr => "ocr",
             Self::TaskbarForeground => "taskbar-foreground",
+            Self::VirtualDesktops => "virtual-desktops",
         }
     }
 
@@ -39,6 +41,7 @@ impl Capability {
                 Ok(!(result.is_error && result.error_reason() == Some("ocr_unavailable")))
             }
             Self::TaskbarForeground => Ok(cx.helper(&["--activate-taskbar"])?.status.success()),
+            Self::VirtualDesktops => crate::desktops::probe(cx),
         }
     }
 }

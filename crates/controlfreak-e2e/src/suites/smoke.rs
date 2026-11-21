@@ -1,5 +1,5 @@
 use crate::{
-    Capability, Ctx, Failure, Suite,
+    Capability, Ctx, Failure, Suite, desktops,
     events::{self, Event},
     workflow::{ensure, task},
 };
@@ -44,6 +44,10 @@ pub(crate) fn suite() -> Suite {
             task("moved-window-keeps-session", moved_window_keeps_session).scene("single"),
             task("baseline-refusal-reasons", baseline_refusal_reasons).scene("single"),
             task("find-elements-of-the-window", find_elements_of_the_window).scene("single"),
+            task("switch-to-empty-desktop", switch_to_empty_desktop)
+                .scene("empty-desktop")
+                .requires(&[Capability::VirtualDesktops])
+                .budget_secs(45),
         ],
     }
 }
@@ -763,6 +767,107 @@ fn taskbar_target(cx: &mut Ctx<'_>) -> Result<(), Failure> {
         .to_owned();
     cx.begin(&target)?;
     cx.end()
+}
+
+/// Adds an empty desktop to the right of the starting one, returns to the start, and switches to
+/// the empty desktop with `switch_virtual_desktop`. Records what the server reported next to what
+/// the shell's own record and `list_virtual_desktops` say, then removes the desktop again, whatever
+/// the outcome, and checks the runner is back on the desktop it started on.
+fn switch_to_empty_desktop(cx: &mut Ctx<'_>) -> Result<(), Failure> {
+    let id = cx.target("app")?;
+    let start = desktops::read(cx)?;
+    let created = desktops::create(cx, &start)?.map_err(Failure::host)?;
+    let switched = switch_to_created_desktop(cx, &id, &start, &created);
+    let removed = desktops::remove(cx, &start, &created);
+    switched.and(removed)
+}
+
+fn switch_to_created_desktop(
+    cx: &mut Ctx<'_>,
+    id: &str,
+    start: &desktops::Desktops,
+    created: &str,
+) -> Result<(), Failure> {
+    // A profile that never had a second desktop has no record of the first, so the desktop left
+    // of the added one is the start. One step right of the start must reach the added desktop.
+    let now = desktops::read(cx)?;
+    let left_of_created = now
+        .ids
+        .iter()
+        .position(|id| id == created)
+        .and_then(|at| at.checked_sub(1))
+        .map(|at| now.ids[at].clone());
+    let origin = start.current.clone().or_else(|| left_of_created.clone());
+    let Some(origin) = origin.filter(|origin| left_of_created.as_ref() == Some(origin)) else {
+        return Err(Failure::host(format!(
+            "the added desktop {created} is not right of the starting one: {start:?}, now {now:?}"
+        )));
+    };
+    desktops::shortcut(cx, "left")?;
+    let (_, back) = desktops::wait(cx, |now| now.current.as_deref() == Some(origin.as_str()))?;
+    ensure!(
+        back,
+        "Ctrl+Win+Left did not return to the starting desktop {origin}"
+    );
+    cx.begin(id)?;
+    cx.focus(id)?;
+    let result = cx.call(
+        "switch_virtual_desktop",
+        json!({"target_ref": id, "direction": "right", "observation": {"mode": "none"}}),
+    )?;
+    let switched = result.structured;
+    let action = &switched["action"];
+    let front = &switched["observation"]["foreground_window"];
+    // The shell's record and the window's own desktop, both independent of the foreground window.
+    let (shell, reached) = desktops::wait(cx, |now| now.current.as_deref() == Some(created))?;
+    let listed = cx.ok("list_virtual_desktops", json!({}))?;
+    let fixture_desktop = listed["desktops"].as_array().and_then(|all| {
+        all.iter().find(|desktop| {
+            desktop["windows"]
+                .as_array()
+                .is_some_and(|windows| windows.iter().any(|window| window["id"] == id))
+        })
+    });
+    // The desktops `list_virtual_desktops` marks current, with how many windows each lists.
+    let listed_current: Vec<serde_json::Value> = listed["desktops"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|d| d["is_current"] == true)
+        .map(|d| json!([d["id"], d["windows"].as_array().map_or(0, Vec::len)]))
+        .collect();
+    cx.note(format!(
+        "evidence switch is_error={} input_outcome={} before_id={} after_id={} transition={} \
+         changed={} foreground={front} shell_start={origin} shell_created={created} \
+         shell_after={} fixture_desktop={} fixture_desktop_is_current={} listed_current={}",
+        result.is_error,
+        switched["input"]["input_outcome"],
+        action["before_id"],
+        action["after_id"],
+        action["transition"],
+        action["changed"],
+        shell.current.as_deref().unwrap_or("none"),
+        fixture_desktop.map_or(serde_json::Value::Null, |d| d["id"].clone()),
+        fixture_desktop.map_or(serde_json::Value::Null, |d| d["is_current"].clone()),
+        serde_json::Value::from(listed_current),
+    ));
+    ensure!(
+        !result.is_error,
+        "switch_virtual_desktop failed: {switched}"
+    );
+    ensure!(
+        reached,
+        "the shell never recorded the added desktop {created} as current: {shell:?}"
+    );
+    ensure!(
+        fixture_desktop.is_some_and(|d| d["is_current"] == false),
+        "the fixture's desktop is still current after the switch: {listed}"
+    );
+    ensure!(
+        action["before_id"] == origin.as_str(),
+        "before_id is not the starting desktop {origin}: {switched}"
+    );
+    Ok(())
 }
 
 /// Runs the fixture helper with `args` until it succeeds, for at most 20 seconds, and returns its

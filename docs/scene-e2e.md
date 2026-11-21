@@ -119,6 +119,16 @@ This is the "copy something from one application into another" desk. A control s
 | `handoff/carry-value-read-by-ocr` | Needs OCR. Types `INV 4471 1280` into `ledger`, reads it back from the screen with `read_text_in_region`, ends the session, and types what it read into `journal`. Checks `journal` received the value and `ledger` received nothing after its session ended. |
 | `handoff/ten-round-trips` | Ten handovers in a row, alternating between the windows. Checks every window's text after each round, and that no round takes longer than 3 seconds. |
 
+## empty-desktop
+
+One green window, `app`, on the desktop the runner starts on.
+
+This is the "switch to an empty virtual desktop" desk. The task adds the empty desktop itself with the shell's Ctrl+Win+D, which appends it on the right, and removes it again with Ctrl+Win+F4. It reads the shell's own record of the current desktop through the fixture (`--virtual-desktops`, from Explorer's registry values), independently of the server and of the foreground window.
+
+| Task | What happens |
+| --- | --- |
+| `smoke/switch-to-empty-desktop` | Needs `virtual-desktops`. Adds a desktop, returns to the start with Ctrl+Win+Left, and switches right with `switch_virtual_desktop` from a session on `app`. Records `before_id`, `after_id`, `transition`, `changed` and the foreground window next to the shell's current desktop and `list_virtual_desktops` in an `evidence` note. Checks the shell reports the added desktop as current, `list_virtual_desktops` no longer marks the fixture's desktop current, and `before_id` is the starting desktop. Then removes the added desktop, whatever the outcome, and checks the shell is back on the starting desktop. |
+
 ## No scene
 
 `smoke/taskbar-target-ref` opens no fixture window. It needs the `taskbar-foreground` capability: the probe brings the shell taskbar to the foreground. The task then checks that a display capture reports the taskbar's target reference and that a session can begin on it.
@@ -131,6 +141,7 @@ A task that needs a capability the runner lacks is reported as BLOCKED, not skip
 | --- | --- |
 | `ocr` | `find_text_on_screen` on a small region. Only an `ocr_unavailable` error counts as missing. |
 | `taskbar-foreground` | The fixture's `--activate-taskbar` helper must succeed. |
+| `virtual-desktops` | The shell must record its desktops, and Ctrl+Win+D must add one that Ctrl+Win+F4 then removes. The reason it is missing is written as a note. |
 
 ## Adding a scene
 

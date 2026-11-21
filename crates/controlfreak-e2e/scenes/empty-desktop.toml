@@ -1,0 +1,4 @@
+description = "One fixture window on the starting desktop; the task adds an empty desktop to its right"
+
+[[window]]
+key = "app"
