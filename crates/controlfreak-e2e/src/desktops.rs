@@ -29,7 +29,7 @@ pub(crate) struct Desktops {
 
 impl Desktops {
     /// Parses the `--virtual-desktops` output: `current GUID|none`, then `ids GUID,…`.
-    pub(crate) fn parse(output: &str) -> Result<Self, String> {
+    fn parse(output: &str) -> Result<Self, String> {
         let mut current = None;
         let mut ids = None;
         for line in output.lines() {
