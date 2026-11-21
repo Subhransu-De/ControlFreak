@@ -127,7 +127,7 @@ This is the "switch to an empty virtual desktop" desk. The task adds the empty d
 
 | Task | What happens |
 | --- | --- |
-| `smoke/switch-to-empty-desktop` | Needs `virtual-desktops`. Adds a desktop, returns to the start with Ctrl+Win+Left, and switches right with `switch_virtual_desktop` from a session on `app`. Records `before_id`, `after_id`, `transition`, `changed` and the foreground window next to the shell's current desktop and `list_virtual_desktops` in an `evidence` note. Checks the shell reports the added desktop as current, `list_virtual_desktops` no longer marks the fixture's desktop current, and `before_id` is the starting desktop. Then removes the added desktop, whatever the outcome, and checks the shell is back on the starting desktop. |
+| `smoke/switch-to-empty-desktop` | Needs `virtual-desktops`. Adds a desktop, returns to the start with Ctrl+Win+Left, and switches right with `switch_virtual_desktop` from a session on `app`. Records `before_id`, `after_id`, `transition`, `changed` and the foreground window next to the shell's current desktop and `list_virtual_desktops` in an `evidence` note. Checks the shell reports the added desktop as current, `list_virtual_desktops` no longer marks the fixture's desktop current, `before_id` is the starting desktop and `transition` is `confirmed_changed`, although the shell's desktop window in front names no desktop. Waits a second after each shell shortcut, because a Ctrl+Win+Left sent right after Ctrl+Win+D did not switch on the runner. Then removes the added desktop, whatever the outcome, and checks the shell is back on the starting desktop. |
 
 ## No scene
 

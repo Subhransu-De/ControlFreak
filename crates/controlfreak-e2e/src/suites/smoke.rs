@@ -853,9 +853,16 @@ fn switch_to_created_desktop(
         reached,
         "the shell never recorded the added desktop {created} as current: {shell:?}"
     );
+    // A window on another desktop is not listed at all, so its desktop reads as not current.
     ensure!(
-        fixture_is_current == false,
-        "the fixture's desktop is still current after the switch"
+        fixture_is_current != true,
+        "list_virtual_desktops still marks the fixture's desktop current after the switch"
+    );
+    // The shell's desktop window is in front of the empty desktop and names no desktop, so the
+    // change is confirmed by the server's own reading through the window that was left behind.
+    ensure!(
+        action["transition"] == "confirmed_changed",
+        "the switch to the empty desktop was not confirmed: {switched}"
     );
     ensure!(
         action["before_id"] == origin.as_str(),

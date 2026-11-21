@@ -399,7 +399,7 @@ pub(super) fn switch_virtual_desktop() -> Contract {
     );
     add_observation(&mut properties);
     contract(
-        "Switch left or right across existing virtual desktops. Needs the session's window in the foreground. The switch ends the control session, because that window is no longer on screen: begin a new session on a window of the new desktop. target_ref is optional and defaults to the session's window, or to the foreground window when no session is active. Trust action.transition, not the legacy changed: unknown means the foreground desktop was unreadable before or after, as an empty desktop may be.",
+        "Switch left or right across existing virtual desktops. Needs the session's window in the foreground. The switch ends the control session, because that window is no longer on screen: begin a new session on a window of the new desktop. target_ref is optional and defaults to the session's window, or to the foreground window when no session is active. Trust action.transition, not the legacy changed: unknown means a foreground desktop was unreadable and nothing else confirmed the result. A switch to an empty desktop reports after_id null with confirmed_changed when the starting desktop is no longer current.",
         object_schema(properties, &["direction"]),
         action_output_schema_with(
             false,
