@@ -9,7 +9,9 @@ use windows::Win32::{
     UI::WindowsAndMessaging::{GetWindowRect, IsHungAppWindow},
 };
 
-use super::desktop::foreground_window;
+use super::desktop::{
+    describe_foreground, foreground_window, foreground_window_handle, window_display_id,
+};
 use super::settle::{SettlePolicy, Settler};
 use super::visual_change::{ComparisonFrames, SystemPollClock, poll_for_change};
 use super::{
@@ -276,8 +278,8 @@ pub(super) fn observe_display(
     })
 }
 
-/// Evidence after a keyboard action, on the display of the foreground window when it has a
-/// reference, else on the primary display. The foreground window is read in every mode.
+/// Evidence after a keyboard action, on the display of the foreground window, else of the
+/// session's target, else on the primary display. The foreground window is read in every mode.
 pub(super) fn observe_foreground(
     options: &ObservationOptions,
     control: &MutationControl,
@@ -292,18 +294,18 @@ pub(super) fn observe_foreground(
         });
     }
     let _timer = timing::start("observe");
-    let foreground_window = foreground_window(target_process);
-    let display = if let Some(ForegroundWindow::Listed(window)) = &foreground_window {
-        find_display(&window.display_id)?
-    } else {
-        enumerate_displays()?
-            .into_iter()
-            .find(|display| display.is_primary)
-            .ok_or_else(|| PlatformError::OperationFailed {
-                operation: "post_action_observation".to_owned(),
-                reason: "Windows reported no foreground window or primary display".to_owned(),
-            })?
-    };
+    let hwnd = foreground_window_handle();
+    let foreground_window = describe_foreground(hwnd, target_process);
+    let display = keyboard_observation_display(
+        enumerate_displays()?,
+        foreground_window.as_ref(),
+        || window_display_id(hwnd),
+        || super::target::approved_window_handle(control).and_then(window_display_id),
+    )
+    .ok_or_else(|| PlatformError::OperationFailed {
+        operation: "post_action_observation".to_owned(),
+        reason: "Windows reported no foreground window or primary display".to_owned(),
+    })?;
     let screenshot = if options.mode == ObservationMode::Screenshot {
         Some(capture_observation_screenshot(display, options)?)
     } else {
@@ -314,6 +316,32 @@ pub(super) fn observe_foreground(
         screenshot,
         settle: None,
     })
+}
+
+/// The display a keyboard action's screenshot shows. A listed foreground window names its
+/// display; an unlisted one (a popup menu, a drop-down) is located from its handle by
+/// `foreground_display`. Without a foreground window on an active display, the session target's
+/// display from `target_display` is used, and the primary display only when neither is known.
+fn keyboard_observation_display(
+    displays: Vec<DisplayInfo>,
+    foreground: Option<&ForegroundWindow>,
+    foreground_display: impl FnOnce() -> Option<String>,
+    target_display: impl FnOnce() -> Option<String>,
+) -> Option<DisplayInfo> {
+    let find = |id: &str| {
+        displays
+            .iter()
+            .position(|display| display.id.eq_ignore_ascii_case(id))
+    };
+    let foreground_index = match foreground {
+        Some(ForegroundWindow::Listed(window)) => find(&window.display_id),
+        Some(ForegroundWindow::Unlisted(_)) => foreground_display().as_deref().and_then(find),
+        None => None,
+    };
+    let index = foreground_index
+        .or_else(|| target_display().as_deref().and_then(find))
+        .or_else(|| displays.iter().position(|display| display.is_primary))?;
+    displays.into_iter().nth(index)
 }
 
 fn capture_observation_screenshot(
@@ -2476,5 +2504,138 @@ mod window_capture_tests {
         // Mismatched pixel data is refused instead of writing a corrupt image.
         assert!(encode_png(width, height, &rgba[..rgba.len() - 4]).is_err());
         assert!(encode_png(width + 1, height, &rgba).is_err());
+    }
+}
+
+#[cfg(test)]
+mod keyboard_display_tests {
+    use super::*;
+    use controlfreak_core::{UnlistedWindow, WindowInfo};
+
+    const PRIMARY: &str = r"\\.\DISPLAY1";
+    // Left of and above the primary display, so its origin is negative on both axes.
+    const SECONDARY: &str = r"\\.\DISPLAY2";
+
+    fn displays() -> Vec<DisplayInfo> {
+        let display = |id: &str, left, top, is_primary| DisplayInfo {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            bounds: DisplayBounds {
+                left,
+                top,
+                width: 1920,
+                height: 1080,
+            },
+            is_primary,
+        };
+        vec![
+            display(PRIMARY, 0, 0, true),
+            display(SECONDARY, -1920, -200, false),
+        ]
+    }
+
+    fn popup() -> ForegroundWindow {
+        ForegroundWindow::Unlisted(UnlistedWindow {
+            class_name: "#32768".to_owned(),
+            process_id: 7,
+            same_process_as_target: Some(true),
+        })
+    }
+
+    fn listed(display_id: &str) -> ForegroundWindow {
+        ForegroundWindow::Listed(WindowInfo {
+            id: "window-1".to_owned(),
+            title: "Synthetic".to_owned(),
+            class_name: "SyntheticWindow".to_owned(),
+            process_id: 7,
+            bounds: WindowBounds {
+                left: 10,
+                top: 10,
+                width: 300,
+                height: 200,
+            },
+            display_id: display_id.to_owned(),
+            is_foreground: true,
+            is_minimized: false,
+            owner: None,
+        })
+    }
+
+    fn chosen(
+        foreground: Option<&ForegroundWindow>,
+        foreground_display: Option<&str>,
+        target_display: Option<&str>,
+    ) -> Option<String> {
+        keyboard_observation_display(
+            displays(),
+            foreground,
+            || foreground_display.map(str::to_owned),
+            || target_display.map(str::to_owned),
+        )
+        .map(|display| display.id)
+    }
+
+    #[test]
+    fn an_unlisted_popup_on_a_secondary_display_is_observed_there() {
+        let chosen = keyboard_observation_display(
+            displays(),
+            Some(&popup()),
+            || Some(SECONDARY.to_ascii_lowercase()),
+            || Some(PRIMARY.to_owned()),
+        )
+        .unwrap();
+        assert_eq!(chosen.id, SECONDARY);
+        assert_eq!((chosen.bounds.left, chosen.bounds.top), (-1920, -200));
+    }
+
+    #[test]
+    fn a_listed_window_is_observed_on_its_own_display_without_a_lookup() {
+        let observed = keyboard_observation_display(
+            displays(),
+            Some(&listed(SECONDARY)),
+            || panic!("a listed window already names its display"),
+            || panic!("the target is not needed when the foreground is known"),
+        );
+        assert_eq!(
+            observed.map(|display| display.id).as_deref(),
+            Some(SECONDARY)
+        );
+        assert_eq!(
+            chosen(Some(&listed(PRIMARY)), Some(SECONDARY), Some(SECONDARY)),
+            Some(PRIMARY.to_owned())
+        );
+    }
+
+    #[test]
+    fn without_a_foreground_window_the_session_target_display_is_observed() {
+        assert_eq!(
+            chosen(None, None, Some(SECONDARY)),
+            Some(SECONDARY.to_owned())
+        );
+        // An unlisted window that Windows cannot locate counts as no foreground window.
+        assert_eq!(
+            chosen(Some(&popup()), None, Some(SECONDARY)),
+            Some(SECONDARY.to_owned())
+        );
+    }
+
+    #[test]
+    fn without_a_foreground_window_or_session_the_primary_display_is_observed() {
+        assert_eq!(chosen(None, None, None), Some(PRIMARY.to_owned()));
+        assert_eq!(chosen(Some(&popup()), None, None), Some(PRIMARY.to_owned()));
+        // A display that is no longer active is skipped like an unknown one.
+        assert_eq!(
+            chosen(Some(&popup()), Some(r"\\.\DISPLAY9"), Some(r"\\.\DISPLAY8")),
+            Some(PRIMARY.to_owned())
+        );
+    }
+
+    #[test]
+    fn no_display_is_chosen_without_a_primary_display_to_fall_back_to() {
+        let secondary_only: Vec<_> = displays()
+            .into_iter()
+            .filter(|display| !display.is_primary)
+            .collect();
+        assert!(keyboard_observation_display(secondary_only, None, || None, || None).is_none());
     }
 }

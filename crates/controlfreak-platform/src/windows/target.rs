@@ -1189,6 +1189,15 @@ pub(super) fn approved_process_id(control: &MutationControl) -> Option<u32> {
         .map(|reference| reference.identity.pid)
 }
 
+/// Window handle of the approved window, from its reference; `None` without an approved window
+/// or once its reference is gone. The handle is not revalidated, so use it only to locate the
+/// window, never to send it input.
+pub(super) fn approved_window_handle(control: &MutationControl) -> Option<HWND> {
+    lookup(&control.approved_target()?)
+        .ok()
+        .map(|reference| HWND(reference.identity.hwnd as *mut std::ffi::c_void))
+}
+
 /// Records after an action whether the approved target, or a window of its own process, still
 /// holds the foreground. A target that is gone or changed identity ends the session's approval;
 /// a target that merely lost the foreground to another process does not, because the next action
