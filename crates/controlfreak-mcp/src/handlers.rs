@@ -1,6 +1,7 @@
 use controlfreak_core::{
-    ActionObservation, InputOutcome, KeyboardActionResult, MutationControl, MutationProgress,
-    ObservationMode, ObservationOptions, PlatformError,
+    ActionObservation, CleanupStatus, FailureCause, InputOutcome, KeyboardActionResult,
+    MutationControl, MutationProgress, ObservationMode, ObservationOptions, PlatformError,
+    limits::DEFAULT_QUIET_SETTLE_MS,
 };
 
 use super::observations::{resolve_display, resolve_observation};
@@ -965,6 +966,9 @@ pub(super) fn prepare_run_actions(
         }
     }
     let final_observation: ObservationOptions = input.observation.into();
+    let budget = input
+        .timeout_ms
+        .map(|timeout_ms| Duration::from_millis(timeout_ms.into()));
     let target_ref = input.target_ref;
     Ok(run_with_lease(move |backend, operation_lease| async move {
         let reports = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
@@ -980,6 +984,7 @@ pub(super) fn prepare_run_actions(
                     backend.as_ref(),
                     &steps,
                     &final_observation,
+                    budget,
                     control,
                     &worker_reports,
                 )
@@ -1064,43 +1069,48 @@ fn run_steps(
     backend: &dyn PlatformBackend,
     steps: &[ActionStep],
     final_observation: &ObservationOptions,
+    budget: Option<Duration>,
     control: &MutationControl,
     reports: &std::sync::Mutex<Vec<Value>>,
 ) -> Result<ActionObservation, PlatformError> {
+    // The batch's `timeout_ms` counts from here, once the batch holds the desktop.
+    let deadline = budget.map(|budget| Instant::now() + budget);
     let report = |value: Value| {
         reports
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(value);
     };
-    let resolved = resolve_points(backend, steps)?;
-    let quiet = ObservationOptions {
-        mode: ObservationMode::None,
-        ..ObservationOptions::default()
+    // A skipped step sent nothing, so it left nothing held.
+    let skip_after = |index: usize| {
+        for (skipped, step) in steps.iter().enumerate().skip(index + 1) {
+            report(
+                json!({ "index": skipped, "action": step.kind(), "status": "skipped", "sent_events": 0, "cleanup": CleanupStatus::NotNeeded }),
+            );
+        }
     };
+    let resolved = resolve_points(backend, steps)?;
     let mut observation = None;
     for (index, (step, point)) in steps.iter().zip(resolved).enumerate() {
+        // Whole milliseconds left of the batch's budget. Each step gets at most this.
+        let remaining_ms = deadline.map(|deadline| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX)
+        });
         if let ActionStep::Wait { wait_ms } = step {
             // A wait sends no input and is never the last step, so it needs no evidence.
-            let outcome = control
-                .check("run_actions")
-                .and_then(|()| pause(*wait_ms, control));
-            match outcome {
+            match run_wait(*wait_ms, remaining_ms, index, control) {
                 Ok(()) => {
                     report(
-                        json!({ "index": index, "action": "wait", "status": "completed", "sent_events": 0 }),
+                        json!({ "index": index, "action": "wait", "status": "completed", "sent_events": 0, "cleanup": CleanupStatus::NotNeeded }),
                     );
                     continue;
                 }
                 Err(error) => {
                     report(
-                        json!({ "index": index, "action": "wait", "status": "failed", "sent_events": 0, "error": error.to_string() }),
+                        json!({ "index": index, "action": "wait", "status": "failed", "sent_events": 0, "cleanup": CleanupStatus::NotNeeded, "error": error.to_string() }),
                     );
-                    for (skipped, step) in steps.iter().enumerate().skip(index + 1) {
-                        report(
-                            json!({ "index": skipped, "action": step.kind(), "status": "skipped", "sent_events": 0 }),
-                        );
-                    }
+                    skip_after(index);
                     if index > 0 {
                         control.steps_incomplete();
                     }
@@ -1108,47 +1118,49 @@ fn run_steps(
                 }
             }
         }
-        let options = if index + 1 == steps.len() {
-            final_observation.clone()
-        } else {
-            quiet.clone()
-        };
+        let last = index + 1 == steps.len();
         let before = control.progress();
-        let outcome = control
-            .check("run_actions")
-            .and_then(|()| run_step(backend, step, point, options, control));
+        let outcome = run_budgeted_step(
+            backend,
+            step,
+            point,
+            last.then_some(final_observation),
+            remaining_ms,
+            index,
+            control,
+        );
         let after = control.progress();
         let sent_events = after.sent_events.saturating_sub(before.sent_events);
         // Typing that stopped between the halves of a surrogate pair says so on its own step,
         // as it does in the batch's `input`.
         let split_character = after.split_character && !before.split_character;
+        // What the single tool reports as `input.cleanup`: whether the step's input was released.
+        // A step that sends nothing keeps the earlier step's value, which is `not_needed`
+        // because the batch only goes on after a completed step.
+        let cleanup = after.cleanup;
         match outcome {
             Ok(step_observation) => {
                 report(
-                    json!({ "index": index, "action": step.kind(), "status": "completed", "sent_events": sent_events, "settle": step_observation.settle, "foreground_window": super::results::foreground_window(step_observation.foreground_window.as_ref()) }),
+                    json!({ "index": index, "action": step.kind(), "status": "completed", "sent_events": sent_events, "cleanup": cleanup, "settle": step_observation.settle, "foreground_window": super::results::foreground_window(step_observation.foreground_window.as_ref()) }),
                 );
                 observation = Some(step_observation);
             }
             Err(error) => {
                 let observation_failed =
                     matches!(error, PlatformError::PostActionObservationFailed { .. });
-                if observation_failed && index + 1 == steps.len() {
+                if observation_failed && last {
                     // Every step's input was sent; only the final evidence is missing.
                     report(
-                        json!({ "index": index, "action": step.kind(), "status": "completed", "sent_events": sent_events, "error": error.to_string() }),
+                        json!({ "index": index, "action": step.kind(), "status": "completed", "sent_events": sent_events, "cleanup": cleanup, "error": error.to_string() }),
                     );
                     return Err(error);
                 }
-                let mut failed = json!({ "index": index, "action": step.kind(), "status": "failed", "sent_events": sent_events, "error": error.to_string() });
+                let mut failed = json!({ "index": index, "action": step.kind(), "status": "failed", "sent_events": sent_events, "cleanup": cleanup, "error": error.to_string() });
                 if split_character {
                     failed["split_character"] = json!(true);
                 }
                 report(failed);
-                for (skipped, step) in steps.iter().enumerate().skip(index + 1) {
-                    report(
-                        json!({ "index": skipped, "action": step.kind(), "status": "skipped", "sent_events": 0 }),
-                    );
-                }
+                skip_after(index);
                 if index > 0 || observation_failed {
                     control.steps_incomplete();
                 }
@@ -1187,11 +1199,84 @@ fn pause(wait_ms: u32, control: &MutationControl) -> Result<(), PlatformError> {
     }
 }
 
+/// Runs wait step `index` within `remaining_ms` of the batch's budget.
+fn run_wait(
+    wait_ms: u32,
+    remaining_ms: Option<u32>,
+    index: usize,
+    control: &MutationControl,
+) -> Result<(), PlatformError> {
+    control.check("run_actions")?;
+    match remaining_ms {
+        // A wait that ends at the deadline leaves no time for the input step after it, so the
+        // batch stops now instead of holding the desktop for nothing.
+        Some(remaining_ms) if wait_ms >= remaining_ms => Err(batch_deadline_reached(index)),
+        _ => pause(wait_ms, control),
+    }
+}
+
+/// Runs input step `index` within `remaining_ms` of the batch's budget. Only the last step gets
+/// `final_observation`; an earlier one takes no screenshot.
+fn run_budgeted_step(
+    backend: &dyn PlatformBackend,
+    step: &ActionStep,
+    point: Option<ResolvedPoint>,
+    final_observation: Option<&ObservationOptions>,
+    remaining_ms: Option<u32>,
+    index: usize,
+    control: &MutationControl,
+) -> Result<ActionObservation, PlatformError> {
+    control.check("run_actions")?;
+    if remaining_ms == Some(0) {
+        return Err(batch_deadline_reached(index));
+    }
+    let options = final_observation
+        .cloned()
+        .unwrap_or_else(|| ObservationOptions {
+            mode: ObservationMode::None,
+            // An earlier step's settle wait is cut to the time left when the step starts. The
+            // backend starts the wait after the input, so a step that ends just before the
+            // deadline can settle past it by up to this cap; the next step then fails. The last
+            // step's settle wait and screenshot keep their own limits, as after a `type_text`
+            // deadline.
+            settle_ms: remaining_ms.map(|remaining_ms| remaining_ms.min(DEFAULT_QUIET_SETTLE_MS)),
+            ..ObservationOptions::default()
+        });
+    // When the batch's time is shorter than the step's own `timeout_ms`, a deadline the step
+    // reaches is the batch's.
+    let batch_limits_step = matches!(step, ActionStep::TypeText { timeout_ms, .. }
+        if remaining_ms.is_some_and(|remaining| timeout_ms.is_none_or(|own| remaining < own)));
+    run_step(backend, step, point, options, remaining_ms, control).map_err(|error| match error {
+        PlatformError::Failed {
+            cause: FailureCause::DeadlineReached,
+            ..
+        } if batch_limits_step => batch_deadline_reached(index),
+        other => other,
+    })
+}
+
+/// Step `index` could not finish within the batch's `timeout_ms`. Earlier steps may have sent
+/// input, so repeating the batch is unsafe.
+fn batch_deadline_reached(index: usize) -> PlatformError {
+    PlatformError::failed(
+        FailureCause::DeadlineReached,
+        "run_actions",
+        format!(
+            "step {index} could not finish within the batch's timeout_ms, so it stopped and later \
+             steps were skipped; action.steps shows what each step sent, so observe the target \
+             before continuing"
+        ),
+    )
+}
+
+/// Runs one input step. `budget_ms` is what is left of the batch's `timeout_ms`; it caps a
+/// `type_text` step's own limit, the only step that runs long.
 fn run_step(
     backend: &dyn PlatformBackend,
     step: &ActionStep,
     point: Option<(String, u32, u32)>,
     observation: ObservationOptions,
+    budget_ms: Option<u32>,
     control: &MutationControl,
 ) -> Result<ActionObservation, PlatformError> {
     let missing_point = || PlatformError::InvalidArgument {
@@ -1245,7 +1330,13 @@ fn run_step(
             .type_text_controlled(
                 &TextInputRequest {
                     text: text.clone(),
-                    timeout_ms: *timeout_ms,
+                    // A relative limit: the backend starts it when typing starts, after its input
+                    // lock, target check and settle baseline, so those can run past the batch's
+                    // deadline before the first keystroke.
+                    timeout_ms: match (*timeout_ms, budget_ms) {
+                        (Some(own), Some(budget)) => Some(own.min(budget)),
+                        (own, budget) => own.or(budget),
+                    },
                     observation,
                 },
                 control,

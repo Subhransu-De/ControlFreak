@@ -795,6 +795,9 @@ pub(super) const MAX_RUN_ACTION_STEPS: usize = 16;
 pub(super) struct RunActionsInput {
     pub(super) target_ref: String,
     steps: Vec<ActionStepInput>,
+    /// Longest time the whole batch may take, in milliseconds. `None` sets no limit.
+    #[serde(default)]
+    pub(super) timeout_ms: Option<u32>,
     #[serde(default)]
     pub(super) observation: ObservationInput,
 }
@@ -1245,6 +1248,8 @@ impl RunActionsInput {
                 ),
             });
         }
+        // The batch takes the same range as a `type_text` step, which it caps.
+        controlfreak_core::validate_text_timeout(self.timeout_ms)?;
         // Only the last step uses these options, so the backend would check them after earlier
         // steps had already sent input.
         self.observation.check_limits()?;

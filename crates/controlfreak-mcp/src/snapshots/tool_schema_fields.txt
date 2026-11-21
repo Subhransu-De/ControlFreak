@@ -1328,6 +1328,7 @@ run_actions input steps[].wait_ms
 run_actions input steps[].x
 run_actions input steps[].y
 run_actions input target_ref required
+run_actions input timeout_ms
 run_actions output anyOf[0].action required
 run_actions output anyOf[0].input required
 run_actions output anyOf[0].input.input_outcome
