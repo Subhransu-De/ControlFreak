@@ -242,6 +242,7 @@ impl WindowBackend for ObservationBackend {
             image_height: 5,
             cursor_marker: true,
             capture_method: "windows_print_window",
+            included_windows: None,
         })
     }
     fn wait_for_window(

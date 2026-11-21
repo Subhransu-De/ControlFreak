@@ -16,6 +16,7 @@ use super::{
 use controlfreak_core::{
     DpiAwareness, DpiAwarenessStatus, FailureCause, ForegroundWindow, UnlistedWindow,
 };
+use windows::Win32::UI::WindowsAndMessaging::{GWL_STYLE, WS_POPUP};
 
 pub(super) fn foreground_window_handle() -> HWND {
     // SAFETY: GetForegroundWindow has no pointer parameters and returns either a valid handle or
@@ -746,6 +747,168 @@ pub(super) fn resolve_window_reference(window_id: &str) -> Result<(HWND, u32), P
     super::target::resolve(window_id)
 }
 
+/// Class of the popup menus Windows creates in the process that opens them.
+const MENU_CLASS: &str = "#32768";
+/// Class of the list a drop-down combo box opens as a top-level window.
+const DROP_DOWN_LIST_CLASS: &str = "ComboLBox";
+/// Most popups one window capture shows. Each one is a bounded render, so this bounds the call;
+/// a cascade of submenus stays well below it.
+pub(super) const MAX_CAPTURED_POPUPS: usize = 8;
+/// Owner links followed to find whether a popup belongs to the captured window.
+const MAX_OWNER_DEPTH: usize = 32;
+
+/// What makes a top-level window one of a captured window's popups, apart from the same-process
+/// rule: a menu or drop-down list, or an untitled `WS_POPUP` window whose owner chain reaches the
+/// captured window.
+struct PopupTraits<'a> {
+    class: &'a str,
+    titled: bool,
+    popup_style: bool,
+    owned_by_target: bool,
+}
+
+fn is_popup_kind(traits: &PopupTraits<'_>) -> bool {
+    traits.class == MENU_CLASS
+        || traits.class == DROP_DOWN_LIST_CLASS
+        || (!traits.titled && traits.popup_style && traits.owned_by_target)
+}
+
+unsafe extern "system" fn collect_window_handle(hwnd: HWND, data: LPARAM) -> BOOL {
+    // SAFETY: `data` was created from the unique mutable `Vec<HWND>` reference passed to
+    // synchronous EnumWindows and remains valid for the complete callback invocation.
+    let handles = unsafe { &mut *(data.0 as *mut Vec<HWND>) };
+    handles.push(hwnd);
+    BOOL::from(handles.len() < MAX_WINDOW_CANDIDATES)
+}
+
+/// Whether `owner` is in `hwnd`'s owner chain.
+fn owned_by(hwnd: HWND, owner: HWND) -> bool {
+    let mut current = hwnd;
+    for _ in 0..MAX_OWNER_DEPTH {
+        // SAFETY: GetWindow only reads a borrowed handle; GW_OWNER returns another opaque handle.
+        match unsafe { GetWindow(current, GW_OWNER) } {
+            Ok(next) if !next.is_invalid() => {
+                if next == owner {
+                    return true;
+                }
+                current = next;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Visible and not cloaked by the compositor, such as a window on another virtual desktop.
+fn is_shown(hwnd: HWND) -> bool {
+    // SAFETY: This predicate only inspects the opaque Windows-owned handle and retains no pointers.
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return false;
+    }
+    let mut cloaked = 0_u32;
+    // SAFETY: `cloaked` is a correctly sized writable u32 and remains alive for the call.
+    let cloaked_result = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            (&raw mut cloaked).cast::<c_void>(),
+            u32::try_from(size_of::<u32>()).unwrap_or(4),
+        )
+    };
+    !(cloaked_result.is_ok() && cloaked != 0)
+}
+
+/// Describes `hwnd` as a popup of `target` (reference `target_id`), or `None` if it is not one.
+/// A popup must belong to the target's application by the same rule that admits input to it, so
+/// a window of another process is never one, and a shell-host target keeps its narrow rule.
+fn describe_popup(
+    hwnd: HWND,
+    target: HWND,
+    target_id: &str,
+    target_process: u32,
+) -> Option<controlfreak_core::PopupWindow> {
+    if hwnd == target || window_process_id(hwnd) != Some(target_process) || !is_shown(hwnd) {
+        return None;
+    }
+    let class_name = window_class_name(hwnd).ok()?;
+    // SAFETY: `hwnd` came from the current enumeration; the call has no output pointer.
+    let titled = unsafe { GetWindowTextLengthW(hwnd) } > 0;
+    // SAFETY: `hwnd` came from the current enumeration and GWL_STYLE requests an integer value.
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
+    let popup_style = style & isize::try_from(WS_POPUP.0).unwrap_or(isize::MAX) != 0;
+    let traits = PopupTraits {
+        class: &class_name,
+        titled,
+        popup_style,
+        owned_by_target: owned_by(hwnd, target),
+    };
+    if !is_popup_kind(&traits) || !super::target::window_serves_target(target_id, hwnd) {
+        return None;
+    }
+    let rect = visible_window_bounds(hwnd).ok()?;
+    let width = u32::try_from(rect.right.checked_sub(rect.left)?).ok()?;
+    let height = u32::try_from(rect.bottom.checked_sub(rect.top)?).ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(controlfreak_core::PopupWindow {
+        class_name,
+        process_id: target_process,
+        bounds: WindowBounds {
+            left: rect.left,
+            top: rect.top,
+            width,
+            height,
+        },
+        instance: hwnd.0 as u64,
+    })
+}
+
+/// The visible popups of `target` (reference `target_id`), bottom first, so the topmost popup is
+/// last. At most `MAX_CAPTURED_POPUPS`, the topmost ones.
+pub(super) fn window_popups(
+    target: HWND,
+    target_id: &str,
+) -> Result<Vec<(HWND, controlfreak_core::PopupWindow)>, PlatformError> {
+    let _timer = controlfreak_core::timing::start("enumerate_popups");
+    let target_process = window_process_id(target)
+        .ok_or_else(|| window_not_available("window process ID is unavailable"))?;
+    let mut handles = Vec::new();
+    // SAFETY: The LPARAM points to `handles`, which remains uniquely borrowed for this
+    // synchronous enumeration. The callback only pushes handle values into it.
+    let result = unsafe {
+        EnumWindows(
+            Some(collect_window_handle),
+            LPARAM((&raw mut handles).cast::<c_void>() as isize),
+        )
+    };
+    // EnumWindows reports failure when the callback stops early at the candidate cap.
+    if handles.len() < MAX_WINDOW_CANDIDATES {
+        result.map_err(|error| win32_error("EnumWindows", &error))?;
+    }
+    Ok(popups_above(handles, target, |hwnd| {
+        describe_popup(hwnd, target, target_id, target_process)
+    }))
+}
+
+/// The described popups among `handles` (in z-order from the top, as `EnumWindows` gives them)
+/// that lie above `target`, bottom first and at most `MAX_CAPTURED_POPUPS`, the topmost ones. A
+/// popup below the target belongs to another window and would be drawn over the target.
+fn popups_above<T>(
+    handles: Vec<HWND>,
+    target: HWND,
+    mut describe: impl FnMut(HWND) -> Option<T>,
+) -> Vec<(HWND, T)> {
+    let mut popups: Vec<_> = handles
+        .into_iter()
+        .take_while(|hwnd| *hwnd != target)
+        .filter_map(|hwnd| describe(hwnd).map(|popup| (hwnd, popup)))
+        .take(MAX_CAPTURED_POPUPS)
+        .collect();
+    popups.reverse();
+    popups
+}
+
 fn window_not_available(reason: &str) -> PlatformError {
     PlatformError::InvalidArgument {
         argument: "window".to_owned(),
@@ -813,6 +976,50 @@ mod switch_result_tests {
 #[cfg(test)]
 mod enumeration_tests {
     use super::*;
+
+    #[test]
+    fn menus_and_drop_down_lists_are_popups_and_other_windows_only_when_untitled_owned_popups() {
+        let kind = |class: &str, titled: bool, popup_style: bool, owned_by_target: bool| {
+            is_popup_kind(&PopupTraits {
+                class,
+                titled,
+                popup_style,
+                owned_by_target,
+            })
+        };
+        assert!(kind(MENU_CLASS, false, true, false));
+        assert!(kind(DROP_DOWN_LIST_CLASS, false, true, false));
+        assert!(kind("Chrome_WidgetWin_1", false, true, true));
+        // A titled window is a dialog or another top-level window, not a popup.
+        assert!(!kind("Chrome_WidgetWin_1", true, true, true));
+        assert!(!kind("Chrome_WidgetWin_1", false, false, true));
+        // An untitled popup of the same process that the window does not own belongs to another
+        // of its windows.
+        assert!(!kind("Chrome_WidgetWin_1", false, true, false));
+    }
+
+    #[test]
+    fn only_popups_above_the_window_are_taken_bottom_first_and_bounded() {
+        let handle = |value: usize| HWND(value as *mut c_void);
+        // z-order from the top: two popups, a plain window, the target, then a popup below it.
+        let handles = [1, 2, 3, 10, 4].map(handle).to_vec();
+        let popups = popups_above(handles, handle(10), |hwnd| {
+            (hwnd != handle(3)).then_some(hwnd.0 as usize)
+        });
+        assert_eq!(
+            popups.iter().map(|(_, value)| *value).collect::<Vec<_>>(),
+            [2, 1]
+        );
+        // Many popups: the topmost ones are kept.
+        let many: Vec<_> = (1..=20).map(handle).chain([handle(100)]).collect();
+        let kept = popups_above(many, handle(100), |hwnd| Some(hwnd.0 as usize));
+        assert_eq!(kept.len(), MAX_CAPTURED_POPUPS);
+        assert_eq!(
+            kept.first().map(|(_, value)| *value),
+            Some(MAX_CAPTURED_POPUPS)
+        );
+        assert_eq!(kept.last().map(|(_, value)| *value), Some(1));
+    }
 
     #[test]
     fn shared_reference_failures_abort_instead_of_reporting_an_empty_desktop() {

@@ -66,6 +66,31 @@ pub struct CaptureWindowRequest {
     pub window_id: String,
     pub max_width: Option<u32>,
     pub include_cursor: bool,
+    /// Also capture the window's own visible menus, drop-down lists and untitled popups.
+    #[serde(default)]
+    pub include_popups: bool,
+}
+
+/// A popup of a captured window's application: a menu, a drop-down list or an untitled popup.
+/// Popups have no target reference and their titles are never reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PopupWindow {
+    pub class_name: String,
+    pub process_id: u32,
+    pub bounds: WindowBounds,
+    /// Tells this popup from a later one of the same class, process and bounds, such as another
+    /// menu opened in the same place. Opaque and backend-defined; never reported to clients.
+    #[serde(skip)]
+    pub instance: u64,
+}
+
+/// A popup shown in a window screenshot, with how its pixels were produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncludedWindow {
+    pub window: PopupWindow,
+    /// `windows_print_window` when the popup rendered itself, `windows_gdi` when its screen
+    /// rectangle was copied.
+    pub capture_method: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +106,9 @@ pub struct WindowScreenshot {
     /// How the pixels were produced, for example `windows_print_window` when the window rendered
     /// itself or `windows_gdi` when its screen rectangle was copied.
     pub capture_method: &'static str,
+    /// The popups in the image, topmost last, when the request included popups; `None` otherwise.
+    /// `source_bounds` then covers the window and these popups.
+    pub included_windows: Option<Vec<IncludedWindow>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

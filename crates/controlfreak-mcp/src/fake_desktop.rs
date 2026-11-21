@@ -21,11 +21,11 @@ use controlfreak_core::{
     BackendMetadata, CapabilityDescriptor, CaptureWindowRequest, DisplayBackend, DisplayBounds,
     DisplayInfo, DisplayLayout, ElementBounds, ElementInfo, ElementPattern, ElementQueryCounts,
     ElementQueryStatus, ElementRole, FindElementsRequest, FindElementsResult, FocusWindowRequest,
-    ForegroundWindow, KeyChordRequest, KeyboardActionResult, KeyboardBackend, MouseClickRequest,
-    MousePosition, MutationControl, OcrBackend, PermissionDescriptor, Platform, PlatformError,
-    PointerActionResult, PointerBackend, TextInputRequest, UnlistedWindow, WaitForWindowRequest,
-    WindowBackend, WindowBounds, WindowFocusResult, WindowInfo, WindowList, WindowScreenshot,
-    WindowWaitResult,
+    ForegroundWindow, IncludedWindow, KeyChordRequest, KeyboardActionResult, KeyboardBackend,
+    MouseClickRequest, MousePosition, MutationControl, OcrBackend, PermissionDescriptor, Platform,
+    PlatformError, PointerActionResult, PointerBackend, PopupWindow, TextInputRequest,
+    UnlistedWindow, WaitForWindowRequest, WindowBackend, WindowBounds, WindowFocusResult,
+    WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
 };
 use std::sync::Mutex;
 
@@ -131,6 +131,26 @@ impl State {
     fn next_key(&self) -> u32 {
         u32::try_from(self.windows.len()).unwrap_or(u32::MAX) + 1
     }
+
+    /// The open untitled popups owned by `target` in its own process, oldest (bottom) first, as
+    /// `capture_window` with `include_popups` shows them. Another process's popup is never one.
+    fn popups(&self, target: &FakeWindow) -> Vec<PopupWindow> {
+        self.windows
+            .iter()
+            .filter(|window| {
+                window.open
+                    && window.title.is_empty()
+                    && window.owner == Some(target.key)
+                    && window.process_id == target.process_id
+            })
+            .map(|window| PopupWindow {
+                class_name: class_name(window).into(),
+                process_id: window.process_id,
+                bounds: window.bounds,
+                instance: u64::from(window.key),
+            })
+            .collect()
+    }
 }
 
 fn display() -> DisplayInfo {
@@ -213,6 +233,22 @@ impl FakeDesktop {
     /// Makes every window's UI Automation provider stop answering.
     pub(super) fn stop_accessibility(&self) {
         self.state().accessibility_unavailable = true;
+    }
+
+    /// Opens an untitled popup at `bounds`, owned by `owner` but in process `process_id`, in the
+    /// foreground. A popup of another process models a window that only looks related.
+    pub(super) fn open_popup(&self, owner: u32, process_id: u32, bounds: WindowBounds) -> u32 {
+        let mut state = self.state();
+        let key = state.next_key();
+        state.add(FakeWindow {
+            key,
+            title: String::new(),
+            process_id,
+            owner: Some(owner),
+            bounds,
+            checked: bounds,
+            open: true,
+        })
     }
 
     /// Changes the window's size. Its reference stays, as for the same window on Windows.
@@ -411,16 +447,53 @@ impl WindowBackend for FakeDesktop {
         let window = state
             .resolve(&request.window_id)
             .ok_or_else(unknown_reference)?;
+        let popups = if request.include_popups {
+            Some(state.popups(window))
+        } else {
+            None
+        };
+        // The window and its popups; the fake display holds them all, so nothing is clipped.
+        let source_bounds = popups.iter().flatten().fold(window.bounds, |area, popup| {
+            let (left, top) = (
+                area.left.min(popup.bounds.left),
+                area.top.min(popup.bounds.top),
+            );
+            let right = (area.left + area.width.cast_signed())
+                .max(popup.bounds.left + popup.bounds.width.cast_signed());
+            let bottom = (area.top + area.height.cast_signed())
+                .max(popup.bounds.top + popup.bounds.height.cast_signed());
+            WindowBounds {
+                left,
+                top,
+                width: (right - left).cast_unsigned(),
+                height: (bottom - top).cast_unsigned(),
+            }
+        });
         Ok(WindowScreenshot {
             window: info(window, &state),
-            source_bounds: window.bounds,
+            source_bounds,
             display_layout: DisplayLayout::from_displays(&[display()]),
             png: vec![1, 2, 3],
-            image_width: window.bounds.width,
-            image_height: window.bounds.height,
+            image_width: source_bounds.width,
+            image_height: source_bounds.height,
             cursor_marker: false,
             capture_method: "windows_print_window",
+            included_windows: popups.map(|popups| {
+                popups
+                    .into_iter()
+                    .map(|window| IncludedWindow {
+                        window,
+                        capture_method: "windows_print_window",
+                    })
+                    .collect()
+            }),
         })
+    }
+
+    fn window_popups(&self, window_id: &str) -> Result<Vec<PopupWindow>, PlatformError> {
+        let state = self.state();
+        let window = state.resolve(window_id).ok_or_else(unknown_reference)?;
+        Ok(state.popups(window))
     }
 
     fn focus_window_controlled(

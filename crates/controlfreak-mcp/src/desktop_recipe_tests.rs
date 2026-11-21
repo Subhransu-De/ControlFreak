@@ -4,7 +4,7 @@
 use super::fake_desktop::{FakeDesktop, Received};
 use super::session_error_tests::{Harness, call, harness_with_backend};
 use super::*;
-use controlfreak_core::ActivationHelperOutcome;
+use controlfreak_core::{ActivationHelperOutcome, WindowBounds};
 
 async fn start(desktop: &Arc<FakeDesktop>) -> Harness {
     harness_with_backend(desktop.clone(), Arc::new(AtomicBool::new(false))).await
@@ -503,5 +503,156 @@ async fn every_run_actions_input_step_reports_the_window_in_front() {
     // A wait sends no input and reads nothing; the step after it reports the window in front.
     assert!(steps[1].get("foreground_window").is_none(), "{result}");
     assert_eq!(steps[2]["foreground_window"], popup, "{result}");
+    harness.finish().await;
+}
+
+fn window_bounds(left: i32, top: i32, width: u32, height: u32) -> WindowBounds {
+    WindowBounds {
+        left,
+        top,
+        width,
+        height,
+    }
+}
+
+/// A capture's structured result after checking it against the tool's full output schema.
+fn window_capture(result: &Value) -> Value {
+    accepted(result);
+    let structured = result["structuredContent"].clone();
+    let validator = super::output_schema_tests::full_validator(CAPTURE_WINDOW);
+    if let Err(error) = validator.validate(&structured) {
+        panic!("capture_window result does not match its schema: {error}: {structured}");
+    }
+    structured
+}
+
+#[tokio::test]
+async fn a_capture_with_popups_covers_a_same_process_popup_outside_the_window_and_maps_into_it() {
+    let desktop = FakeDesktop::new();
+    // The editor is at (100, 100) and 800 x 600, so it ends at x = 900.
+    let app = desktop.open("Editor", 10);
+    let target = desktop.id(app);
+    let mut harness = start(&desktop).await;
+    begin(&mut harness, &target).await;
+    // A window of another process that claims the editor as its owner is never included.
+    desktop.open_popup(app, 20, window_bounds(40, 760, 100, 100));
+    // A menu that opens past the editor's right edge.
+    let menu = desktop.open_popup(app, 10, window_bounds(850, 300, 200, 150));
+
+    let capture = window_capture(
+        &call(
+            &mut harness,
+            CAPTURE_WINDOW,
+            json!({"window_id": target, "include_popups": true}),
+        )
+        .await,
+    );
+    assert_eq!(
+        capture["source_bounds"],
+        json!({"left": 100, "top": 100, "width": 950, "height": 600}),
+        "{capture}"
+    );
+    assert_eq!(
+        capture["included_windows"],
+        json!([{
+            "class_name": "FakePopup",
+            "process_id": 10,
+            "bounds": {"left": 850, "top": 300, "width": 200, "height": 150},
+            "capture_method": "windows_print_window",
+        }]),
+        "{capture}"
+    );
+    assert_eq!(capture["window"]["id"], target);
+    let point = |image_x: u32, image_y: u32| {
+        json!({
+            "target_ref": target,
+            "observation_id": capture["observation_id"],
+            "image_x": image_x,
+            "image_y": image_y,
+            "observation": {"mode": "none"},
+        })
+    };
+    // (1000, 350) on the screen is inside the menu and outside the editor.
+    accepted(&call(&mut harness, CLICK_MOUSE, point(900, 250)).await);
+    assert_eq!(
+        desktop.received(),
+        [Received::Click {
+            window: menu,
+            x: 1000,
+            y: 350
+        }]
+    );
+
+    desktop.close(menu);
+    let closed = call(&mut harness, CLICK_MOUSE, point(900, 250)).await;
+    assert_eq!(refused_code(&closed), "invalid_argument");
+    assert!(
+        closed
+            .to_string()
+            .contains("popup at this image point closed"),
+        "{closed}"
+    );
+    // Another menu of the same class, process and bounds is not the one in the image.
+    let replacement = desktop.open_popup(app, 10, window_bounds(850, 300, 200, 150));
+    let replaced = call(&mut harness, CLICK_MOUSE, point(900, 250)).await;
+    assert_eq!(refused_code(&replaced), "invalid_argument");
+    desktop.close(replacement);
+    // A point on the editor does not depend on the menu, so it still maps.
+    accepted(&call(&mut harness, CLICK_MOUSE, point(10, 10)).await);
+    assert_eq!(
+        desktop.received()[1..],
+        [Received::Click {
+            window: app,
+            x: 110,
+            y: 110
+        }]
+    );
+    harness.finish().await;
+}
+
+#[tokio::test]
+async fn a_capture_without_include_popups_is_unchanged_while_a_popup_is_open() {
+    let desktop = FakeDesktop::new();
+    let app = desktop.open("Editor", 10);
+    let target = desktop.id(app);
+    desktop.open_popup(app, 10, window_bounds(850, 300, 200, 150));
+    let mut harness = start(&desktop).await;
+    // The image and the structured result without its per-call observation_id.
+    let essence = |result: &Value| {
+        let mut structured = window_capture(result);
+        let id = structured.as_object_mut().unwrap().remove("observation_id");
+        assert!(id.is_some(), "{result}");
+        (result["content"][0].to_string(), structured.to_string())
+    };
+    let default = call(&mut harness, CAPTURE_WINDOW, json!({"window_id": target})).await;
+    let structured = window_capture(&default);
+    let mut fields: Vec<_> = structured.as_object().unwrap().keys().cloned().collect();
+    fields.sort();
+    assert_eq!(
+        fields,
+        [
+            "byte_length",
+            "capture_method",
+            "cursor_marker",
+            "image_height",
+            "image_width",
+            "mime_type",
+            "observation_id",
+            "source_bounds",
+            "window"
+        ],
+        "the result has exactly the fields it had before include_popups"
+    );
+    assert_eq!(
+        structured["source_bounds"],
+        json!({"left": 100, "top": 100, "width": 800, "height": 600})
+    );
+    let explicit = call(
+        &mut harness,
+        CAPTURE_WINDOW,
+        json!({"window_id": target, "include_popups": false}),
+    )
+    .await;
+    assert_eq!(essence(&explicit), essence(&default));
     harness.finish().await;
 }

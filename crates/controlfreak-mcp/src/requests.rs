@@ -635,6 +635,8 @@ pub(super) struct CaptureWindowInput {
     native: bool,
     #[serde(default = "default_true")]
     include_cursor: bool,
+    #[serde(default)]
+    include_popups: bool,
 }
 
 impl CaptureWindowInput {
@@ -647,6 +649,7 @@ impl CaptureWindowInput {
             window_id,
             max_width: capture_width(self.max_width, self.native)?,
             include_cursor: self.include_cursor,
+            include_popups: self.include_popups,
         })
     }
 }

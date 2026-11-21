@@ -19,15 +19,16 @@ use controlfreak_core::{
     CapabilityDescriptor, CapabilityState, CaptureDisplayRequest, CaptureRegionRequest,
     CaptureWindowRequest, ClickTextRequest, ClickTextResult, DisplayBackend, DisplayBounds,
     DisplayInfo, DisplayScreenshot, DisplayServer, FindTextRequest, FindTextResult,
-    FocusWindowRequest, Key, KeyChordRequest, KeyboardActionResult, KeyboardBackend, MouseButton,
-    MouseClickRequest, MouseDragRequest, MouseMoveRequest, MousePosition, MouseScrollRequest,
-    MutationControl, ObservationMode, ObservationOptions, OcrBackend, OcrLine, OcrRegionRequest,
-    OcrResult, OcrWord, PermissionDescriptor, PermissionId, PermissionState, Platform,
-    PlatformError, PointerActionResult, PointerBackend, SecurityContext, TextInputRequest,
-    VirtualDesktopList, VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult, VisualBaseline,
-    VisualBaselineRequest, VisualChangeResult, WaitForChangeSinceRequest, WaitForTextRequest,
-    WaitForTextResult, WaitForVisualChangeRequest, WaitForWindowRequest, WindowBackend,
-    WindowBounds, WindowFocusResult, WindowInfo, WindowList, WindowScreenshot, WindowWaitResult,
+    FocusWindowRequest, IncludedWindow, Key, KeyChordRequest, KeyboardActionResult,
+    KeyboardBackend, MouseButton, MouseClickRequest, MouseDragRequest, MouseMoveRequest,
+    MousePosition, MouseScrollRequest, MutationControl, ObservationMode, ObservationOptions,
+    OcrBackend, OcrLine, OcrRegionRequest, OcrResult, OcrWord, PermissionDescriptor, PermissionId,
+    PermissionState, Platform, PlatformError, PointerActionResult, PointerBackend, PopupWindow,
+    SecurityContext, TextInputRequest, VirtualDesktopList, VirtualDesktopSwitchRequest,
+    VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest, VisualChangeResult,
+    WaitForChangeSinceRequest, WaitForTextRequest, WaitForTextResult, WaitForVisualChangeRequest,
+    WaitForWindowRequest, WindowBackend, WindowBounds, WindowFocusResult, WindowInfo, WindowList,
+    WindowScreenshot, WindowWaitResult,
 };
 use windows::Win32::{
     Foundation::{HWND, LPARAM, POINT, RECT},
@@ -945,6 +946,86 @@ impl OcrBackend for Backend {
     }
 }
 
+/// `capture_window` with `include_popups`: the window and its visible popups (see
+/// `desktop::window_popups`), each popup clipped to the window's display. The image covers their
+/// union. Without popups the image is the window alone, captured as without `include_popups`.
+fn capture_window_and_popups(
+    request: &CaptureWindowRequest,
+    window: WindowInfo,
+    hwnd: HWND,
+) -> Result<WindowScreenshot, PlatformError> {
+    let bounds = display_bounds_from_window(window.bounds);
+    let display = find_display(&window.display_id)?;
+    let found = desktop::window_popups(hwnd, &request.window_id)?;
+    let popups: Vec<_> = found
+        .iter()
+        .filter_map(|(popup, info)| {
+            capture::clip_to_display(display_bounds_from_window(info.bounds), display.bounds)
+                .map(|part| (*popup, part, info.clone()))
+        })
+        .collect();
+    let parts: Vec<_> = popups.iter().map(|(_, part, _)| *part).collect();
+    let area = capture::union_bounds(bounds, &parts);
+    let ((capture, popup_methods), display_layout) = on_one_layout(Some(&display), || {
+        if popups.is_empty() {
+            capture_window_bounds(hwnd, bounds, request.max_width, request.include_cursor)
+                .map(|capture| (capture, Vec::new()))
+        } else {
+            let handles: Vec<_> = popups
+                .iter()
+                .map(|(popup, part, _)| (*popup, *part))
+                .collect();
+            capture::capture_window_with_popups(
+                hwnd,
+                bounds,
+                &handles,
+                area,
+                request.max_width,
+                request.include_cursor,
+            )
+        }
+    })?;
+    // As without popups, the image is the window only if it is the same window at the same
+    // place, and its popups only if the same ones are still open where they were.
+    let popups_now: Vec<_> = desktop::window_popups(hwnd, &request.window_id)?
+        .into_iter()
+        .map(|(_, popup)| popup)
+        .collect();
+    let popups_before: Vec<_> = found.into_iter().map(|(_, popup)| popup).collect();
+    if target::issue(hwnd)? != window.id
+        || find_window(&request.window_id)?.bounds != window.bounds
+        || popups_now != popups_before
+    {
+        return Err(target::invalid(
+            "window or popup geometry changed during capture; observe again",
+        ));
+    }
+    let included_windows = popups
+        .into_iter()
+        .zip(popup_methods)
+        .map(|((_, _, popup), capture_method)| IncludedWindow {
+            window: popup,
+            capture_method,
+        })
+        .collect();
+    Ok(WindowScreenshot {
+        source_bounds: WindowBounds {
+            left: area.left,
+            top: area.top,
+            width: area.width,
+            height: area.height,
+        },
+        display_layout,
+        window,
+        png: capture.png,
+        image_width: capture.image_width,
+        image_height: capture.image_height,
+        cursor_marker: capture.cursor_marker,
+        capture_method: capture.capture_method,
+        included_windows: Some(included_windows),
+    })
+}
+
 impl WindowBackend for Backend {
     fn list_windows(&self) -> Result<WindowList, PlatformError> {
         ensure_dpi_awareness()?;
@@ -1105,6 +1186,9 @@ impl WindowBackend for Backend {
         }
         let bounds = display_bounds_from_window(window.bounds);
         let (hwnd, _) = resolve_window_reference(&request.window_id)?;
+        if request.include_popups {
+            return capture_window_and_popups(request, window, hwnd);
+        }
         // The window renders itself, so a window covered by others is captured as itself; a
         // window that cannot is copied from the screen, and `capture_method` says which.
         let (capture, display_layout) = on_one_layout(None, || {
@@ -1129,7 +1213,17 @@ impl WindowBackend for Backend {
             image_height: capture.image_height,
             cursor_marker: capture.cursor_marker,
             capture_method: capture.capture_method,
+            included_windows: None,
         })
+    }
+
+    fn window_popups(&self, window_id: &str) -> Result<Vec<PopupWindow>, PlatformError> {
+        let window = find_window(window_id)?;
+        let (hwnd, _) = resolve_window_reference(&window.id)?;
+        Ok(desktop::window_popups(hwnd, window_id)?
+            .into_iter()
+            .map(|(_, popup)| popup)
+            .collect())
     }
 
     fn wait_for_window(
@@ -1999,6 +2093,7 @@ mod tests {
                     window_id: window.id.clone(),
                     max_width: Some(320),
                     include_cursor: false,
+                    include_popups: false,
                 })
                 .expect("capture visible non-minimized window");
             assert_eq!(screenshot.window.id, window.id);

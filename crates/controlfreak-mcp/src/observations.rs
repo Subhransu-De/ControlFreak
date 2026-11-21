@@ -10,12 +10,15 @@
 //! bounds are compared too, and a stale image is refused instead of mapped onto
 //! whatever now lies under the old rectangle.
 //!
+//! An image of a window with its popups maps a point inside a popup only while that same popup
+//! window is still open with the same bounds, because a closed menu's items are gone.
+//!
 //! Every image also records the display layout it was captured on (display IDs and bounds). A
 //! point maps only while that layout is unchanged: after a display was added, removed or moved,
 //! the old virtual rectangle may lie on another display, so the point is refused instead.
 
 use controlfreak_core::{
-    DisplayBounds, DisplayLayout, ObservationOptions, PlatformBackend, PlatformError,
+    DisplayBounds, DisplayLayout, ObservationOptions, PlatformBackend, PlatformError, PopupWindow,
     WaitForWindowRequest, WindowBounds,
 };
 use std::{
@@ -57,6 +60,15 @@ struct Observation {
 pub(super) struct ShownWindow {
     pub(super) id: String,
     pub(super) bounds: WindowBounds,
+    /// The window's popups in the image; empty unless the capture included popups.
+    pub(super) popups: Vec<PopupWindow>,
+}
+
+fn contains(bounds: WindowBounds, x: i64, y: i64) -> bool {
+    x >= i64::from(bounds.left)
+        && x < i64::from(bounds.left) + i64::from(bounds.width)
+        && y >= i64::from(bounds.top)
+        && y < i64::from(bounds.top) + i64::from(bounds.height)
 }
 
 static OBSERVATIONS: Mutex<VecDeque<Observation>> = Mutex::new(VecDeque::new());
@@ -297,7 +309,7 @@ impl PointerTarget {
         }
         // Ask for this one window's reference directly: `list_windows` is capped, so a window
         // missing from that list would otherwise look closed.
-        if let Some(shown) = shown {
+        if let Some(shown) = &shown {
             let unchanged = backend
                 .wait_for_window(&WaitForWindowRequest {
                     window_id: Some(shown.id.clone()),
@@ -317,6 +329,24 @@ impl PointerTarget {
             }
         }
         let (x, y) = to_virtual(&mapping, image_x, image_y)?;
+        // A point on a popup in the image needs that popup to be open where it was. Points
+        // elsewhere do not depend on the popups, so a closed tooltip does not refuse them.
+        if let Some(shown) = &shown {
+            let under: Vec<&PopupWindow> = shown
+                .popups
+                .iter()
+                .filter(|popup| contains(popup.bounds, x, y))
+                .collect();
+            if !under.is_empty() {
+                let open = backend.window_popups(&shown.id)?;
+                if !under.iter().all(|popup| open.contains(popup)) {
+                    return Err(invalid(
+                        "observation_id",
+                        "the popup at this image point closed or moved since the capture; capture the window again",
+                    ));
+                }
+            }
+        }
         let display = displays
             .into_iter()
             .find(|display| {
