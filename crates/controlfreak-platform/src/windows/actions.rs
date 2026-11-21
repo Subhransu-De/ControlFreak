@@ -13,7 +13,7 @@ use super::{
     send_unicode_text, validate_click_request, validate_duration, validate_key_chord,
     validate_modifiers, validate_observation, window_info,
 };
-use controlfreak_core::{SettleOutcome, SettleReport};
+use controlfreak_core::{ElementActionRequest, ElementActionResult, SettleOutcome, SettleReport};
 
 impl PointerBackend for Backend {
     fn move_mouse_controlled(
@@ -315,6 +315,39 @@ impl Backend {
                 )
             }),
         )
+    }
+
+    /// A semantic action on an element of the session's window, under the input lock like any
+    /// input: the target is checked, the window is watched to settle, the helper acts, and the
+    /// foreground evidence is read as after keyboard input.
+    pub(super) fn perform_element_action(
+        &self,
+        request: &ElementActionRequest,
+        control: &MutationControl,
+        environment: &impl super::uia::ActionEnvironment,
+    ) -> Result<ElementActionResult, PlatformError> {
+        const OPERATION: &str = "act_on_element";
+        ensure_dpi_awareness()?;
+        validate_observation(&request.observation)?;
+        request.validate()?;
+        let _guard = self.lock_input(control)?;
+        // Checked here so a refused action reads no settle baseline, and again by the action
+        // itself right before the request goes to the helper.
+        environment.validate(control)?;
+        let watch = settle_watch(control, &request.observation);
+        super::uia::act_on_element(request, control, environment, &self.element_refs)?;
+        let settled = settle(
+            OPERATION,
+            watch,
+            &request.observation,
+            POST_INPUT_SETTLE_MS,
+            control,
+        )?;
+        super::target::evidence(control);
+        let mut observation = observe_foreground(&request.observation, control)
+            .map_err(|error| post_action_error(OPERATION, error.to_string()))?;
+        observation.settle = Some(settled);
+        Ok(ElementActionResult { observation })
     }
 
     pub(super) fn lock_input(

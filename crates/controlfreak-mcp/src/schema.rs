@@ -496,7 +496,7 @@ pub(super) fn find_elements() -> Contract {
         json!({ "type": "integer", "minimum": MIN_ELEMENT_TIMEOUT_MS, "maximum": MAX_ELEMENT_TIMEOUT_MS, "default": DEFAULT_ELEMENT_TIMEOUT_MS }),
     );
     contract(
-        "Read-only, no session: one window's UI Automation controls with role, name, state, patterns and display-local bounds; click inside bounds with click_mouse. Values are never read. status=partial: see limits_reached.",
+        "Read-only, no session: one window's UI Automation controls with role, name, state, patterns and display-local bounds; act with act_on_element, or click inside bounds with click_mouse. Values are never read. status=partial: see limits_reached.",
         object_schema(properties, &[]),
         output_schema(vec![find_elements_output_schema()], false),
     )
@@ -733,6 +733,24 @@ pub(super) fn press_keys() -> Contract {
     contract(
         "Send a key or chord to the approved window. Needs the window in the foreground; if it is not, call focus_window first. Refused if another process took the foreground.",
         object_schema(properties, &["keys"]),
+        action_output_schema(false),
+    )
+}
+
+pub(super) fn act_on_element() -> Contract {
+    let mut properties = JsonObject::new();
+    properties.insert(
+        "element_ref".to_owned(),
+        json!({ "type": "string", "minLength": 1, "description": "From find_elements for the same target_ref." }),
+    );
+    properties.insert(
+        "action".to_owned(),
+        json!({ "type": "string", "enum": ["invoke", "toggle", "expand", "collapse"] }),
+    );
+    add_action_observation(&mut properties);
+    contract(
+        "Invoke, toggle, expand or collapse one element of the approved window through UI Automation, without the pointer. Needs that window itself in the foreground and not minimized. The element is found again first: a stale, ambiguous, disabled or unsupported element is refused, never clicked by coordinates. The application may handle it differently from a click; check the screenshot.",
+        object_schema(properties, &["element_ref", "action"]),
         action_output_schema(false),
     )
 }

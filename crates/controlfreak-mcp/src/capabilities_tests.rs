@@ -211,7 +211,7 @@ fn no_tool_launches_applications_runs_commands_or_reaches_files_or_the_clipboard
         .into_iter()
         .map(|tool| tool.name.to_string())
         .collect();
-    assert_eq!(names.len(), 28);
+    assert_eq!(names.len(), 29);
     for name in &names {
         for fragment in forbidden {
             assert!(!name.contains(fragment), "{name} contains {fragment}");

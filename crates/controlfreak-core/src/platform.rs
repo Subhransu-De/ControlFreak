@@ -3,14 +3,15 @@ use serde::{Deserialize, Serialize};
 use crate::{
     CapabilityDescriptor, CapabilityReport, CaptureDisplayRequest, CaptureRegionRequest,
     CaptureWindowRequest, ClickTextRequest, ClickTextResult, DisplayInfo, DisplayScreenshot,
-    DpiAwarenessStatus, FindElementsRequest, FindElementsResult, FindTextRequest, FindTextResult,
-    FocusWindowRequest, KeyChordRequest, KeyboardActionResult, MouseClickRequest, MouseDragRequest,
-    MouseMoveRequest, MouseScrollRequest, MutationControl, OcrRegionRequest, OcrResult,
-    PermissionDescriptor, PlatformError, PointerActionResult, PopupWindow, RuntimeReadiness,
-    SecurityContext, TextInputRequest, VirtualDesktopList, VirtualDesktopSwitchRequest,
-    VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest, VisualChangeResult,
-    WaitForChangeSinceRequest, WaitForTextRequest, WaitForTextResult, WaitForVisualChangeRequest,
-    WaitForWindowRequest, WindowFocusResult, WindowList, WindowScreenshot, WindowWaitResult,
+    DpiAwarenessStatus, ElementActionRequest, ElementActionResult, FindElementsRequest,
+    FindElementsResult, FindTextRequest, FindTextResult, FocusWindowRequest, KeyChordRequest,
+    KeyboardActionResult, MouseClickRequest, MouseDragRequest, MouseMoveRequest,
+    MouseScrollRequest, MutationControl, OcrRegionRequest, OcrResult, PermissionDescriptor,
+    PlatformError, PointerActionResult, PopupWindow, RuntimeReadiness, SecurityContext,
+    TextInputRequest, VirtualDesktopList, VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult,
+    VisualBaseline, VisualBaselineRequest, VisualChangeResult, WaitForChangeSinceRequest,
+    WaitForTextRequest, WaitForTextResult, WaitForVisualChangeRequest, WaitForWindowRequest,
+    WindowFocusResult, WindowList, WindowScreenshot, WindowWaitResult,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,8 +438,9 @@ pub trait KeyboardBackend {
     }
 }
 
-/// Reads the accessibility tree of one window. Read-only: it changes nothing on the desktop and
-/// claims no control session.
+/// Reads the accessibility tree of one window, and performs semantic actions on its elements.
+/// A query changes nothing on the desktop and claims no control session; an action is a mutation
+/// and runs inside one.
 pub trait AccessibilityBackend {
     fn find_elements_controlled(
         &self,
@@ -448,6 +450,17 @@ pub trait AccessibilityBackend {
         Err(PlatformError::unsupported(
             "find_elements",
             "the active platform backend has no accessibility-tree implementation",
+        ))
+    }
+
+    fn act_on_element_controlled(
+        &self,
+        _request: &ElementActionRequest,
+        _control: &MutationControl,
+    ) -> Result<ElementActionResult, PlatformError> {
+        Err(PlatformError::unsupported(
+            "act_on_element",
+            "the active platform backend has no semantic-action implementation",
         ))
     }
 }

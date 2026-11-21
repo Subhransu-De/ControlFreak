@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+mod act_on_element_tests;
 mod arguments;
 #[cfg(test)]
 mod begin_cancel_tests;
@@ -38,9 +40,9 @@ mod stop_tests;
 
 use diagnostics::Diagnostics;
 use requests::{
-    BeginControlSessionInput, CaptureDisplayInput, CaptureRegionInput, CaptureWindowInput,
-    ClickMouseInput, ClickTextInput, DragMouseInput, FindElementsInput, FindTextInput,
-    FocusWindowInput, MoveMouseInput, NoArguments, OcrRegionInput, PressKeysInput,
+    ActOnElementInput, BeginControlSessionInput, CaptureDisplayInput, CaptureRegionInput,
+    CaptureWindowInput, ClickMouseInput, ClickTextInput, DragMouseInput, FindElementsInput,
+    FindTextInput, FocusWindowInput, MoveMouseInput, NoArguments, OcrRegionInput, PressKeysInput,
     ScrollMouseInput, SwitchVirtualDesktopInput, TypeTextInput, VisualBaselineInput,
     WaitForChangeSinceInput, WaitForTextInput, WaitForVisualChangeInput, WaitForWindowInput,
     parse_arguments,
@@ -78,10 +80,10 @@ use controlfreak_core::{CaptureWindowRequest, WaitForChangeSinceRequest, WaitFor
 use handlers::call_get_server_status;
 pub use profile::{Profile, ProfileError};
 use results::{
-    CarriesPng, Encoded, click_text_result, keyboard_result, pointer_result, read_text_result,
-    screenshot_result, tool_error, tool_execution_error, virtual_desktop_list_result,
-    virtual_desktop_switch_result, visual_baseline_result, visual_change_result,
-    window_focus_result, window_screenshot_result, window_wait_result,
+    CarriesPng, Encoded, click_text_result, element_action_result, keyboard_result, pointer_result,
+    read_text_result, screenshot_result, tool_error, tool_execution_error,
+    virtual_desktop_list_result, virtual_desktop_switch_result, visual_baseline_result,
+    visual_change_result, window_focus_result, window_screenshot_result, window_wait_result,
 };
 pub use schema::full_tools as full_tool_definitions;
 #[cfg(test)]
@@ -103,8 +105,8 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use controlfreak_core::{
     ActionObservation, BuildInfo, CaptureDisplayRequest, CaptureRegionRequest, ClickTextRequest,
-    ClickTextResult, DisplayScreenshot, FocusWindowRequest, ForegroundWindow, KeyChordRequest,
-    KeyboardActionResult, MouseClickRequest, MouseDragRequest, MouseMoveRequest,
+    ClickTextResult, DisplayScreenshot, ElementActionResult, FocusWindowRequest, ForegroundWindow,
+    KeyChordRequest, KeyboardActionResult, MouseClickRequest, MouseDragRequest, MouseMoveRequest,
     MouseScrollRequest, MutationControl, OcrRegionRequest, PlatformBackend, PlatformError,
     PointerActionResult, TextInputRequest, UNKNOWN_REVISION, VirtualDesktopList,
     VirtualDesktopSwitchRequest, VirtualDesktopSwitchResult, VisualBaseline, VisualBaselineRequest,
@@ -149,6 +151,7 @@ const FOCUS_WINDOW: &str = "focus_window";
 const CAPTURE_WINDOW: &str = "capture_window";
 const WAIT_FOR_WINDOW: &str = "wait_for_window";
 const FIND_ELEMENTS: &str = "find_elements";
+const ACT_ON_ELEMENT: &str = "act_on_element";
 const PRESS_KEYS: &str = "press_keys";
 const TYPE_TEXT: &str = "type_text";
 

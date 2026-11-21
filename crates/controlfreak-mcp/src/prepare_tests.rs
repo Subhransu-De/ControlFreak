@@ -89,7 +89,7 @@ impl Server {
         self.call(GET_SERVER_STATUS, json!({})).await["structuredContent"]["session"].clone()
     }
 
-    fn acting_shown(&self) -> usize {
+    pub(super) fn acting_shown(&self) -> usize {
         self.indicator_events
             .lock()
             .unwrap()

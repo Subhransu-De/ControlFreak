@@ -10,21 +10,21 @@ use super::requests::{ActionStep, RunActionsInput};
 use std::time::{Duration, Instant};
 
 use super::{
-    Arc, CallToolResponse, CallToolResult, CaptureDisplayInput, CaptureDisplayRequest,
-    CaptureRegionInput, CaptureRegionRequest, CaptureWindowInput, CarriesPng, ClickMouseInput,
-    ClickTextInput, ClickTextRequest, Diagnostics, DragMouseInput, Encoded, ErrorData,
-    FindElementsInput, FindTextInput, FocusWindowInput, FocusWindowRequest, InputRun, JsonObject,
-    KeyChordRequest, MouseClickRequest, MouseDragRequest, MouseMoveRequest, MouseScrollRequest,
-    MoveMouseInput, NoArguments, OcrRegionInput, OcrRegionRequest, OperationLease, Ordering,
-    PlatformBackend, PreparedInput, PressKeysInput, SafetyIndicator, ScrollMouseInput,
-    SessionRuntime, SwitchVirtualDesktopInput, TextInputRequest, TypeTextInput, Value,
-    VirtualDesktopSwitchRequest, VisualBaselineInput, VisualBaselineRequest,
+    ActOnElementInput, Arc, CallToolResponse, CallToolResult, CaptureDisplayInput,
+    CaptureDisplayRequest, CaptureRegionInput, CaptureRegionRequest, CaptureWindowInput,
+    CarriesPng, ClickMouseInput, ClickTextInput, ClickTextRequest, Diagnostics, DragMouseInput,
+    Encoded, ErrorData, FindElementsInput, FindTextInput, FocusWindowInput, FocusWindowRequest,
+    InputRun, JsonObject, KeyChordRequest, MouseClickRequest, MouseDragRequest, MouseMoveRequest,
+    MouseScrollRequest, MoveMouseInput, NoArguments, OcrRegionInput, OcrRegionRequest,
+    OperationLease, Ordering, PlatformBackend, PreparedInput, PressKeysInput, SafetyIndicator,
+    ScrollMouseInput, SessionRuntime, SwitchVirtualDesktopInput, TextInputRequest, TypeTextInput,
+    Value, VirtualDesktopSwitchRequest, VisualBaselineInput, VisualBaselineRequest,
     WaitForChangeSinceInput, WaitForTextInput, WaitForVisualChangeInput,
-    WaitForVisualChangeRequest, WaitForWindowInput, click_text_result, join_error, json,
-    keyboard_result, parse_arguments, pointer_result, read_text_result, screenshot_result,
-    tool_error, tool_execution_error, virtual_desktop_list_result, virtual_desktop_switch_result,
-    visual_baseline_result, visual_change_result, window_focus_result, window_screenshot_result,
-    window_wait_result,
+    WaitForVisualChangeRequest, WaitForWindowInput, click_text_result, element_action_result,
+    join_error, json, keyboard_result, parse_arguments, pointer_result, read_text_result,
+    screenshot_result, tool_error, tool_execution_error, virtual_desktop_list_result,
+    virtual_desktop_switch_result, visual_baseline_result, visual_change_result,
+    window_focus_result, window_screenshot_result, window_wait_result,
 };
 
 pub(super) async fn run_platform_operation<T, F>(
@@ -789,8 +789,8 @@ pub(super) async fn call_wait_for_window(
     }
 }
 
-/// Reads the controls of one window through UI Automation. Read-only: it claims no session, and
-/// the element references it returns are accepted only by a later `find_elements`.
+/// Reads the controls of one window through UI Automation. Read-only: it claims no session. The
+/// element references it returns scope a later `find_elements` and name `act_on_element`'s element.
 pub(super) async fn call_find_elements(
     backend: Arc<dyn PlatformBackend>,
     arguments: Option<JsonObject>,
@@ -841,6 +841,38 @@ pub(super) fn prepare_press_keys(
                 &json!({ "kind": "key_chord", "keys": action_keys }),
             )
             .into()),
+            Err(error) => Ok(tool_error(&error).into()),
+        }
+        .map(|response| super::results::with_progress(response, progress))
+    }))
+}
+
+/// A semantic action on an element that `find_elements` returned for the session's window. It
+/// is input: it runs under the operation lease and the same admission, indicator and target
+/// checks as the pointer tools.
+pub(super) fn prepare_act_on_element(
+    arguments: Option<JsonObject>,
+    _profile: &Profile,
+) -> PreparedInput {
+    let request = parse_input::<ActOnElementInput>(arguments)?
+        .into_request()
+        .map_err(|error| refuse(&error))?;
+    let action = json!({ "kind": "element", "action": request.action });
+    let target_ref = request.target_ref.clone();
+    Ok(run_with_lease(move |backend, operation_lease| async move {
+        let (result, progress) = run_encoded_mutation(
+            operation_lease,
+            Some(target_ref),
+            Arc::clone(&backend),
+            move |control| {
+                let mut request = request;
+                resolve_observation(backend.as_ref(), &mut request.observation)?;
+                backend.act_on_element_controlled(&request, control)
+            },
+        )
+        .await;
+        match result {
+            Ok(result) => Ok(element_action_result(result, &action).into()),
             Err(error) => Ok(tool_error(&error).into()),
         }
         .map(|response| super::results::with_progress(response, progress))

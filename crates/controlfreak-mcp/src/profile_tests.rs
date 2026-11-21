@@ -50,7 +50,7 @@ fn expected(name: &str) -> Vec<&'static str> {
         .collect()
 }
 
-const CATALOG_NAMES: [&str; 28] = [
+const CATALOG_NAMES: [&str; 29] = [
     GET_SERVER_STATUS,
     BEGIN_CONTROL_SESSION,
     END_CONTROL_SESSION,
@@ -77,6 +77,7 @@ const CATALOG_NAMES: [&str; 28] = [
     SCROLL_MOUSE,
     PRESS_KEYS,
     TYPE_TEXT,
+    ACT_ON_ELEMENT,
     RUN_ACTIONS,
     STOP_DESKTOP_WORK,
 ];
@@ -220,6 +221,12 @@ fn mutating_calls(target: &str) -> Vec<(&'static str, Value)> {
             CLICK_TEXT,
             json!({"target_ref": target, "x": 0, "y": 0, "width": 10, "height": 10,
                    "query": "Save", "observation": none}),
+        ),
+        (
+            // The fake desktop's `Ping` button of its first window.
+            ACT_ON_ELEMENT,
+            json!({"target_ref": target, "element_ref": "element-1-1", "action": "invoke",
+                   "observation": none}),
         ),
         (
             RUN_ACTIONS,

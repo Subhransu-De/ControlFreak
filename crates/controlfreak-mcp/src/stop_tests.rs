@@ -70,7 +70,15 @@ impl PointerBackend for WaitingBackend {
         self.wait(control)
     }
 }
-impl controlfreak_core::AccessibilityBackend for WaitingBackend {}
+impl controlfreak_core::AccessibilityBackend for WaitingBackend {
+    fn act_on_element_controlled(
+        &self,
+        _request: &controlfreak_core::ElementActionRequest,
+        control: &MutationControl,
+    ) -> Result<controlfreak_core::ElementActionResult, PlatformError> {
+        self.wait(control)
+    }
+}
 
 impl KeyboardBackend for WaitingBackend {
     fn type_text_controlled(
@@ -467,7 +475,7 @@ async fn observation_cancellation_refuses_queued_work_and_discards_late_results(
     }
 }
 
-fn worker_requests() -> [(&'static str, Value); 7] {
+fn worker_requests() -> [(&'static str, Value); 8] {
     [
         (
             MOVE_MOUSE,
@@ -480,6 +488,11 @@ fn worker_requests() -> [(&'static str, Value); 7] {
         (
             RUN_ACTIONS,
             json!({"target_ref": "target-00000000-0000-0000-0000-000000000003","steps":[{"action":"type_text","text":"synthetic"}]}),
+        ),
+        (
+            ACT_ON_ELEMENT,
+            json!({"target_ref": "target-00000000-0000-0000-0000-000000000003",
+                    "element_ref": "element-1", "action": "invoke"}),
         ),
         (
             WAIT_FOR_VISUAL_CHANGE,

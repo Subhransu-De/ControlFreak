@@ -46,6 +46,10 @@ pub(super) struct HelperKind {
     /// Requests one helper process serves before it is retired.
     pub max_requests: u32,
     pub error: fn(String) -> PlatformError,
+    /// Whether a request may be sent again to a fresh helper when a reused one produced nothing
+    /// for it. Only a request that changes nothing may: a helper that exited without a reply may
+    /// have acted before it exited.
+    pub retry_unstarted: bool,
 }
 
 /// A reply line that names the request it answers.
@@ -64,10 +68,13 @@ pub(super) struct HelperPool {
 
 impl HelperPool {
     /// Sends one request, built by `line` from its request ID, to the warm helper or a new one,
-    /// and returns the matching reply. Only a helper whose reply keeps it is reused.
+    /// and returns the matching reply. Only a helper whose reply keeps it is reused. `sending`
+    /// runs immediately before the request line is written to a helper, so a caller can record
+    /// that the helper may act from then on.
     ///
-    /// A reused helper can exit while idle just as a request arrives. Helpers only read the
-    /// desktop, so one retry on a fresh helper cannot repeat a desktop effect.
+    /// A reused helper can exit while idle just as a request arrives. A kind that only reads the
+    /// desktop (`retry_unstarted`) then retries once on a fresh helper, which cannot repeat a
+    /// desktop effect; any other kind reports the failure.
     pub(super) fn request<R: HelperReply>(
         &self,
         kind: &'static HelperKind,
@@ -75,6 +82,7 @@ impl HelperPool {
         control: &MutationControl,
         timeout: Duration,
         line: impl Fn(u64) -> Result<Vec<u8>, PlatformError>,
+        sending: &dyn Fn(),
     ) -> Result<R, PlatformError> {
         control.check(kind.operation)?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -89,13 +97,18 @@ impl HelperPool {
             Some(helper) => (helper, true),
             None => (WarmHelper::spawn(kind, command)?, false),
         };
-        let reply = match helper.request::<R>(id, &line, control, timeout) {
+        let reply = match helper.request::<R>(kind, id, &line, control, timeout, sending) {
             Ok(reply) => reply,
-            Err(failure) if reused && !failure.started && !control.is_cancelled() => {
+            Err(failure)
+                if kind.retry_unstarted
+                    && reused
+                    && !failure.started
+                    && !control.is_cancelled() =>
+            {
                 drop(helper);
                 helper = WarmHelper::spawn(kind, command)?;
                 helper
-                    .request::<R>(id, &line, control, timeout)
+                    .request::<R>(kind, id, &line, control, timeout, sending)
                     .map_err(|failure| failure.error)?
             }
             Err(failure) => return Err(failure.error),
@@ -251,14 +264,18 @@ impl WarmHelper {
 
     fn request<R: HelperReply>(
         &mut self,
+        kind: &'static HelperKind,
         id: u64,
         line: &[u8],
         control: &MutationControl,
         timeout: Duration,
+        sending: &dyn Fn(),
     ) -> Result<R, RequestFailure> {
-        let kind = self.kind;
+        // A warm helper serves every kind of its pool; errors name the request's own kind.
+        self.kind = kind;
         let label = kind.label;
         let fail = |helper: &mut Self, reason: String, started: bool| helper.fail(&reason, started);
+        sending();
         let sent = self.stdin.as_mut().map_or_else(
             || {
                 Err(std::io::Error::other(format!(

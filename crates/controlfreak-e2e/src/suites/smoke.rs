@@ -33,6 +33,7 @@ pub(crate) fn suite() -> Suite {
             task("untitled-popup-described", untitled_popup_described).scene("with-popup"),
             task("foreign-window-refused", foreign_refused).scene("two-processes"),
             task("focus-after-user-input", focus_after_user_input).scene("two-processes"),
+            task("act-on-element-in-front", act_on_element_in_front).scene("two-processes"),
             task("taskbar-target-ref", taskbar_target).requires(&[Capability::TaskbarForeground]),
             task("injected-stop-click-ignored", injected_stop_click)
                 .scene("single")
@@ -50,6 +51,65 @@ pub(crate) fn suite() -> Suite {
                 .budget_secs(45),
         ],
     }
+}
+
+/// `act_on_element` presses `ledger`'s `Ping` button through UI Automation while `ledger` is in
+/// front. Once a real click has brought `journal` to the front, the same action is refused with
+/// `not_foreground`, sends nothing, and `ledger`'s button is not pressed again.
+fn act_on_element_in_front(cx: &mut Ctx<'_>) -> Result<(), Failure> {
+    let id = cx.target("ledger")?;
+    let found = cx.ok(
+        "find_elements",
+        json!({"target_ref": id, "role": "button", "name": "ping"}),
+    )?;
+    let element = found["elements"]
+        .as_array()
+        .filter(|elements| elements.len() == 1)
+        .and_then(|elements| elements[0]["element_ref"].as_str())
+        .ok_or_else(|| Failure::assertion(format!("expected one Ping button: {found}")))?
+        .to_owned();
+    let invoke = json!({"target_ref": id, "element_ref": element, "action": "invoke",
+                        "observation": {"mode": "none"}});
+    cx.begin(&id)?;
+    cx.focus(&id)?;
+    let acted = cx.ok("act_on_element", invoke.clone())?;
+    ensure!(acted["status"] == "completed", "{acted}");
+    cx.expect("ledger", "the invoked button press", |e| {
+        events::button_pressed(e, "ping")
+    })?;
+    let presses = |cx: &Ctx<'_>| -> Result<usize, Failure> {
+        Ok(cx
+            .window("ledger")?
+            .events()
+            .iter()
+            .filter(|event| matches!(event, Event::Button { name, .. } if name == "ping"))
+            .count())
+    };
+    let before = presses(cx)?;
+
+    let journal = cx.center("journal", "edit")?;
+    let output = cx.helper(&["--inject-click", &format!("{},{}", journal.0, journal.1)])?;
+    ensure!(
+        output.status.success(),
+        "the fixture could not inject the click"
+    );
+    cx.expect("journal", "the injected click", |e| {
+        !events::left_downs(e, "main").is_empty()
+    })?;
+    let refused = cx.refused("act_on_element", invoke)?;
+    ensure!(
+        refused.error_code() == Some("target_invalidated")
+            && refused.error_reason() == Some("not_foreground")
+            && refused.structured["input"]["input_outcome"] == "not_started",
+        "wrong refusal: {}",
+        refused.structured
+    );
+    thread::sleep(Duration::from_millis(300));
+    ensure!(
+        presses(cx)? == before,
+        "the button was pressed while ledger was not in front"
+    );
+    cx.end()
 }
 
 fn control(cx: &mut Ctx<'_>, key: &str) -> Result<String, Failure> {

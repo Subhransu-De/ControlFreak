@@ -1,6 +1,6 @@
 # Tools
 
-ControlFreak exposes 28 MCP tools. Every tool publishes a title, an input schema, an `outputSchema` and annotations. Export the full contract with `controlfreak --print-tools`.
+ControlFreak exposes 29 MCP tools. Every tool publishes a title, an input schema, an `outputSchema` and annotations. Export the full contract with `controlfreak --print-tools`.
 
 - Tools are listed in the order an agent needs them. `stop_desktop_work` is last.
 - Every input tool is annotated `destructiveHint: true` and `openWorldHint: true`. `stop_desktop_work` is also destructive, because it closes input permanently. Use `end_control_session` to finish normally.
@@ -41,6 +41,7 @@ desktop and run inside a [control session](sessions.md).
 | `type_text` | Input | Type Unicode text without the clipboard. Line breaks and tabs are pressed as Enter and Tab. |
 | `click_text` | Input | Click the unique OCR text that matches, at the matched words. |
 | `switch_virtual_desktop` | Input | Switch one or more virtual desktops (`steps`) left or right. |
+| `act_on_element` | Input | Invoke, toggle, expand or collapse one `find_elements` element of the approved window, only while that window itself is in front. See [Element actions](#element-actions). |
 | `run_actions` | Input | Up to 16 clicks, scrolls, keys, text and wait steps in one call. |
 
 ## Tool profiles
@@ -134,7 +135,7 @@ Several matches return at once and approve nothing. Pick a candidate by its `id`
 
 ## Waiting for the window to settle
 
-Every input action (`move_mouse`, `click_mouse`, `click_text`, `scroll_mouse`, `drag_mouse`, `press_keys`, `type_text` and each `run_actions` step) watches the approved window after it sends input and reads its evidence once the window has visibly responded and then stayed unchanged for 150 ms. This keeps an action from returning the screen as it was before the application reacted, for example a menu that is still opening or a page that is still loading.
+Every input action (`move_mouse`, `click_mouse`, `click_text`, `scroll_mouse`, `drag_mouse`, `press_keys`, `type_text`, `act_on_element` and each `run_actions` step) watches the approved window after it sends input and reads its evidence once the window has visibly responded and then stayed unchanged for 150 ms. This keeps an action from returning the screen as it was before the application reacted, for example a menu that is still opening or a page that is still loading.
 
 - A window that does not visibly change within 500 ms (150 ms for an action without a screenshot) is taken as not responding, and the action returns.
 - `observation.settle_ms` bounds the whole wait: 2000 ms by default, 500 ms for an action without a screenshot (`mode` `none` or `metadata`, and every `run_actions` step before the last), at most 10000. `0` keeps a short fixed wait (75 ms after pointer input, 150 ms after keys) and watches nothing.
@@ -199,19 +200,31 @@ OCR text and checkbox glyphs do not prove the state of a control.
 
 ## UI elements (UI Automation)
 
-`find_elements` reads the controls of one window through Windows UI Automation. Use it when OCR cannot tell controls apart: duplicate labels such as an `Approve` button on every row, icon-only buttons, disabled controls. It is read-only. It needs no control session and claims none, and it changes nothing in the window: no pattern is invoked and no value is read or set.
+`find_elements` reads the controls of one window through Windows UI Automation. Use it when OCR cannot tell controls apart: duplicate labels such as an `Approve` button on every row, icon-only buttons, disabled controls. It is read-only. It needs no control session and claims none, and it changes nothing in the window: no pattern is invoked and no value is read or set. To act on an element it found, use `act_on_element` (see [Element actions](#element-actions)) or click inside its `bounds`.
 
 - `target_ref` (required) names the window, from `list_windows`, a screenshot or the session. Only that window's subtree is read: the walk starts at the window and never reaches its parent or its siblings. Elements of another process inside the window, such as an embedded browser control of another program, are skipped with their subtrees and counted in `counts.skipped_other_process`. For a packaged app's frame (`ApplicationFrameHost.exe`), the app's own content process counts as the window's.
 - Filters: `role` (a control type such as `button`, `edit`, `list_item`, `check_box`, `data_item`, `menu_item`, `tab_item`, `tree_item`; an unknown role is refused with the full list) and `name` (a case-insensitive substring of the accessible name, at most 256 characters). The filters choose what is returned, not what is read.
 - Limits: `max_depth` (levels below the root, 0 to 64, default 32), `max_elements` (1 to 500, default 100) and `timeout_ms` (100 to 10000, default 3000). The server also stops at 5,000 elements read and at 256 KiB of elements. Names longer than 256 characters are cut and marked `name_truncated: true`.
 - Each element has `element_ref`, `role`, `name`, `depth` (0 is the root), `enabled`, `focusable`, `focused` (has keyboard focus), `offscreen`, `patterns` (the UI Automation patterns it supports, such as `invoke`, `toggle`, `value`, `expand_collapse`, `selection_item`) and `bounds`.
-- `bounds` is `{display_id, x, y, width, height}` in display-local physical pixels, the space of the pointer tools, on the display that holds the element's centre. `x` and `y` can be negative, or reach past the display, for an element partly outside it. `bounds` is `null` when the element has no on-screen rectangle. To act on an element, begin a session and click inside `bounds` with `click_mouse`: every pointer check applies as for any click. An element with `offscreen: true` is not visible, for example scrolled away; scroll first.
+- `bounds` is `{display_id, x, y, width, height}` in display-local physical pixels, the space of the pointer tools, on the display that holds the element's centre. `x` and `y` can be negative, or reach past the display, for an element partly outside it. `bounds` is `null` when the element has no on-screen rectangle. To click an element, begin a session and click inside `bounds` with `click_mouse`: every pointer check applies as for any click. An element with `offscreen: true` is not visible, for example scrolled away; scroll first.
 - `status` is `complete` when everything in scope was read, or `partial`. A partial result lists the limits it reached in `limits_reached` (`max_depth`, `max_elements`, `node_limit`, `timeout`, `response_bytes`, and `truncated` is `true`), or counts the subtrees whose provider failed in `counts.provider_errors`. `counts.visited` is the number of elements read, matching or not.
-- `within` takes an `element_ref` from an earlier result for the same `target_ref` and reads only that element's subtree, for example one table row. An element reference is opaque and is kept for 2 minutes. It is refused with `invalid_argument` when it is unknown or expired, belongs to another `target_ref`, the window's process changed, or the element is no longer in the window; nothing falls back to coordinates. No input tool accepts it.
+- `within` takes an `element_ref` from an earlier result for the same `target_ref` and reads only that element's subtree, for example one table row. An element reference is opaque and is kept for 2 minutes. It is refused with `invalid_argument` when it is unknown or expired, belongs to another `target_ref`, the window's process changed, or the element is no longer in the window; nothing falls back to coordinates. `act_on_element` is the only input tool that accepts it.
 - Password fields have `password: true` and an empty `name`, and a `name` filter never matches them. An edit control whose provider does not say whether it is a password field is treated as one. No element's value or text content is read.
 - A provider that cannot be asked or does not answer before anything was read is reported as `platform_operation_failed` with reason `accessibility_unavailable`, never as an empty list. A provider that stops answering part-way gives a `partial` result with what was read. A window that closes or changes during the query fails with `target_invalidated`.
 - The queries run in a separate helper process (`controlfreak --uia-helper`) that the server starts on first use and keeps for later queries. A provider call that does not return stops the query at `timeout_ms`; the helper then answers with what it read and exits, and the server ends a helper that has not answered 3 seconds after `timeout_ms`. A query that was cut short says nothing about whether the application recovered.
 - Custom-drawn applications, games and some canvases expose little or nothing through UI Automation. Use screenshots and OCR for them.
+
+### Element actions
+
+`act_on_element` performs one semantic action on an element that `find_elements` returned: `invoke` (press a button, open a link), `toggle` (a check box), `expand` or `collapse` (a combo box, tree item or menu). It sends no pointer or keyboard input and never falls back to coordinates. It is an input tool: it runs in a control session with the same lease, indicator, Esc and Stop handling, unlocked Default desktop and integrity checks as a click. Setting a value is not offered.
+
+- `target_ref` is the session's approved window, and `element_ref` must come from `find_elements` for that same `target_ref`. A reference of another window, including a dialog with its own `target_ref`, is refused.
+- The approved window itself must be the foreground window and not minimized. Unlike pointer input, a dialog or menu of the same application in front is not enough: the action is refused with `target_invalidated`, reason `not_foreground`, and the session is kept. Call `focus_window` on the window, or act on the dialog in a session of its own.
+- Before acting, the server checks the element again: the reference is known and under 2 minutes old, and names the same `target_ref`, window and process instance (process ID and creation time). The helper then finds the element by its UI Automation runtime ID inside the window and requires exactly one such element, of the window's own process, enabled, with the pattern the action needs (`invoke`, `toggle` or `expand_collapse`). Elements of a packaged app's content process, which `find_elements` lists for an `ApplicationFrameHost.exe` frame, are refused: click them instead. Anything else is refused with `invalid_argument` (`element_ref`, or `action` for a missing pattern), `status: "not_started"` and nothing sent. Call `find_elements` again.
+- A held Shift, Ctrl, Alt or Win key is refused with `key_held`, as for a click.
+- The action runs in the UI Automation helper with a 3-second deadline. Right before the pattern call, the helper checks again that the window is in front, not minimized and on the unlocked Default desktop, because finding the element can take a moment; if not, the action is refused with `not_foreground` (or the desktop error) and nothing is sent. A provider that does not answer before the pattern call reports `accessibility_unavailable` with `status: "not_started"`. A pattern call that fails, for any reason, or does not return reports `accessibility_unavailable` with `status: "unknown"`: the action may or may not have happened, so observe before acting again, and never repeat it (`retry_action: false`). The helper is then retired. A stop or cancellation while the action runs gives `status: "unknown"` too.
+- The result has the shape of the other input tools: `status`, `input` (no events are counted, so `sent_events` stays 0), `action` (`{"kind": "element", "action": ...}`) and `observation` with the screenshot, the settle report and `foreground_window`.
+- An application can handle a semantic action differently from a click, for example skip a confirmation or ignore it. Check the screenshot.
 
 ## Keys
 
@@ -227,7 +240,7 @@ OCR text and checkbox glyphs do not prove the state of a control.
 
 An unknown name is refused with the nearest valid name, or the full list.
 
-Windows adds a modifier the user is holding to every key, click and wheel turn the server sends: Delete becomes Shift+Delete, Tab becomes Alt+Tab, L becomes Win+L, a click becomes a Ctrl-click. So while the user holds Shift, Ctrl, Alt or Win, `press_keys`, `type_text`, `click_mouse`, `click_text`, `drag_mouse`, `scroll_mouse`, `switch_virtual_desktop` and the matching `run_actions` steps are refused with reason `key_held` before anything is sent. A modifier named in the request's own `keys` or `modifiers` is refused too, because the server presses it itself. A click, drag or scroll is refused before the pointer moves if the key is already down when it starts. If the key goes down during a timed approach, the action stops before its button or wheel event, as `partially_sent` with no events, because the pointer already moved. If it goes down between the clicks of a double or triple click, the click stops before its next press and releases the button. `move_mouse` is not refused. Release the key and retry. The server's own modifiers never cause a refusal, and releases and cleanup are never held back.
+Windows adds a modifier the user is holding to every key, click and wheel turn the server sends: Delete becomes Shift+Delete, Tab becomes Alt+Tab, L becomes Win+L, a click becomes a Ctrl-click. So while the user holds Shift, Ctrl, Alt or Win, `press_keys`, `type_text`, `click_mouse`, `click_text`, `drag_mouse`, `scroll_mouse`, `switch_virtual_desktop`, `act_on_element` and the matching `run_actions` steps are refused with reason `key_held` before anything is sent. A modifier named in the request's own `keys` or `modifiers` is refused too, because the server presses it itself. A click, drag or scroll is refused before the pointer moves if the key is already down when it starts. If the key goes down during a timed approach, the action stops before its button or wheel event, as `partially_sent` with no events, because the pointer already moved. If it goes down between the clicks of a double or triple click, the click stops before its next press and releases the button. `move_mouse` is not refused. Release the key and retry. The server's own modifiers never cause a refusal, and releases and cleanup are never held back.
 
 `type_text` sends text as Unicode characters, except that `\n`, `\r\n`, a lone `\r` and `\t` are pressed as Enter and Tab keys, because a control that ignores those characters still reacts to the keys. Each character, Enter and Tab is checked against the target before it is sent, and is refused if Shift, Ctrl, Alt or Win is held at that moment, or, for Enter and Tab, if that key itself is held. A held Alt could turn characters into menu shortcuts. If the user presses a modifier part-way through, typing stops before the next character with `key_held`, and `input.sent_events` shows how much was sent.
 
@@ -307,7 +320,7 @@ Every error also has `error.retryable`. It says whether repeating the same reque
 | `input_interleaved` | Another input ran during text recognition. Find the text again. | Yes |
 | `cancelled` | A stop, client cancellation or closing session cancelled the work. | No |
 | `ocr_unavailable` | The OCR helper failed. | No |
-| `accessibility_unavailable` | `find_elements` could not ask the window's UI Automation provider, or it did not answer before anything was read. Use screenshots and OCR. | No |
+| `accessibility_unavailable` | `find_elements` could not ask the window's UI Automation provider, or it did not answer before anything was read. Use screenshots and OCR. For `act_on_element`, the provider failed, refused or did not answer: with `status: "unknown"` the action may have happened, so observe first. | No |
 | `input_blocked` | Windows accepted only part of the input, for example for a higher-integrity window. | No |
 | `target_not_responding` | The window with keyboard focus stopped answering while text was typed, so typing stopped. Observe it before typing the rest. | No |
 | `deadline_reached` | `type_text` or a `run_actions` `type_text` step reached its `timeout_ms` and stopped between two keystrokes, or a `run_actions` step could not finish within the batch's `timeout_ms`. `input.sent_events` shows how much was sent. Observe the text before typing the rest. | No |
@@ -321,7 +334,7 @@ Every error also has `error.retryable`. It says whether repeating the same reque
 
 | `reason` | Meaning | `retryable` |
 | --- | --- | --- |
-| `not_foreground` | The target (or a window of its process) is not in front, or nothing is. Call `focus_window`. The session is kept. | Yes |
+| `not_foreground` | The target (or a window of its process) is not in front, or nothing is. For `act_on_element`, the target window itself is not in front or is minimized. Call `focus_window`. The session is kept. | Yes |
 | `foreground_changed` | The foreground changed while the action was checked. The session is kept. | Yes |
 | `observation_stale` | The foreground or the window set changed while `click_text` read the screen, or the window in front cannot be identified, so the text may belong to another window. Call `click_text` again. The session is kept. | Yes |
 | `foreign_destination` | The point or the keyboard focus is in a window of another process. The session is kept. | Yes |
@@ -393,7 +406,7 @@ After a stop, observation tools keep working: `list_displays`, `list_windows`, `
 | --- | --- |
 | `features` | What the backend implements: each `capability` with `state` `supported`, `degraded`, `requires_permission` or `unsupported`. |
 | `ocr` | OCR readiness, with `languages` (the installed OCR language tags, at most 64) and `default_language` (used without `language`, or `null`). |
-| `helpers` | `ocr` (the isolated OCR process), `activation` (the `focus_window` helper), `lamp` (the session lamp) and `ui_automation` (the `find_elements` helper). |
+| `helpers` | `ocr` (the isolated OCR process), `activation` (the `focus_window` helper), `lamp` (the session lamp) and `ui_automation` (the `find_elements` and `act_on_element` helper). |
 | `limits` | The hard request limits, such as `max_wait_ms` and `max_capture_width`. |
 | `forbidden_families` | Tool families ControlFreak never offers: `application_launch`, `shell`, `filesystem`, `registry`, `network`, `clipboard`, `browser_dom`. These are a product boundary, not missing features. |
 | `hidden_tools` | Tools the [tool profile](#tool-profiles) hides, in tool-list order. |
@@ -421,7 +434,7 @@ After a stop, observation tools keep working: `list_displays`, `list_windows`, `
 
 - OCR is checked by asking the OCR helper for its languages, with a 3-second deadline. The helper reads no pixels for it and stays ready for the next OCR call. The server checks once at startup, and a status call checks again when the last check is older than one minute.
 - `activation` and `lamp` are started only when needed, so `ready` means the server is configured to start them, not that they ran. A failed lamp shows as `unavailable` with `indicator_failed`.
-- `ui_automation` is not started for the report either. It is `degraded` with `not_verified` until the first `find_elements` call, then `ready`, or `unavailable` with `helper_failed` if that helper could not answer.
+- `ui_automation` is not started for the report either. It is `degraded` with `not_verified` until the first `find_elements` or `act_on_element` call that reaches the helper, then `ready`, or `unavailable` with `helper_failed` if that helper could not answer.
 - The report contains no path, user name, host name or environment value. A language tag that is not plain BCP-47 (letters, digits and `-`, at most 35 characters) is left out.
 
 ## Build identity
@@ -441,6 +454,6 @@ A build from a source archive without `.git` takes `revision` from the `CONTROLF
 ## Limits
 
 - Windows 10 version 2004 or later, or Windows 11, on x86-64.
-- UI Automation is read-only. `find_elements` finds controls, and clicks still go through the pointer tools. There are no semantic actions such as invoke, toggle or set value.
+- UI Automation actions are invoke, toggle, expand and collapse, on the approved window only while it is itself in front. No value is set through UI Automation.
 - Protected video and HDR content may not capture correctly.
 - No tools for shell commands, launching applications, files, clipboard, registry, network, browser DOM or elevation. `capabilities.forbidden_families` lists them, and [Opening an application](#opening-an-application) shows the hand-off from the host.

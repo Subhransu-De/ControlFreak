@@ -1,8 +1,15 @@
-//! Read-only UI Automation queries scoped to one window.
+//! UI Automation queries and semantic actions scoped to one window.
 //!
 //! A query reads the UI Automation subtree of the window a target reference names and returns
-//! its controls. Nothing here changes the desktop: no pattern is invoked, no value is read, and
-//! the element references it issues are accepted only as the root of a later query.
+//! its controls. It changes nothing: no pattern is invoked and no value is read. The element
+//! references it issues are accepted as the root of a later query, and by `act_on_element`.
+//!
+//! An action (invoke, toggle, expand, collapse) is a desktop mutation. It runs under the input
+//! lock after the session's target passed every input check and is the foreground window itself.
+//! Its element reference must name the same target reference, window and process instance, and
+//! the helper finds the element again by its runtime ID inside the window: it must be exactly one
+//! element, of the window's process, enabled and supporting the action's pattern. Nothing falls
+//! back to coordinates.
 //!
 //! Provider calls are cross-process COM calls into the target application, which can hang or
 //! fault. They run in a helper process (`--uia-helper`, see `uia_process`), on a dedicated
@@ -14,7 +21,8 @@
 //! 2. When one provider call does not return, the helper's own watchdog answers at the deadline
 //!    with what was read so far, or with `accessibility_unavailable` if not even the root
 //!    answered, and then exits: a blocked COM call cannot be cancelled, only abandoned with its
-//!    process.
+//!    process. For an action whose pattern call was made, the answer says so, and the server
+//!    reports the delivery as unknown.
 //! 3. The server kills a helper that has not answered `HELPER_GRACE` after the deadline.
 //!
 //! A helper that was abandoned or killed says nothing about whether the target recovered.
@@ -23,12 +31,13 @@ use super::uia_process::{HelperKind, HelperPool, HelperReply, read_bounded_line}
 // The command type is named for OCR, its first helper; it starts any helper mode.
 use crate::OcrHelperCommand as HelperCommand;
 use controlfreak_core::{
-    DisplayInfo, ElementBounds, ElementInfo, ElementPattern, ElementQueryCounts, ElementQueryLimit,
-    ElementRole, FailureCause, FindElementsRequest, FindElementsResult, MutationControl,
-    PlatformError,
+    DisplayInfo, ElementAction, ElementActionRequest, ElementBounds, ElementInfo, ElementPattern,
+    ElementQueryCounts, ElementQueryLimit, ElementRole, FailureCause, FindElementsRequest,
+    FindElementsResult, MutationControl, PlatformError,
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    cell::Cell,
     collections::VecDeque,
     io::{BufReader, Read, Write},
     sync::{
@@ -61,11 +70,15 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 /// An element reference can scope a later query for this long.
 const ELEMENT_REF_TTL: Duration = Duration::from_mins(2);
 const MAX_ELEMENT_REFS: usize = 4_096;
+/// How long finding the element again and its pattern call may take. UI Automation's own
+/// transaction timeout (2 s, see `uia_native`) ends most hung calls before it.
+const ACTION_TIMEOUT_MS: u32 = 3_000;
+const ACTION: &str = "act_on_element";
 
 /// Starts the reason of a reply whose helper could not create its UI Automation client.
 const CLIENT_START_FAILED: &str = "the UI Automation client could not start";
 
-static UIA_HELPER: HelperKind = HelperKind {
+const UIA_KIND: HelperKind = HelperKind {
     label: "UI Automation",
     operation: "find_elements",
     stdout_thread: "controlfreak-uia-stdout",
@@ -75,6 +88,18 @@ static UIA_HELPER: HelperKind = HelperKind {
     reply_limit: MAX_REPLY_BYTES,
     max_requests: MAX_REQUESTS_PER_HELPER,
     error: unavailable,
+    retry_unstarted: true,
+};
+
+static UIA_HELPER: HelperKind = UIA_KIND;
+
+/// The same helper process, asked to act. A helper that exits without a reply may have acted, so
+/// the request is never sent again.
+static UIA_ACTION_HELPER: HelperKind = HelperKind {
+    operation: ACTION,
+    error: action_failed,
+    retry_unstarted: false,
+    ..UIA_KIND
 };
 
 fn unavailable(reason: String) -> PlatformError {
@@ -83,6 +108,10 @@ fn unavailable(reason: String) -> PlatformError {
         "find_elements",
         reason,
     )
+}
+
+fn action_failed(reason: String) -> PlatformError {
+    PlatformError::failed(FailureCause::AccessibilityUnavailable, ACTION, reason)
 }
 
 /// What one walk reads: a window (and optionally one element inside it), the processes whose
@@ -100,6 +129,30 @@ pub(super) struct WalkQuery {
     pub max_depth: u32,
     pub max_elements: u32,
     pub timeout_ms: u32,
+}
+
+/// One semantic action: the element with `runtime_id` inside the window, and what to do with it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct ActQuery {
+    pub hwnd: usize,
+    /// The window's own process. Unlike a query, an action never reaches the content process of
+    /// a packaged app's frame: its process instance cannot be checked against the reference.
+    pub pid: u32,
+    pub runtime_id: Vec<i32>,
+    pub action: ElementAction,
+    pub timeout_ms: u32,
+}
+
+/// Why an action failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ActError {
+    /// The element has no such pattern: nothing was done.
+    Refused(String),
+    /// The last check before the call refused it (cancelled, or the window is no longer in
+    /// front): nothing was done.
+    NotReady(PlatformError),
+    /// The pattern call failed, a provider timeout included: the action may have happened.
+    Unknown(String),
 }
 
 /// What the walk needs to know about one element, read in one cached batch.
@@ -154,6 +207,23 @@ pub(super) trait Tree {
     fn first_child(&self, node: &Self::Node) -> Result<Option<(Self::Node, NodeFacts)>, TreeError>;
     fn next_sibling(&self, node: &Self::Node)
     -> Result<Option<(Self::Node, NodeFacts)>, TreeError>;
+    /// Every element with runtime ID `runtime_id` in the window's subtree, the window included.
+    fn find_all(
+        &self,
+        hwnd: usize,
+        runtime_id: &[i32],
+    ) -> Result<Vec<(Self::Node, NodeFacts)>, TreeError>;
+    /// Performs `action` through the element's control pattern. `ready` runs after the pattern
+    /// was obtained and immediately before the pattern call, which is made only if it passes.
+    fn act(
+        &self,
+        node: &Self::Node,
+        action: ElementAction,
+        ready: &dyn Fn() -> Result<(), PlatformError>,
+    ) -> Result<(), ActError>;
+    /// The last desktop check before a pattern call: window `hwnd` of process `pid` is the
+    /// foreground window, not minimized, on the unlocked Default input desktop.
+    fn in_front(&self, hwnd: usize, pid: u32) -> Result<(), PlatformError>;
 }
 
 /// One element as the helper reports it, before the server maps its rectangle and issues its
@@ -401,18 +471,143 @@ fn stale_within(reason: &str) -> PlatformError {
     }
 }
 
+fn stale_element(reason: &str) -> PlatformError {
+    PlatformError::InvalidArgument {
+        argument: "element_ref".to_owned(),
+        reason: format!("{reason}; call find_elements again for a new element_ref"),
+    }
+}
+
+/// Finds the action's element again and performs the action. The element must be exactly one
+/// element of the window's subtree with the reference's runtime ID, belong to the window's own
+/// process, be enabled and support the action's pattern; otherwise nothing is done. Once the
+/// pattern is obtained, and immediately before its call, the request must still be open and the
+/// window still in front (`Tree::in_front`): the server checked both before the request, but
+/// finding the element can take seconds. `dispatched` is set only for the call itself, so a hung
+/// or failed call leaves it set: the action may have happened.
+///
+/// # Errors
+///
+/// `invalid_argument` for a stale, ambiguous, foreign, disabled or unsupported element,
+/// `target_invalidated` when the window is gone or no longer in front, `cancelled` when the
+/// request was closed, and `accessibility_unavailable` when the provider failed.
+pub(super) fn perform<T: Tree>(
+    tree: &T,
+    query: &ActQuery,
+    closed: &AtomicBool,
+    dispatched: &AtomicBool,
+) -> Result<(), PlatformError> {
+    let found = match tree.find_all(query.hwnd, &query.runtime_id) {
+        Ok(found) => found,
+        Err(TreeError::Gone(_)) => {
+            return Err(PlatformError::TargetInvalidated {
+                reason: "the window no longer exists".to_owned(),
+            });
+        }
+        Err(TreeError::Failed(reason)) => {
+            return Err(action_failed(format!(
+                "the window's UI Automation provider did not answer, so nothing was done: {reason}"
+            )));
+        }
+    };
+    let (node, facts) = match found.as_slice() {
+        [] => return Err(stale_element("the element is no longer in the window")),
+        [one] => one,
+        _ => {
+            return Err(stale_element(
+                "more than one element of the window has this element's runtime ID",
+            ));
+        }
+    };
+    if facts.process_id != query.pid {
+        return Err(stale_element(
+            "the element does not belong to the window's process",
+        ));
+    }
+    if !facts.enabled {
+        return Err(stale_element("the element is disabled"));
+    }
+    let pattern = query.action.pattern();
+    // The pattern's bit in `NodeFacts::patterns`, its index in `ElementPattern::ALL`.
+    let bit = ElementPattern::ALL
+        .iter()
+        .position(|candidate| *candidate == pattern)
+        .map_or(0, |index| 1_u32 << index);
+    if facts.patterns & bit == 0 {
+        return Err(PlatformError::InvalidArgument {
+            argument: "action".to_owned(),
+            reason: format!(
+                "the element does not support the {pattern:?} pattern that this action needs; see its patterns in find_elements"
+            ),
+        });
+    }
+    let ready = || {
+        // Set before `closed` is read, while the watchdog sets `closed` before it reads
+        // `dispatched`: either this side sees the request closed and does not act, or the
+        // watchdog's answer says the action may have happened.
+        dispatched.store(true, Ordering::SeqCst);
+        let checked = if closed.load(Ordering::SeqCst) {
+            Err(PlatformError::failed(
+                FailureCause::Cancelled,
+                ACTION,
+                "the request was cancelled before the action",
+            ))
+        } else {
+            tree.in_front(query.hwnd, query.pid)
+        };
+        if checked.is_err() {
+            dispatched.store(false, Ordering::SeqCst);
+        }
+        checked
+    };
+    match tree.act(node, query.action, &ready) {
+        Ok(()) => Ok(()),
+        Err(ActError::Refused(reason)) => Err(PlatformError::InvalidArgument {
+            argument: "action".to_owned(),
+            reason: format!("the element does not offer the pattern this action needs: {reason}"),
+        }),
+        Err(ActError::NotReady(error)) => Err(error),
+        Err(ActError::Unknown(reason)) => Err(action_failed(format!(
+            "the pattern call failed, so the action may or may not have happened; observe before acting again: {reason}"
+        ))),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct UiaHelperRequest {
     id: u64,
     #[serde(flatten)]
-    query: WalkQuery,
+    job: HelperJob,
+}
+
+/// What one request asks the helper to do.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "request", rename_all = "snake_case")]
+enum HelperJob {
+    Walk(WalkQuery),
+    Act(ActQuery),
+}
+
+impl HelperJob {
+    const fn timeout_ms(&self) -> u32 {
+        match self {
+            Self::Walk(query) => query.timeout_ms,
+            Self::Act(query) => query.timeout_ms,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum UiaHelperResponse {
-    Success { snapshot: Snapshot },
-    Error { error: PlatformError },
+    Success {
+        snapshot: Snapshot,
+    },
+    /// The action's pattern call returned success.
+    Acted,
+    Error {
+        error: PlatformError,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -428,6 +623,10 @@ struct UiaHelperReply {
     /// and exits after this reply.
     #[serde(default)]
     retire: bool,
+    /// An action's pattern call was made and did not return a refusal, so an error reply leaves
+    /// the action's effect unknown.
+    #[serde(default)]
+    dispatched: bool,
 }
 
 impl HelperReply for UiaHelperReply {
@@ -440,11 +639,23 @@ impl HelperReply for UiaHelperReply {
     }
 }
 
+/// One request for the walker thread.
 struct WalkJob {
-    query: WalkQuery,
-    deadline: Instant,
-    out: Arc<Mutex<Snapshot>>,
+    work: Work,
     done: mpsc::Sender<Result<(), PlatformError>>,
+}
+
+enum Work {
+    Walk {
+        query: WalkQuery,
+        deadline: Instant,
+        out: Arc<Mutex<Snapshot>>,
+    },
+    Act {
+        query: ActQuery,
+        closed: Arc<AtomicBool>,
+        dispatched: Arc<AtomicBool>,
+    },
 }
 
 /// Whether the walker's UI Automation client exists yet.
@@ -456,8 +667,8 @@ enum ClientState {
 }
 
 /// Starts the walker thread, which creates the provider client with `open` and then serves
-/// walk jobs in order. A client that cannot be created fails every job. `state` tells the
-/// helper whether the client exists, even while the walker is blocked.
+/// walk and action jobs in order. A client that cannot be created fails every job. `state` tells
+/// the helper whether the client exists, even while the walker is blocked.
 fn start_walker<T, F>(open: F, state: Arc<AtomicU8>) -> std::io::Result<mpsc::Sender<WalkJob>>
 where
     T: Tree,
@@ -475,9 +686,29 @@ where
             };
             state.store(ready as u8, Ordering::Release);
             while let Ok(job) = receiver.recv() {
-                let result = match &tree {
-                    Ok(tree) => walk(tree, &job.query, job.deadline, &job.out),
-                    Err(reason) => Err(unavailable(format!("{CLIENT_START_FAILED}: {reason}"))),
+                let result = match (&tree, &job.work) {
+                    (
+                        Ok(tree),
+                        Work::Walk {
+                            query,
+                            deadline,
+                            out,
+                        },
+                    ) => walk(tree, query, *deadline, out),
+                    (
+                        Ok(tree),
+                        Work::Act {
+                            query,
+                            closed,
+                            dispatched,
+                        },
+                    ) => perform(tree, query, closed, dispatched),
+                    (Err(reason), Work::Walk { .. }) => {
+                        Err(unavailable(format!("{CLIENT_START_FAILED}: {reason}")))
+                    }
+                    (Err(reason), Work::Act { .. }) => Err(action_failed(format!(
+                        "{CLIENT_START_FAILED}, so nothing was done: {reason}"
+                    ))),
                 };
                 let _ = job.done.send(result);
             }
@@ -499,7 +730,8 @@ pub(crate) fn serve_uia_helper(
 
 /// Serves request lines until input ends, the helper stays idle for `idle_exit`, or a walker is
 /// abandoned in a provider call that did not return. Closing input ends the helper at once: a
-/// walk only reads, so there is nothing to finish.
+/// walk only reads, so there is nothing to finish, and an action that has not reached its pattern
+/// call is not made.
 fn serve_uia_helper_with<T, F>(
     input: impl Read + Send + 'static,
     mut output: impl Write,
@@ -530,16 +762,25 @@ where
     let walker = start_walker(open, Arc::clone(&client))?;
     while let Ok(line) = requests.recv_timeout(idle_exit) {
         let request: UiaHelperRequest = serde_json::from_slice(&line)?;
-        let timeout_ms = request.query.timeout_ms;
+        let acting = matches!(request.job, HelperJob::Act(_));
+        let timeout_ms = request.job.timeout_ms();
         let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
         let out = Arc::new(Mutex::new(Snapshot::default()));
+        let dispatched = Arc::new(AtomicBool::new(false));
         let (done, finished) = mpsc::channel();
-        walker.send(WalkJob {
-            query: request.query,
-            deadline,
-            out: Arc::clone(&out),
-            done,
-        })?;
+        let work = match request.job {
+            HelperJob::Walk(query) => Work::Walk {
+                query,
+                deadline,
+                out: Arc::clone(&out),
+            },
+            HelperJob::Act(query) => Work::Act {
+                query,
+                closed: Arc::clone(&closed),
+                dispatched: Arc::clone(&dispatched),
+            },
+        };
+        walker.send(WalkJob { work, done })?;
         let mut retire = false;
         let result = loop {
             match finished.recv_timeout(Duration::from_millis(10)) {
@@ -556,6 +797,14 @@ where
                 // The walker is blocked in a provider call. Answer with what it read and exit:
                 // the call cannot be cancelled, and a blocked walker cannot serve again.
                 retire = true;
+                if acting {
+                    // A walker still finding the element must not act after this answer; see
+                    // `perform` for the order of the two flags.
+                    closed.store(true, Ordering::SeqCst);
+                    break Err(action_failed(format!(
+                        "the window's UI Automation provider did not answer within {timeout_ms} ms; the action may or may not have happened, so observe before acting again"
+                    )));
+                }
                 let mut snapshot = lock(&out);
                 if !snapshot.root_answered {
                     break Err(unavailable(format!(
@@ -567,7 +816,12 @@ where
                 break Ok(());
             }
         };
+        let dispatched = dispatched.load(Ordering::SeqCst);
+        // A pattern call that failed, a UI Automation timeout included, may have left the
+        // provider blocked or the client in a bad state: this helper serves no further request.
+        retire |= acting && dispatched && result.is_err();
         let response = match result {
+            Ok(()) if acting => UiaHelperResponse::Acted,
             Ok(()) => UiaHelperResponse::Success {
                 snapshot: lock(&out).clone(),
             },
@@ -584,6 +838,7 @@ where
                 response,
                 ready: client == ClientState::Ready as u8,
                 retire,
+                dispatched,
             },
         )?;
         output.write_all(b"\n")?;
@@ -645,10 +900,11 @@ impl QueryEnvironment for HelperEnvironment<'_> {
             |id| {
                 serde_json::to_vec(&UiaHelperRequest {
                     id,
-                    query: query.clone(),
+                    job: HelperJob::Walk(query.clone()),
                 })
                 .map_err(|error| unavailable(format!("could not encode the query: {error}")))
             },
+            &|| {},
         );
         let reply = match reply {
             Ok(reply) => reply,
@@ -659,16 +915,179 @@ impl QueryEnvironment for HelperEnvironment<'_> {
                 return Err(error);
             }
         };
-        (self.answered)(match &reply.response {
-            _ if reply.ready => Ok(()),
-            UiaHelperResponse::Error { error } => Err(error.to_string()),
-            UiaHelperResponse::Success { .. } => {
-                Err("the UI Automation client did not start".to_owned())
-            }
-        });
+        self.record(&reply);
         match reply.response {
             UiaHelperResponse::Success { snapshot } => Ok(snapshot),
             UiaHelperResponse::Error { error } => Err(error),
+            UiaHelperResponse::Acted => Err(unavailable(
+                "the UI Automation helper answered a query as an action".to_owned(),
+            )),
+        }
+    }
+}
+
+impl HelperEnvironment<'_> {
+    /// Tells capability reporting whether the helper's UI Automation client answered.
+    fn record(&self, reply: &UiaHelperReply) {
+        (self.answered)(match &reply.response {
+            _ if reply.ready => Ok(()),
+            UiaHelperResponse::Error { error } => Err(error.to_string()),
+            UiaHelperResponse::Success { .. } | UiaHelperResponse::Acted => {
+                Err("the UI Automation client did not start".to_owned())
+            }
+        });
+    }
+}
+
+/// A failed action, and whether its pattern call may have run.
+#[derive(Debug)]
+pub(super) struct ActFailure {
+    pub error: PlatformError,
+    /// The helper may have acted: its pattern call was made, or the request reached a helper that
+    /// gave no answer.
+    pub dispatched: bool,
+}
+
+/// What a semantic action needs from the desktop and the helper; the backend supplies the real
+/// ones.
+pub(super) trait ActionEnvironment {
+    /// Checks the session's target for this action: every check of pointer input except the
+    /// hit test, and that the target window itself is the foreground window and not minimized.
+    fn validate(&self, control: &MutationControl) -> Result<(), PlatformError>;
+    fn scope(&self, target_ref: &str) -> Result<Scope, PlatformError>;
+    /// Sends the action to the helper. `sending` runs immediately before the request is written.
+    fn act(
+        &self,
+        query: &ActQuery,
+        control: &MutationControl,
+        sending: &dyn Fn(),
+    ) -> Result<(), ActFailure>;
+}
+
+/// The production environment for actions: the session's target checks and the warm helper.
+pub(super) struct ActionHelper<'a> {
+    pub helper: HelperEnvironment<'a>,
+}
+
+impl ActionEnvironment for ActionHelper<'_> {
+    fn validate(&self, control: &MutationControl) -> Result<(), PlatformError> {
+        super::target::validate(control, ACTION, None)?;
+        // A held modifier reaches an application that reads the keyboard state when it handles
+        // the action, as it would reach a click.
+        super::input::ensure_no_modifier_held(ACTION)?;
+        super::target::ensure_target_in_front(control)
+    }
+
+    fn scope(&self, target_ref: &str) -> Result<Scope, PlatformError> {
+        super::target::observation_scope(target_ref)
+    }
+
+    fn act(
+        &self,
+        query: &ActQuery,
+        control: &MutationControl,
+        sending: &dyn Fn(),
+    ) -> Result<(), ActFailure> {
+        let timeout = Duration::from_millis(u64::from(query.timeout_ms)) + HELPER_GRACE;
+        let reply = self
+            .helper
+            .pool
+            .request::<UiaHelperReply>(
+                &UIA_ACTION_HELPER,
+                self.helper.command,
+                control,
+                timeout,
+                |id| {
+                    serde_json::to_vec(&UiaHelperRequest {
+                        id,
+                        job: HelperJob::Act(query.clone()),
+                    })
+                    .map_err(|error| action_failed(format!("could not encode the action: {error}")))
+                },
+                sending,
+            )
+            .map_err(|error| {
+                if !control.is_cancelled() {
+                    (self.helper.answered)(Err(error.to_string()));
+                }
+                // Whether the request reached the helper is told by `sending`; once it did, a
+                // helper that gave no answer may have acted.
+                ActFailure {
+                    error,
+                    dispatched: true,
+                }
+            })?;
+        self.helper.record(&reply);
+        match reply.response {
+            UiaHelperResponse::Acted => Ok(()),
+            UiaHelperResponse::Error { error } => Err(ActFailure {
+                error,
+                dispatched: reply.dispatched,
+            }),
+            UiaHelperResponse::Success { .. } => Err(ActFailure {
+                error: action_failed(
+                    "the UI Automation helper answered an action as a query".to_owned(),
+                ),
+                dispatched: true,
+            }),
+        }
+    }
+}
+
+/// Runs one semantic action on the session's target, after the checks above. The caller holds
+/// the input lock. Delivery is recorded as unknown from the moment the request is written to the
+/// helper, rejected when the helper says it did not act, and accepted when the pattern call
+/// returned success.
+///
+/// # Errors
+///
+/// `target_invalidated` without a session target or for another window, every refusal of the
+/// target checks, `invalid_argument` for a stale, ambiguous, foreign or unsuitable element, and
+/// `accessibility_unavailable` when the provider failed or did not answer.
+pub(super) fn act_on_element(
+    request: &ElementActionRequest,
+    control: &MutationControl,
+    environment: &impl ActionEnvironment,
+    refs: &ElementRefs,
+) -> Result<(), PlatformError> {
+    control.check(ACTION)?;
+    request.validate()?;
+    let approved = control
+        .approved_target()
+        .ok_or_else(|| PlatformError::TargetInvalidated {
+            reason: "an approved target reference is required".to_owned(),
+        })?;
+    if approved != request.target_ref {
+        return Err(PlatformError::TargetInvalidated {
+            reason: "end the control session before acting on another window".to_owned(),
+        });
+    }
+    environment.validate(control)?;
+    let scope = environment.scope(&approved)?;
+    let runtime_id = refs.resolve(&request.element_ref, &approved, &scope, "element_ref")?;
+    control.check(ACTION)?;
+    let query = ActQuery {
+        hwnd: scope.hwnd,
+        pid: scope.pid,
+        runtime_id,
+        action: request.action,
+        timeout_ms: ACTION_TIMEOUT_MS,
+    };
+    let previous = Cell::new(None);
+    match environment.act(&query, control, &|| {
+        previous.set(Some(control.dispatch_started()));
+    }) {
+        Ok(()) => {
+            control.dispatch_accepted(0);
+            Ok(())
+        }
+        Err(failure) => {
+            if !failure.dispatched
+                && let Some(previous) = previous.get()
+            {
+                control.dispatch_rejected(previous);
+            }
+            Err(failure.error)
         }
     }
 }
@@ -676,6 +1095,7 @@ impl QueryEnvironment for HelperEnvironment<'_> {
 struct ElementEntry {
     id: String,
     target_ref: String,
+    hwnd: usize,
     pid: u32,
     created: u64,
     runtime_id: Vec<i32>,
@@ -691,14 +1111,23 @@ pub(super) struct ElementRefs {
 }
 
 impl ElementRefs {
-    /// The runtime ID that `id` names, if it was issued for `target_ref` in the same process
-    /// instance as `scope` and has not expired.
+    /// The runtime ID that `id` names, if it was issued for `target_ref` in the same window and
+    /// process instance as `scope` and has not expired. A refusal names `argument`, the field
+    /// that carried the reference (`within` or `element_ref`).
     fn resolve(
         &self,
         id: &str,
         target_ref: &str,
         scope: &Scope,
+        argument: &str,
     ) -> Result<Vec<i32>, PlatformError> {
+        let stale = |reason: &str| {
+            if argument == "within" {
+                stale_within(reason)
+            } else {
+                stale_element(reason)
+            }
+        };
         let entries = self
             .entries
             .lock()
@@ -706,14 +1135,15 @@ impl ElementRefs {
         let entry = entries
             .iter()
             .find(|entry| entry.id == id && entry.issued.elapsed() < ELEMENT_REF_TTL)
-            .ok_or_else(|| stale_within("unknown or expired element reference"))?;
+            .ok_or_else(|| stale("unknown or expired element reference"))?;
         if entry.target_ref != target_ref {
-            return Err(stale_within(
-                "the element reference belongs to another target_ref",
-            ));
+            return Err(stale("the element reference belongs to another target_ref"));
         }
         if entry.pid != scope.pid || entry.created != scope.created {
-            return Err(stale_within("the window's process changed"));
+            return Err(stale("the window's process changed"));
+        }
+        if entry.hwnd != scope.hwnd {
+            return Err(stale("the window changed"));
         }
         Ok(entry.runtime_id.clone())
     }
@@ -727,6 +1157,7 @@ impl ElementRefs {
         let now = Instant::now();
         if let Some(entry) = entries.iter_mut().find(|entry| {
             entry.target_ref == target_ref
+                && entry.hwnd == scope.hwnd
                 && entry.pid == scope.pid
                 && entry.created == scope.created
                 && entry.runtime_id == runtime_id
@@ -745,6 +1176,7 @@ impl ElementRefs {
         entries.push_back(ElementEntry {
             id: id.clone(),
             target_ref: target_ref.to_owned(),
+            hwnd: scope.hwnd,
             pid: scope.pid,
             created: scope.created,
             runtime_id: runtime_id.to_vec(),
@@ -797,7 +1229,7 @@ pub(super) fn find_elements(
     let within = request
         .within
         .as_deref()
-        .map(|id| refs.resolve(id, &request.target_ref, &scope))
+        .map(|id| refs.resolve(id, &request.target_ref, &scope, "within"))
         .transpose()?;
     let query = WalkQuery {
         hwnd: scope.hwnd,
