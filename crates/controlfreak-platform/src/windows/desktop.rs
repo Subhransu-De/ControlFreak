@@ -753,7 +753,7 @@ const MENU_CLASS: &str = "#32768";
 const DROP_DOWN_LIST_CLASS: &str = "ComboLBox";
 /// Most popups one window capture shows. Each one is a bounded render, so this bounds the call;
 /// a cascade of submenus stays well below it.
-pub(super) const MAX_CAPTURED_POPUPS: usize = 8;
+const MAX_CAPTURED_POPUPS: usize = 8;
 /// Owner links followed to find whether a popup belongs to the captured window.
 const MAX_OWNER_DEPTH: usize = 32;
 
