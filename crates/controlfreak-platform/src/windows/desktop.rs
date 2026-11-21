@@ -161,20 +161,45 @@ pub(super) fn current_virtual_desktop_id(manager: &IVirtualDesktopManager) -> Op
 
 /// The foreground window's desktop as the shell reports it, including the all-zero ID.
 pub(super) fn foreground_desktop(manager: &IVirtualDesktopManager) -> Option<windows::core::GUID> {
-    let foreground = foreground_window_handle();
-    if foreground.is_invalid() {
-        return None;
-    }
-    window_desktop_id(manager, foreground).ok()
+    window_desktop(manager, foreground_window_handle())
 }
 
-/// Builds a switch result from the raw readings before and after the shortcuts. The shell gives
-/// an all-zero ID for a window it does not track, which names no desktop, so it is unknown for
-/// `transition` and reported as `None`. `changed` keeps comparing the raw readings, as before.
+/// `hwnd`'s desktop as the shell reports it, including the all-zero ID; `None` for no window.
+pub(super) fn window_desktop(
+    manager: &IVirtualDesktopManager,
+    hwnd: HWND,
+) -> Option<windows::core::GUID> {
+    if hwnd.is_invalid() {
+        return None;
+    }
+    window_desktop_id(manager, hwnd).ok()
+}
+
+/// Whether `window`, in front before a switch, is still on its desktop `before` and that desktop
+/// is no longer current. This reads the current desktop through the window, not the foreground,
+/// so it still answers after a switch to an empty desktop, where the shell's desktop window is in
+/// front and names no desktop. A window that closed, moved or shows on every desktop gives `false`.
+pub(super) fn start_desktop_left(
+    manager: &IVirtualDesktopManager,
+    window: HWND,
+    before: Option<windows::core::GUID>,
+) -> bool {
+    before.is_some_and(|before| {
+        before != windows::core::GUID::zeroed()
+            && window_desktop(manager, window) == Some(before)
+            && window_on_current_desktop(manager, window).is_ok_and(|on_current| !on_current)
+    })
+}
+
+/// Builds a switch result from the raw readings before and after the shortcuts, and
+/// `before_left` from `start_desktop_left`. The shell gives an all-zero ID for a window it does
+/// not track, which names no desktop, so it is unknown for `transition` and reported as `None`.
+/// `changed` keeps comparing the raw readings, as before.
 pub(super) fn desktop_switch_result(
     request: &controlfreak_core::VirtualDesktopSwitchRequest,
     before: Option<windows::core::GUID>,
     after: Option<windows::core::GUID>,
+    before_left: bool,
     observation: controlfreak_core::ActionObservation,
 ) -> controlfreak_core::VirtualDesktopSwitchResult {
     let known = |desktop: Option<windows::core::GUID>| {
@@ -190,6 +215,7 @@ pub(super) fn desktop_switch_result(
         transition: controlfreak_core::VirtualDesktopTransition::classify(
             before_id.as_deref(),
             after_id.as_deref(),
+            before_left,
         ),
         before_id,
         after_id,
@@ -912,7 +938,11 @@ mod switch_result_tests {
     };
     use windows::core::GUID;
 
-    fn switch(before: Option<GUID>, after: Option<GUID>) -> VirtualDesktopSwitchResult {
+    fn switch(
+        before: Option<GUID>,
+        after: Option<GUID>,
+        before_left: bool,
+    ) -> VirtualDesktopSwitchResult {
         let request = VirtualDesktopSwitchRequest {
             direction: VirtualDesktopDirection::Left,
             steps: 2,
@@ -923,28 +953,62 @@ mod switch_result_tests {
             screenshot: None,
             settle: None,
         };
-        desktop_switch_result(&request, before, after, observation)
+        desktop_switch_result(&request, before, after, before_left, observation)
     }
 
     #[test]
-    fn a_missing_or_untracked_reading_confirms_nothing_and_changed_stays_raw() {
+    fn a_missing_or_untracked_reading_confirms_only_a_left_start_and_changed_stays_raw() {
         let a = Some(GUID::from_u128(0xa));
         let b = Some(GUID::from_u128(0xb));
         let zero = Some(GUID::zeroed());
-        for (before, after, expected) in [
-            (a, None, (true, VirtualDesktopTransition::Unknown)),
-            (None, None, (false, VirtualDesktopTransition::Unknown)),
-            (a, zero, (true, VirtualDesktopTransition::Unknown)),
-            (zero, zero, (false, VirtualDesktopTransition::Unknown)),
-            (None, zero, (true, VirtualDesktopTransition::Unknown)),
-            (a, a, (false, VirtualDesktopTransition::ConfirmedUnchanged)),
-            (a, b, (true, VirtualDesktopTransition::ConfirmedChanged)),
+        for (before, after, before_left, expected) in [
+            (a, None, false, (true, VirtualDesktopTransition::Unknown)),
+            (
+                a,
+                None,
+                true,
+                (true, VirtualDesktopTransition::ConfirmedChanged),
+            ),
+            (
+                None,
+                None,
+                false,
+                (false, VirtualDesktopTransition::Unknown),
+            ),
+            (a, zero, false, (true, VirtualDesktopTransition::Unknown)),
+            // The shell's desktop window in front after a switch to an empty desktop.
+            (
+                a,
+                zero,
+                true,
+                (true, VirtualDesktopTransition::ConfirmedChanged),
+            ),
+            (
+                zero,
+                zero,
+                false,
+                (false, VirtualDesktopTransition::Unknown),
+            ),
+            (zero, None, true, (true, VirtualDesktopTransition::Unknown)),
+            (None, zero, false, (true, VirtualDesktopTransition::Unknown)),
+            (
+                a,
+                a,
+                false,
+                (false, VirtualDesktopTransition::ConfirmedUnchanged),
+            ),
+            (
+                a,
+                b,
+                false,
+                (true, VirtualDesktopTransition::ConfirmedChanged),
+            ),
         ] {
-            let result = switch(before, after);
+            let result = switch(before, after, before_left);
             assert_eq!(
                 (result.changed, result.transition),
                 expected,
-                "{before:?} -> {after:?}"
+                "{before:?} -> {after:?}, before_left={before_left}"
             );
         }
     }
@@ -952,7 +1016,7 @@ mod switch_result_tests {
     #[test]
     fn an_untracked_reading_is_reported_as_an_unknown_id() {
         let a = GUID::from_u128(0xa);
-        let result = switch(Some(a), Some(GUID::zeroed()));
+        let result = switch(Some(a), Some(GUID::zeroed()), true);
         assert_eq!(result.before_id, Some(format!("{a:?}")));
         assert_eq!(result.after_id, None);
         assert_eq!(result.direction, VirtualDesktopDirection::Left);

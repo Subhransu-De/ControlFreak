@@ -90,14 +90,18 @@ pub enum VirtualDesktopTransition {
 }
 
 impl VirtualDesktopTransition {
-    /// Only two known readings confirm anything. A reading is unknown when no window holds the
-    /// foreground or the shell reports no desktop for it, and an empty destination desktop may
-    /// read that way after a successful switch, so a missing reading on either side is `Unknown`.
+    /// Two known readings confirm the result. A reading is unknown when no window holds the
+    /// foreground or the shell reports no desktop for it. After a switch to an empty desktop the
+    /// shell's own desktop window holds the foreground and reads that way, so a known desktop
+    /// followed by an unknown one is `ConfirmedChanged` only when `before_left` confirms it: the
+    /// window that was in front before the switch is still on `before`, and that desktop is no
+    /// longer current. Anything else with a missing reading is `Unknown`.
     #[must_use]
-    pub fn classify(before: Option<&str>, after: Option<&str>) -> Self {
+    pub fn classify(before: Option<&str>, after: Option<&str>, before_left: bool) -> Self {
         match (before, after) {
             (Some(before), Some(after)) if before == after => Self::ConfirmedUnchanged,
             (Some(_), Some(_)) => Self::ConfirmedChanged,
+            (Some(_), None) if before_left => Self::ConfirmedChanged,
             _ => Self::Unknown,
         }
     }
@@ -201,20 +205,25 @@ mod tests {
     }
 
     #[test]
-    fn only_two_known_readings_confirm_a_transition() {
+    fn a_missing_reading_confirms_a_change_only_when_the_start_desktop_was_left() {
         let a = Some("A");
         let b = Some("B");
-        for (before, after, expected) in [
-            (None, None, VirtualDesktopTransition::Unknown),
-            (a, None, VirtualDesktopTransition::Unknown),
-            (None, a, VirtualDesktopTransition::Unknown),
-            (a, a, VirtualDesktopTransition::ConfirmedUnchanged),
-            (a, b, VirtualDesktopTransition::ConfirmedChanged),
+        for (before, after, before_left, expected) in [
+            (None, None, false, VirtualDesktopTransition::Unknown),
+            (None, None, true, VirtualDesktopTransition::Unknown),
+            (a, None, false, VirtualDesktopTransition::Unknown),
+            // An empty destination desktop: the shell's desktop window is in front.
+            (a, None, true, VirtualDesktopTransition::ConfirmedChanged),
+            (None, a, false, VirtualDesktopTransition::Unknown),
+            (None, a, true, VirtualDesktopTransition::Unknown),
+            (a, a, false, VirtualDesktopTransition::ConfirmedUnchanged),
+            (a, b, false, VirtualDesktopTransition::ConfirmedChanged),
+            (a, b, true, VirtualDesktopTransition::ConfirmedChanged),
         ] {
             assert_eq!(
-                VirtualDesktopTransition::classify(before, after),
+                VirtualDesktopTransition::classify(before, after, before_left),
                 expected,
-                "{before:?} -> {after:?}"
+                "{before:?} -> {after:?}, before_left={before_left}"
             );
         }
     }

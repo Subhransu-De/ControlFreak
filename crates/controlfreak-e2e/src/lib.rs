@@ -1,3 +1,4 @@
+mod desktops;
 pub mod events;
 pub mod github;
 pub mod host;

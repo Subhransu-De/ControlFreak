@@ -20,7 +20,12 @@
 //! controlfreak-fixture --release-clip         # free the pointer from any ClipCursor rectangle
 //! controlfreak-fixture --clip-rect            # print the rectangle the pointer is confined to
 //! controlfreak-fixture --move-window TITLE DX,DY  # move the top-level window titled TITLE
+//! controlfreak-fixture --virtual-desktops     # print the shell's current and listed desktops
+//! controlfreak-fixture --desktop-shortcut new|left|right|close  # SendInput Ctrl+Win+D/←/→/F4
 //! ```
+//!
+//! `--virtual-desktops` reads what Explorer records in the registry, independently of any window:
+//! `current GUID` (or `current none`) and `ids GUID,GUID,…` in desktop order (or `ids` alone).
 //!
 //! With `--clip-cursor` the window confines the pointer to the left part of its client area with
 //! `ClipCursor` whenever it is activated, as games and remote viewers do, and frees it when it is
@@ -69,21 +74,28 @@ mod win {
     };
     use windows::{
         Win32::{
-            Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+            Foundation::{
+                COLORREF, ERROR_FILE_NOT_FOUND, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT,
+                WPARAM,
+            },
             Graphics::Gdi::{
                 BeginPaint, ClientToScreen, CreateFontIndirectW, CreateSolidBrush, DeleteObject,
                 EndPaint, FillRect, HDC, HGDIOBJ, InvalidateRect, LOGFONTW, PAINTSTRUCT,
                 SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
             },
-            System::LibraryLoader::GetModuleHandleW,
+            System::{
+                LibraryLoader::GetModuleHandleW,
+                Registry::{HKEY_CURRENT_USER, RRF_RT_REG_BINARY, RegGetValueW},
+            },
             UI::{
                 HiDpi::{
                     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
                 },
                 Input::KeyboardAndMouse::{
                     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-                    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-                    MOUSEINPUT, SendInput, SetFocus, VIRTUAL_KEY,
+                    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+                    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT, SendInput, SetFocus,
+                    VIRTUAL_KEY, VK_CONTROL, VK_F4, VK_LEFT, VK_LWIN, VK_RIGHT,
                 },
                 WindowsAndMessaging::{
                     AdjustWindowRectEx, BM_CLICK, BN_CLICKED, BS_PUSHBUTTON, ClipCursor,
@@ -102,7 +114,7 @@ mod win {
                 },
             },
         },
-        core::{BOOL, PCWSTR, w},
+        core::{BOOL, GUID, PCWSTR, w},
     };
 
     const CLIENT_WIDTH: i32 = 360;
@@ -208,6 +220,10 @@ mod win {
                 "--inject-unicode" => return inject_unicode(&args.next().unwrap_or_default()),
                 "--release-clip" => return release_clip(),
                 "--clip-rect" => return print_clip_rect(),
+                "--virtual-desktops" => return print_virtual_desktops(),
+                "--desktop-shortcut" => {
+                    return desktop_shortcut(&args.next().unwrap_or_default());
+                }
                 "--move-window" => {
                     let title = args.next().unwrap_or_default();
                     return move_window(&title, &args.next().unwrap_or_default());
@@ -1069,9 +1085,138 @@ mod win {
         }
     }
 
+    /// Where Explorer records the virtual desktops of the signed-in user on Windows 11 and
+    /// Windows Server 2025. Undocumented, so this is test evidence only, never server behavior.
+    const VIRTUAL_DESKTOPS_KEY: PCWSTR =
+        w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops");
+    /// More desktops than a test runner ever has; a longer list is reported as an error.
+    const MAX_LISTED_DESKTOPS: usize = 64;
+
+    /// Prints `current GUID` and `ids GUID,…` from the registry, in the server's GUID format. A
+    /// missing value prints `current none` or an empty `ids`, as on a profile that never had a
+    /// second desktop. Exit code 0 when both values were read or are missing.
+    fn print_virtual_desktops() -> i32 {
+        let current = match desktop_guids(w!("CurrentVirtualDesktop")) {
+            Ok(Some(ids)) if ids.len() == 1 => Some(ids[0]),
+            Ok(None) => None,
+            Ok(Some(ids)) => {
+                eprintln!("CurrentVirtualDesktop holds {} GUIDs", ids.len());
+                return 1;
+            }
+            Err(error) => {
+                eprintln!("CurrentVirtualDesktop: {error}");
+                return 1;
+            }
+        };
+        let ids = match desktop_guids(w!("VirtualDesktopIDs")) {
+            Ok(ids) => ids.unwrap_or_default(),
+            Err(error) => {
+                eprintln!("VirtualDesktopIDs: {error}");
+                return 1;
+            }
+        };
+        let format = |id: &GUID| format!("{id:?}");
+        println!(
+            "current {}",
+            current.as_ref().map_or_else(|| "none".to_owned(), format)
+        );
+        println!(
+            "ids {}",
+            ids.iter().map(format).collect::<Vec<_>>().join(",")
+        );
+        0
+    }
+
+    /// The GUIDs a binary value under `VIRTUAL_DESKTOPS_KEY` holds, `None` when it is missing.
+    fn desktop_guids(value: PCWSTR) -> Result<Option<Vec<GUID>>, String> {
+        let mut data = [0_u8; 16 * MAX_LISTED_DESKTOPS];
+        let mut size = u32::try_from(data.len()).unwrap_or(0);
+        // SAFETY: `data` is writable for `size` bytes during this synchronous call, which writes
+        // at most `size` bytes and stores the length it wrote back into `size`.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                VIRTUAL_DESKTOPS_KEY,
+                value,
+                RRF_RT_REG_BINARY,
+                None,
+                Some(data.as_mut_ptr().cast()),
+                Some(&raw mut size),
+            )
+        };
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        if status.is_err() {
+            return Err(format!("RegGetValueW failed with {}", status.0));
+        }
+        let data = data
+            .get(..usize::try_from(size).unwrap_or(0))
+            .unwrap_or_default();
+        if data.len() % 16 != 0 {
+            return Err(format!("{} bytes is not a list of GUIDs", data.len()));
+        }
+        Ok(Some(data.chunks_exact(16).map(guid_from_bytes).collect()))
+    }
+
+    /// A GUID stored in memory order: three little-endian fields, then eight bytes.
+    fn guid_from_bytes(bytes: &[u8]) -> GUID {
+        let mut tail = [0_u8; 8];
+        tail.copy_from_slice(&bytes[8..16]);
+        GUID::from_values(
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            u16::from_le_bytes([bytes[6], bytes[7]]),
+            tail,
+        )
+    }
+
+    /// Sends the shell's virtual-desktop shortcut Ctrl+Win plus D (new desktop, which the shell
+    /// also switches to), Left, Right or F4 (close the current desktop). Exit code 0 only if
+    /// Windows accepted every event.
+    fn desktop_shortcut(which: &str) -> i32 {
+        let (key, extended) = match which {
+            "new" => (VIRTUAL_KEY(u16::from(b'D')), false),
+            "left" => (VK_LEFT, true),
+            "right" => (VK_RIGHT, true),
+            "close" => (VK_F4, false),
+            _ => {
+                eprintln!("--desktop-shortcut needs new, left, right or close");
+                return 2;
+            }
+        };
+        let flags = |extended: bool, up: bool| {
+            let mut flags = KEYBD_EVENT_FLAGS::default();
+            if extended {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            if up {
+                flags |= KEYEVENTF_KEYUP;
+            }
+            flags
+        };
+        send_keys(&[
+            key_event(VK_CONTROL, 0, flags(false, false)),
+            key_event(VK_LWIN, 0, flags(true, false)),
+            key_event(key, 0, flags(extended, false)),
+            key_event(key, 0, flags(extended, true)),
+            key_event(VK_LWIN, 0, flags(true, true)),
+            key_event(VK_CONTROL, 0, flags(false, true)),
+        ])
+    }
+
     #[cfg(test)]
     mod tests {
-        use super::join_surrogates;
+        use super::{GUID, guid_from_bytes, join_surrogates};
+
+        #[test]
+        fn a_registry_guid_reads_in_memory_order() {
+            let bytes: Vec<u8> = (0..16).collect();
+            assert_eq!(
+                guid_from_bytes(&bytes),
+                GUID::from_u128(0x0302_0100_0504_0706_0809_0A0B_0C0D_0E0F)
+            );
+        }
 
         fn paint(units: &[u16]) -> String {
             let mut pending = None;

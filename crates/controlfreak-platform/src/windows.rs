@@ -1146,7 +1146,8 @@ impl WindowBackend for Backend {
         ensure_interactive_input_desktop("switch_virtual_desktop")?;
         // Read under the input lock, so another of this server's actions cannot move the
         // foreground between this reading and the first shortcut.
-        let before = desktop::foreground_desktop(&manager);
+        let before_window = desktop::foreground_window_handle();
+        let before = desktop::window_desktop(&manager, before_window);
         input::send_desktop_switch_hops(
             request.direction,
             request.steps,
@@ -1167,13 +1168,18 @@ impl WindowBackend for Backend {
         control.input_complete();
         target::evidence(control);
         let after = desktop::foreground_desktop(&manager);
+        // After a switch to an empty desktop the foreground names no desktop, so whether the
+        // starting desktop is still current is read through the window that was in front on it.
+        let before_left = desktop::start_desktop_left(&manager, before_window, before);
         let observation = observe_foreground(&request.observation, control)
             .map_err(|error| post_action_error("switch_virtual_desktop", error.to_string()))?;
-        // A missing reading leaves the transition unknown; the input is still reported as sent.
+        // A missing reading the check above cannot settle leaves the transition unknown; the
+        // input is still reported as sent.
         Ok(desktop::desktop_switch_result(
             request,
             before,
             after,
+            before_left,
             observation,
         ))
     }

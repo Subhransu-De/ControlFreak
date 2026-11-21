@@ -344,7 +344,7 @@ impl WindowBackend for ContractBackend {
         self.recorded.lock().unwrap().switches += 1;
         self.act(
             control,
-            // A known desktop, then none: what an empty destination desktop may look like.
+            // A known desktop, then none, and nothing confirmed that the start desktop was left.
             VirtualDesktopSwitchResult {
                 direction: request.direction,
                 requested_steps: request.steps,
