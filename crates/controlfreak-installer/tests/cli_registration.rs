@@ -349,6 +349,88 @@ fn register_and_remove_cli_respects_existing_entries_profiles_and_customizations
 }
 
 #[test]
+fn registering_second_profile_retains_earlier_profile_for_uninstall_warning() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    let state = root.path().join("installer-state");
+    fs::create_dir_all(&bin).unwrap();
+    let exe = root.path().join("ControlFreak").join("controlfreak.exe");
+
+    let claude_entry_a = root.path().join("claude-a.entry");
+    let claude_entry_b = root.path().join("claude-b.entry");
+    let claude_log = root.path().join("claude.log");
+    // Profile-aware fake claude shim storing separate state files per CLAUDE_CONFIG_DIR.
+    fs::write(
+        bin.join("claude.cmd"),
+        format!(
+            "@echo off\r\n\
+echo %CLAUDE_CONFIG_DIR% %*>>\"{log}\"\r\n\
+if \"%1 %2\"==\"mcp add\" goto do_add\r\n\
+if \"%1 %2\"==\"mcp remove\" goto do_remove\r\n\
+exit /b 1\r\n\
+:do_add\r\n\
+if \"%CLAUDE_CONFIG_DIR%\"==\"A\" echo reg>\"{a}\"\r\n\
+if \"%CLAUDE_CONFIG_DIR%\"==\"B\" echo reg>\"{b}\"\r\n\
+exit /b 0\r\n\
+:do_remove\r\n\
+if \"%CLAUDE_CONFIG_DIR%\"==\"B\" del /f /q \"{b}\"\r\n\
+exit /b 0\r\n",
+            log = claude_log.display(),
+            a = claude_entry_a.display(),
+            b = claude_entry_b.display()
+        ),
+    )
+    .unwrap();
+
+    let report_a = root.path().join("reg-a.ini");
+    let out_a = run_helper_with_env(
+        &bin,
+        &[
+            "register-cli",
+            "claude-code",
+            exe.to_str().unwrap(),
+            state.to_str().unwrap(),
+            report_a.to_str().unwrap(),
+        ],
+        &[("CLAUDE_CONFIG_DIR", "A")],
+    );
+    assert!(out_a.status.success());
+
+    let report_b = root.path().join("reg-b.ini");
+    let out_b = run_helper_with_env(
+        &bin,
+        &[
+            "register-cli",
+            "claude-code",
+            exe.to_str().unwrap(),
+            state.to_str().unwrap(),
+            report_b.to_str().unwrap(),
+        ],
+        &[("CLAUDE_CONFIG_DIR", "B")],
+    );
+    assert!(out_b.status.success());
+
+    // Uninstalling under profile B removes B, keeps profile A's marker record, and warns about it.
+    let remove_report = root.path().join("remove-b.ini");
+    let out_rm = run_helper_with_env(
+        &bin,
+        &[
+            "remove-cli",
+            state.to_str().unwrap(),
+            remove_report.to_str().unwrap(),
+        ],
+        &[("CLAUDE_CONFIG_DIR", "B")],
+    );
+    assert!(out_rm.status.success());
+    assert!(!claude_entry_b.exists());
+    assert!(claude_entry_a.is_file());
+    assert!(state.join("claude-code.managed").is_file());
+    let text = fs::read_to_string(&remove_report).unwrap();
+    assert!(text.contains("status=warning"));
+    assert!(text.contains("claude-code"));
+}
+
+#[test]
 fn failed_codex_lookup_never_overwrites_existing_entry() {
     let root = tempfile::tempdir().unwrap();
     let bin = root.path().join("bin");

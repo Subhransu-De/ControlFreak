@@ -257,17 +257,40 @@ fn marker_path(state: &Path, id: &str) -> PathBuf {
     state.join(format!("{id}.managed"))
 }
 
-fn write_marker(state: &Path, id: &str, exe: &str) -> std::io::Result<()> {
-    let (profile_override, userprofile) = current_profile(id);
-    fs::create_dir_all(state)?;
-    let content = format!(
-        "version=1\nexe={exe}\nprofile_override={profile_override}\nuserprofile={userprofile}\n"
-    );
-    fs::write(marker_path(state, id), content)
+fn parse_marker_object(value: &serde_json::Value) -> Option<ManagedMarker> {
+    let obj = value.as_object()?;
+    if obj.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return None;
+    }
+    let exe = obj.get("exe").and_then(serde_json::Value::as_str)?;
+    if exe.is_empty() {
+        return None;
+    }
+    Some(ManagedMarker {
+        exe: exe.to_owned(),
+        profile_override: obj
+            .get("profile_override")
+            .and_then(serde_json::Value::as_str)?
+            .to_owned(),
+        userprofile: obj
+            .get("userprofile")
+            .and_then(serde_json::Value::as_str)?
+            .to_owned(),
+    })
 }
 
-fn read_marker(path: &Path) -> Option<ManagedMarker> {
+fn read_markers(path: &Path) -> Option<Vec<ManagedMarker>> {
     let text = fs::read_to_string(path).ok()?;
+    let trimmed = text.trim();
+    if trimmed.starts_with('[') {
+        let items = serde_json::from_str::<Vec<serde_json::Value>>(trimmed).ok()?;
+        let mut parsed = Vec::with_capacity(items.len());
+        for item in &items {
+            parsed.push(parse_marker_object(item)?);
+        }
+        return (!parsed.is_empty()).then_some(parsed);
+    }
+    // Support legacy single-record key=value marker format.
     let mut version = None;
     let mut exe = None;
     let mut profile_override = None;
@@ -290,11 +313,60 @@ fn read_marker(path: &Path) -> Option<ManagedMarker> {
     if exe.is_empty() {
         return None;
     }
-    Some(ManagedMarker {
+    Some(vec![ManagedMarker {
         exe,
         profile_override: profile_override?,
         userprofile: userprofile?,
-    })
+    }])
+}
+
+fn write_markers_list(path: &Path, markers: &[ManagedMarker]) -> std::io::Result<()> {
+    let json: Vec<serde_json::Value> = markers
+        .iter()
+        .map(|marker| {
+            serde_json::json!({
+                "version": 1,
+                "exe": marker.exe,
+                "profile_override": marker.profile_override,
+                "userprofile": marker.userprofile,
+            })
+        })
+        .collect();
+    let encoded = serde_json::to_string(&json).map_err(std::io::Error::other)?;
+    fs::write(path, encoded)
+}
+
+fn write_marker(state: &Path, id: &str, exe: &str) -> std::io::Result<()> {
+    let (profile_override, userprofile) = current_profile(id);
+    fs::create_dir_all(state)?;
+    let path = marker_path(state, id);
+    let mut markers = if path.is_file() {
+        read_markers(&path).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    // Preserve earlier registered profiles while updating any record for the active profile.
+    markers.retain(|existing| {
+        existing.profile_override != profile_override || existing.userprofile != userprofile
+    });
+    markers.push(ManagedMarker {
+        exe: exe.to_owned(),
+        profile_override,
+        userprofile,
+    });
+    write_markers_list(&path, &markers)
+}
+
+fn enter_non_project_dir() -> Result<()> {
+    // Use Windows' System32 directory so project-scoped `.codex/config.toml` files in any
+    // workspace (including one containing TMP) cannot shadow global Codex configuration.
+    let cmd_exe = controlfreak_platform::system_cmd_exe()
+        .map_err(|_| "Windows system directory was not found.")?;
+    let system_dir = cmd_exe
+        .parent()
+        .ok_or("Windows system directory was not found.")?;
+    env::set_current_dir(system_dir)
+        .map_err(|_| "Could not isolate Codex lookup outside project directories.")
 }
 
 fn is_codex_not_found(output: &str) -> bool {
@@ -405,9 +477,7 @@ pub fn register(id: &str, executable: &Path, state: &Path, allow_elevated: bool)
             Err("claude mcp add failed; copy the command and run it in PowerShell.")
         }
         "codex" => {
-            // Move out of any project working directory so project-local `.codex/config.toml`
-            // cannot shadow the global Codex configuration that `codex mcp add` edits.
-            let _ = env::set_current_dir(env::temp_dir());
+            enter_non_project_dir()?;
             // Check existing registration first and only proceed to `codex mcp add` on an
             // exact absence line, so customized entries (e.g. --profile observe) are never
             // silently overwritten on a lookup error or corrupt config.
@@ -466,15 +536,24 @@ pub fn remove_managed(state: &Path, allow_elevated: bool) -> RemoveOutcome {
         if !marker_file.is_file() {
             continue;
         }
-        let Some(marker) = read_marker(&marker_file) else {
+        let Some(markers) = read_markers(&marker_file) else {
             outcome.retained.push(id);
             continue;
         };
         let (profile_override, userprofile) = current_profile(id);
-        if marker.profile_override != profile_override || marker.userprofile != userprofile {
+        let mut active_marker = None;
+        let mut other_profiles = Vec::new();
+        for marker in markers {
+            if marker.profile_override == profile_override && marker.userprofile == userprofile {
+                active_marker = Some(marker);
+            } else {
+                other_profiles.push(marker);
+            }
+        }
+        let Some(marker) = active_marker else {
             outcome.retained.push(id);
             continue;
-        }
+        };
         let Ok(cli_name) = cli_binary_name(id) else {
             outcome.retained.push(id);
             continue;
@@ -484,10 +563,12 @@ pub fn remove_managed(state: &Path, allow_elevated: bool) -> RemoveOutcome {
             continue;
         };
 
+        let mut active_removed = false;
         if id == "codex" {
-            // Move out of any project working directory so `codex mcp get --json` inspects
-            // global configuration matching what `codex mcp remove` edits.
-            let _ = env::set_current_dir(env::temp_dir());
+            if enter_non_project_dir().is_err() {
+                outcome.retained.push(id);
+                continue;
+            }
             // Verify Codex still holds the exact unmodified entry Setup registered before removing.
             match run_cli(&resolved, &["mcp", "get", "--json", "controlfreak"]) {
                 Ok(check) if check.success => {
@@ -497,9 +578,7 @@ pub fn remove_managed(state: &Path, allow_elevated: bool) -> RemoveOutcome {
                     }
                 }
                 Ok(check) if is_codex_not_found(&check.combined) => {
-                    let _ = fs::remove_file(&marker_file);
-                    outcome.removed.push(id);
-                    continue;
+                    active_removed = true;
                 }
                 _ => {
                     outcome.retained.push(id);
@@ -508,16 +587,28 @@ pub fn remove_managed(state: &Path, allow_elevated: bool) -> RemoveOutcome {
             }
         }
 
-        let args: &[&str] = match id {
-            "claude-code" => &["mcp", "remove", "--scope", "user", "controlfreak"],
-            "codex" => &["mcp", "remove", "controlfreak"],
-            _ => continue,
-        };
-        if let Ok(output) = run_cli(&resolved, args)
-            && output.success
-        {
-            let _ = fs::remove_file(&marker_file);
+        if !active_removed {
+            let args: &[&str] = match id {
+                "claude-code" => &["mcp", "remove", "--scope", "user", "controlfreak"],
+                "codex" => &["mcp", "remove", "controlfreak"],
+                _ => continue,
+            };
+            if let Ok(output) = run_cli(&resolved, args)
+                && output.success
+            {
+                active_removed = true;
+            }
+        }
+
+        if active_removed {
             outcome.removed.push(id);
+            if other_profiles.is_empty() {
+                let _ = fs::remove_file(&marker_file);
+            } else {
+                // Keep records for other profiles and warn so earlier registrations are not lost silently.
+                let _ = write_markers_list(&marker_file, &other_profiles);
+                outcome.retained.push(id);
+            }
         } else {
             outcome.retained.push(id);
         }
