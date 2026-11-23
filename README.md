@@ -62,23 +62,16 @@ that says "An agent is using this PC". Press Esc while the agent is working, or 
 
 ## Install
 
-1. Download `ControlFreak-<version>.exe` from
-   [Releases](https://github.com/Subhransu-De/ControlFreak/releases).
-2. Run it and tick the MCP clients you use.
+1. Download `ControlFreak-<version>.exe` from [Releases](https://github.com/Subhransu-De/ControlFreak/releases).
+2. Run it and optionally select **Claude Code** or **Codex** to register ControlFreak using their official CLI commands, or copy each command to run yourself.
 3. Restart those clients.
 
-Setup adds a `controlfreak` entry to each client you tick, and keeps a backup of the file:
-
-| Client | File setup updates |
+| Client | Command setup runs (PowerShell syntax) |
 | --- | --- |
-| Claude Code | `%USERPROFILE%\.claude.json` |
-| Codex | `%USERPROFILE%\.codex\config.toml` |
-| Claude Desktop | `%APPDATA%\Claude\claude_desktop_config.json` |
-| OpenCode | `%USERPROFILE%\.config\opencode\opencode.json` |
-| Pi | `%USERPROFILE%\.pi\agent\mcp.json` |
+| Claude Code | `claude mcp add --scope user controlfreak -- '<install-dir>\controlfreak.exe'` |
+| Codex | `codex mcp add controlfreak -- '<install-dir>\controlfreak.exe'` |
 
-Needs Windows 10 (2004) or Windows 11 on x86-64. For the portable ZIP, silent install, manual
-setup and uninstall, see [Install and configure](https://github.com/Subhransu-De/ControlFreak/blob/main/docs/install.md).
+Setup never edits third-party configuration files directly. Needs Windows 10 (2004) or Windows 11 on x86-64. For Claude Desktop, OpenCode, Pi, the portable ZIP, silent install, manual setup and uninstall, see [Install and configure](https://github.com/Subhransu-De/ControlFreak/blob/main/docs/install.md).
 
 ## Privacy
 

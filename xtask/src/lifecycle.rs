@@ -3,52 +3,53 @@ use controlfreak_platform::packaging_tests::{self as native, Registration};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::process::CommandExt;
 use std::{
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
 };
 
-const CLIENT_PATHS: [&str; 5] = [
-    ".codex/config.toml",
-    ".claude.json",
-    "roaming/Claude/claude_desktop_config.json",
-    ".pi/agent/mcp.json",
-    ".config/opencode/opencode.json",
-];
-
 struct Fixture {
     output: PathBuf,
     profile: PathBuf,
+    bin: PathBuf,
     install: PathBuf,
     registration: Registration,
 }
+
 impl Fixture {
     fn command(&self, executable: &Path) -> Command {
         let mut command = Command::new(executable);
-        for name in [
-            "CODEX_HOME",
-            "CLAUDE_CONFIG_DIR",
-            "PI_CODING_AGENT_DIR",
-            "OPENCODE_CONFIG",
-            "OPENCODE_CONFIG_DIR",
-            "XDG_CONFIG_HOME",
-        ] {
+        for name in ["CODEX_HOME", "CLAUDE_CONFIG_DIR"] {
             command.env_remove(name);
         }
+        let sys_root = env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        let sys_root = PathBuf::from(sys_root);
+        let path = env::join_paths([self.bin.clone(), sys_root.join("System32"), sys_root])
+            .expect("join synthetic PATH");
         command
+            .env("PATH", path)
             .env("USERPROFILE", &self.profile)
             .env("LOCALAPPDATA", self.profile.join("local"))
             .env("APPDATA", self.profile.join("roaming"));
         command
     }
-    fn setup(&self, executable: &Path, configure: bool) -> Result<i32> {
+
+    fn setup_with_flags(
+        &self,
+        executable: &Path,
+        configure: bool,
+        allow_elevated: bool,
+    ) -> Result<i32> {
         let mut command = self.command(executable);
         command.args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]);
+        if allow_elevated {
+            command.arg("/ALLOWELEVATEDCLI=1");
+        }
         if configure {
             command
                 .arg(format!("/DIR={}", self.install.display()))
-                .arg("/CLIENTS=codex,claude-code,claude-desktop,pi,opencode");
+                .arg("/CLIENTS=claude-code,codex");
         } else {
             command.arg("/REMOVECONFIG=1").arg(format!(
                 "/LOG={}",
@@ -61,7 +62,74 @@ impl Fixture {
             .code()
             .ok_or_else(|| "Installer terminated without an exit code".into())
     }
+
+    fn setup(&self, executable: &Path, configure: bool) -> Result<i32> {
+        let elevated =
+            controlfreak_platform::server_security_context(true).map_or(true, |ctx| ctx.elevated);
+        self.setup_with_flags(executable, configure, elevated)
+    }
+
+    fn write_synthetic_clis(&self, claude_present: bool, codex_present: bool) -> Result<()> {
+        if self.bin.exists() {
+            fs::remove_dir_all(&self.bin)?;
+        }
+        fs::create_dir_all(&self.bin)?;
+        if claude_present {
+            let state = self.profile.join("claude.registered");
+            let script = format!(
+                "@echo off\r\n\
+chcp 65001 >nul\r\n\
+if \"%1 %2\"==\"mcp add\" goto do_add\r\n\
+if \"%1 %2\"==\"mcp remove\" goto do_remove\r\n\
+exit /b 1\r\n\
+:do_add\r\n\
+if exist \"{s}\" goto already\r\n\
+echo %*>\"{s}\"\r\n\
+exit /b 0\r\n\
+:already\r\n\
+echo MCP server controlfreak already exists in user config 1>&2\r\n\
+exit /b 1\r\n\
+:do_remove\r\n\
+if not exist \"{s}\" exit /b 1\r\n\
+del /f /q \"{s}\"\r\n\
+exit /b 0\r\n",
+                s = state.display()
+            );
+            fs::write(self.bin.join("claude.cmd"), script)?;
+        }
+        if codex_present {
+            let state = self.profile.join("codex.registered");
+            let script = format!(
+                "@echo off\r\n\
+chcp 65001 >nul\r\n\
+if \"%1 %2\"==\"mcp get\" goto do_get\r\n\
+if \"%1 %2\"==\"mcp add\" goto do_add\r\n\
+if \"%1 %2\"==\"mcp remove\" goto do_remove\r\n\
+exit /b 1\r\n\
+:do_get\r\n\
+if exist \"{s}\" (\r\n\
+  type \"{s}\"\r\n\
+  exit /b 0\r\n\
+)\r\n\
+echo Error: No MCP server named 'controlfreak' found. 1>&2\r\n\
+exit /b 1\r\n\
+:do_add\r\n\
+set \"EXE=%~5\"\r\n\
+set \"EXE=%EXE:\\=\\\\%\"\r\n\
+echo {{\"name\":\"controlfreak\",\"enabled\":true,\"transport\":{{\"type\":\"stdio\",\"command\":\"%EXE%\",\"args\":[],\"env\":null,\"env_vars\":[],\"cwd\":null}}}}>\"{s}\"\r\n\
+exit /b 0\r\n\
+:do_remove\r\n\
+if not exist \"{s}\" exit /b 1\r\n\
+del /f /q \"{s}\"\r\n\
+exit /b 0\r\n",
+                s = state.display()
+            );
+            fs::write(self.bin.join("codex.cmd"), script)?;
+        }
+        Ok(())
+    }
 }
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         // A pre-existing registration was excluded before constructing this guard.
@@ -76,6 +144,20 @@ impl Drop for Fixture {
                 );
             }
         }
+    }
+}
+
+fn read_uninstall_log(path: &Path) -> Result<String> {
+    let bytes = fs::read(path)?;
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        Ok(String::from_utf16(
+            &bytes[2..]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect::<Vec<_>>(),
+        )?)
+    } else {
+        Ok(String::from_utf8(bytes)?)
     }
 }
 
@@ -99,6 +181,7 @@ pub fn run(directory: &Path, output: &Path, version: &str, production: bool) -> 
     let output = package::fresh(output)?;
     let mut fixture = Fixture {
         profile: output.join("synthetic-profile"),
+        bin: output.join("synthetic-bin"),
         install: output.join("Apps with spaces 日本語/ControlFreak"),
         registration,
         output,
@@ -107,50 +190,60 @@ pub fn run(directory: &Path, output: &Path, version: &str, production: bool) -> 
     // Inno's uninstaller can finish deleting its old files after its launcher
     // exits. A second scenario must not reinstall into that same directory.
     fixture.install = fixture.output.join("Missing helper/ControlFreak");
+    fixture.profile = fixture.output.join("missing-helper-profile");
     verify_missing_helper_uninstall(&fixture, &installer)?;
-    fixture.install = fixture.output.join("Cleanup unavailable/ControlFreak");
-    fixture.profile = fixture.output.join("cleanup-unavailable-profile");
-    verify_failed_cleanup_uninstall(&fixture, &installer)?;
-    fixture.install = fixture.output.join("Cleanup warning/ControlFreak");
-    fixture.profile = fixture.output.join("cleanup-warning-profile");
-    verify_retained_cleanup_uninstall(&fixture, &installer)?;
+    fixture.install = fixture.output.join("Missing cli cleanup/ControlFreak");
+    fixture.profile = fixture.output.join("missing-cli-profile");
+    verify_missing_cli_cleanup_uninstall(&fixture, &installer)?;
+    fixture.install = fixture.output.join("Legacy receipt upgrade/ControlFreak");
+    fixture.profile = fixture.output.join("legacy-receipt-profile");
+    verify_legacy_v030_receipt_uninstall(&fixture, &installer)?;
     println!(
-        "Installer lifecycle: client configuration, permissions, upgrades, refusals, partial failure and uninstall passed."
+        "Installer lifecycle: CLI registration, UTF-8 results, upgrades, legacy receipt notice, refusals, partial failure and uninstall passed."
     );
     Ok(())
 }
 
 fn exercise(fixture: &Fixture, installer: &Path, directory: &Path, version: &str) -> Result<()> {
     fs::create_dir_all(&fixture.profile)?;
-    let config = fixture.profile.join(".claude.json");
-    fs::write(
-        &config,
-        r#"{"preferences":{"synthetic":true},"mcpServers":{"controlfreak":{"command":"old-synthetic.exe"},"other":{"command":"other-synthetic.exe"}}}"#,
-    )?;
-    native::restrict_fixture_permissions(&config)?;
-    let permissions = native::configuration_permissions(&config)?;
+    fixture.write_synthetic_clis(true, true)?;
+    let claude_state = fixture.profile.join("claude.registered");
+    let codex_state = fixture.profile.join("codex.registered");
+    // Pre-populate Codex so we verify Setup keeps pre-existing entries untouched and does not remove them on uninstall.
+    let preexisting_codex = r#"{"name":"controlfreak","enabled":true,"transport":{"type":"stdio","command":"C:\\Existing\\controlfreak.exe","args":["--profile","observe"],"env":null,"env_vars":[],"cwd":null}}"#;
+    fs::write(&codex_state, preexisting_codex)?;
+
+    let elevated =
+        controlfreak_platform::server_security_context(true).map_or(true, |ctx| ctx.elevated);
+    if elevated && fixture.setup_with_flags(installer, true, false)? != 10 {
+        return Err("Elevated setup must refuse automatic CLI registration without opt-in".into());
+    }
     if fixture.setup(installer, true)? != 0 {
         return Err("Fresh installation failed".into());
     }
     if fixture.registration.location()?.as_deref() != Some(fixture.install.as_path()) {
         return Err("Wrong uninstall registration".into());
     }
-    if native::configuration_permissions(&config)? != permissions {
-        return Err("Configuration permissions changed".into());
+    let results_txt = fs::read_to_string(fixture.install.join("setup-results.txt"))?;
+    if !results_txt.contains("Apps with spaces 日本語") {
+        return Err("setup-results.txt did not preserve the Unicode install path as UTF-8".into());
     }
-    let backups = fs::read_dir(&fixture.profile)?
-        .collect::<std::io::Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with(".claude.json.controlfreak-backup-")
-        })
-        .collect::<Vec<_>>();
-    if backups.len() != 1 || native::configuration_permissions(&backups[0].path())? != permissions {
-        return Err("Backup permissions changed".into());
+    if !claude_state.is_file()
+        || !fixture
+            .install
+            .join("installer-state/claude-code.managed")
+            .is_file()
+    {
+        return Err("Claude Code CLI registration or managed marker missing".into());
     }
-    verify_updated_entry(fixture, &config)?;
+    if fs::read_to_string(&codex_state)? != preexisting_codex
+        || fixture
+            .install
+            .join("installer-state/codex.managed")
+            .exists()
+    {
+        return Err("Pre-existing Codex entry was modified or wrongly claimed".into());
+    }
     verify_blocker_pid(fixture)?;
     let portable = fixture.output.join("portable comparison");
     verify::extract(&directory.join(package::archive_name(version)), &portable)?;
@@ -160,11 +253,7 @@ fn exercise(fixture: &Fixture, installer: &Path, directory: &Path, version: &str
         }
     }
     verify::server(&fixture.install.join("controlfreak.exe"), version, None)?;
-    for path in CLIENT_PATHS {
-        if !fs::read_to_string(fixture.profile.join(path))?.contains("controlfreak") {
-            return Err("Selected client configuration missing".into());
-        }
-    }
+
     if fixture.setup(installer, true)? != 0 {
         return Err("Reinstallation failed".into());
     }
@@ -186,11 +275,14 @@ fn exercise(fixture: &Fixture, installer: &Path, directory: &Path, version: &str
             return Err("Setup replaced an in-use executable".into());
         }
     }
-    fs::write(&config, "synthetic invalid JSON")?;
+
+    // Missing Claude CLI while selected must still install files and return exit code 10.
+    fixture.write_synthetic_clis(false, true)?;
     if fixture.setup(installer, true)? != 10 {
-        return Err("Partial configuration failure must return exit 10".into());
+        return Err("Partial CLI registration failure must return exit 10".into());
     }
-    fs::write(&config, "{}")?;
+    fixture.write_synthetic_clis(true, true)?;
+
     fs::write(
         fixture.install.join("unrelated-fixture.txt"),
         "retain this synthetic file",
@@ -206,24 +298,27 @@ fn exercise(fixture: &Fixture, installer: &Path, directory: &Path, version: &str
     if !fixture.install.join("unrelated-fixture.txt").is_file() {
         return Err("Uninstall removed unrelated content".into());
     }
-    for path in CLIENT_PATHS {
-        if fs::read_to_string(fixture.profile.join(path))?.contains("controlfreak") {
-            return Err("Installer-created configuration remains".into());
-        }
+    if claude_state.exists() {
+        return Err("Installer-managed Claude Code registration remains after uninstall".into());
+    }
+    if fs::read_to_string(&codex_state)? != preexisting_codex {
+        return Err("Uninstall modified pre-existing Codex registration".into());
     }
     Ok(())
 }
 
 fn verify_missing_helper_uninstall(fixture: &Fixture, installer: &Path) -> Result<()> {
     // A deleted/quarantined helper must not prevent removing the application.
+    fs::create_dir_all(&fixture.profile)?;
+    fixture.write_synthetic_clis(true, true)?;
     if fixture.setup(installer, true)? != 0 {
         return Err("Missing-helper fixture installation failed".into());
     }
-    let configs = CLIENT_PATHS
-        .iter()
-        .map(|path| fs::read(fixture.profile.join(path)))
-        .collect::<std::io::Result<Vec<_>>>()
-        .map_err(|_| "Missing-helper fixture configuration was not created")?;
+    let claude_state = fixture.profile.join("claude.registered");
+    let codex_state = fixture.profile.join("codex.registered");
+    if !claude_state.is_file() || !codex_state.is_file() {
+        return Err("Missing-helper fixture registrations were not created".into());
+    }
     fs::remove_file(fixture.install.join("controlfreak-installer.exe"))
         .map_err(|_| "Missing-helper fixture executable was not installed")?;
     if fixture.setup(&fixture.install.join("unins000.exe"), false)? != 0
@@ -232,82 +327,78 @@ fn verify_missing_helper_uninstall(fixture: &Fixture, installer: &Path) -> Resul
     {
         return Err("Missing cleanup helper prevented uninstall".into());
     }
-    for (path, original) in CLIENT_PATHS.iter().zip(configs) {
-        if fs::read(fixture.profile.join(path))? != original {
-            return Err("Missing-helper uninstall changed client configuration".into());
-        }
+    if !claude_state.is_file() || !codex_state.is_file() {
+        return Err("Missing-helper uninstall unexpectedly changed registrations".into());
     }
     Ok(())
 }
 
-fn verify_failed_cleanup_uninstall(fixture: &Fixture, installer: &Path) -> Result<()> {
+fn verify_missing_cli_cleanup_uninstall(fixture: &Fixture, installer: &Path) -> Result<()> {
+    fs::create_dir_all(&fixture.profile)?;
+    fixture.write_synthetic_clis(true, true)?;
     if fixture.setup(installer, true)? != 0 {
-        return Err("Cleanup-failure fixture installation failed".into());
+        return Err("Missing-CLI cleanup fixture installation failed".into());
     }
-    let configs = CLIENT_PATHS
-        .iter()
-        .map(|path| fs::read(fixture.profile.join(path)))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    // Make the real helper return an error before touching any configuration.
-    // This checks the installer's failure policy, not only helper exit codes.
-    let guard = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(fixture.profile.join("local/ControlFreak/installer.lock"))?;
-    guard.try_lock()?;
+    // Remove Codex CLI before uninstall; Claude should be removed while Codex reports a warning without blocking uninstall.
+    fixture.write_synthetic_clis(true, false)?;
     if fixture.setup(&fixture.install.join("unins000.exe"), false)? != 0
         || fixture.install.join("controlfreak.exe").exists()
         || fixture.registration.location()?.is_some()
     {
-        return Err("Optional configuration cleanup failure prevented uninstall".into());
+        return Err("Missing CLI during cleanup prevented uninstall".into());
     }
-    for (path, original) in CLIENT_PATHS.iter().zip(configs) {
-        if fs::read(fixture.profile.join(path))? != original {
-            return Err("Unavailable cleanup modified client configuration".into());
-        }
+    if fixture.profile.join("claude.registered").exists() {
+        return Err("Missing Codex CLI prevented Claude Code cleanup".into());
+    }
+    if !fixture.profile.join("codex.registered").is_file() {
+        return Err("Codex entry disappeared without CLI".into());
+    }
+    let log = read_uninstall_log(&fixture.output.join("uninstall.log"))?;
+    if !log.contains("Could not verify or remove MCP entry for: codex") {
+        return Err("Uninstall log did not record the CLI cleanup warning".into());
     }
     Ok(())
 }
 
-fn verify_retained_cleanup_uninstall(fixture: &Fixture, installer: &Path) -> Result<()> {
-    if fixture.setup(installer, true)? != 0 {
-        return Err("Cleanup-warning fixture installation failed".into());
+fn verify_legacy_v030_receipt_uninstall(fixture: &Fixture, installer: &Path) -> Result<()> {
+    // Seed a v0.3.0-format JSON receipt in installer-state before upgrading in place without
+    // re-selecting clients, then verify uninstall leaves the legacy receipt untouched and logs
+    // manual cleanup guidance.
+    fs::create_dir_all(&fixture.profile)?;
+    let state_dir = fixture.install.join("installer-state");
+    fs::create_dir_all(&state_dir)?;
+    let legacy_receipt = state_dir.join("claude-desktop.json");
+    let receipt_body = r#"[{"client":"claude-desktop","path":"C:\\Synthetic\\claude_desktop_config.json","entry":"{}","committed":true}]"#;
+    fs::write(&legacy_receipt, receipt_body)?;
+    fixture.write_synthetic_clis(true, true)?;
+
+    // Install with no /CLIENTS selected (files-only upgrade over v0.3.0 state).
+    let mut install_cmd = fixture.command(installer);
+    install_cmd
+        .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"])
+        .arg(format!("/DIR={}", fixture.install.display()));
+    let install_code = process::run(&mut install_cmd, "", Duration::from_mins(1))?
+        .status
+        .code();
+    if install_code != Some(0) {
+        return Err("Legacy-receipt upgrade installation failed".into());
     }
-    let config = fixture.profile.join(CLIENT_PATHS[0]);
-    let original = fs::read(&config)?;
-    let _guard = fs::OpenOptions::new()
-        .read(true)
-        .share_mode(1)
-        .open(&config)?;
+
     if fixture.setup(&fixture.install.join("unins000.exe"), false)? != 0
         || fixture.install.join("controlfreak.exe").exists()
         || fixture.registration.location()?.is_some()
     {
-        return Err("Retained configuration prevented uninstall".into());
+        return Err("Legacy receipt prevented uninstall".into());
     }
-    if fs::read(&config)? != original
-        || !fixture.install.join("installer-state/codex.json").exists()
+    if fs::read_to_string(&legacy_receipt)? != receipt_body {
+        return Err("Uninstall modified or removed a legacy v0.3.0 receipt".into());
+    }
+    let log = read_uninstall_log(&fixture.output.join("uninstall.log"))?;
+    if !log.contains("Legacy MCP receipts detected") || !log.contains(".controlfreak-backup-*.bak")
     {
-        return Err("Cleanup warning lost retained configuration or receipt".into());
-    }
-    for path in CLIENT_PATHS.iter().skip(1) {
-        if fs::read_to_string(fixture.profile.join(path))?.contains("controlfreak") {
-            return Err("Retained configuration prevented other client cleanup".into());
-        }
-    }
-    let bytes = fs::read(fixture.output.join("uninstall.log"))?;
-    let log = if bytes.starts_with(&[0xff, 0xfe]) {
-        String::from_utf16(
-            &bytes[2..]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect::<Vec<_>>(),
-        )?
-    } else {
-        String::from_utf8(bytes)?
-    };
-    if !log.contains("Cleanup incomplete for: codex") {
-        return Err("Successful helper exit concealed a cleanup warning".into());
+        return Err(
+            "Uninstall log did not record manual cleanup guidance for v0.3.0 receipts".into(),
+        );
     }
     Ok(())
 }
@@ -338,8 +429,11 @@ fn verify_blocker_pid(fixture: &Fixture) -> Result<()> {
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         let text = String::from_utf16(&words)?;
-        if !text.contains(&format!("PID: {}", child.id())) {
-            return Err("Blocker diagnostics did not identify the owned server PID".into());
+        if !text.contains(&format!("PID: {}, holds file", child.id())) {
+            return Err(
+                "Blocker diagnostics did not identify the owned server PID as holding the file"
+                    .into(),
+            );
         }
         if !text
             .lines()
@@ -358,21 +452,4 @@ fn verify_blocker_pid(fixture: &Fixture) -> Result<()> {
     let _ = child.kill();
     let _ = child.wait();
     result
-}
-
-fn verify_updated_entry(fixture: &Fixture, config: &Path) -> Result<()> {
-    let updated: serde_json::Value = serde_json::from_str(&fs::read_to_string(config)?)?;
-    let command = updated["mcpServers"]["controlfreak"]["command"]
-        .as_str()
-        .ok_or("Updated client command is missing")?;
-    if Path::new(command).canonicalize()?
-        != fixture.install.join("controlfreak.exe").canonicalize()?
-        || updated["mcpServers"]["other"]["command"] != "other-synthetic.exe"
-        || updated["preferences"]["synthetic"] != true
-    {
-        return Err(
-            "Install did not update the existing entry while preserving other settings".into(),
-        );
-    }
-    Ok(())
 }

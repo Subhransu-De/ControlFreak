@@ -28,15 +28,7 @@ A profile narrows the MCP tool surface. It is not a sandbox. The observe profile
 
 ## Process integrity and elevation
 
-The optional Windows setup program and its separate `controlfreak-installer.exe` utility edit only
-the explicitly selected clients' MCP configuration. These are installation features, not MCP tools.
-Setup creates private configuration backups alongside existing files; those backups may contain
-credentials and are intentionally retained after uninstall. Backups preserve access permissions;
-EFS-encrypted source configurations are refused before backup creation. Optional uninstall cleanup
-retains data it cannot safely change and reports failed rollback as requiring backup recovery. The setup utility reports fixed error
-messages rather than configuration contents. It never enables `--allow-elevated` in generated client
-entries, starts a server, or changes the server's desktop-control checks. Run setup as the intended
-non-elevated user so configuration changes apply to that user.
+The optional Windows setup program and its separate `controlfreak-installer.exe` utility never read, parse, edit or back up third-party client configuration files directly. When the user opts in to connecting Claude Code or Codex, the helper invokes the client's official CLI (`claude mcp add` or `codex mcp add`) and records a `.managed` marker with the installed path and profile environment only for entries it created. Automatic CLI registration and removal are refused by default when setup runs elevated and are always disabled in interactive setup; silent automation on an elevated runner requires an explicit `/ALLOWELEVATEDCLI=1` opt-in (`--allow-elevated` on the helper). The helper resolves CLIs only from absolute `PATH` entries, prefers native `.exe` binaries without a shell, invokes `.cmd`/`.bat` shims only through Windows' system `cmd.exe` while rejecting shell metacharacters, requires Windows job-object containment for spawned CLI process trees under a single deadline for execution and output collection, and reports fixed error messages rather than CLI output. These are installation features, not MCP tools. Setup never enables `--allow-elevated` in registered entries, starts a server, or changes the server's desktop-control checks. Run setup as the intended non-elevated user so registration applies to that user.
 
 ControlFreak inherits the Windows access token of the MCP client that starts it. It never requests
 elevation itself, but an elevated client would otherwise make ControlFreak elevated too. The server

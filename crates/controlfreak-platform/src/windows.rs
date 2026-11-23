@@ -97,6 +97,24 @@ pub(crate) fn spawn_helper_process(
     process::spawn_managed_child(program, arguments)
 }
 
+pub(crate) fn spawn_contained_process(
+    program: &std::path::Path,
+    arguments: &[std::ffi::OsString],
+) -> std::io::Result<ManagedChild> {
+    process::spawn_contained_child(program, arguments)
+}
+
+pub(crate) fn spawn_contained_command_line(
+    program: &std::path::Path,
+    command_line: &std::ffi::OsStr,
+) -> std::io::Result<ManagedChild> {
+    process::spawn_managed_command_line(program, command_line, true)
+}
+
+pub(crate) fn system_cmd_exe() -> std::io::Result<std::path::PathBuf> {
+    process::system_cmd_exe()
+}
+
 pub(crate) fn serve_desktop_glow_helper(arguments: &[String]) -> std::io::Result<Option<()>> {
     let Some(config) = glow::HelperConfig::parse(arguments)? else {
         return Ok(None);

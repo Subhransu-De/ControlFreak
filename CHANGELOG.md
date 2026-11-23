@@ -9,6 +9,13 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Changed
+
+- The Windows installer now registers MCP clients optionally through the official `claude mcp add` and `codex mcp add` commands instead of editing third-party configuration files or writing `.bak` backups directly. Each client shows its own PowerShell command preview and Copy button so you can run it yourself or let setup run it.
+- Installer client registration now supports Claude Code and Codex only (`/CLIENTS=claude-code,codex`). Use the manual instructions in `docs/install.md` for Claude Desktop, OpenCode and Pi. Entries and `*.controlfreak-backup-*.bak` files created by v0.3.0 or earlier are left untouched on upgrade and uninstall and must be removed manually.
+- When an upgrade or uninstall is blocked by a running ControlFreak process, setup now displays a parent-child process tree distinguishing parent apps from exact `holds file` PIDs instead of a flat PID list.
+- Added the ControlFreak mascot icon to the installer window, header and finish sidebar, and simplified the finish screen layout.
+
 ## [0.3.0] - 2026-11-21
 
 ### Fixed

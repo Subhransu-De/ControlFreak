@@ -10,9 +10,10 @@ use std::{
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
         process::ExitStatusExt,
     },
-    path::Path,
+    path::{Path, PathBuf},
     process::ExitStatus,
     ptr,
+    time::Duration,
 };
 
 use windows::{
@@ -29,6 +30,7 @@ use windows::{
                 SetInformationJobObject, TerminateJobObject,
             },
             Pipes::CreatePipe,
+            SystemInformation::GetSystemDirectoryW,
             Threading::{
                 CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
                 DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
@@ -83,9 +85,14 @@ impl ManagedChild {
     }
 
     pub fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
+        self.wait_exit_within(Duration::ZERO)
+    }
+
+    pub fn wait_exit_within(&self, timeout: Duration) -> io::Result<Option<ExitStatus>> {
+        let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
         let process = raw_handle(&self.process);
-        // SAFETY: `process` remains valid for the duration of this synchronous wait.
-        let outcome = unsafe { WaitForSingleObject(process, 0) };
+        // SAFETY: `process` remains valid for the duration of this bounded synchronous wait.
+        let outcome = unsafe { WaitForSingleObject(process, millis) };
         if outcome == WAIT_TIMEOUT {
             return Ok(None);
         }
@@ -109,9 +116,53 @@ impl ManagedChild {
     }
 }
 
+pub(super) fn system_cmd_exe() -> io::Result<PathBuf> {
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        // SAFETY: `buffer` is a live writable UTF-16 slice passed to GetSystemDirectoryW.
+        let written = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
+        if written == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if written < buffer.len() {
+            let dir = String::from_utf16(&buffer[..written])
+                .map_err(|_| io::Error::other("System directory is not valid UTF-16"))?;
+            let path = PathBuf::from(dir).join("cmd.exe");
+            if !path.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Windows system cmd.exe was not found",
+                ));
+            }
+            return Ok(path);
+        }
+        if written > 32_768 {
+            return Err(io::Error::other("System directory path is too long"));
+        }
+        buffer.resize(written + 1, 0);
+    }
+}
+
 pub(super) fn spawn_managed_child(
     program: &Path,
     arguments: &[OsString],
+) -> io::Result<ManagedChild> {
+    let command_line = build_command_line(program.as_os_str(), arguments);
+    spawn_managed_command_line(program, &command_line, false)
+}
+
+pub(super) fn spawn_contained_child(
+    program: &Path,
+    arguments: &[OsString],
+) -> io::Result<ManagedChild> {
+    let command_line = build_command_line(program.as_os_str(), arguments);
+    spawn_managed_command_line(program, &command_line, true)
+}
+
+pub(super) fn spawn_managed_command_line(
+    program: &Path,
+    command_line: &OsStr,
+    require_job: bool,
 ) -> io::Result<ManagedChild> {
     let stdin_pipe = anonymous_pipe(true)?;
     let stdout_pipe = anonymous_pipe(false)?;
@@ -120,21 +171,26 @@ pub(super) fn spawn_managed_child(
     clear_inherit(&stdout_pipe.parent)?;
     clear_inherit(&stderr_pipe.parent)?;
 
-    let helper_job = create_job().ok();
+    let helper_job = match create_job() {
+        Ok(job) => Some(job),
+        Err(error) if require_job => return Err(error),
+        Err(_) => None,
+    };
     let (process_info, containment_reason) = match helper_job.as_ref() {
         Some(job) => match create_process(
             program,
-            arguments,
+            command_line,
             &stdin_pipe,
             &stdout_pipe,
             &stderr_pipe,
             Some(job),
         ) {
             Ok(process) => (process, None),
+            Err(error) if require_job => return Err(error),
             Err(error) => (
                 create_process(
                     program,
-                    arguments,
+                    command_line,
                     &stdin_pipe,
                     &stdout_pipe,
                     &stderr_pipe,
@@ -148,7 +204,7 @@ pub(super) fn spawn_managed_child(
         None => (
             create_process(
                 program,
-                arguments,
+                command_line,
                 &stdin_pipe,
                 &stdout_pipe,
                 &stderr_pipe,
@@ -251,14 +307,14 @@ fn create_job() -> io::Result<OwnedHandle> {
 
 fn create_process(
     program: &Path,
-    arguments: &[OsString],
+    raw_command_line: &OsStr,
     stdin: &PipePair,
     stdout: &PipePair,
     stderr: &PipePair,
     helper_job: Option<&OwnedHandle>,
 ) -> io::Result<PROCESS_INFORMATION> {
     let application = wide_null(program.as_os_str());
-    let mut command_line = wide_null(&build_command_line(program.as_os_str(), arguments));
+    let mut command_line = wide_null(raw_command_line);
     let environment = encode_environment_block(normalized_environment(std::env::vars_os()));
     // SAFETY: Both Win32 structures are plain data whose documented initial state is zeroed.
     let mut process_info: PROCESS_INFORMATION = unsafe { zeroed() };
@@ -304,15 +360,17 @@ fn create_process(
         return Err(windows_error(error));
     }
 
-    if let Some(job) = helper_job {
-        let job_handle = raw_handle(job);
-        // SAFETY: The attribute list and job handle live through CreateProcessW below.
+    // Keep the job handle value alive until after CreateProcessW and DeleteProcThreadAttributeList.
+    let job_handle = helper_job.map(raw_handle);
+    if let Some(job_handle_ref) = job_handle.as_ref() {
+        // SAFETY: The attribute list and `job_handle` storage live through CreateProcessW and
+        // DeleteProcThreadAttributeList below.
         if let Err(error) = unsafe {
             UpdateProcThreadAttribute(
                 list,
                 0,
                 usize::try_from(PROC_THREAD_ATTRIBUTE_JOB_LIST).unwrap_or(0),
-                Some(ptr::from_ref(&job_handle).cast::<c_void>()),
+                Some(ptr::from_ref(job_handle_ref).cast::<c_void>()),
                 size_of::<HANDLE>(),
                 None,
                 None,

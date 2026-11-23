@@ -14,18 +14,11 @@ compile_error!("ControlFreak v0.1.0-alpha supports Windows only");
 mod windows;
 
 #[cfg(target_os = "windows")]
-#[path = "windows/installer_files.rs"]
-mod installer_files;
-
-#[cfg(target_os = "windows")]
-pub use installer_files::copy_configuration_permissions;
-
-#[cfg(target_os = "windows")]
 #[path = "windows/installer_processes.rs"]
 mod installer_processes;
 
 #[cfg(target_os = "windows")]
-pub use installer_processes::{InstallerBlocker, installer_blockers};
+pub use installer_processes::{InstallerBlocker, ProcessAncestor, installer_blockers};
 
 #[cfg(all(target_os = "windows", feature = "packaging-tests"))]
 #[path = "windows/packaging_tests.rs"]
@@ -105,6 +98,27 @@ pub fn spawn_helper_process(
     arguments: &[OsString],
 ) -> std::io::Result<ManagedChild> {
     implementation::spawn_helper_process(program, arguments)
+}
+
+#[cfg(target_os = "windows")]
+pub fn spawn_contained_process(
+    program: &Path,
+    arguments: &[OsString],
+) -> std::io::Result<ManagedChild> {
+    implementation::spawn_contained_process(program, arguments)
+}
+
+#[cfg(target_os = "windows")]
+pub fn spawn_contained_command_line(
+    program: &Path,
+    command_line: &std::ffi::OsStr,
+) -> std::io::Result<ManagedChild> {
+    implementation::spawn_contained_command_line(program, command_line)
+}
+
+#[cfg(target_os = "windows")]
+pub fn system_cmd_exe() -> std::io::Result<PathBuf> {
+    implementation::system_cmd_exe()
 }
 
 #[cfg(target_os = "windows")]
