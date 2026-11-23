@@ -12,8 +12,7 @@ in this repository.
   client that started it, such as Claude Code or Codex. What that client does next, including sending it to an AI
   model provider, is decided by the client and its provider, not by ControlFreak.
 - It keeps short-lived data in memory only, and writes no files unless you turn on its error log.
-- The setup program changes the MCP configuration of the clients you select, and keeps backups of
-  those files.
+- The optional setup program can register ControlFreak with Claude Code or Codex by running their official CLI commands (`claude mcp add` / `codex mcp add`). It never reads, edits or backs up third-party configuration files directly.
 
 ## What the server reads and why
 
@@ -79,30 +78,20 @@ content.
 
 ## What the setup program changes
 
-The setup program installs to `%LOCALAPPDATA%\Programs\ControlFreak` for the current user, without
-administrator rights. When you select an MCP client, it:
+The setup program installs to `%LOCALAPPDATA%\Programs\ControlFreak` for the current user, without administrator rights. When you opt in to connecting a supported client (Claude Code or Codex), it:
 
-- Adds a `controlfreak` entry to that client's MCP configuration file.
-- Saves a private backup of the original file next to it, named
-  `<file>.controlfreak-backup-*.bak`. Configuration files can contain credentials, such as API
-  keys for other MCP servers, so the backup can contain them too. The backup keeps the original
-  file's access permissions.
-- Records which file it changed in the `installer-state` folder inside the install folder.
+- Runs the client's official CLI (`claude mcp add --scope user controlfreak -- '<path>'` or `codex mcp add controlfreak -- '<path>'`) instead of reading, editing or backing up third-party configuration files directly.
+- Preserves any existing `controlfreak` entry rather than overwriting it (for Codex, setup only adds after `codex mcp get --json controlfreak` confirms the server is absent).
+- Writes a marker file (`claude-code.managed` or `codex.managed`) in the `installer-state` folder inside the install folder recording the installed path and active profile environment (`USERPROFILE` and `CLAUDE_CONFIG_DIR` or `CODEX_HOME`).
 
-Setup error messages never include configuration contents.
+Setup error messages use fixed strings and never repeat CLI output or configuration contents.
 
-When you uninstall, you can choose to remove the `controlfreak` entries it added. The backups stay
-on disk on purpose, so that you can restore a configuration if needed. You can delete them
-yourself once you no longer need them.
+When you uninstall, you can choose to remove the `controlfreak` entries that setup registered when the active profile environment matches the marker. Codex verifies the exact unmodified command before calling `codex mcp remove`; Claude Code runs `claude mcp remove --scope user controlfreak` in the matching profile upon confirmation. Pre-existing entries and any `*.controlfreak-backup-*.bak` files created by v0.3.0 or earlier (which may contain credentials) are left untouched; remove old backup files manually if you no longer need them.
 
 ## Your controls
 
-- Press **Esc** while the "An agent is using this PC" tab is on screen to stop the agent's control
-  session.
-- Remove the `controlfreak` entry from a client's MCP configuration, or uninstall ControlFreak, to
-  stop all access.
-- Delete `*.controlfreak-backup-*.bak` files next to your client configurations to remove the
-  backups.
+- Press **Esc** while the "An agent is using this PC" tab is on screen to stop the agent's control session.
+- Remove the `controlfreak` entry from your MCP client, or uninstall ControlFreak, to stop all access.
 
 ## Contact
 

@@ -6,19 +6,8 @@ use std::{
     path::{Path, PathBuf},
 };
 use windows::{
-    Win32::{
-        Foundation::{HLOCAL, LocalFree},
-        Security::{
-            Authorization::{
-                ConvertSecurityDescriptorToStringSecurityDescriptorW,
-                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-            },
-            DACL_SECURITY_INFORMATION, GetFileSecurityW, PROTECTED_DACL_SECURITY_INFORMATION,
-            PSECURITY_DESCRIPTOR, SetFileSecurityW,
-        },
-        Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW},
-    },
-    core::{PCWSTR, PWSTR, w},
+    Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW},
+    core::{PCWSTR, w},
 };
 use winreg::{
     RegKey,
@@ -62,92 +51,6 @@ fn wide(path: &Path) -> io::Result<Vec<u16>> {
     let mut value: Vec<u16> = path.canonicalize()?.as_os_str().encode_wide().collect();
     value.push(0);
     Ok(value)
-}
-struct LocalAllocation(HLOCAL);
-impl Drop for LocalAllocation {
-    fn drop(&mut self) {
-        // SAFETY: The allocation came from a successful Windows conversion API,
-        // is owned by this guard and is freed exactly once after all uses end.
-        unsafe {
-            let _ = LocalFree(Some(self.0));
-        }
-    }
-}
-
-pub fn restrict_fixture_permissions(path: &Path) -> io::Result<()> {
-    let path = wide(path)?;
-    let mut descriptor = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: Literal SDDL and live output pointer. On success the API returns an
-    // allocated descriptor; its lifetime is owned by LocalAllocation below.
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            w!("D:P(A;;FA;;;OW)"),
-            SDDL_REVISION_1,
-            &raw mut descriptor,
-            None,
-        )
-    }?;
-    let _allocation = LocalAllocation(HLOCAL(descriptor.0));
-    // SAFETY: The path is NUL-terminated and the initialized descriptor remains
-    // allocated during this synchronous operation. Only the synthetic fixture DACL changes.
-    unsafe {
-        SetFileSecurityW(
-            PCWSTR(path.as_ptr()),
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            descriptor,
-        )
-    }
-    .ok()?;
-    Ok(())
-}
-
-/// Compare DACL rules and protection, excluding Windows' historical AI bookkeeping.
-pub fn configuration_permissions(path: &Path) -> io::Result<String> {
-    let path = wide(path)?;
-    let mut needed = 0;
-    // SAFETY: Size-only query with no descriptor buffer and a writable length.
-    unsafe {
-        let _ = GetFileSecurityW(
-            PCWSTR(path.as_ptr()),
-            DACL_SECURITY_INFORMATION.0,
-            None,
-            0,
-            &raw mut needed,
-        );
-    }
-    if needed == 0 || needed > 1024 * 1024 {
-        return Err(io::Error::other("Cannot size fixture security descriptor"));
-    }
-    let mut data = vec![0_u32; (needed as usize).div_ceil(4)];
-    let descriptor = PSECURITY_DESCRIPTOR(data.as_mut_ptr().cast());
-    // SAFETY: DWORD-aligned buffer is at least needed bytes; all pointers remain live.
-    unsafe {
-        GetFileSecurityW(
-            PCWSTR(path.as_ptr()),
-            DACL_SECURITY_INFORMATION.0,
-            Some(descriptor),
-            needed,
-            &raw mut needed,
-        )
-    }
-    .ok()?;
-    let mut text = PWSTR::null();
-    // SAFETY: Valid initialized descriptor and live output pointer. The returned
-    // string is owned and freed by the following guard.
-    unsafe {
-        ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            descriptor,
-            SDDL_REVISION_1,
-            DACL_SECURITY_INFORMATION,
-            &raw mut text,
-            None,
-        )
-    }?;
-    let _allocation = LocalAllocation(HLOCAL(text.0.cast()));
-    // SAFETY: Successful conversion returned a NUL-terminated UTF-16 string,
-    // whose allocation remains live until after the owned Rust String is created.
-    let value = unsafe { text.to_string() }.map_err(io::Error::other)?;
-    Ok(value.replacen("D:PAI", "D:P", 1).replacen("D:AI", "D:", 1))
 }
 
 /// Read the version resource so a production installer cannot enter a local test.

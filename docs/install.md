@@ -7,62 +7,52 @@
 
 ## Installer
 
-Download `ControlFreak-<version>.exe` from
-[GitHub Releases](https://github.com/Subhransu-De/ControlFreak/releases) and run it as your
-normal user.
+Download `ControlFreak-<version>.exe` from [GitHub Releases](https://github.com/Subhransu-De/ControlFreak/releases) and run it as your normal user.
 
-- It installs to `%LOCALAPPDATA%\Programs\ControlFreak` for the current user. No administrator
-  rights.
-- It offers a checkbox for each supported MCP client. For each one you select, it adds a
-  `controlfreak` entry to that client's configuration. It does not install the client.
-- Restart the selected clients afterwards.
+- It installs to `%LOCALAPPDATA%\Programs\ControlFreak` for the current user. No administrator rights.
+- On the optional **Connect MCP clients** step, it shows the exact CLI registration command and an individual **Copy** button for **Claude Code** and **Codex**. Check a client to let setup run its command after installing files, or leave it unchecked to copy and run it yourself. It does not install the client.
+- Restart configured clients afterwards.
 - The finish page and `setup-results.txt` in the install folder show the result for each client.
 
 ### What setup changes
 
-| Client | File | Override |
+| Client | Registration command (PowerShell syntax) | Removal command on uninstall |
 | --- | --- | --- |
-| Codex | `%USERPROFILE%\.codex\config.toml` | `CODEX_HOME` |
-| Claude Code | `%USERPROFILE%\.claude.json` | `CLAUDE_CONFIG_DIR` |
-| Claude Desktop | `%APPDATA%\Claude\claude_desktop_config.json` | `APPDATA` |
-| OpenCode | `%USERPROFILE%\.config\opencode\opencode.json` (or `.jsonc`) | `XDG_CONFIG_HOME`, `OPENCODE_CONFIG_DIR`, `OPENCODE_CONFIG` |
-| Pi | `%USERPROFILE%\.pi\agent\mcp.json` | `PI_CODING_AGENT_DIR` |
+| Claude Code | `claude mcp add --scope user controlfreak -- '<install-dir>\controlfreak.exe'` | `claude mcp remove --scope user controlfreak` |
+| Codex | `codex mcp add controlfreak -- '<install-dir>\controlfreak.exe'` | `codex mcp remove controlfreak` |
 
-- Other servers, settings and comments in these files are kept.
-- Before it changes a file, setup saves a backup next to it named
-  `<file>.controlfreak-backup-*.bak`. Backups can contain credentials from the original file.
-  Keep them private.
-- Files that are malformed, encrypted (EFS) or changed during setup are left alone and reported.
-- Pi also needs `pi install npm:pi-mcp-adapter`. Setup does not install it.
-- Project or managed client configuration can override these user files.
-- Setup does not change `PATH`, start the server, add a service, enable `--allow-elevated` or
-  install an updater.
+- Setup never reads, parses, edits or backs up third-party client configuration files directly.
+- Existing `controlfreak` entries are kept untouched: for Codex, setup checks `codex mcp get --json controlfreak` outside any project directory and only calls `codex mcp add` on the exact not-found response (Codex has no atomic add-if-absent command); for Claude Code, an existing entry is preserved. Note that if you copy and run `codex mcp add controlfreak -- ...` manually in PowerShell, Codex replaces any existing `controlfreak` entry. If your install path contains `cmd.exe` metacharacters (`&|<>^%!"`) and your client CLI is a `.cmd`/`.bat` shim, install to a path without those characters or use the native `.exe` CLI.
+- For each client that setup registers, it writes a marker file (`claude-code.managed` or `codex.managed`) under `installer-state` in the install folder recording the executable path and active profile environment (`USERPROFILE` plus `CLAUDE_CONFIG_DIR` or `CODEX_HOME`).
+- Automatic CLI registration and removal are disabled by default when setup runs as Administrator (and always disabled in interactive setup); copy and run the PowerShell commands from a normal user terminal instead. Silent automation on elevated runners can explicitly opt in with `/ALLOWELEVATEDCLI=1`.
+- Project or managed client configuration can override user-scoped entries.
+- Setup does not change `PATH`, start the server, add a service, enable `--allow-elevated` or install an updater.
+- For Claude Desktop, OpenCode and Pi, use the manual setup instructions below.
 
 ### Upgrade
 
 - Close the MCP clients that use ControlFreak, then run the new installer.
-- If a file is locked, setup lists the processes that hold it. Close them and select Try Again.
-- Setup refuses downgrades.
+- If a file is locked, setup shows a parent-child process tree marking the exact `holds file` PIDs separately from their parent app. Close the parent app or end only the `holds file` PIDs and select **Try Again**.
+- Setup refuses downgrades and reports the existing folder if you select a different directory.
+- If you are upgrading from v0.3.0 or earlier, client entries written by the earlier direct-edit installer (including Claude Desktop, OpenCode and Pi) and any `*.controlfreak-backup-*.bak` files are left untouched.
 - Restart running clients to load the new version.
 
 ### Uninstall
 
 - Uninstall from Windows Settings, or run `unins000.exe` in the install folder.
-- Uninstall offers to remove the `controlfreak` entries that setup added. It removes an entry only
-  if it is unchanged.
-- Other entries and the backups are kept. To restore an earlier configuration, copy its backup
-  back.
+- If files are in use, uninstall shows the same process tree and stops without killing any process.
+- Uninstall offers to remove the `controlfreak` MCP entries that setup registered, only when the active profile environment matches the recorded marker. For Codex, setup verifies via `codex mcp get --json controlfreak` that the entry still points to the installed executable with no custom flags before calling `codex mcp remove controlfreak`. Because `claude mcp get` connects to the server rather than reading offline config, confirming uninstall runs `claude mcp remove --scope user controlfreak` in the matching profile without pre-connecting.
+- Entries that existed before setup, customized Codex entries, and entries written by v0.3.0 or earlier (along with any old `*.controlfreak-backup-*.bak` files, which may contain credentials) are left untouched and must be removed manually.
 
 ### Silent install
 
 ```powershell
-ControlFreak-<version>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLIENTS=codex,claude-code,claude-desktop,pi,opencode
+ControlFreak-<version>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLIENTS=claude-code,codex
 ```
 
 - `/DIR="C:\Tools\ControlFreak"` sets the install folder.
-- Without `/CLIENTS`, no client is configured.
-- Exit code `10` means ControlFreak installed but at least one client failed. See
-  `setup-results.txt`.
+- Supported `/CLIENTS` values are `claude-code` and `codex`. Without `/CLIENTS`, no client is registered.
+- Exit code `10` means ControlFreak installed but at least one CLI command failed (for example, the CLI was not on `PATH`). See `setup-results.txt`.
 - Silent uninstall keeps client entries unless you add `/REMOVECONFIG=1`.
 
 ## Portable ZIP

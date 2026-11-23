@@ -54,10 +54,7 @@ The domain traits support test doubles; only Windows has a production desktop ba
 
 ## Windows packaging
 
-`make release` builds both the server and the setup helper. The Windows target statically links
-the MSVC runtime through `.cargo/config.toml`. Keep installer-only dependencies out of the server:
-`toml_edit` and `jsonc-parser` preserve configuration formatting, `tempfile` stages new files
-and unique backups, and `semver` compares installed versions, including prereleases.
+`make release` builds both the server and the setup helper. The Windows target statically links the MSVC runtime through `.cargo/config.toml`. Keep installer-only dependencies out of the server: `semver` compares installed versions (including prereleases) and `serde_json` parses `codex mcp get --json` output without editing third-party config files directly.
 
 Run the Rust packaging tool through the workspace's `cargo xtask` alias. Cargo builds it on demand;
 there is no separate script runner to install. Compiler downloads use Windows' built-in `curl.exe`.
@@ -104,7 +101,7 @@ To stop a release before step 4, close its pull request and delete its branch. D
 
 If publication fails, use **Re-run failed jobs**, or run the workflow on the existing tag: `gh workflow run release.yml --ref vX.Y.Z`. This retries the same source without changing versions or tags. A published release is never overwritten; inspect it before any retry. Release commits that the earlier workflow pushed to `main`, up to v0.2.3, have no CI run, so the workflow refuses to retry their tags.
 
-`cargo xtask prepare-release` updates the workspace version and local dependency requirements in `Cargo.toml`, fetches the complete locked dependency graph before using Cargo to update workspace versions in `Cargo.lock`, and preserves the changelog history. Versions cannot decrease or reuse an existing release section or tag, and empty releases are refused. `semver` validates versions and `toml_edit` preserves the manifest layout; both are also used by the setup helper, and the release preparation commands remain developer-only. Alpha, beta and RC versions are prereleases.
+`cargo xtask prepare-release` updates the workspace version and local dependency requirements in `Cargo.toml`, fetches the complete locked dependency graph before using Cargo to update workspace versions in `Cargo.lock`, and preserves the changelog history. Versions cannot decrease or reuse an existing release section or tag, and empty releases are refused. `semver` validates versions and `toml_edit` preserves the manifest layout for release preparation; the release preparation commands remain developer-only. Alpha, beta and RC versions are prereleases.
 
 The `release` environment must exist with the maintainer as a required reviewer and deployments limited to `v*` tags. Publication only runs on tags, so `main` does not need to be allowed. Without the environment, GitHub creates an unprotected one and the release publishes without approval. The repository setting **Allow GitHub Actions to create and approve pull requests** (Settings, Actions, General) must be on, or the workflow pushes the release branch but cannot open its pull request. The ruleset requires no approvals, so the setting lets Actions skip no review. Publishing needs no personal access token.
 

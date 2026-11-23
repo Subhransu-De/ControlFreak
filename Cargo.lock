@@ -286,12 +286,9 @@ name = "controlfreak-installer"
 version = "0.3.0"
 dependencies = [
  "controlfreak-platform",
- "jsonc-parser",
  "semver",
- "serde",
  "serde_json",
  "tempfile",
- "toml_edit",
 ]
 
 [[package]]
@@ -690,16 +687,6 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "jsonc-parser"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ecded084f9b9a718d39668a42657c32253663d1f6afb3fbb9134f0305f73f48"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1450,8 +1437,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd43688c4858d7264ae1cf9a9f874a67c3feb74a883b1cd7bebd6a4ea8307218"
 dependencies = [
  "indexmap",
- "serde_core",
- "serde_spanned",
  "toml_datetime",
  "toml_parser",
  "toml_writer",
