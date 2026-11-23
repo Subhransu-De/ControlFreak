@@ -9,6 +9,8 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+## [0.3.1] - 2026-11-23
+
 ### Changed
 
 - The Windows installer now registers MCP clients optionally through the official `claude mcp add` and `codex mcp add` commands instead of editing third-party configuration files or writing `.bak` backups directly. Each client shows its own PowerShell command preview and Copy button so you can run it yourself or let setup run it.
