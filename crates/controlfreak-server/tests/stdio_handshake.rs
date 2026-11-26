@@ -833,3 +833,62 @@ fn malformed_profile_flags_exit_at_startup() {
         assert_eq!(error["error"]["code"], "server_startup_failed");
     }
 }
+
+/// The server advertises only tools, so methods of the prompts, resources and completions
+/// capabilities are refused as unknown instead of answered with an empty list.
+#[test]
+fn unadvertised_capability_methods_are_method_not_found() {
+    let mut child = test_server_command()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn controlfreak server");
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"integration-test","version":"0.1.0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"prompts/list","params":{}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":4,"method":"resources/templates/list","params":{}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":5,"method":"completion/complete","params":{"ref":{"type":"ref/prompt","name":"none"},"argument":{"name":"a","value":"b"}}}"#,
+        "\n",
+    );
+    child
+        .stdin
+        .take()
+        .expect("open server stdin")
+        .write_all(requests.as_bytes())
+        .expect("write MCP requests");
+    let output = child.wait_with_output().expect("wait for server");
+    assert!(
+        output.status.success(),
+        "server failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses: Vec<Value> = String::from_utf8(output.stdout)
+        .expect("MCP output is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSON-RPC response"))
+        .collect();
+
+    let capabilities = &responses
+        .iter()
+        .find(|response| response["id"] == 1)
+        .expect("initialize response")["result"]["capabilities"];
+    for absent in ["prompts", "resources", "completions"] {
+        assert!(capabilities.get(absent).is_none(), "{absent} advertised");
+    }
+    for id in 2..=5 {
+        let response = responses
+            .iter()
+            .find(|response| response["id"] == id)
+            .unwrap_or_else(|| panic!("response {id}"));
+        assert!(response.get("result").is_none(), "{id}: {response}");
+        assert_eq!(response["error"]["code"], -32601, "{id}: {response}");
+    }
+}
