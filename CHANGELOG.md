@@ -9,6 +9,10 @@ versioned section and uses that section for the corresponding GitHub Release not
 
 ## Unreleased
 
+### Changed
+
+- `prompts/list`, `resources/list`, `resources/templates/list` and `completion/complete` now return JSON-RPC error `-32601` (method not found) instead of an empty result. ControlFreak advertises only tools, and rmcp 3.11.0 rejects methods for capabilities a server does not advertise.
+
 ## [0.3.1] - 2026-11-23
 
 ### Changed
